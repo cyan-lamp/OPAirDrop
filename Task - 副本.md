@@ -257,6 +257,42 @@ AirDrop 用自签证书，TXT 记录里有 `phash`（证书指纹）。**我们�
 所以现在这个 APK 只完成了应用侧：接收端会 bind 8770（真机验过 `/Discover` 有应答），但
 `wonder0` 没人拉，iPhone 那边连端口都不可达。
 
+### 7.3 驱动加载的**确切序列**（从旧模块 `bin/control.sh` 抄下来，别凭记忆写）
+
+`.ko` 在 `repo-v2/build/package/module/payload/kernel/`：`mac80211.ko` 17.6 MB、
+`qca_cld3_peach_v2.ko` 20.0 MB、`opairshare_wonder_provider.ko` 271 KB、`wonder.ko` 78 KB。
+**合计 37.4 MB**——全塞进 APK 会让包从 890 KB 变成约 38 MB，这是「完全摆脱 KSU」的真实代价，
+要先认下来再动手。
+
+顺序（每一步之间旧脚本都会 `boot_id` 打标记，中断后能续）：
+
+```sh
+am force-stop com.coloros.oshare
+svc wifi disable                 # 必须等 Wi-Fi 真正关掉，再停 HAL
+rmmod qca_cld3_peach_v2
+insmod opairshare_wonder_provider.ko
+insmod qca_cld3_peach_v2.ko \
+  passthru_awdl_addba=1 passthru_awdl_native_rx=1 passthru_ht=1 passthru_fwtype=7 \
+  passthru_mon_rings=0 passthru_dry_run=0 passthru_mon_chan_sync=1 passthru_ndi_peer=1 \
+  passthru_ndi_no_up=1 passthru_mgmt_bridge=1 passthru_aux_monitor=1 passthru_tx_audit=1 \
+  passthru_ndi_fw_authorize=0 passthru_awdl_wmi_raw=1 passthru_awdl_target_mac="" \
+  passthru_awdl_target_auto=1 passthru_awdl_target_enable=1 passthru_awdl_target_auth=2 \
+  passthru_native_data_rx=1 passthru_awdl_backpressure=1 passthru_awdl_raw_rx=1 \
+  passthru_awdl_rate_mbps=54 passthru_awdl_host_seq=1 passthru_awdl_rx_dedup=1 \
+  passthru_awdl_attempts=3 passthru_awdl_rx_auto=1 passthru_awdl_rx_rearm=1 \
+  passthru_sta_coexist=3 passthru_sta_regular_rx=1 passthru_sta_action_rx=1 \
+  passthru_pas_discovery_actions=1 $turbo_args
+rmmod mac80211
+insmod mac80211.ko
+insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
+# 之后恢复 HAL 与 Wi-Fi，再 iw 建 IBSS（awdl_link_up），最后才启动接收端
+```
+
+`turbo_args` 来自旧脚本的 `turbo_module_args`（按机型/温度拼的可选参数），要另抄。
+**风险点两条，动手前必须明确**：① `rmmod` 掉的是 Wi-Fi 驱动，失败会让人没有 Wi-Fi，所以
+必须像旧脚本那样先关 Wi-Fi、留退路（boot 内重试 + 失败回滚检测）；② 从应用目录 `insmod`
+会被 SELinux 拦，必须先复制到 `/data/local/tmp` 再加载。
+
 ---
 
 ## 8. QuickShare / Mosey 剔除清单
@@ -337,6 +373,11 @@ AirDrop 用自签证书，TXT 记录里有 `phash`（证书指纹）。**我们�
 
 ## 13. 变更日志（新的在上）
 
+- **2026-11-14 02:50**：进度回调补上**阶段**。只报字节数不够用：`/Ask` 发出到它 `200` 回来
+  这一段可能十几秒，而进度始终 0%——那不是「慢」，那是「对面正在决定」。现在
+  `ProgressCallback` 带 `phase`：`READY`（连上、对面收）/ `WAITING`（报价已发、等对面点）/
+  `SENDING` / `DONE`，JNI 侧签名 `(IJJ)V`，`SendActivity` 按阶段说话。260 测试、clippy 零
+  warning、clean APK **889 653 字节**。
 - **2026-11-14 02:45**：**重建这份任务书**。它和两个源文件在同一天被「整篇写回」的脚本清空过；
   代码靠 git 救回，文档只能重建。本版把「怎么和苹果设备通信」独立成第 4 节、把影响速度的参数
   收进 5.3、把三次事故写进 6.5 作为禁令。
