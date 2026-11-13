@@ -262,6 +262,7 @@ pub unsafe extern "C" fn opairdrop_serve_decided(
 /// `settings` and `model` must point at their stated lengths of readable bytes, or be null;
 /// `read` and `write` must be valid function pointers whose `context` stays valid for the
 /// duration; `report` must point at a zeroed [`OpairdropBuffer`] that outlives the call.
+#[allow(clippy::too_many_arguments)]
 unsafe fn serve(
     directory: *const u8,
     directory_len: usize,
