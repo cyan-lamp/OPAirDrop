@@ -30,4 +30,35 @@
         <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_icon_anim</item>
         <item name="android:windowSplashScreenAnimationDuration">1000</item>
     </style>
+
+    <!-- 发送面板：一块从底边上滑的玻璃，不是一个新建的页面。
+
+         windowIsTranslucent + 透明窗口背景，是为了让 Window.setBackgroundBlurRadius
+         有东西可模糊：系统模糊的是**这个窗口后面**的那个窗口，而窗口背景不透明时它模糊的
+         只是自己，什么也看不见。分享面板还开在下面时，透出来的就是它。
+
+         整套窗口动画都换成 0 时长（@anim/none）：面板自己负责上滑与下滑，平台再叠一层
+         淡入或缩放，读起来就是两段互不相干的移动同时发生。
+
+         backgroundDimEnabled=false 同理：压暗一层会把模糊让位给一块灰板，读起来像系统
+         弹了个对话框，而不是这个应用浮在自己那一层上。 -->
+    <style name="SendPanelTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowAnimationStyle">@style/PanelAnimation</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+    </style>
+
+    <style name="PanelAnimation">
+        <item name="android:activityOpenEnterAnimation">@anim/none</item>
+        <item name="android:activityOpenExitAnimation">@anim/none</item>
+        <item name="android:activityCloseEnterAnimation">@anim/none</item>
+        <item name="android:activityCloseExitAnimation">@anim/none</item>
+    </style>
 </resources>

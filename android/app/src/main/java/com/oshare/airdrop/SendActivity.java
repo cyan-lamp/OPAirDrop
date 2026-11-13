@@ -4,13 +4,28 @@ import android.app.Activity;
 import android.content.res.Configuration;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Insets;
+import android.graphics.LinearGradient;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.RectF;
+import android.graphics.Shader;
 import android.graphics.Typeface;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.view.Gravity;
+import android.view.MotionEvent;
+import android.view.VelocityTracker;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
+import android.view.WindowManager;
+import android.view.animation.AccelerateInterpolator;
+import android.view.animation.DecelerateInterpolator;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -33,7 +48,7 @@ import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
 
 /**
- * 发送面板：仿一加互传「与 iPhone 互传」那一页。
+ * 发送面板：仿一加互传「与 iPhone 互传」那一页，形态是一块从底边上滑的玻璃。
  *
  * <p># 为什么是这一页，而不是一张列表
  *
@@ -42,21 +57,59 @@ import javax.net.ssl.X509TrustManager;
  * 本设备名）、**中部**（搜索态是雷达，结果态是头像）、**底部**（说明卡）。文件信息收成标题
  * 下面一行小字。
  *
+ * <p># 为什么背景要用窗口模糊，而不是自绘一块假的
+ *
+ * <p>主界面的导航胶囊用 {@link RealtimeBlurView} 捕获它背后的内容，因为那里两者在同一个
+ * Activity 里，能拿到 {@code RenderNode}。这一页是另一个 Activity，它背后是**别人的**窗口
+ * （一加互传的分享面板，或者主屏），拿不到。能拿到那个后景的只有系统：
+ * {@link Window#setBackgroundBlurRadius}，Android 12 起跨窗口实时模糊。所以「同款」在这里
+ * 不是同一个实现，是同一个观感——玻璃背后确实有东西在动。
+ *
+ * <p>代价是窗口必须透明（{@code windowIsTranslucent} + 透明窗口背景），否则系统模糊的是
+ * 它自己。于是这块面板自己负责画圆角、描边与那层半透明底色：
+ * {@link #sheetColor()} 保留一点透明度，让模糊透出来。
+ *
+ * <p># 上滑与下滑都是自己的
+ *
+ * <p>窗口动画在主题里换成了 0 时长（{@code @anim/none}）。上滑是第一帧之前把面板挪到屏幕
+ * 下方再动画回来；下滑是 {@link Sheet} 拦下的纵向拖动，松手按位移与速度决定回弹还是走人。
+ * 平台的淡入淡出留在这里只会变成第二段动作。
+ *
  * <p># 头像上那圈进度是真的
  *
  * <p>它来自 Rust 侧读文件时的计数（每 512 KiB 一次），不是定时器。四个阶段对应协议四步：
  * 连上 → 报价（对面在弹确认）→ 传字节 → 收端确认。中间那段可能停十几秒，所以说的是
  * 「等待对方接受」，而不是一个停在 0% 的进度条。
  *
- * <p># 颜色跟着日夜走
+ * <p># 换深浅色不重建页面
  *
- * <p>浅色近白底黑字、深色近黑底白字，蓝只给状态与进度。颜色来自 {@link Scheme}，和主界面
- * 同一张表——两处各自定义，迟早会出现「设置页是浅的、这里还是深色」。
+ * <p>{@code configChanges} 里带 {@code uiMode}，所以系统日夜切换时这个 Activity 不会被销毁
+ * 重建——那会让正在传的那一圈进度连同它的 {@link Transfer} 一起消失。改动落在
+ * {@link #onConfigurationChanged}：换一张配色表，重建视图树，然后从字段里把状态重放一遍。
+ * 视图只是状态的投影，状态不放在视图里。
  */
 public final class SendActivity extends Activity implements Peers.Watcher {
 
     private static final int CONNECT_TIMEOUT_MS = 8000;
     private static final int READ_TIMEOUT_MS = 300_000;
+
+    /** 上滑进来的时长。比系统对话框略慢：它是整块面板在动，不是一个小窗在淡入。 */
+    private static final int ENTER_MS = 340;
+    /** 下滑走人的时长。要短：手指已经做了决定，动画只是收尾。 */
+    private static final int EXIT_MS = 220;
+    /** 回弹的时长。 */
+    private static final int SPRING_MS = 240;
+
+    /** 面板顶部的圆角。和导航胶囊同一个数。 */
+    private static final float CORNER_DP = 28f;
+
+    /**
+     * 窗口背后那块模糊的半径。
+     *
+     * <p>比导航胶囊的 5f 大得多，因为量纲不同：导航胶囊那一个模糊的是同进程里一张已经录好
+     * 的 {@code RenderNode}，半径以「scratch 像素」计；这里交给系统，半径以屏幕像素计。
+     */
+    private static final float BLUR_DP = 28f;
 
     private Scheme S;
     private float density;
@@ -66,42 +119,46 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     private long totalBytes;
 
     private Peers peers;
+
+    /** 根：负责下滑关闭与上滑进入。它在配置变更时**不**重建，重建的是它里面的内容。 */
+    private Sheet sheet;
+    /** 内容容器。{@link #rebuild} 清空它再填。 */
+    private FrameLayout content;
     private LinearLayout stage;
-    private TextView self;
     private TextView subtitle;
 
-    /** 每台设备一行状态，键是设备名；重扫时复用，避免文字闪一下。 */
-    private final Map<String, String> statuses = new LinkedHashMap<>();
+    /** 标题下一行说发了什么。重建时从它重放。 */
+    private String subtitleText = "正在准备……";
 
+    /** 中部此刻说的话（没有设备时显示在雷达下面）。 */
+    private String searching = "正在搜索附近设备……";
+    /** 最近一次发现到的、能连的设备。 */
+    private List<Peers.Peer> found = new ArrayList<>();
+
+    /** 每台设备一句话状态，键是设备名；重扫与换主题时复用，避免文字闪一下。 */
+    private final Map<String, String> statuses = new LinkedHashMap<>();
+    /** 每台设备当前的进度 [0..1]。环只认它，所以重建之后环还在原处。 */
+    private final Map<String, Float> progressOf = new LinkedHashMap<>();
+    /** 当前这一份视图里的头像与状态字。重建时清空重填，进度更新按名字找。 */
+    private final Map<String, Nick> nicks = new LinkedHashMap<>();
+    private final Map<String, TextView> stateViews = new LinkedHashMap<>();
+
+    /** 窗口是否真的在做背景模糊。不成立时底色要完全不透明，否则会看见底下没被遮住的东西。 */
+    private boolean blurred;
+    /** 正在滑出。防止连按两次返回键跑两遍动画。 */
+    private boolean closing;
     private volatile boolean sending;
 
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
 
-        int mode = getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
-        S = Scheme.of(mode != Configuration.UI_MODE_NIGHT_YES);
+        S = schemeOf(getResources().getConfiguration());
         density = getResources().getDisplayMetrics().density;
+        applyWindow();
 
-        FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(S.bg);
-
-        LinearLayout column = new LinearLayout(this);
-        column.setOrientation(LinearLayout.VERTICAL);
-        column.setPadding(dp(20), 0, dp(20), 0);
-        root.addView(column, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-
-        column.addView(topBar());
-        column.addView(subtitleLine());
-        stage = new LinearLayout(this);
-        stage.setOrientation(LinearLayout.VERTICAL);
-        column.addView(stage, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-        column.addView(bottomCard());
-
-        setContentView(root);
-        showSearching("正在搜索附近设备……");
+        buildShell();
+        slideIn();
 
         new Thread(this::intake, "opairdrop-intake").start();
     }
@@ -122,26 +179,225 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         }
     }
 
+    /**
+     * 日夜切换：不重建 Activity，只换一张表再重画。
+     *
+     * <p>这里**不能**调 {@code recreate()}：那一瞬间正在传的那条线程还握着一个已经没人看的
+     * 视图，进度会停住，而文件还在传——界面与事实分成两半。重画视图树没有这个问题，
+     * 因为进度存在 {@link #progressOf} 里，视图只是把它画出来。
+     */
+    @Override
+    public void onConfigurationChanged(Configuration next) {
+        super.onConfigurationChanged(next);
+        Scheme fresh = schemeOf(next);
+        if (fresh.light == S.light) {
+            return;
+        }
+        S = fresh;
+        applyWindowBars();
+        tintSheet();
+        rebuild();
+    }
+
+    // ------------------------------------------------------------------ 窗口
+
+    /**
+     * 把窗口变成一块可以透出后景的玻璃。
+     *
+     * <p>透明窗口背景必须在 {@link Window#setBackgroundBlurRadius} 之前——那个半径模糊的是
+     * 窗口**背后**的窗口，而一个还在画自己不透明底色的窗口，模糊结果会被自己的底色整个盖住，
+     * 看起来像「模糊没生效」。
+     *
+     * <p>模糊半径本身要等 {@code setContentView} 之后再设：平台上那条路径直接对
+     * {@code DecorView} 调用同名方法，而 DecorView 是等有人要它的时候才建的。在
+     * {@code onCreate} 开头设，拿到的是一个空引用，整个 Activity 起不来。真机上撞到过一次。
+     */
+    private void applyWindow() {
+        Window window = getWindow();
+        window.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+
+        WindowManager manager = getSystemService(WindowManager.class);
+        blurred = manager != null && manager.isCrossWindowBlurEnabled();
+    }
+
+    /** 窗口有了 DecorView 之后才做得成的两件事：模糊半径与系统栏图标。 */
+    private void applyGlass() {
+        if (blurred) {
+            getWindow().setBackgroundBlurRadius(dp(BLUR_DP));
+        }
+        applyWindowBars();
+    }
+
+    /** 系统栏图标跟着深浅走。主题里那两条只在 Activity 创建时生效一次。 */
+    private void applyWindowBars() {
+        WindowInsetsController controller = getWindow().getInsetsController();
+        if (controller == null) {
+            return;
+        }
+        int mask = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+        controller.setSystemBarsAppearance(S.light ? mask : 0, mask);
+    }
+
+    /**
+     * 这层玻璃自己的染色。
+     *
+     * <p>模糊生效时留一点透明度，让下面的东西透上来；不生效时填死，因为那时底下是别人的
+     * 界面，透出来是一团读不出重点的乱码。
+     */
+    private int sheetColor() {
+        // 浅色 224/255、深色 230/255，比导航胶囊的 240 更透一点。那一块玻璃背后是同色的
+        // 卡片内容，240 还看得出层次；这一块背后是桌面——壁纸和图标，遮到 240 就只剩一块白板，
+        // 模糊等于白做。再薄就会让标题压到别人的图标上，所以停在这两个数。
+        int alpha = S.light ? 0xE0 : 0xE6;
+        return blurred ? (S.bg & 0x00FFFFFF) | (alpha << 24) : S.bg;
+    }
+
+    private void tintSheet() {
+        if (sheet == null) {
+            return;
+        }
+        Drawable background = sheet.getBackground();
+        if (background instanceof GradientDrawable) {
+            ((GradientDrawable) background).setColor(sheetColor());
+        }
+    }
+
+    // ------------------------------------------------------------------ 骨架
+
+    private void buildShell() {
+        sheet = new Sheet(this);
+
+        GradientDrawable shape = new GradientDrawable();
+        float radius = dp(CORNER_DP);
+        // 上两角圆、下两角方：它是从底边长出来的一整块，底边在屏幕外面。
+        shape.setCornerRadii(new float[]{radius, radius, radius, radius, 0f, 0f, 0f, 0f});
+        shape.setColor(sheetColor());
+        sheet.setBackground(shape);
+
+        content = new FrameLayout(this);
+        sheet.addView(content, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // 一圈上亮下暗的描边，和导航胶囊同一条配方。没有它，玻璃的边界只是一处颜色突变。
+        sheet.addView(new Rim(radius, dp(1.4f)), new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // 状态栏 / 导航条的高度进内边距，页面内容不压在系统栏底下。
+        sheet.setOnApplyWindowInsetsListener((view, insets) -> {
+            Insets bars = insets.getInsets(WindowInsets.Type.systemBars());
+            content.setPadding(0, bars.top, 0, bars.bottom);
+            return insets;
+        });
+
+        setContentView(sheet);
+        applyGlass();
+        rebuild();
+    }
+
+    /** 把内容整棵重建。配置变更、以及第一次搭骨架时都走这里。 */
+    private void rebuild() {
+        if (content == null) {
+            return;
+        }
+        content.removeAllViews();
+        nicks.clear();
+        stateViews.clear();
+
+        LinearLayout column = new LinearLayout(this);
+        column.setOrientation(LinearLayout.VERTICAL);
+        column.setPadding(dp(20), 0, dp(20), 0);
+        content.addView(column, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        column.addView(topBar());
+        column.addView(subtitleLine());
+
+        stage = new LinearLayout(this);
+        stage.setOrientation(LinearLayout.VERTICAL);
+        // 中部整块上下居中：雷达与它下面那行字是一个整体，居中的是整体，不是雷达自己。
+        stage.setGravity(Gravity.CENTER);
+        column.addView(stage, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        column.addView(bottomCard());
+
+        renderStage();
+    }
+
+    /**
+     * 先藏起来，等量出高度，再挪到屏幕下方滑上来。
+     *
+     * <p>不用 {@code onPreDraw} 里 {@code return false} 那一招（取消首帧、下一帧才是动画的
+     * 第一帧）：真机上它把整个页面停在了一件都没画的状态——首帧被取消，动画的 invalidate
+     * 又被吞掉，窗口有 surface、{@code HAS_DRAWN}，屏幕上却只有背后的桌面。窗口本身是透明
+     * 的，所以「先不可见一帧」看不出任何东西，代价为零。
+     */
+    private void slideIn() {
+        sheet.setVisibility(View.INVISIBLE);
+        sheet.post(() -> {
+            int height = sheet.getHeight();
+            sheet.setTranslationY(height > 0 ? height : dp(600));
+            sheet.setVisibility(View.VISIBLE);
+            layer(true);
+            sheet.animate()
+                    .translationY(0f)
+                    .setDuration(ENTER_MS)
+                    .setInterpolator(new DecelerateInterpolator(1.6f))
+                    .withEndAction(() -> layer(false))
+                    .start();
+        });
+    }
+
+    /**
+     * 把面板提升成一个硬件层，或还回去。
+     *
+     * <p># 为什么位移必须走层
+     *
+     * <p>{@code setTranslationY} 不是一次「搬动」，它会让这个 View 连同整棵子树重新绘制一遍：
+     * 每一帧都要重新栅格化这块 1440×3168 上的全部文字、再走一遍那条全屏圆角描边路径。文字在
+     * 每一帧落到略微不同的亚像素位置上，抗锯齿结果就跟着变——肉眼看到的就是**字在抖**，同时
+     * 帧预算被烧光。
+     *
+     * <p>硬件层之后，内容只栅格化一次，之后每帧只是把这张纹理挪个位置，由合成器完成。代价是
+     * 一张全屏纹理（约 18 MB），所以只在移动期间拿着，停下就还回去——常驻的话它和窗口模糊
+     * 抢同一块 GPU 内存，反而更慢。
+     */
+    private void layer(boolean on) {
+        sheet.setLayerType(on ? View.LAYER_TYPE_HARDWARE : View.LAYER_TYPE_NONE, null);
+        dragging = on;
+        if (!on) {
+            // 拖动期间雷达停了呼吸（理由见 {@link Radar#onDraw}），还回层之后要把它叫醒。
+            sheet.invalidate();
+        }
+    }
+
+    /** 正在拖动 / 正在做位移动画。它决定雷达要不要每 32ms invalidate 一次。 */
+    private boolean dragging;
+
     // ------------------------------------------------------------------ 顶部
 
     private View topBar() {
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER_VERTICAL);
-        bar.setPadding(0, dp(28), 0, dp(10));
+        bar.setPadding(0, dp(14), 0, dp(10));
 
         TextView back = new TextView(this);
         back.setText("‹");
         back.setTextSize(24);
         back.setTextColor(S.text);
         back.setGravity(Gravity.CENTER);
-        back.setBackground(round(S.cardHi, 22));
-        back.setOnClickListener(view -> finish());
+        // 用卡片色而不是 cardHi：cardHi 和页底色几乎同值（#F1F3F6 / #F0F1F3），浅色下那圈底
+        // 完全看不出来，只剩一个孤零零的「‹」浮在玻璃上。
+        back.setBackground(round(S.card, 22));
+        back.setOnClickListener(view -> close());
         bar.addView(back, new LinearLayout.LayoutParams(dp(44), dp(44)));
 
         LinearLayout titles = new LinearLayout(this);
         titles.setOrientation(LinearLayout.VERTICAL);
         titles.setPadding(dp(14), 0, 0, 0);
+
         TextView title = new TextView(this);
         title.setText("与 iPhone 互传");
         title.setTextSize(22);
@@ -149,67 +405,86 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         title.setTextColor(S.text);
         titles.addView(title);
 
-        self = new TextView(this);
+        TextView self = new TextView(this);
         self.setTextSize(12.5f);
         self.setTextColor(S.textDim);
         self.setPadding(0, dp(3), 0, 0);
         self.setText("本设备：" + senderName() + "（Air）");
         titles.addView(self);
+
         bar.addView(titles);
         return bar;
     }
 
-    /** 标题下面那一行：发了什么。空的时候说「正在准备」，别留一行空的。 */
+    /** 标题下面那一行：发了什么。 */
     private View subtitleLine() {
         subtitle = new TextView(this);
         subtitle.setTextSize(12.5f);
         subtitle.setTextColor(S.textDim);
         subtitle.setPadding(dp(2), 0, 0, dp(6));
-        subtitle.setText("正在准备……");
+        subtitle.setText(subtitleText);
         return subtitle;
     }
 
     // ------------------------------------------------------------------ 中部
 
-    /** 搜索态：雷达 + 一行字。 */
-    private void showSearching(String line) {
+    /** 按当前状态（搜索 / 有设备）重画中部。 */
+    private void renderStage() {
+        if (stage == null) {
+            return;
+        }
         stage.removeAllViews();
-        Radar radar = new Radar();
-        LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(dp(180), dp(180));
-        size.gravity = Gravity.CENTER_HORIZONTAL;
-        size.topMargin = dp(36);
-        stage.addView(radar, size);
+        nicks.clear();
+        stateViews.clear();
 
-        TextView hint = new TextView(this);
-        hint.setText(line);
-        hint.setTextSize(14);
-        hint.setTextColor(S.textDim);
-        hint.setGravity(Gravity.CENTER);
-        hint.setPadding(0, dp(20), 0, 0);
-        stage.addView(hint);
+        if (found.isEmpty()) {
+            Radar radar = new Radar();
+            LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(dp(180), dp(180));
+            size.gravity = Gravity.CENTER_HORIZONTAL;
+            stage.addView(radar, size);
+
+            TextView hint = new TextView(this);
+            hint.setText(searching);
+            hint.setTextSize(14);
+            hint.setTextColor(S.textDim);
+            hint.setGravity(Gravity.CENTER);
+            hint.setPadding(0, dp(20), 0, 0);
+            stage.addView(hint);
+            return;
+        }
+
+        LinearLayout grid = new LinearLayout(this);
+        grid.setOrientation(LinearLayout.HORIZONTAL);
+        grid.setGravity(Gravity.CENTER);
+        for (Peers.Peer peer : found) {
+            grid.addView(deviceCell(peer));
+        }
+        stage.addView(grid);
     }
 
     @Override
-    public void onPeers(List<Peers.Peer> found, String problem) {
+    public void onPeers(List<Peers.Peer> peers, String problem) {
         List<Peers.Peer> usable = new ArrayList<>();
-        for (Peers.Peer peer : found) {
+        for (Peers.Peer peer : peers) {
             if (peer.connectable()) {
                 usable.add(peer);
             }
         }
-        if (usable.isEmpty()) {
-            showSearching(problem != null ? problem : "正在搜索附近设备……");
-            return;
+        found = usable;
+        searching = problem != null ? problem : "正在搜索附近设备……";
+
+        // 设备集合没变就不重建：重建会把正在跑的那圈进度丢掉一帧，而进度每秒来两次。
+        if (!nicks.keySet().equals(namesOf(usable))) {
+            renderStage();
         }
-        LinearLayout grid = new LinearLayout(this);
-        grid.setOrientation(LinearLayout.HORIZONTAL);
-        grid.setGravity(Gravity.TOP);
-        grid.setPadding(0, dp(20), 0, 0);
-        for (Peers.Peer peer : usable) {
-            grid.addView(deviceCell(peer));
+    }
+
+    private static java.util.Set<String> namesOf(List<Peers.Peer> peers) {
+        java.util.Set<String> names = new java.util.LinkedHashSet<>();
+        for (Peers.Peer peer : peers) {
+            names.add(peer.name);
         }
-        stage.removeAllViews();
-        stage.addView(grid);
+        return names;
     }
 
     /** 一台设备：圆头像（带进度环）+ 名字 + 状态。 */
@@ -241,7 +516,15 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         state.setText(known == null ? "" : known);
         cell.addView(state);
 
-        cell.setOnClickListener(view -> send(peer, nick, state));
+        nicks.put(peer.name, nick);
+        stateViews.put(peer.name, state);
+        // 重建之前就已经在传的那台，环要接着上一次的位置画，而不是从 0 开始。
+        Float progress = progressOf.get(peer.name);
+        if (progress != null) {
+            nick.progress(progress);
+        }
+
+        cell.setOnClickListener(view -> send(peer));
         return cell;
     }
 
@@ -287,24 +570,26 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             for (File file : files) {
                 totalBytes += file.length();
             }
-            if (files.isEmpty()) {
-                subtitle.setText(batch.problem == null ? "没有可发送的内容" : batch.problem);
-            } else {
-                subtitle.setText(files.size() + " 个文件 · " + size(totalBytes));
+            subtitleText = files.isEmpty()
+                    ? (batch.problem == null ? "没有可发送的内容" : batch.problem)
+                    : files.size() + " 个文件 · " + size(totalBytes);
+            if (subtitle != null) {
+                subtitle.setText(subtitleText);
             }
         });
     }
 
-    private void send(Peers.Peer peer, Nick nick, TextView state) {
+    private void send(Peers.Peer peer) {
         if (sending) {
             return;
         }
         if (files.isEmpty()) {
-            state.setText("没有可发送的内容");
+            status(peer, "没有可发送的内容");
             return;
         }
         sending = true;
-        say(peer, state, "正在连接…");
+        status(peer, "正在连接…");
+
         List<String> paths = new ArrayList<>();
         for (File file : files) {
             paths.add(file.getAbsolutePath());
@@ -312,27 +597,29 @@ public final class SendActivity extends Activity implements Peers.Watcher {
 
         new Thread(() -> {
             try {
-                byte[] frame = transfer(peer, paths, nick, state);
-                Report report = Report.parse(new String(frame, java.nio.charset.StandardCharsets.UTF_8));
+                byte[] frame = transfer(peer, paths);
+                Report report = Report.parse(
+                        new String(frame, java.nio.charset.StandardCharsets.UTF_8));
                 runOnUiThread(() -> {
                     sending = false;
-                    nick.finish();
-                    say(peer, state, "已发送 · " + size(report.bytes));
+                    // 环褪回未开始：留着满圈会读成「还在跑」，而它已经跑完了。
+                    progressOf.remove(peer.name);
+                    redrawProgress(peer.name);
+                    status(peer, "已发送 · " + size(report.bytes));
                 });
             } catch (Exception failed) {
                 String message = failed.getMessage() == null ? failed.toString() : failed.getMessage();
                 runOnUiThread(() -> {
                     sending = false;
-                    // 出错时把环褪回未开始的样子：留着半圈会读成「还在跑」。
-                    nick.finish();
-                    say(peer, state, message);
+                    progressOf.remove(peer.name);
+                    redrawProgress(peer.name);
+                    status(peer, message);
                 });
             }
         }, "opairdrop-send").start();
     }
 
-    private byte[] transfer(Peers.Peer peer, List<String> paths, Nick nick, TextView state)
-            throws Exception {
+    private byte[] transfer(Peers.Peer peer, List<String> paths) throws Exception {
         Socket raw = new Socket();
         raw.connect(new InetSocketAddress(peer.address, peer.port), CONNECT_TIMEOUT_MS);
         raw.setSoTimeout(READ_TIMEOUT_MS);
@@ -352,16 +639,19 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     session.getOutputStream(),
                     (phase, sent, total) -> runOnUiThread(() -> {
                         switch (phase) {
-                            case Native.Progress.READY -> say(peer, state, "已连接，正在请求发送…");
-                            case Native.Progress.WAITING -> say(peer, state, "等待对方接受…");
+                            case Native.Progress.READY -> status(peer, "已连接，正在请求发送…");
+                            case Native.Progress.WAITING -> status(peer, "等待对方接受…");
                             case Native.Progress.SENDING -> {
-                                nick.progress(total == 0 ? 0f : Math.min(1f, (float) sent / total));
-                                say(peer, state, "发送中 "
+                                progressOf.put(peer.name,
+                                        total == 0 ? 0f : Math.min(1f, (float) sent / total));
+                                redrawProgress(peer.name);
+                                status(peer, "发送中 "
                                         + (total == 0 ? 0 : sent * 100 / total) + "%");
                             }
                             case Native.Progress.DONE -> {
-                                nick.progress(1f);
-                                say(peer, state, "已发送，等待确认…");
+                                progressOf.put(peer.name, 1f);
+                                redrawProgress(peer.name);
+                                status(peer, "已发送，等待确认…");
                             }
                             default -> {
                             }
@@ -370,12 +660,212 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         }
     }
 
-    private void say(Peers.Peer peer, TextView state, String line) {
+    /** 写一句状态。存进表里，重建之后还能重放。 */
+    private void status(Peers.Peer peer, String line) {
         statuses.put(peer.name, line);
-        state.setText(line);
+        TextView state = stateViews.get(peer.name);
+        if (state != null) {
+            state.setText(line);
+        }
+    }
+
+    /** 按 {@link #progressOf} 重画某一台的环。视图可能不在（还没建或已重建）。 */
+    private void redrawProgress(String name) {
+        Nick nick = nicks.get(name);
+        if (nick == null) {
+            return;
+        }
+        Float progress = progressOf.get(name);
+        nick.progress(progress == null ? 0f : progress);
+    }
+
+    // ------------------------------------------------------------------ 关闭
+
+    /**
+     * 下滑关闭的根。
+     *
+     * <p>它同时是内容的父，所以这里拦手势不会漏掉任何一块：从标题、雷达、说明卡上往下拉，
+     * 走的都是同一个判定。
+     */
+    private final class Sheet extends FrameLayout {
+        private final int slop;
+        private final int fling;
+        private final VelocityTracker tracker = VelocityTracker.obtain();
+        private float downY;
+        private float downX;
+        /** 这一次触摸里模糊是否已经关掉了。只在第一帧 MOVE 上做一次，不是每帧。 */
+        private boolean moving;
+
+        Sheet(Activity activity) {
+            super(activity);
+            ViewConfiguration configuration = ViewConfiguration.get(activity);
+            slop = configuration.getScaledTouchSlop();
+            // 三倍最小速度：这个手势要「甩」，不是「慢慢挪一点点」。
+            fling = configuration.getScaledMinimumFlingVelocity() * 3;
+        }
+
+        @Override
+        public boolean onInterceptTouchEvent(MotionEvent event) {
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN -> {
+                    downX = event.getX();
+                    downY = event.getY();
+                    moving = false;
+                    // 上一个回弹或上滑可能还在跑。它每帧都往 translationY 里写一个值，和手指
+                    // 写进去的那个互相覆盖——同一帧里先被动画拉回、再被手指推开，读起来就是
+                    // 整个窗口在上下摆。先让它停，位置从此只由手指决定。
+                    animate().cancel();
+                    tracker.clear();
+                    tracker.addMovement(event);
+                    return false;
+                }
+                case MotionEvent.ACTION_MOVE -> {
+                    float dy = event.getY() - downY;
+                    float dx = Math.abs(event.getX() - downX);
+                    // 只接管「明显向下、且比横向更竖」的移动。横向留给以后可能加的翻页，
+                    // 而点击（位移不到 slop）根本不进这里。
+                    if (dy > slop && dy > dx) {
+                        tracker.addMovement(event);
+                        // 一旦确认是要拖，就把面板提升成硬件层：见 {@link #layer}。
+                        if (!moving) {
+                            moving = true;
+                            layer(true);
+                        }
+                        return true;
+                    }
+                    return false;
+                }
+                default -> {
+                    return false;
+                }
+            }
+        }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent event) {
+            if (closing) {
+                return true;
+            }
+            tracker.addMovement(event);
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN -> {
+                    downX = event.getX();
+                    downY = event.getY();
+                    moving = false;
+                    return true;
+                }
+                case MotionEvent.ACTION_MOVE -> {
+                    // 空白处按下时 DOWN 由这个 ViewGroup 自己接住（没有子 view 要它），
+                    // 于是后续 MOVE 不进 onInterceptTouchEvent，直接到这里。提升层要在这里
+                    // 也做一次，否则从标题或雷达上开始拖，整段都还在每帧重绘。
+                    if (!moving) {
+                        moving = true;
+                        layer(true);
+                    }
+                    // 只往下拖。往上推没有对应语义（这一页已经在最上面了），硬跟手会读成失灵。
+                    //
+                    // 不取整：层已经建好，小数位移只是把纹理放到下一个十六分之一像素上，由
+                    // 合成器插值，本来就平滑；取整反而把它变成 1 像素一级的台阶——手指每帧
+                    // 移动不到一像素时，那正是「整个窗口在抖」的来源。
+                    float dy = Math.max(0f, event.getY() - downY);
+                    setTranslationY(dy);
+                    return true;
+                }
+                case MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    moving = false;
+                    tracker.computeCurrentVelocity(1000);
+                    float velocity = tracker.getYVelocity();
+                    boolean leave = getTranslationY() > getHeight() * 0.18f || velocity > fling;
+                    if (leave) {
+                        close();
+                    } else {
+                        springBack();
+                    }
+                    return true;
+                }
+                default -> {
+                    return true;
+                }
+            }
+        }
+    }
+
+    private void springBack() {
+        sheet.animate()
+                .translationY(0f)
+                .setDuration(SPRING_MS)
+                .setInterpolator(new DecelerateInterpolator(1.6f))
+                .withEndAction(() -> layer(false))
+                .start();
+    }
+
+    /** 滑出屏幕再结束。返回键与下滑走同一条路，读起来是同一个动作。 */
+    private void close() {
+        if (closing) {
+            return;
+        }
+        closing = true;
+        // 返回键那条路没有拖动过，层还没建；滑出去的这段同样要走层。
+        layer(true);
+        sheet.animate()
+                .translationY(sheet.getHeight())
+                .setDuration(EXIT_MS)
+                .setInterpolator(new AccelerateInterpolator(1.4f))
+                .withEndAction(this::finish)
+                .start();
+    }
+
+    @Override
+    public void onBackPressed() {
+        close();
     }
 
     // ------------------------------------------------------------------ 自绘
+
+    /** 一圈上亮下暗的描边，圆角跟着面板走。 */
+    private final class Rim extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path path = new Path();
+        private final RectF box = new RectF();
+        private final float radius;
+        private final float stroke;
+        /** 描边的渐变。按高度缓存：拖动时整页每帧重绘，每帧新建一个 shader 是白扔的分配。 */
+        private Shader shade;
+        private int shadeHeight = -1;
+        private boolean shadeLight;
+
+        Rim(float radius, float stroke) {
+            super(SendActivity.this);
+            this.radius = radius;
+            this.stroke = stroke;
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(stroke);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            int height = getHeight();
+            if (getWidth() <= 0 || height <= 0) {
+                return;
+            }
+            float half = stroke / 2f;
+            box.set(half, half, getWidth() - half, height - half);
+            path.reset();
+            path.addRoundRect(box,
+                    new float[]{radius, radius, radius, radius, 0f, 0f, 0f, 0f},
+                    Path.Direction.CW);
+            if (shade == null || shadeHeight != height || shadeLight != S.light) {
+                shadeHeight = height;
+                shadeLight = S.light;
+                shade = new LinearGradient(0f, 0f, 0f, height,
+                        S.light ? 0xB3FFFFFF : 0x73FFFFFF,
+                        S.light ? 0x33FFFFFF : 0x1AFFFFFF,
+                        Shader.TileMode.CLAMP);
+            }
+            paint.setShader(shade);
+            canvas.drawPath(path, paint);
+        }
+    }
 
     /** 圆头像：手机图形 + 一圈进度。 */
     private final class Nick extends View {
@@ -400,12 +890,11 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         }
 
         void progress(float value) {
-            progress = Math.max(0f, Math.min(1f, value));
-            invalidate();
-        }
-
-        void finish() {
-            progress = 0f;
+            float next = Math.max(0f, Math.min(1f, value));
+            if (next == progress) {
+                return;
+            }
+            progress = next;
             invalidate();
         }
 
@@ -443,6 +932,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         private final Paint glyph = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final RectF box = new RectF();
         private float phase;
+        private boolean attached;
 
         Radar() {
             super(SendActivity.this);
@@ -455,6 +945,20 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             glyph.setStrokeWidth(dp(2.4f));
             glyph.setStrokeCap(Paint.Cap.ROUND);
             glyph.setStrokeJoin(Paint.Join.ROUND);
+        }
+
+        @Override
+        protected void onAttachedToWindow() {
+            super.onAttachedToWindow();
+            attached = true;
+        }
+
+        @Override
+        protected void onDetachedFromWindow() {
+            // 关掉自己的帧循环。这个 View 在每次发现设备、每次换主题时都会被丢掉，留下一个
+            // 还在 postInvalidateDelayed 的孤儿，等于每次换主题都多一条永不停止的心跳。
+            attached = false;
+            super.onDetachedFromWindow();
         }
 
         @Override
@@ -482,15 +986,27 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             canvas.drawRoundRect(box, corner, corner, glyph);
             canvas.drawLine(cx - phoneW * 0.14f, box.top + phoneH * 0.1f,
                     cx + phoneW * 0.14f, box.top + phoneH * 0.1f, glyph);
-            postInvalidateDelayed(32);
+
+            // 拖动期间不自转。
+            //
+            // 面板这时是一个硬件层，层里的任何一次 invalidate 都要把整块 1440×3168 的纹理
+            // 重画一遍——每 32ms 一次，一边还在跟手，就是一秒三十次全屏重绘。停掉它，拖动的
+            // 每一帧就只剩下「把已有纹理挪个位置」。呼吸环没人盯着看的那半秒里，静止它不亏。
+            if (attached && !dragging) {
+                postInvalidateDelayed(32);
+            }
         }
     }
 
     // ------------------------------------------------------------------ 小工具
 
-    private android.graphics.drawable.Drawable round(int color, float radiusDp) {
-        android.graphics.drawable.GradientDrawable shape =
-                new android.graphics.drawable.GradientDrawable();
+    private static Scheme schemeOf(Configuration configuration) {
+        int mode = configuration.uiMode & Configuration.UI_MODE_NIGHT_MASK;
+        return Scheme.of(mode != Configuration.UI_MODE_NIGHT_YES);
+    }
+
+    private Drawable round(int color, float radiusDp) {
+        GradientDrawable shape = new GradientDrawable();
         shape.setColor(color);
         shape.setCornerRadius(dp(radiusDp));
         return shape;

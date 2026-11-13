@@ -207,6 +207,9 @@ AirDrop 用自签证书，TXT 记录里有 `phash`（证书指纹）。**我们�
 | 钩子装进 SystemUI 报 `ClassNotFoundException: OShareSysUiInlineViewService` | 那个类是**互传的**，视图在互传进程里展开 | 钩子跟着类走：装进互传进程；高度钩子留在 SystemUI |
 | 用 logcat 判断钩子没装 | **libxposed 的 `log()` 写 `/data/adb/lspd/log/modules_*.log`，不进 logcat** | 读那个文件 |
 | 窗口过期后接收端不停 | 「线程在跑」被当成「该收」，窗口自我续命 | 手动开关另立凭据（SharedPreferences），判断看凭据不看线程 |
+| 发送页一打开就闪退 | `setBackgroundBlurRadius` 在 `setContentView` 之前调用，平台直接对**惰性创建**的 `DecorView` 下手 → NPE | 放到 `setContentView` 之后（`applyGlass()`） |
+| 发送页窗口有 surface 却一片空白 | `onPreDraw` 里 `return false` 取消首帧，动画的 invalidate 被一起吞掉 | `INVISIBLE` + `post`（窗口本就透明，先不可见一帧看不出） |
+| 拖动面板时**字在抖**、整个窗口上下摆 | ① `setTranslationY` 让整棵子树重绘（全屏圆角描边 + 全部文字每帧重栅格化）；② 层里的雷达每 32ms invalidate 逼整块纹理重画；③ 上一次回弹动画还在跑，和手指抢着写 `translationY`；④ 位移取整制造 1 像素台阶 | 移动期 `setLayerType(HARDWARE)`、拖动时停雷达呼吸、`ACTION_DOWN` 里 `animate().cancel()`、位移保留小数 |
 
 ### 6.4 构建与工具链
 
@@ -373,6 +376,37 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 ## 13. 变更日志（新的在上）
 
+- **2026-11-14 03:30**：发送面板改成**从底边上滑的一块玻璃**，并修掉三个只有真机才看得出的问题。
+  **形态**：`SendPanelTheme`（`windowIsTranslucent` + 透明窗口背景 + `@anim/none` 的零时长
+  窗口动画）+ `Window.setBackgroundBlurRadius(28dp)` —— 跨窗口实时模糊，因为这一页背后是
+  **别人的**窗口（一加互传的分享面板或主屏），`RealtimeBlurView` 拿不到它的 `RenderNode`。
+  底色 `(S.bg & 0x00FFFFFF) | alpha`，浅色 224/255、深色 230/255（比导航胶囊的 240 更透：
+  那一块背后是同色的卡片内容，240 还看得出层次；这一块背后是壁纸，遮到 240 就只剩一块白板）。
+  **上滑**：`post` 后把 `translationY` 设成面板高度再动画回 0（340ms，`DecelerateInterpolator(1.6f)`）。
+  **下滑**：`Sheet extends FrameLayout` 重写 `onInterceptTouchEvent`，`dy > slop && dy > dx`
+  才接管；`onTouchEvent` 里 1:1 跟手，松手按「位移 > 18% 屏高或速度 > 3× 最小甩速」决定
+  滑出（220ms）还是回弹（240ms）。返回键走同一条滑出。
+  **深浅色不重建**：`configChanges` 带 `uiMode`，`onConfigurationChanged` 里换配色表 + `rebuild()`
+  重画视图树；进度存在 `progressOf` 字段里，视图只是投影，所以重组后环还在原处。
+  **中部**：`stage.setGravity(Gravity.CENTER)`，雷达与它下面那行字作为一个整体居中。
+  三个真机坑（都记进 6.4）：
+  ① `setBackgroundBlurRadius` 在 `setContentView` **之前**调用会 NPE —— 平台上那条路径直接对
+  `DecorView` 调用同名方法，而 DecorView 是惰性创建的；先是整个 Activity 起不来。
+  ② `onPreDraw` 里 `return false`（想取消首帧、下一帧才是动画第一帧）会把页面停在**一帧都没有**
+  的状态：窗口有 surface、`HAS_DRAWN`，屏幕上只有背后的桌面，动画的 invalidate 被吞掉。改用
+  `INVISIBLE` + `post`：窗口本来就透明，先不可见一帧看不出任何东西。
+  ③ **文字抖动与掉帧的真因不是模糊**：`setTranslationY` 会让整棵子树重绘，1440×3168 上的全屏
+  圆角描边路径 + 全部文字每帧重新栅格化，文字落在不同的亚像素位置上，抗锯齿随之变化——读起来
+  就是「字在抖」。三个修法叠起来：
+  · 移动期提升为硬件层（`setLayerType(HARDWARE)`，停手即还 `NONE`，常驻会与窗口模糊抢
+  GPU 内存）；层建好之后位移**故意不取整**——小数位移只是把纹理放到下一个十六分之一像素上，
+  由合成器插值；取整反而制造 1 像素一级的台阶，手指每帧移动不到一像素时那就是「整个窗口在抖」；
+  · 拖动期间**停掉雷达的 32ms 呼吸**：层里的每一次 invalidate 都要把整块纹理重画一遍，
+  一秒三十次全屏重绘，一边还在跟手；
+  · `ACTION_DOWN` 里 `animate().cancel()`：上一次的回弹/上滑若还在跑，它每帧写的
+  `translationY` 会和手指写的那个互相覆盖——同一帧先被拉回再被推开，读起来就是上下摆。
+  实测：`dumpsys gfxinfo` 拖行 145 帧、**0 janky**、50th 5ms / 90th 7ms / 99th 7ms、
+  GPU 5–6ms。**模糊全程保持开启**（用户要求），没有为此付掉帧。
 - **2026-11-14 02:50**：进度回调补上**阶段**。只报字节数不够用：`/Ask` 发出到它 `200` 回来
   这一段可能十几秒，而进度始终 0%——那不是「慢」，那是「对面正在决定」。现在
   `ProgressCallback` 带 `phase`：`READY`（连上、对面收）/ `WAITING`（报价已发、等对面点）/

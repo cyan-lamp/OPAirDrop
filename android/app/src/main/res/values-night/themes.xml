@@ -21,4 +21,21 @@
         <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_icon_anim</item>
         <item name="android:windowSplashScreenAnimationDuration">1000</item>
     </style>
+
+    <!-- 发送面板的深色版。样式是整条选中的，所以这里每一条都要写一遍——少写的那一条会
+         退回平台默认值，而平台默认的深色是 Theme.Material 的深灰，不是这一页的 #1F1F1F。
+
+         系统栏图标反过来（windowLightStatusBar=false）：深色玻璃上的深色图标等于没有。 -->
+    <style name="SendPanelTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowAnimationStyle">@style/PanelAnimation</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+    </style>
 </resources>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A transition that lasts no time and changes nothing.
+
+     The send panel draws its own entrance and exit (it slides up from the bottom edge
+     and back down when dragged), so any window animation the platform adds underneath
+     would play on top of that: a fade or a scale appearing around a pane that is already
+     moving makes the movement read as two movements.
+
+     A zero-duration alpha rather than `@null`: some platform versions treat a null
+     window animation as "use the default", which is the thing being avoided. -->
+<alpha xmlns:android="http://schemas.android.com/apk/res/android"
+    android:fromAlpha="1.0"
+    android:toAlpha="1.0"
+    android:duration="0" />
