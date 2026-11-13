@@ -289,14 +289,18 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         tls.startHandshake();
 
         try (SSLSocket session = tls) {
-            byte[] frame = Native.send(
+            // 进度来自读文件那一层（每 512 KiB 一次），所以这一条在传输过程中会一直动；
+            // 它跑在发送线程上，界面只在主线程改，两件事不能混。
+            byte[] frame = Native.sendWithProgress(
                     peer.host.isEmpty() ? peer.address : peer.host,
                     senderName(),
                     modelName(),
                     UUID.randomUUID().toString(),
                     paths.toArray(new String[0]),
                     session.getInputStream(),
-                    session.getOutputStream());
+                    session.getOutputStream(),
+                    (sent, total) -> runOnUiThread(() -> statusLine.setText(
+                            "正在发送 " + Math.min(100, total == 0 ? 0 : sent * 100 / total) + "%")));
             return Report.parse(new String(frame, java.nio.charset.StandardCharsets.UTF_8));
         }
     }

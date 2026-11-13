@@ -43,7 +43,7 @@ use std::ffi::{c_void, CString};
 use std::ptr;
 
 use jni_sys::{
-    jbyte, jbyteArray, jclass, jint, jobject, jobjectArray, jsize, jstring, JNIEnv,
+    jbyte, jbyteArray, jclass, jint, jlong, jobject, jobjectArray, jsize, jstring, JNIEnv,
     JNINativeInterface_,
 };
 
@@ -443,6 +443,122 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_send(
             read_connection,
             write_connection,
             &mut connection as *mut Connection as *mut c_void,
+            &mut report,
+        )
+    };
+
+    // SAFETY: `report` is a zeroed buffer the call above filled, one way or the other.
+    unsafe { finish(env, outcome, &mut report) }
+}
+
+/// Sends `paths`, reporting how much has been taken off disk.
+///
+/// `progress` is a `com.oshare.airdrop.Native$Progress`: its `report(long, long)` runs on the
+/// sending thread, once per half-megabyte and once at the end. It must not block — the meter
+/// calls it from inside the file read, so a slow listener slows the transfer itself.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv` and objects of the declared types.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_sendWithProgress(
+    env: *mut JNIEnv,
+    _class: jclass,
+    host: jstring,
+    sender: jstring,
+    model: jstring,
+    transfer_id: jstring,
+    paths: jobjectArray,
+    input: jobject,
+    output: jobject,
+    progress: jobject,
+) -> jbyteArray {
+    if env.is_null() {
+        return ptr::null_mut();
+    }
+    if host.is_null() || transfer_id.is_null() || paths.is_null() || input.is_null()
+        || output.is_null() || progress.is_null()
+    {
+        // SAFETY: `env` was checked non-null.
+        unsafe {
+            throw(
+                env,
+                "java/lang/NullPointerException",
+                "host, transfer id, paths, both streams and a progress sink are required",
+            );
+        }
+        return ptr::null_mut();
+    }
+
+    // SAFETY: all four are live `java.lang.String`s, and null is taken before `read_string`.
+    let Some(host) = (unsafe { read_string(env, host) }) else {
+        return ptr::null_mut();
+    };
+    let Some(transfer_id) = (unsafe { read_string(env, transfer_id) }) else {
+        return ptr::null_mut();
+    };
+    let sender = if sender.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, sender) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
+    };
+    let model = if model.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, model) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
+    };
+    // SAFETY: `paths` is a live `java.lang.String[]`.
+    let Some(paths) = (unsafe { read_paths(env, paths) }) else {
+        return ptr::null_mut();
+    };
+
+    // SAFETY: both are live streams and `env` outlives this call.
+    let (Ok(reader), Ok(sink)) = (unsafe { Stream::new(env, input) }, unsafe {
+        Sink::new(env, output)
+    }) else {
+        return ptr::null_mut();
+    };
+    let mut connection = Connection { reader, sink };
+    // SAFETY: `progress` is a live object; the method id is looked up on its own class.
+    let Ok(mut gauge) = (unsafe { Gauge::new(env, progress) }) else {
+        return ptr::null_mut();
+    };
+
+    let (sender_pointer, sender_len) = match &sender {
+        Some(text) => (text.as_ptr(), text.len()),
+        None => (ptr::null(), 0),
+    };
+    let (model_pointer, model_len) = match &model {
+        Some(text) => (text.as_ptr(), text.len()),
+        None => (ptr::null(), 0),
+    };
+
+    let mut report = OpairdropBuffer::EMPTY;
+    // SAFETY: every byte slice outlives the call or is null, each callback is paired with the
+    // context it was built for, and `report` is a zeroed buffer on this frame.
+    let outcome = unsafe {
+        crate::send::opairdrop_send_with_progress(
+            host.as_ptr(),
+            host.len(),
+            sender_pointer,
+            sender_len,
+            model_pointer,
+            model_len,
+            transfer_id.as_ptr(),
+            transfer_id.len(),
+            paths.as_ptr(),
+            paths.len(),
+            read_connection,
+            write_connection,
+            &mut connection as *mut Connection as *mut c_void,
+            report_progress,
+            &mut gauge as *mut Gauge as *mut c_void,
             &mut report,
         )
     };
@@ -934,6 +1050,80 @@ unsafe extern "C" fn write_sink(context: *mut c_void, buf: *const u8, len: usize
         written += take;
     }
     len as isize
+}
+
+/// A Java object told how far a transfer has got.
+struct Gauge {
+    env: *mut JNIEnv,
+    object: jobject,
+    /// Cached `Progress.report(long, long)V`.
+    report: jni_sys::jmethodID,
+    /// Set once the sink threw. The transfer is not aborted for it, but the sink is not
+    /// called again either: one broken listener must not become thousands of exceptions.
+    failed: bool,
+}
+
+impl Gauge {
+    /// # Safety
+    ///
+    /// `env` must be valid and `object` a live `com.oshare.airdrop.Native$Progress`.
+    unsafe fn new(env: *mut JNIEnv, object: jobject) -> Result<Gauge, ()> {
+        // SAFETY: `env` is valid for the whole call, and the table outlives it.
+        let table = unsafe { table(env) };
+        // SAFETY: `object` is a live object.
+        let class = unsafe { (entry!(table, GetObjectClass))(env, object) };
+        if class.is_null() {
+            return Err(());
+        }
+        let name = c_str("report");
+        let signature = c_str("(JJ)V");
+        // SAFETY: `class` is the live class object made above, both strings outlive the call.
+        let report = unsafe { (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr()) };
+        // SAFETY: `class` is the local reference made above.
+        unsafe { (entry!(table, DeleteLocalRef))(env, class) };
+        if report.is_null() || unsafe { pending(env) } {
+            return Err(());
+        }
+        Ok(Gauge {
+            env,
+            object,
+            report,
+            failed: false,
+        })
+    }
+}
+
+/// The C ABI's progress callback, backed by `Progress.report`.
+///
+/// # Safety
+///
+/// `context` must point at a live [`Gauge`].
+unsafe extern "C" fn report_progress(context: *mut c_void, sent: u64, total: u64) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: the caller passes the `Gauge` this layer created, on the thread doing the
+    // sending, so the borrow cannot alias.
+    let gauge = unsafe { &mut *(context as *mut Gauge) };
+    if gauge.failed {
+        return;
+    }
+    let table = unsafe { table(gauge.env) };
+    // SAFETY: `report` is `Progress.report(JJ)V` on the object the caller handed over.
+    unsafe {
+        (entry!(table, CallVoidMethod))(
+            gauge.env,
+            gauge.object,
+            gauge.report,
+            sent as jlong,
+            total as jlong,
+        )
+    };
+    // SAFETY: `gauge.env` is valid.
+    if unsafe { pending(gauge.env) } {
+        // The exception stays pending: it is the caller's, and it is the honest report.
+        gauge.failed = true;
+    }
 }
 
 /// A Java object that answers whether a transfer should be taken.

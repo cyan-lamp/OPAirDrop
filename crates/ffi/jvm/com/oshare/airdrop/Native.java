@@ -96,6 +96,38 @@ public final class Native {
             throws IOException;
 
     /**
+     * How far a transfer has got.
+     *
+     * <p>Called on the sending thread, once per half-megabyte read off disk and once at the
+     * end. It must not block: the call happens inside the file read, so a slow listener makes
+     * the transfer itself slow. Marshal to the UI thread and return.
+     */
+    public interface Progress {
+        void report(long sent, long total);
+    }
+
+    /**
+     * Sends, reporting progress as the files are read.
+     *
+     * <p>The numbers count bytes taken off disk, not bytes on the wire: DVZip compresses, so
+     * the two disagree by however much the data happens to compress to, and a ring driven by
+     * the wire would jump. What the person chose is the honest denominator.
+     *
+     * @param progress a sink that is called while the transfer runs; never null
+     * @return {@code peer<TAB>name\nbytes<TAB>count\n} as UTF-8
+     */
+    public static native byte[] sendWithProgress(
+            String host,
+            String sender,
+            String model,
+            String transferId,
+            String[] paths,
+            InputStream input,
+            OutputStream output,
+            Progress progress)
+            throws IOException;
+
+    /**
      * Who decides whether a transfer is taken.
      *
      * <p>Called on the thread serving the connection, after the offer has been read and
