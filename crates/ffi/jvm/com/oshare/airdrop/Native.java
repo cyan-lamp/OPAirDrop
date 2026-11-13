@@ -98,12 +98,23 @@ public final class Native {
     /**
      * How far a transfer has got.
      *
-     * <p>Called on the sending thread, once per half-megabyte read off disk and once at the
-     * end. It must not block: the call happens inside the file read, so a slow listener makes
+     * <p>Called on the sending thread. {@link #READY}, {@link #WAITING} and {@link #DONE}
+     * arrive once each; {@link #SENDING} arrives at most once per half-megabyte read.
+     *
+     * <p>It must not block: the call happens inside the file read, so a slow listener makes
      * the transfer itself slow. Marshal to the UI thread and return.
      */
     public interface Progress {
-        void report(long sent, long total);
+        /** Connected, and the peer has said it takes files. */
+        int READY = 0;
+        /** `/Ask` is out; the other phone is showing its accept prompt. */
+        int WAITING = 1;
+        /** Accepted, bytes are moving. */
+        int SENDING = 2;
+        /** The archive is in and the peer said so. */
+        int DONE = 3;
+
+        void report(int phase, long sent, long total);
     }
 
     /**

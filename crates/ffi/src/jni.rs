@@ -1076,7 +1076,7 @@ impl Gauge {
             return Err(());
         }
         let name = c_str("report");
-        let signature = c_str("(JJ)V");
+        let signature = c_str("(IJJ)V");
         // SAFETY: `class` is the live class object made above, both strings outlive the call.
         let report = unsafe { (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr()) };
         // SAFETY: `class` is the local reference made above.
@@ -1098,7 +1098,7 @@ impl Gauge {
 /// # Safety
 ///
 /// `context` must point at a live [`Gauge`].
-unsafe extern "C" fn report_progress(context: *mut c_void, sent: u64, total: u64) {
+unsafe extern "C" fn report_progress(context: *mut c_void, phase: i32, sent: u64, total: u64) {
     if context.is_null() {
         return;
     }
@@ -1109,12 +1109,13 @@ unsafe extern "C" fn report_progress(context: *mut c_void, sent: u64, total: u64
         return;
     }
     let table = unsafe { table(gauge.env) };
-    // SAFETY: `report` is `Progress.report(JJ)V` on the object the caller handed over.
+    // SAFETY: `report` is `Progress.report(IJJ)V` on the object the caller handed over.
     unsafe {
         (entry!(table, CallVoidMethod))(
             gauge.env,
             gauge.object,
             gauge.report,
+            phase as jint,
             sent as jlong,
             total as jlong,
         )

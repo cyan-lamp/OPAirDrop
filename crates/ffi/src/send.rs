@@ -32,11 +32,26 @@ use opairdrop_cpio::{dvzip, Builder, Format, MODE_REGULAR};
 use crate::api::{status, CallbackReader, CallbackWriter, ReadCallback, WriteCallback};
 use crate::buffer::{fill, OpairdropBuffer};
 
-/// Reports how much of the transfer has been taken off disk.
+/// Which part of the conversation is running, as the numbers a caller can switch on.
+pub mod phase {
+    /// Connected, and `/Discover` has answered: the peer exists and takes files.
+    pub const READY: i32 = 0;
+    /// `/Ask` is on its way and the answer is not back yet. This is the interval the other
+    /// phone spends showing its accept prompt, and the only honest thing to say is "waiting".
+    pub const WAITING: i32 = 1;
+    /// The peer accepted; bytes are moving.
+    pub const SENDING: i32 = 2;
+    /// The archive is in and the peer said so.
+    pub const DONE: i32 = 3;
+}
+
+/// Reports how far the transfer has got: which phase, and how many bytes off disk.
 ///
-/// Called on the sending thread, at most once per [`REPORT_EVERY`] bytes and once when the
-/// total is reached. `sent` never exceeds `total`.
-pub type ProgressCallback = unsafe extern "C" fn(context: *mut c_void, sent: u64, total: u64);
+/// Called on the sending thread. [`phase::READY`], [`phase::WAITING`] and [`phase::DONE`]
+/// arrive once each and carry the byte count as it stands; [`phase::SENDING`] arrives at most
+/// once per [`REPORT_EVERY`] bytes.
+pub type ProgressCallback =
+    unsafe extern "C" fn(context: *mut c_void, phase: i32, sent: u64, total: u64);
 
 /// How much may pass between two reports.
 ///
@@ -62,10 +77,15 @@ impl Meter {
         self.sent.set(sent);
         if sent.saturating_sub(self.last.get()) >= REPORT_EVERY || sent >= self.total {
             self.last.set(sent);
-            // SAFETY: the caller of `opairdrop_send_with_progress` promised the callback and
-            // its context for the duration of the call.
-            unsafe { (self.callback)(self.context, sent, self.total) };
+            self.say(phase::SENDING);
         }
+    }
+
+    /// Announces a phase with the byte count as it stands.
+    fn say(&self, phase: i32) {
+        // SAFETY: the caller of `opairdrop_send_with_progress` promised the callback and its
+        // context for the duration of the call.
+        unsafe { (self.callback)(self.context, phase, self.sent.get(), self.total) };
     }
 }
 
@@ -317,7 +337,16 @@ fn transfer(
     // `/Discover` first: a peer that is not accepting answers 503 here, and that answer has
     // to arrive before the other phone shows a prompt.
     let discovered = client.discover(sender).map_err(describe_error)?;
+    if let Some(gauge) = meter {
+        gauge.say(phase::READY);
+    }
+    if let Some(gauge) = meter {
+        gauge.say(phase::WAITING);
+    }
     let asked = client.ask(sender, id, &items, &[]).map_err(describe_error)?;
+    if let Some(gauge) = meter {
+        gauge.say(phase::SENDING);
+    }
 
     let peer = if discovered.computer_name.is_empty() {
         asked.computer_name.clone()
@@ -328,6 +357,12 @@ fn transfer(
     client
         .upload(id, total, |out| archive(out, &files, meter))
         .map_err(describe_error)?;
+
+    if let Some(gauge) = meter {
+        // The last report: a ring that stops at 97% because the final block was small is a
+        // ring that makes people think it failed.
+        gauge.say(phase::DONE);
+    }
 
     Ok(Sent { peer, bytes: total })
 }

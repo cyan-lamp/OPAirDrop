@@ -299,9 +299,30 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     paths.toArray(new String[0]),
                     session.getInputStream(),
                     session.getOutputStream(),
-                    (sent, total) -> runOnUiThread(() -> statusLine.setText(
-                            "正在发送 " + Math.min(100, total == 0 ? 0 : sent * 100 / total) + "%")));
+                    (phase, sent, total) -> runOnUiThread(() -> statusLine.setText(phased(phase, sent, total))));
             return Report.parse(new String(frame, java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    /**
+     * 一段进度变成一句话。
+     *
+     * <p>四句话对应协议的四步，不是四种语气：`READY` 是「连上了、对面收」，`WAITING` 是
+     * 「报价已发、等对面点」，`SENDING` 才是真的在走字节，`DONE` 是收端已确认。把它们合并成
+     * 一个百分比会说谎——`/Ask` 之后那一段可能停十几秒，而进度一直是 0%。
+     */
+    private static String phased(int phase, long sent, long total) {
+        switch (phase) {
+            case Native.Progress.READY:
+                return "已连接，正在请求发送…";
+            case Native.Progress.WAITING:
+                return "等待对方接受…";
+            case Native.Progress.SENDING:
+                return "正在发送 " + Math.min(100, total == 0 ? 0 : sent * 100 / total) + "%";
+            case Native.Progress.DONE:
+                return "已发送，等待对方确认…";
+            default:
+                return "正在发送…";
         }
     }
 
