@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OPAirDrop</string>
+    <string name="settings_title">设置</string>
+    <string name="about_title">关于</string>
+    <!-- 系统分享面板里显示的名字：面板会把应用名拼在它后面，所以这里只说做什么。 -->
+    <string name="send_title">发送到 iPhone</string>
+</resources>

@@ -1,0 +1,1305 @@
+//! The JNI shim: the same export, dressed for a JVM.
+//!
+//! # Why the symbols are spelled out
+//!
+//! A JNI export is found by name — `Java_` plus the class's binary name with `/` and `_`
+//! replaced by `_`. The alternative is `JNI_OnLoad` plus `RegisterNatives`, which decouples
+//! the symbol from the class name at the cost of a hand-built method table, a `FindClass`
+//! that fails silently if the class was renamed, and one more thing to get right before a
+//! single byte moves. The default Android ProGuard/R8 configuration already keeps native
+//! method names, so the spelled-out form survives shrinking without an extra rule; the
+//! only requirements on the Java side are that the package stays `com.oshare.airdrop` and the
+//! class stays `Native` — the package is part of the symbol, so the two are renamed together
+//! or not at all.
+//!
+//! # Why the archive is an `InputStream`
+//!
+//! The receiver's budget is 8 GiB and an Android process cannot hold a `byte[]` that size,
+//! so an array-taking signature would have promised what it could not be handed. The Java
+//! side already has a stream — the socket — and [`api`] already takes a callback, so this
+//! layer is a callback that calls `InputStream.read(byte[], int, int)`.
+//!
+//! # Why the answer is bytes
+//!
+//! A `java.lang.String[]` of names would exhaust the JVM's local reference table at 512
+//! entries, which a share of a few hundred photos reaches, and it would fail with an error
+//! that names nothing. One array cannot.
+//!
+//! # Why `jni-sys` 0.3 and not 0.4
+//!
+//! 0.4 puts a proc macro over the interface table that regroups its entries into
+//! per-version unions — `v1_1`, `v1_2`, `v1_4`, `v9` — so reaching something the C header
+//! declares flat means naming a group and reading a union field. That is a fair way to
+//! track which JVM has which entry, but this crate only calls entries from JNI 1.1 and 1.2,
+//! where the question does not arise, and a union read puts a proof obligation on every
+//! call site for no gain. 0.3's table is the header field for field, and its `Option` marks
+//! exactly what a JVM may leave unset; `entry!` pays that once, at the call. The 0.4 types
+//! it re-exports (it depends on 0.4 for `_jobject`) are the same ones this file names, so
+//! nothing incompatible ends up in the binary.
+
+#![allow(non_snake_case)]
+
+use std::ffi::{c_void, CString};
+use std::ptr;
+
+use jni_sys::{
+    jbyte, jbyteArray, jclass, jint, jobject, jobjectArray, jsize, jstring, JNIEnv,
+    JNINativeInterface_,
+};
+
+use crate::api::{self, status};
+use crate::buffer::{opairdrop_buffer_free, OpairdropBuffer};
+use crate::settings;
+
+/// Bytes requested from the Java stream per crossing.
+///
+/// Matching `opairdrop_cpio::dvzip::CHUNK` keeps a whole DVZip block — the unit a sender
+/// writes — inside one read, so nothing below depends on where a block happened to be cut.
+const READ_CHUNK: usize = 64 * 1024;
+
+/// One entry from the table.
+///
+/// `Option` is how the C header describes a slot that a JVM older than the entry's version
+/// may leave null. Every entry this file calls dates from JNI 1.1 or 1.2, the oldest
+/// versions still in use, and a JVM that reached this code has already loaded an ABI that
+/// implies them — so a null here is not a condition to recover from but a sign that the
+/// thing calling us is not a JVM. There is no channel left to report it through: the
+/// function table is the channel.
+macro_rules! entry {
+    ($table:expr, $name:ident) => {
+        match $table.$name {
+            Some(entry) => entry,
+            None => panic!(concat!(
+                "the JVM's interface table has no ",
+                stringify!($name),
+                ", which every JVM that can load this library has"
+            )),
+        }
+    };
+}
+
+/// Reports the version of the ABI the loaded library was built against.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv`.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_abiVersion(
+    _env: *mut JNIEnv,
+    _class: jclass,
+) -> jint {
+    api::ABI_VERSION as jint
+}
+
+/// Receives one archive from `archive` into `directory`.
+///
+/// Returns a [`api::Report`] frame on success. On failure it throws and returns null, the
+/// message being the failure's own.
+///
+/// `settings` is the stored settings text, or null for the table's defaults.
+///
+/// `archive` is typed `jobject` rather than `jbyteArray` because it is a
+/// `java.io.InputStream`: the length is not known up front and would not fit in an array
+/// even if it were.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv` and objects of the declared types.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_receiveArchive(
+    env: *mut JNIEnv,
+    _class: jclass,
+    directory: jstring,
+    settings: jstring,
+    archive: jobject,
+) -> jbyteArray {
+    if env.is_null() {
+        return ptr::null_mut();
+    }
+    if directory.is_null() || archive.is_null() {
+        // SAFETY: `env` was checked non-null.
+        unsafe {
+            throw(
+                env,
+                "java/lang/NullPointerException",
+                "directory and archive are required",
+            );
+        }
+        return ptr::null_mut();
+    }
+
+    // SAFETY: `directory` is a live `java.lang.String`, per the JVM's call.
+    let Some(directory) = (unsafe { read_string(env, directory) }) else {
+        // `read_string` has already thrown; a lone surrogate cannot name a path anyway.
+        return ptr::null_mut();
+    };
+
+    // A null settings string is the documented way to say "the defaults", so it is checked
+    // before `read_string`, which would refuse it.
+    let settings = if settings.is_null() {
+        None
+    } else {
+        // SAFETY: `settings` is a live `java.lang.String`, per the JVM's call.
+        match unsafe { read_string(env, settings) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
+    };
+
+    // SAFETY: `archive` is a live `java.io.InputStream` and `env` outlives this call.
+    let Ok(mut stream) = (unsafe { Stream::new(env, archive) }) else {
+        return ptr::null_mut();
+    };
+
+    let (settings_pointer, settings_len) = match &settings {
+        Some(text) => (text.as_ptr(), text.len()),
+        None => (ptr::null(), 0),
+    };
+
+    let mut report = OpairdropBuffer::EMPTY;
+    // SAFETY: the directory bytes outlive the call, the settings bytes do too or the pointer
+    // is null, the callback and its context are valid for its duration, and `report` is a
+    // zeroed buffer on this frame.
+    let outcome = unsafe {
+        api::opairdrop_receive_archive(
+            directory.as_ptr(),
+            directory.len(),
+            settings_pointer,
+            settings_len,
+            read_stream,
+            &mut stream as *mut Stream as *mut c_void,
+            &mut report,
+        )
+    };
+
+    // SAFETY: `report` is a zeroed buffer the call above filled, one way or the other.
+    unsafe { finish(env, outcome, &mut report) }
+}
+
+/// Serves one connection: requests from `input`, answers to `output`.
+///
+/// Returns a [`api::Report`] frame on success. On failure it throws and returns null.
+///
+/// `settings` is the stored settings text, or null for the table's defaults. `model` is
+/// what the operating system calls this hardware, or null.
+///
+/// Both streams are typed `jobject` rather than a socket or a channel: this layer only
+/// needs `read` and `write`, and taking the narrower type is what lets the same call serve
+/// a socket, a `PipedStream` in the JVM check, or a TLS stream the caller wrapped before
+/// handing it over. Closing either stream stays the caller's business, because it owns the
+/// socket that outlives this call.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv` and objects of the declared types.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_serve(
+    env: *mut JNIEnv,
+    _class: jclass,
+    directory: jstring,
+    settings_text: jstring,
+    model: jstring,
+    input: jobject,
+    output: jobject,
+) -> jbyteArray {
+    if env.is_null() {
+        return ptr::null_mut();
+    }
+    if directory.is_null() || input.is_null() || output.is_null() {
+        // SAFETY: `env` was checked non-null.
+        unsafe {
+            throw(
+                env,
+                "java/lang/NullPointerException",
+                "directory, input and output are required",
+            );
+        }
+        return ptr::null_mut();
+    }
+
+    // SAFETY: `directory` is a live `java.lang.String`, per the JVM's call.
+    let Some(directory) = (unsafe { read_string(env, directory) }) else {
+        return ptr::null_mut();
+    };
+    // SAFETY: as above, for each optional string. Null is the documented way to say "the
+    // defaults" / "no model", and is taken before `read_string`, which would refuse it.
+    let settings_text = if settings_text.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, settings_text) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
+    };
+    // SAFETY: as above.
+    let model = if model.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, model) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
+    };
+
+    // SAFETY: both are live streams and `env` outlives this call.
+    let (Ok(reader), Ok(sink)) = (unsafe { Stream::new(env, input) }, unsafe {
+        Sink::new(env, output)
+    }) else {
+        return ptr::null_mut();
+    };
+    let mut connection = Connection { reader, sink };
+
+    let (settings_pointer, settings_len) = match &settings_text {
+        Some(text) => (text.as_ptr(), text.len()),
+        None => (ptr::null(), 0),
+    };
+    let (model_pointer, model_len) = match &model {
+        Some(text) => (text.as_ptr(), text.len()),
+        None => (ptr::null(), 0),
+    };
+
+    let mut report = OpairdropBuffer::EMPTY;
+    // SAFETY: every byte slice outlives the call or is null, each callback is paired with
+    // the context it was built for, and `report` is a zeroed buffer on this frame.
+    let outcome = unsafe {
+        crate::serve::opairdrop_serve(
+            directory.as_ptr(),
+            directory.len(),
+            settings_pointer,
+            settings_len,
+            model_pointer,
+            model_len,
+            read_connection,
+            write_connection,
+            &mut connection as *mut Connection as *mut c_void,
+            &mut report,
+        )
+    };
+
+    // SAFETY: `report` is a zeroed buffer the call above filled, one way or the other.
+    unsafe { finish(env, outcome, &mut report) }
+}
+
+/// Builds the PTR query a sender multicasts to find AirDrop peers.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv`.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_mdnsQuery(
+    env: *mut JNIEnv,
+    _class: jclass,
+) -> jbyteArray {
+    if env.is_null() {
+        return ptr::null_mut();
+    }
+    let mut report = OpairdropBuffer::EMPTY;
+    // SAFETY: `report` is a zeroed buffer on this frame.
+    let outcome = unsafe { crate::browse::opairdrop_mdns_query(&mut report) };
+    // SAFETY: as above, filled one way or the other.
+    unsafe { finish(env, outcome, &mut report) }
+}
+
+/// Reads one mDNS response into `kind<TAB>…` lines.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv` and a live `byte[]`.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_mdnsRecords(
+    env: *mut JNIEnv,
+    _class: jclass,
+    packet: jbyteArray,
+) -> jbyteArray {
+    if env.is_null() {
+        return ptr::null_mut();
+    }
+    if packet.is_null() {
+        // SAFETY: `env` was checked non-null.
+        unsafe { throw(env, "java/lang/NullPointerException", "a packet is required") };
+        return ptr::null_mut();
+    }
+    // SAFETY: `packet` is a live array, per the JVM's call.
+    let Some(packet) = (unsafe { read_bytes(env, packet) }) else {
+        return ptr::null_mut();
+    };
+
+    let mut report = OpairdropBuffer::EMPTY;
+    // SAFETY: `packet` outlives the call and `report` is a zeroed buffer on this frame.
+    let outcome = unsafe {
+        crate::browse::opairdrop_mdns_records(packet.as_ptr(), packet.len(), &mut report)
+    };
+    // SAFETY: as above, filled one way or the other.
+    unsafe { finish(env, outcome, &mut report) }
+}
+
+/// Sends `paths` to the peer reachable through `input`/`output`.
+///
+/// Returns a two-line `key<TAB>value` frame on success — `peer` and `bytes` — the same
+/// shape the settings catalog uses. On failure it throws and returns null, with
+/// `IllegalArgumentException` for a path that cannot be sent and `IOException` for
+/// everything the connection did, including the peer refusing.
+///
+/// `sender` and `model` may be null, which say "nothing to put on the other phone's
+/// prompt". `transferId` may not: it has to be 32 hexadecimal digits, optionally with
+/// dashes, because the receiver echoes it and a made-up value is a protocol error there
+/// rather than here.
+///
+/// The streams are typed `jobject` for the reason `serve` gives: this layer needs `read`
+/// and `write`, and taking the narrower type is what lets a caller hand over a TLS session
+/// it has already established. Closing them stays the caller's business.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv` and objects of the declared types.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_send(
+    env: *mut JNIEnv,
+    _class: jclass,
+    host: jstring,
+    sender: jstring,
+    model: jstring,
+    transfer_id: jstring,
+    paths: jobjectArray,
+    input: jobject,
+    output: jobject,
+) -> jbyteArray {
+    if env.is_null() {
+        return ptr::null_mut();
+    }
+    if host.is_null() || transfer_id.is_null() || paths.is_null() || input.is_null() || output.is_null() {
+        // SAFETY: `env` was checked non-null.
+        unsafe {
+            throw(
+                env,
+                "java/lang/NullPointerException",
+                "host, transfer id, paths, input and output are required",
+            );
+        }
+        return ptr::null_mut();
+    }
+
+    // SAFETY: all four are live `java.lang.String`s, per the JVM's call, and null is taken
+    // before `read_string`, which would refuse it.
+    let Some(host) = (unsafe { read_string(env, host) }) else {
+        return ptr::null_mut();
+    };
+    let Some(transfer_id) = (unsafe { read_string(env, transfer_id) }) else {
+        return ptr::null_mut();
+    };
+    let sender = if sender.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, sender) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
+    };
+    let model = if model.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, model) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
+    };
+    // SAFETY: `paths` is a live `java.lang.String[]`.
+    let Some(paths) = (unsafe { read_paths(env, paths) }) else {
+        return ptr::null_mut();
+    };
+
+    // SAFETY: both are live streams and `env` outlives this call.
+    let (Ok(reader), Ok(sink)) = (unsafe { Stream::new(env, input) }, unsafe {
+        Sink::new(env, output)
+    }) else {
+        return ptr::null_mut();
+    };
+    let mut connection = Connection { reader, sink };
+
+    let (sender_pointer, sender_len) = match &sender {
+        Some(text) => (text.as_ptr(), text.len()),
+        None => (ptr::null(), 0),
+    };
+    let (model_pointer, model_len) = match &model {
+        Some(text) => (text.as_ptr(), text.len()),
+        None => (ptr::null(), 0),
+    };
+
+    let mut report = OpairdropBuffer::EMPTY;
+    // SAFETY: every byte slice outlives the call or is null, each callback is paired with
+    // the context it was built for, and `report` is a zeroed buffer on this frame.
+    let outcome = unsafe {
+        crate::send::opairdrop_send(
+            host.as_ptr(),
+            host.len(),
+            sender_pointer,
+            sender_len,
+            model_pointer,
+            model_len,
+            transfer_id.as_ptr(),
+            transfer_id.len(),
+            paths.as_ptr(),
+            paths.len(),
+            read_connection,
+            write_connection,
+            &mut connection as *mut Connection as *mut c_void,
+            &mut report,
+        )
+    };
+
+    // SAFETY: `report` is a zeroed buffer the call above filled, one way or the other.
+    unsafe { finish(env, outcome, &mut report) }
+}
+
+/// Serves one connection, asking a person before every transfer is taken.
+///
+/// `decide` is a `com.oshare.airdrop.Native$Decision`: its `accept(String)` runs on the
+/// thread serving this connection, after the offer has been read and before `/Ask` is
+/// answered. It may block — that is the whole point — and a `false`, an exception, or a
+/// decision that never arrives all end the same way: the transfer is refused.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv` and objects of the declared types.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_serveDecided(
+    env: *mut JNIEnv,
+    _class: jclass,
+    directory: jstring,
+    settings_text: jstring,
+    model: jstring,
+    input: jobject,
+    output: jobject,
+    decide: jobject,
+) -> jbyteArray {
+    if env.is_null() {
+        return ptr::null_mut();
+    }
+    if directory.is_null() || input.is_null() || output.is_null() || decide.is_null() {
+        // SAFETY: `env` was checked non-null.
+        unsafe {
+            throw(
+                env,
+                "java/lang/NullPointerException",
+                "directory, input, output and a decision are required",
+            );
+        }
+        return ptr::null_mut();
+    }
+
+    // SAFETY: `directory` is a live `java.lang.String`, per the JVM's call.
+    let Some(directory) = (unsafe { read_string(env, directory) }) else {
+        return ptr::null_mut();
+    };
+    // SAFETY: as above, for each optional string.
+    let settings_text = if settings_text.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, settings_text) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
+    };
+    let model = if model.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, model) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
+    };
+
+    // SAFETY: both are live streams and `env` outlives this call.
+    let (Ok(reader), Ok(sink)) = (unsafe { Stream::new(env, input) }, unsafe {
+        Sink::new(env, output)
+    }) else {
+        return ptr::null_mut();
+    };
+    let mut connection = Connection { reader, sink };
+    // SAFETY: `decide` is a live object; the method id is looked up on its own class.
+    let Ok(mut decider) = (unsafe { Decider::new(env, decide) }) else {
+        return ptr::null_mut();
+    };
+
+    let (settings_pointer, settings_len) = match &settings_text {
+        Some(text) => (text.as_ptr(), text.len()),
+        None => (ptr::null(), 0),
+    };
+    let (model_pointer, model_len) = match &model {
+        Some(text) => (text.as_ptr(), text.len()),
+        None => (ptr::null(), 0),
+    };
+
+    let mut report = OpairdropBuffer::EMPTY;
+    // SAFETY: every byte slice outlives the call or is null, each callback is paired with
+    // the context it was built for, and `report` is a zeroed buffer on this frame.
+    let outcome = unsafe {
+        crate::serve::opairdrop_serve_decided(
+            directory.as_ptr(),
+            directory.len(),
+            settings_pointer,
+            settings_len,
+            model_pointer,
+            model_len,
+            read_connection,
+            write_connection,
+            &mut connection as *mut Connection as *mut c_void,
+            decide_java,
+            &mut decider as *mut Decider as *mut c_void,
+            &mut report,
+        )
+    };
+
+    // SAFETY: `report` is a zeroed buffer the call above filled, one way or the other.
+    unsafe { finish(env, outcome, &mut report) }
+}
+
+/// Reports the settings catalog: one line per setting, tab-separated.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv`.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_settingsCatalog(
+    env: *mut JNIEnv,
+    _class: jclass,
+) -> jbyteArray {
+    if env.is_null() {
+        return ptr::null_mut();
+    }
+    let mut out = OpairdropBuffer::EMPTY;
+    // SAFETY: `out` is a zeroed buffer on this frame.
+    let outcome = unsafe { settings::opairdrop_settings_catalog(&mut out) };
+    // SAFETY: as above, filled one way or the other.
+    unsafe { finish(env, outcome, &mut out) }
+}
+
+/// Reads the settings stored at `path`, or the table's defaults when there is no file.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv` and a live `java.lang.String`.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_loadSettings(
+    env: *mut JNIEnv,
+    _class: jclass,
+    path: jstring,
+) -> jbyteArray {
+    if env.is_null() {
+        return ptr::null_mut();
+    }
+    if path.is_null() {
+        // SAFETY: `env` was checked non-null.
+        unsafe { throw(env, "java/lang/NullPointerException", "a settings path is required") };
+        return ptr::null_mut();
+    }
+    // SAFETY: `path` is a live `java.lang.String`, per the JVM's call.
+    let Some(path) = (unsafe { read_string(env, path) }) else {
+        return ptr::null_mut();
+    };
+
+    let mut out = OpairdropBuffer::EMPTY;
+    // SAFETY: `out` is a zeroed buffer and `path` outlives the call.
+    let outcome = unsafe { settings::opairdrop_settings_load(path.as_ptr(), path.len(), &mut out) };
+    // SAFETY: as above, filled one way or the other.
+    unsafe { finish(env, outcome, &mut out) }
+}
+
+/// Validates `text` and, if it holds, stores it at `path`.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv` and live `java.lang.String`s.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_saveSettings(
+    env: *mut JNIEnv,
+    _class: jclass,
+    path: jstring,
+    text: jstring,
+) -> jbyteArray {
+    if env.is_null() {
+        return ptr::null_mut();
+    }
+    if path.is_null() || text.is_null() {
+        // SAFETY: `env` was checked non-null.
+        unsafe {
+            throw(
+                env,
+                "java/lang/NullPointerException",
+                "a settings path and its text are required",
+            );
+        }
+        return ptr::null_mut();
+    }
+    // SAFETY: both are live `java.lang.String`s, per the JVM's call.
+    let (Some(path), Some(text)) = (unsafe { read_string(env, path) }, unsafe {
+        read_string(env, text)
+    }) else {
+        return ptr::null_mut();
+    };
+
+    let mut out = OpairdropBuffer::EMPTY;
+    // SAFETY: `out` is a zeroed buffer and both strings outlive the call.
+    let outcome = unsafe {
+        settings::opairdrop_settings_save(path.as_ptr(), path.len(), text.as_ptr(), text.len(), &mut out)
+    };
+    // SAFETY: as above, filled one way or the other.
+    unsafe { finish(env, outcome, &mut out) }
+}
+
+/// Turns a status and the buffer it filled into the `byte[]` a Java method returns.
+///
+/// Every export above ends here, so the rule "success copies the buffer out and releases
+/// it, failure throws and returns null" is written once. A second copy of it is a second
+/// chance to leak the buffer on the failure path, which is the path that gets exercised
+/// least.
+///
+/// # Safety
+///
+/// `env` must be valid and `report` a buffer the call filled.
+unsafe fn finish(env: *mut JNIEnv, outcome: i32, report: &mut OpairdropBuffer) -> jbyteArray {
+    // SAFETY: the call that produced `outcome` filled `report`, and nothing has released it.
+    let content = unsafe { report.as_slice() }.to_vec();
+    // SAFETY: the contents were copied out first, and the buffer came from this library.
+    unsafe { opairdrop_buffer_free(report) };
+
+    if outcome == status::OK {
+        // SAFETY: `env` is valid.
+        return unsafe { new_bytes(env, &content) };
+    }
+
+    let message = String::from_utf8_lossy(&content).into_owned();
+    // A stream that failed has already thrown; a second throw would replace a precise
+    // exception with a vague one.
+    // SAFETY: `env` is valid.
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
+    // SAFETY: `env` is valid.
+    unsafe { throw(env, class_for(outcome), &message) };
+    ptr::null_mut()
+}
+
+/// The Java exception that best describes a status.
+///
+/// A refused setting and a bad path are both "you asked for something that is not allowed"
+/// and cannot be retried into working, so they are unchecked; everything else is an I/O
+/// failure the caller is expected to handle.
+fn class_for(outcome: i32) -> &'static str {
+    match outcome {
+        status::NULL_ARGUMENT => "java/lang/NullPointerException",
+        status::SETTINGS | status::BAD_PATH => "java/lang/IllegalArgumentException",
+        _ => "java/io/IOException",
+    }
+}
+
+/// A Java `InputStream` seen as the C ABI's read callback.
+struct Stream {
+    env: *mut JNIEnv,
+    stream: jobject,
+    /// Reused across crossings: a fresh array every 64 KiB would spend more time in the
+    /// collector than in the copy.
+    buffer: jbyteArray,
+    /// Cached `InputStream.read([BII)I`, valid as long as `stream` is.
+    read: jni_sys::jmethodID,
+    /// Set once this stream has failed, so the callback does not retry a broken stream.
+    failed: bool,
+}
+
+impl Stream {
+    /// # Safety
+    ///
+    /// `env` must be valid and `stream` a live `java.io.InputStream`.
+    unsafe fn new(env: *mut JNIEnv, stream: jobject) -> Result<Stream, ()> {
+        // SAFETY: `env` is valid for the whole call, and the table outlives it.
+        let table = unsafe { table(env) };
+
+        // SAFETY: `stream` is a live object.
+        let class = unsafe { (entry!(table, GetObjectClass))(env, stream) };
+        if class.is_null() {
+            return Err(());
+        }
+        let name = c_str("read");
+        let signature = c_str("([BII)I");
+        // SAFETY: `class` is the live class object made above and both strings outlive the
+        // call.
+        let read = unsafe { (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr()) };
+        // SAFETY: `class` is the local reference made above.
+        unsafe { (entry!(table, DeleteLocalRef))(env, class) };
+        if read.is_null() || unsafe { pending(env) } {
+            return Err(());
+        }
+
+        // SAFETY: a fresh local array of a fixed size.
+        let buffer = unsafe { (entry!(table, NewByteArray))(env, READ_CHUNK as jsize) };
+        if buffer.is_null() || unsafe { pending(env) } {
+            return Err(());
+        }
+
+        Ok(Stream {
+            env,
+            stream,
+            buffer,
+            read,
+            failed: false,
+        })
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        // SAFETY: `buffer` is a local reference this struct owns, and `env` is the one it
+        // was created with.
+        unsafe { delete_local(self.env, self.buffer) };
+    }
+}
+
+/// The C ABI's read callback, backed by `InputStream.read`.
+///
+/// # Safety
+///
+/// `context` must point at a live [`Stream`] and `buf` must be writable for `len` bytes.
+unsafe extern "C" fn read_stream(context: *mut c_void, buf: *mut u8, len: usize) -> isize {
+    if context.is_null() || buf.is_null() || len == 0 {
+        return -1;
+    }
+    // SAFETY: the caller passes the `Stream` this layer created, and a shared borrow of it
+    // cannot alias another because the C ABI drives the callback on one thread.
+    let stream = unsafe { &mut *(context as *mut Stream) };
+    if stream.failed {
+        return -1;
+    }
+    // SAFETY: `stream.env` is the valid environment the stream was made with.
+    let table = unsafe { table(stream.env) };
+
+    let want = len.min(READ_CHUNK) as jsize;
+    // SAFETY: `stream.read` is `InputStream.read([BII)I` on `stream.stream`, `buffer` is an
+    // array this layer allocated for exactly that purpose, and the trailing numbers are the
+    // `int offset, int length` the variadic call expects.
+    let got = unsafe { (entry!(table, CallIntMethod))(stream.env, stream.stream, stream.read, stream.buffer, 0, want) };
+
+    // SAFETY: `stream.env` is valid.
+    if unsafe { pending(stream.env) } {
+        // The Java exception is the one the caller should see, so it is left pending and
+        // the shim is told not to throw over it.
+        stream.failed = true;
+        return -1;
+    }
+    if got < 0 {
+        // `InputStream` reports end of stream as -1.
+        return 0;
+    }
+    if got == 0 || got > want {
+        // A blocking stream cannot report zero for a non-empty request, and more than was
+        // asked for is not something the `Read` contract can express.
+        stream.failed = true;
+        return -1;
+    }
+
+    // SAFETY: `got` bytes are present in `stream.buffer`, and `buf` has room for `len`,
+    // which is at least `want`.
+    unsafe { (entry!(table, GetByteArrayRegion))(stream.env, stream.buffer, 0, got, buf as *mut jbyte) };
+    if unsafe { pending(stream.env) } {
+        stream.failed = true;
+        return -1;
+    }
+    got as isize
+}
+
+/// A Java `OutputStream` seen as the C ABI's write callback.
+///
+/// The mirror of [`Stream`], and separately written rather than shared: a reader and a
+/// writer differ in the one method they call (`read` returns a count, `write` returns
+/// nothing) and in what a failure means (a reader can stop at end of stream, a writer has
+/// no such value). A shared struct with two nullable method ids would put both questions
+/// at every call site.
+struct Sink {
+    env: *mut JNIEnv,
+    stream: jobject,
+    /// Reused across crossings, for the same reason as the reader's.
+    buffer: jbyteArray,
+    /// Cached `OutputStream.write([BII)V`, valid as long as `stream` is.
+    write: jni_sys::jmethodID,
+    /// Set once this stream has failed, so the callback does not retry a broken stream.
+    failed: bool,
+}
+
+impl Sink {
+    /// # Safety
+    ///
+    /// `env` must be valid and `stream` a live `java.io.OutputStream`.
+    unsafe fn new(env: *mut JNIEnv, stream: jobject) -> Result<Sink, ()> {
+        // SAFETY: `env` is valid for the whole call, and the table outlives it.
+        let table = unsafe { table(env) };
+
+        // SAFETY: `stream` is a live object.
+        let class = unsafe { (entry!(table, GetObjectClass))(env, stream) };
+        if class.is_null() {
+            return Err(());
+        }
+        let name = c_str("write");
+        let signature = c_str("([BII)V");
+        // SAFETY: `class` is the live class object made above and both strings outlive the
+        // call.
+        let write = unsafe { (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr()) };
+        // SAFETY: `class` is the local reference made above.
+        unsafe { (entry!(table, DeleteLocalRef))(env, class) };
+        if write.is_null() || unsafe { pending(env) } {
+            return Err(());
+        }
+
+        // SAFETY: a fresh local array of a fixed size.
+        let buffer = unsafe { (entry!(table, NewByteArray))(env, READ_CHUNK as jsize) };
+        if buffer.is_null() || unsafe { pending(env) } {
+            return Err(());
+        }
+
+        Ok(Sink {
+            env,
+            stream,
+            buffer,
+            write,
+            failed: false,
+        })
+    }
+}
+
+impl Drop for Sink {
+    fn drop(&mut self) {
+        // SAFETY: `buffer` is a local reference this struct owns, and `env` is the one it
+        // was created with.
+        unsafe { delete_local(self.env, self.buffer) };
+    }
+}
+
+/// The C ABI's write callback, backed by `OutputStream.write`.
+///
+/// Returns `len`, because this layer either writes all of it or fails: a partial write
+/// handed back to the caller would mean the connection asked for the rest, which reads as
+/// a peer that stopped reading rather than as the local stream that actually broke.
+///
+/// # Safety
+///
+/// `context` must point at a live [`Sink`] and `buf` must be readable for `len` bytes.
+unsafe extern "C" fn write_sink(context: *mut c_void, buf: *const u8, len: usize) -> isize {
+    if context.is_null() || buf.is_null() {
+        return -1;
+    }
+    // SAFETY: the caller passes the `Sink` this layer created, and a mutable borrow of it
+    // cannot alias another because the C ABI drives the callback on one thread.
+    let sink = unsafe { &mut *(context as *mut Sink) };
+    if sink.failed {
+        return -1;
+    }
+    // SAFETY: `sink.env` is the valid environment the sink was made with.
+    let table = unsafe { table(sink.env) };
+
+    let mut written = 0;
+    while written < len {
+        let take = (len - written).min(READ_CHUNK);
+        // SAFETY: `buf` has `len` readable bytes and `written < len`, so the tail from
+        // `written` is at least `take` long; `sink.buffer` has room for `take`.
+        unsafe {
+            (entry!(table, SetByteArrayRegion))(
+                sink.env,
+                sink.buffer,
+                0,
+                take as jsize,
+                buf.add(written) as *const jbyte,
+            )
+        };
+        // SAFETY: `sink.env` is valid.
+        if unsafe { pending(sink.env) } {
+            sink.failed = true;
+            return -1;
+        }
+        // SAFETY: `sink.write` is `OutputStream.write([BII)V` on `sink.stream`, and the
+        // trailing numbers are the `int offset, int length` the variadic call expects.
+        unsafe {
+            (entry!(table, CallVoidMethod))(
+                sink.env,
+                sink.stream,
+                sink.write,
+                sink.buffer,
+                0,
+                take as jsize,
+            )
+        };
+        // SAFETY: `sink.env` is valid.
+        if unsafe { pending(sink.env) } {
+            // The Java exception is the one the caller should see, so it is left pending.
+            sink.failed = true;
+            return -1;
+        }
+        written += take;
+    }
+    len as isize
+}
+
+/// A Java object that answers whether a transfer should be taken.
+///
+/// The summary crosses as a `String` rather than as bytes because this is the one place a
+/// person reads it: `String` is what the prompt is built from, and every byte-level reason
+/// this layer usually avoids arrays does not apply to one short line.
+struct Decider {
+    env: *mut JNIEnv,
+    object: jobject,
+    /// Cached `Decision.accept(String)Z`.
+    accept: jni_sys::jmethodID,
+}
+
+impl Decider {
+    /// # Safety
+    ///
+    /// `env` must be valid and `object` a live `com.oshare.airdrop.Native$Decision`.
+    unsafe fn new(env: *mut JNIEnv, object: jobject) -> Result<Decider, ()> {
+        // SAFETY: `env` is valid for the whole call, and the table outlives it.
+        let table = unsafe { table(env) };
+        // SAFETY: `object` is a live object.
+        let class = unsafe { (entry!(table, GetObjectClass))(env, object) };
+        if class.is_null() {
+            return Err(());
+        }
+        let name = c_str("accept");
+        let signature = c_str("(Ljava/lang/String;)Z");
+        // SAFETY: `class` is the live class object made above and both strings outlive the
+        // call.
+        let accept = unsafe { (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr()) };
+        // SAFETY: `class` is the local reference made above.
+        unsafe { (entry!(table, DeleteLocalRef))(env, class) };
+        if accept.is_null() || unsafe { pending(env) } {
+            return Err(());
+        }
+        Ok(Decider {
+            env,
+            object,
+            accept,
+        })
+    }
+}
+
+/// The C ABI's decision callback, backed by `Decision.accept`.
+///
+/// Every failure path answers zero, which the endpoint reads as a refusal. A prompt that
+/// threw is not a person saying yes: taking a file on behalf of an exception is the one
+/// outcome that cannot be undone.
+///
+/// # Safety
+///
+/// `context` must point at a live [`Decider`] and `summary` must be readable for `len` bytes.
+unsafe extern "C" fn decide_java(context: *mut c_void, summary: *const u8, len: usize) -> i32 {
+    if context.is_null() || summary.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller passes the `Decider` this layer created, on the thread serving
+    // one connection, so the borrow cannot alias.
+    let decider = unsafe { &mut *(context as *mut Decider) };
+    let bytes = unsafe { std::slice::from_raw_parts(summary, len) };
+    // A sender name may be any text the other phone allows; invalid UTF-8 is replaced
+    // rather than dropped, because a prompt with a mangled name still describes a transfer
+    // and an empty one does not.
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    let Ok(c_text) = CString::new(text) else {
+        return 0;
+    };
+    let table = unsafe { table(decider.env) };
+    // SAFETY: `c_text` is a NUL-terminated C string that outlives the call.
+    let argument = unsafe { (entry!(table, NewStringUTF))(decider.env, c_text.as_ptr()) };
+    if argument.is_null() {
+        return 0;
+    }
+    // SAFETY: `argument` is the string just made, and `accept` is
+    // `Decision.accept(String)Z` on the object the caller handed over.
+    let answer = unsafe {
+        (entry!(table, CallBooleanMethod))(
+            decider.env,
+            decider.object,
+            decider.accept,
+            argument,
+        )
+    };
+    // SAFETY: `argument` is a local reference this frame owns.
+    unsafe { (entry!(table, DeleteLocalRef))(decider.env, argument) };
+    if unsafe { pending(decider.env) } {
+        // The Java exception stays pending: it is the caller's, and it says more than a
+        // refusal code would.
+        return 0;
+    }
+    // `CallBooleanMethod` answers a `jboolean`: 0 or 1, not `false`/`true`.
+    i32::from(answer != 0)
+}
+
+/// One connection: the stream it reads from and the stream it writes to.
+///
+/// The C ABI gives both callbacks one context, and that is not a compromise here — the
+/// connection is the unit the call serves, so its context is the connection's state. The
+/// two trampolines below exist because a callback receives a context, not a field: each
+/// hands the field's address to the adapter that expects it, which is the same shape
+/// `receiveArchive` uses when it passes a lone [`Stream`].
+struct Connection {
+    reader: Stream,
+    sink: Sink,
+}
+
+/// The C ABI's read callback, pointed at the connection's reader.
+///
+/// # Safety
+///
+/// `context` must point at a live [`Connection`] and `buf` must be writable for `len` bytes.
+unsafe extern "C" fn read_connection(context: *mut c_void, buf: *mut u8, len: usize) -> isize {
+    if context.is_null() {
+        return -1;
+    }
+    // SAFETY: the caller passes the `Connection` created above, and the C ABI drives the
+    // callbacks on one thread, so the borrows the two trampolines take cannot overlap.
+    let connection = unsafe { &mut *(context as *mut Connection) };
+    // SAFETY: `buf` and `len` come from the caller unchanged, and the field's address is
+    // valid for the call.
+    unsafe { read_stream(&mut connection.reader as *mut Stream as *mut c_void, buf, len) }
+}
+
+/// The C ABI's write callback, pointed at the connection's sink.
+///
+/// # Safety
+///
+/// `context` must point at a live [`Connection`] and `buf` must be readable for `len` bytes.
+unsafe extern "C" fn write_connection(context: *mut c_void, buf: *const u8, len: usize) -> isize {
+    if context.is_null() {
+        return -1;
+    }
+    // SAFETY: as above.
+    let connection = unsafe { &mut *(context as *mut Connection) };
+    // SAFETY: as above, for the sink.
+    unsafe { write_sink(&mut connection.sink as *mut Sink as *mut c_void, buf, len) }
+}
+
+/// Reads a `java.lang.String` as UTF-16 and converts it, throwing if it is not a string.
+///
+/// # Safety
+///
+/// `env` must be valid and `value` a live `java.lang.String`.
+unsafe fn read_string(env: *mut JNIEnv, value: jstring) -> Option<String> {
+    // SAFETY: `env` is valid for the whole call.
+    let table = unsafe { table(env) };
+    // SAFETY: `value` is a live string.
+    let length = unsafe { (entry!(table, GetStringLength))(env, value) };
+    if length < 0 {
+        return None;
+    }
+    let mut units = vec![0u16; length as usize];
+    // SAFETY: `units` has room for `length` UTF-16 code units.
+    unsafe { (entry!(table, GetStringRegion))(env, value, 0, length, units.as_mut_ptr()) };
+    // SAFETY: `env` is valid.
+    if unsafe { pending(env) } {
+        return None;
+    }
+    match String::from_utf16(&units) {
+        Ok(text) => Some(text),
+        Err(_) => {
+            // A lone surrogate is not a path any filesystem can hold, and silently
+            // replacing it would create a file under a name the caller never asked for.
+            // SAFETY: `env` is valid.
+            unsafe {
+                throw(
+                    env,
+                    "java/lang/IllegalArgumentException",
+                    "the inbox path is not a well-formed string",
+                )
+            };
+            None
+        }
+    }
+}
+
+/// Reads a `java.lang.String[]` as one NUL-separated blob.
+///
+/// The C ABI takes paths as a single region — a path cannot contain NUL, so NUL separates
+/// without escaping — and Java's natural way to say "these files" is an array. This is
+/// where the two meet, and it is the only place that has to know both.
+///
+/// Each element's local reference is deleted as soon as it has been read: a share of a few
+/// thousand files would otherwise fill the 512-entry table before the loop ended. That is
+/// the same limit that keeps names from crossing as a `String[]` in the other direction,
+/// and here it is avoided rather than documented as a ceiling.
+///
+/// # Safety
+///
+/// `env` must be valid and `array` a live `java.lang.String[]`.
+unsafe fn read_paths(env: *mut JNIEnv, array: jobjectArray) -> Option<String> {
+    // SAFETY: `env` is valid for the whole call.
+    let table = unsafe { table(env) };
+    // SAFETY: `array` is a live array.
+    let length = unsafe { (entry!(table, GetArrayLength))(env, array) };
+    if length <= 0 {
+        // SAFETY: `env` is valid.
+        unsafe { throw(env, "java/lang/IllegalArgumentException", "at least one path is required") };
+        return None;
+    }
+
+    let mut joined = String::new();
+    for index in 0..length {
+        // SAFETY: `index` is inside the array, and the element is a live reference this
+        // frame owns from here on.
+        let element = unsafe { (entry!(table, GetObjectArrayElement))(env, array, index) };
+        if element.is_null() {
+            // SAFETY: `env` is valid.
+            unsafe {
+                throw(
+                    env,
+                    "java/lang/NullPointerException",
+                    "a path in the array is null",
+                )
+            };
+            return None;
+        }
+        // SAFETY: the elements of a `String[]` are `java.lang.String`s, per the signature.
+        let text = unsafe { read_string(env, element as jstring) };
+        // SAFETY: `element` is a local reference made above.
+        unsafe { (entry!(table, DeleteLocalRef))(env, element) };
+        let text = text?;
+        if !joined.is_empty() {
+            joined.push('\0');
+        }
+        joined.push_str(&text);
+    }
+    Some(joined)
+}
+
+/// Copies a `byte[]` into a `Vec<u8>`.
+///
+/// A packet is copied rather than pinned: the C ABI wants a plain region, and the copy is a
+/// four-kilobyte memcpy on a path that runs once per answer.
+///
+/// # Safety
+///
+/// `env` must be valid and `array` a live `byte[]`.
+unsafe fn read_bytes(env: *mut JNIEnv, array: jbyteArray) -> Option<Vec<u8>> {
+    // SAFETY: `env` is valid for the whole call.
+    let table = unsafe { table(env) };
+    // SAFETY: `array` is a live array.
+    let length = unsafe { (entry!(table, GetArrayLength))(env, array) };
+    if length <= 0 {
+        // An empty packet is not a packet; the parser would refuse it a frame later with a
+        // message about a truncated header, which names the wrong thing.
+        // SAFETY: `env` is valid.
+        unsafe { throw(env, "java/lang/IllegalArgumentException", "the packet is empty") };
+        return None;
+    }
+    let mut bytes = vec![0u8; length as usize];
+    // SAFETY: `bytes` has room for `length` and `array` holds at least that many.
+    unsafe {
+        (entry!(table, GetByteArrayRegion))(
+            env,
+            array,
+            0,
+            length,
+            bytes.as_mut_ptr() as *mut jbyte,
+        )
+    };
+    // SAFETY: `env` is valid.
+    if unsafe { pending(env) } {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Copies bytes into a new `byte[]`.
+///
+/// # Safety
+///
+/// `env` must be valid.
+unsafe fn new_bytes(env: *mut JNIEnv, bytes: &[u8]) -> jbyteArray {
+    // SAFETY: `env` is valid for the whole call.
+    let table = unsafe { table(env) };
+    // SAFETY: a fresh local array of the given length.
+    let array = unsafe { (entry!(table, NewByteArray))(env, bytes.len() as jsize) };
+    if array.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: `array` has room for `bytes.len()` and the source slice is that long.
+    unsafe {
+        (entry!(table, SetByteArrayRegion))(
+            env,
+            array,
+            0,
+            bytes.len() as jsize,
+            bytes.as_ptr() as *const jbyte,
+        )
+    };
+    // SAFETY: `env` is valid.
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
+    array
+}
+
+/// Raises `class` with `message`.
+///
+/// `message` is passed through as UTF-8. JNI wants modified UTF-8, which differs only for
+/// a NUL (impossible here, the messages name paths and sizes) and for characters outside
+/// the basic plane, which would come out garbled rather than lost. A diagnostic is worth
+/// more than the rule that would keep it exact.
+///
+/// # Safety
+///
+/// `env` must be valid.
+unsafe fn throw(env: *mut JNIEnv, class: &str, message: &str) {
+    // SAFETY: `env` is valid for the whole call.
+    let table = unsafe { table(env) };
+    // A class the JVM cannot find raises `NoClassDefFoundError` by itself, which is a
+    // better diagnosis than returning silently.
+    let class = CString::new(class).unwrap_or_else(|_| c_str("java/lang/RuntimeException"));
+    let text = CString::new(message)
+        .unwrap_or_else(|_| c_str("the operation failed, and its message could not be passed"));
+    // SAFETY: `env` is valid and both strings outlive the call.
+    let found = unsafe { (entry!(table, FindClass))(env, class.as_ptr()) };
+    if found.is_null() {
+        return;
+    }
+    // SAFETY: `found` is a live local class reference.
+    unsafe { (entry!(table, ThrowNew))(env, found, text.as_ptr()) };
+    // SAFETY: `found` is the local reference made above, and the throw has taken what it
+    // needs from it.
+    unsafe { (entry!(table, DeleteLocalRef))(env, found) };
+}
+
+/// True when the JVM has an exception waiting for the caller.
+///
+/// # Safety
+///
+/// `env` must be valid.
+unsafe fn pending(env: *mut JNIEnv) -> bool {
+    // SAFETY: `env` is valid.
+    // SAFETY: `env` is valid. `ExceptionCheck` answers with a `jboolean`, which is a byte
+    // in this ABI and not Rust's `bool`.
+    unsafe { (entry!(table(env), ExceptionCheck))(env) != 0 }
+}
+
+/// Releases a local reference.
+///
+/// # Safety
+///
+/// `env` must be valid and `reference` a local reference that has not been released.
+unsafe fn delete_local(env: *mut JNIEnv, reference: jobject) {
+    if reference.is_null() {
+        return;
+    }
+    // SAFETY: `reference` is a live local reference.
+    unsafe { (entry!(table(env), DeleteLocalRef))(env, reference) };
+}
+
+/// The function table the JVM handed us.
+///
+/// # Safety
+///
+/// `env` must be valid for the lifetime of the borrow.
+unsafe fn table<'a>(env: *mut JNIEnv) -> &'a JNINativeInterface_ {
+    // SAFETY: `env` is a `JNIEnv`, which is a pointer to the table, and the table itself
+    // outlives any call.
+    unsafe { &**env }
+}
+
+/// A static C string, for the JNI entry points that take one.
+fn c_str(text: &'static str) -> CString {
+    CString::new(text).expect("a static string has no interior NUL")
+}

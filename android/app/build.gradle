@@ -1,0 +1,104 @@
+plugins {
+    id 'com.android.application'
+}
+
+// The Rust sources live one level above this Gradle project, because they are the library
+// and this is one of its two consumers (the other is `crates/ffi/jvm/check.sh`, which runs
+// the same Java classes on a desktop JVM).
+def repoRoot = rootProject.projectDir.parentFile
+def rustTarget = 'aarch64-linux-android'
+def rustSo = new File(repoRoot, "target/${rustTarget}/release/libopairdrop_ffi.so")
+
+// Where the built library is put for the APK to pick up. A build directory rather than a
+// checked-in `jniLibs/`: a 455 KB binary in the source tree is a binary nobody rebuilds, and
+// the first symptom of a stale one is a transfer that fails on a device for no visible
+// reason.
+def jniDir = layout.buildDirectory.dir('rustJniLibs')
+
+android {
+    namespace 'com.oshare.airdrop'
+    // 37 to match targetSdk: the SDK refuses a target above the platform it compiles against,
+    // and compiling against the same platform the app targets is the only way the two cannot
+    // drift. The published platform here is Android 17, which calls itself API level 37.0;
+    // `platforms/android-37` is a copy of it whose `source.properties` says 37, because AGP
+    // 8.9 has no way to spell a minor level and looks the platform up by that integer. The
+    // whole story is Task.md 10.1.
+    compileSdk 37
+
+    defaultConfig {
+        applicationId 'com.oshare.airdrop'
+        // 35, and the linker floor in ../../.cargo/config.toml is the same number: the two
+        // numbers describe one decision, so they are kept equal rather than each justified
+        // separately.
+        minSdk 35
+        targetSdk 37
+        versionCode 1
+        versionName '0.1.0'
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    sourceSets {
+        main {
+            // The Java half of the FFI layer, compiled from where the Rust side's tests
+            // already compile it from. The two entry points are excluded: they have `main`
+            // methods and belong to the checks, not to the app.
+            java.srcDirs += [new File(repoRoot, 'crates/ffi/jvm')]
+            java.exclude '**/SettingsCheck.java'
+            java.exclude '**/RoundTrip.java'
+            jniLibs.srcDirs += [jniDir.get().asFile]
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    lint {
+        // A missing translation is a real problem in a shipped app and noise in a library
+        // host; there is one locale here and the strings are Chinese.
+        disable 'MissingTranslation'
+    }
+}
+
+// Copies the cross-compiled library into the layout the APK expects
+// (`<dir>/arm64-v8a/libopairdrop_ffi.so`).
+//
+// A missing file stops the build with the command that produces it, rather than producing an
+// APK that installs and then dies with UnsatisfiedLinkError on first touch — which is the
+// failure this task exists to make impossible.
+def copyRustSo = tasks.register('copyRustSo', Copy) {
+    into jniDir.map { it.dir('arm64-v8a') }
+    from(rustSo)
+    doFirst {
+        if (!rustSo.isFile()) {
+            throw new GradleException(
+                    "the Rust library is missing: ${rustSo}\n" +
+                    "build it first: cargo build --release --target ${rustTarget} -p opairdrop-ffi")
+        }
+    }
+}
+
+tasks.named('preBuild').configure {
+    dependsOn copyRustSo
+}
+
+dependencies {
+    // The LSPosed module interface. Compile-only and deliberately so: at runtime the class
+    // comes from the framework, and shipping a second copy inside the APK is how a module
+    // ends up loaded against a class the framework never handed it. 102.0.0 matches the
+    // `minApiVersion=102` in resources/META-INF/xposed/module.prop.
+    compileOnly 'io.github.libxposed:api:102.0.0'
+    // RecyclerView, for the wrapper that adds one row to OShare's device list. Also
+    // compile-only: OShare ships its own copy, and two RecyclerView classes in one process
+    // is a ClassCastException waiting for the first layout pass.
+    compileOnly 'androidx.recyclerview:recyclerview:1.3.2'
+}

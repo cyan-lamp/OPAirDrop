@@ -1,0 +1,8 @@
+[package]
+name = "opairdrop-settings"
+description = "Every tunable the protocol stack has, declared once, with the range each one may take"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true

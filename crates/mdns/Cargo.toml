@@ -1,0 +1,10 @@
+[package]
+name = "opairdrop-mdns"
+description = "DNS wire codec covering the subset mDNS and DNS-SD need for AirDrop discovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

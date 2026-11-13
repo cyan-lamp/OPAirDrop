@@ -1,0 +1,10 @@
+[package]
+name = "opairdrop-bplist"
+description = "Apple binary property list (bplist00) codec for the AirDrop wire format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

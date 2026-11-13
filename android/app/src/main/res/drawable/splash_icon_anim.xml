@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 冷启动的启动图标：中心点先出现，内圈、外圈依次由里向外撑开，最后停在静态图标那一帧上。
+
+     顺序不靠 target 的书写次序，靠各自 animator 里的 startOffset（0 / 110 / 230 ms）。
+     target 这里仍按「外、内、点」写，与 splash_icon.xml 里的组顺序一致，读的时候不必来回跳。
+
+     没有环绕、没有循环：动画的最后一帧必须与静态启动图标一模一样，否则系统撤掉 splash 的
+     那一刻会看到图形跳一下。 -->
+<animated-vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/splash_icon">
+    <target
+        android:name="ringOuter"
+        android:animation="@animator/splash_ring_outer" />
+    <target
+        android:name="ringInner"
+        android:animation="@animator/splash_ring_inner" />
+    <target
+        android:name="dot"
+        android:animation="@animator/splash_dot" />
+</animated-vector>

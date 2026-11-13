@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 深色下的一整套窗口底色。
+
+         和 values/themes.xml 是同一份东西的两面：样式在资源合并时是「整条选中」而不是「逐
+         条覆盖」，所以这里有几条就得写几条，少写一条那一条就会退回平台默认值。
+
+         选 Theme.Material 而不是 Theme.DeviceDefault.DayNight：DayNight 会把控件样式交给厂
+         商皮肤，而这一页的卡片、行、输入框全是自己画的，只剩 Switch 和 AlertDialog 两个平台
+         控件——Material 的深色版给的正是这两样需要的对比度，且不随 ROM 变。 -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:colorAccent">#398FFE</item>
+        <!-- 与 Scheme.DARK.bg 同一个数：玻璃填的就是页底色，差一点就会画出一块更亮的方块。 -->
+        <item name="android:windowBackground">#1F1F1F</item>
+        <!-- 深色页底上的系统栏图标必须反过来：默认的深色图标在黑底上等于没有。 -->
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+
+        <!-- 冷启动沿用同一段动画，只是底换成深色（见 values-night/ic_launcher_background）。 -->
+        <item name="android:windowSplashScreenBackground">@color/ic_launcher_background</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_icon_anim</item>
+        <item name="android:windowSplashScreenAnimationDuration">1000</item>
+    </style>
+</resources>

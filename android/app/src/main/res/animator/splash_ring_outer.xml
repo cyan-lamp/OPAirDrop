@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 最后一拍：外圈。内圈起跑 120 ms 后跟上，全程 680 ms——比内圈略长，
+     于是最外面那一圈总是最后停下的，视线被送到边缘，正好接上界面出现。
+
+     三段时间相加 230 + 680 = 910 ms，落在 theme 里 windowSplashScreenAnimationDuration
+     的 1000 ms 之内：系统给的这段窗口只够画完，不够重来一次。 -->
+<objectAnimator xmlns:android="http://schemas.android.com/apk/res/android"
+    android:duration="680"
+    android:startOffset="230"
+    android:interpolator="@android:interpolator/decelerate_cubic">
+    <propertyValuesHolder
+        android:propertyName="alpha"
+        android:valueFrom="0"
+        android:valueTo="1" />
+    <propertyValuesHolder
+        android:propertyName="scaleX"
+        android:valueFrom="0.55"
+        android:valueTo="1" />
+    <propertyValuesHolder
+        android:propertyName="scaleY"
+        android:valueFrom="0.55"
+        android:valueTo="1" />
+</objectAnimator>

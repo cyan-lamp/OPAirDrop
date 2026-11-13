@@ -1,0 +1,5 @@
+# Two processes, one hook each: OShare draws the share panel, SystemUI draws the
+# control-centre panel. Every package listed here costs a load of this module in that
+# process, so a package with no hook of its own stays out.
+com.coloros.oshare
+com.android.systemui

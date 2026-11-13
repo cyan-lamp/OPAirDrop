@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 冷启动里第一个动的东西：中心那一点。
+
+     顺序是「由内向外」：点先长出，两圈再由里向外依次撑开（见 splash_ring_inner /
+     splash_ring_outer）。原版是反过来的——外圈先、内圈跟上、点最后落——观感是「收拢到位」；
+     这里改成从中心出发，所以点必须第一个出来，否则后面那两圈没有出处。
+
+     缩放从 0 起、alpha 从 0 起：点在中心从无到有，是这一串动画的起点，不是一次弹跳。
+     曲线仍是 decelerate_cubic，原版选它是因为任何过冲都会把图形顶出启动图标自己的几何；
+     方向变了，这条理由没变。 -->
+<objectAnimator xmlns:android="http://schemas.android.com/apk/res/android"
+    android:duration="420"
+    android:interpolator="@android:interpolator/decelerate_cubic">
+    <propertyValuesHolder
+        android:propertyName="alpha"
+        android:valueFrom="0"
+        android:valueTo="1" />
+    <propertyValuesHolder
+        android:propertyName="scaleX"
+        android:valueFrom="0"
+        android:valueTo="1" />
+    <propertyValuesHolder
+        android:propertyName="scaleY"
+        android:valueFrom="0"
+        android:valueTo="1" />
+</objectAnimator>

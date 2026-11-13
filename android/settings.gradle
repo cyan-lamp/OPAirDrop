@@ -1,0 +1,20 @@
+// The app module is the only module: the Rust crates are built by cargo, and their Java
+// half (com.oshare.airdrop.Native, com.oshare.airdrop.SettingsScreen) is compiled in from
+// crates/ffi/jvm rather than copied here. One copy, so the contract cannot drift.
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'OPAirDrop'
+include ':app'

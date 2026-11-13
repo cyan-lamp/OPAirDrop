@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- The receive endpoint binds a socket and answers HTTP on it, so this is the one
+         permission the receiver needs. The legacy manifest's service and link permissions
+         stay undeclared: nothing here touches the device's own AirDrop plumbing, and a
+         permission declared for code that does not exist reads as a feature that does. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- 底栏三格按下时那声「一下」。没有这条权限，Vibrator.vibrate 会抛 SecurityException，
+         而调用点是故意吞掉异常的（触感失败不该让切页失败），于是表现为「完全没有震动」——
+         看起来像代码没写，其实是没声明。 -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- Finding peers is a multicast subscription: without this the socket receives nothing
+         once the screen dims, because the platform treats an app with no multicast lock as
+         one that does not need the packets. It is normal-level and needs no prompt. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <!-- Receiving has to outlive the window: without a foreground service ColorOS stops a
+         background process about ninety seconds after the last activity closes, and a phone
+         lying on a desk is exactly when a transfer is expected to arrive. Type
+         connectedDevice (not dataSync) because talking to a foreign device is the whole job
+         and dataSync carries a time limit this feature would collide with. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- The notification is not a message to the user, it is the receipt a foreground
+         service has to show. Without the permission the service still runs; the notice is
+         simply not drawn. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:name=".App"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 发送页，也是本应用在系统分享面板里的入口。
+             type 写 */* 是故意的：分享什么都要能接，具体能不能发由发送页判断——
+             拒绝一份 PDF 的理由，只有拿到文件之后才知道。singleTop 是为了第二次分享
+             替换掉第一次的文件，而不是叠出第二个窗口。 -->
+        <activity
+            android:name=".SendActivity"
+            android:exported="true"
+            android:label="@string/send_title"
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|uiMode">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+
+        <!-- Reachable only from the settings page, so not exported: there is nothing a
+             settings page does that another app should be able to trigger. -->
+        <activity
+            android:name=".AboutActivity"
+            android:exported="false"
+            android:label="@string/about_title"
+            android:parentActivityName=".MainActivity" />
+
+        <!-- The receiver's foreground identity: started when something says we should be
+             listening (the control-centre window, or OShare's own everyone mode) and stopped
+             when nothing does. stopWithTask=false so closing the window does not cut a
+             transfer that is arriving. -->
+        <service
+            android:name=".ReceiveService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice"
+            android:stopWithTask="false" />
+
+        <!-- The two buttons on the "somebody wants to send you files" notification. Not
+             exported: a PendingIntent carries this app's identity, so the notification can
+             reach it while no other app can forge an "accept". -->
+        <receiver
+            android:name=".DecisionReceiver"
+            android:exported="false" />
+
+    </application>
+</manifest>

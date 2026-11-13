@@ -1,0 +1,27 @@
+# Building the shared library for a phone.
+#
+# The NDK is on this machine at the SDK the tools directory holds, so the linker is named
+# outright rather than left to `cargo-ndk`: one less tool to install, and the path is the
+# same one the Gradle build points at, which means the two cannot disagree about which NDK
+# produced the `.so`.
+#
+# The API level in the linker's name (35) is the floor the manifest declares, and the two
+# numbers are kept equal on purpose. A `.so` linked against a higher floor fails to load on a
+# device below it with "cannot locate symbol", which reads as a corrupt library rather than a
+# version mismatch. Linking against a *lower* floor is not wrong, but it makes the two
+# numbers disagree for no reason and leaves a comment somewhere claiming the old floor was
+# required.
+#
+# `ar` is named for the same reason: without it a build that needs to archive static
+# objects (any dependency with a `build.rs` producing one) silently uses the host's `ar`
+# and produces a library the device cannot read.
+
+[target.aarch64-linux-android]
+linker = "D:/Downloads/project/tools/android-sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd"
+ar = "D:/Downloads/project/tools/android-sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+# 16 KB pages. Android 15 and later can boot with a 16 KB page size, and the loader refuses a
+# library whose LOAD segments are only 4 KB-aligned before any of its code runs: the app dies
+# with "unsatisfied link" and a compatibility dialog naming this file. NDK r27 still links this
+# triple at 4 KB, so the alignment has to be asked for. 16384 is a multiple of 4096, so the
+# same library keeps loading on a 4 KB device — this is one artefact for both.
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

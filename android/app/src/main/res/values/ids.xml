@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 面板那一行自己的状态位。用资源 id 而不是随便一个对象：setTag(Object) 的那个位置
+         已经被「这一行加过了吗」占着，再拿它存别的东西，两处会互相覆盖。 -->
+    <item name="opairdrop_panel_state" type="id" />
+</resources>

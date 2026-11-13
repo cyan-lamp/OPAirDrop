@@ -1,0 +1,13 @@
+[package]
+name = "opairdrop-cpio"
+description = "cpio (newc/odc) and DVZip codecs for the AirDrop /Upload payload"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# miniz_oxide backend: pure Rust, so the crate builds without a C toolchain and
+# cross-compiles to Android targets with nothing but `rustup target add`.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

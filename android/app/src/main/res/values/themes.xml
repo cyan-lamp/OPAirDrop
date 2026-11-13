@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The platform's own Material theme, not a library's: this app has no dependency
+         beyond the Android SDK, and the settings page is built from widgets, so a theme
+         library would be a second set of defaults to fight.
+
+         NoActionBar because both pages draw their own heading. With an action bar the status
+         page showed "OPAirDrop" twice — once in a black strip and once as the title it draws
+         itself — and the strip also pushed the real content down by its own height. -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:colorAccent">#2563EB</item>
+        <!-- The page colour, and the same value as MainActivity.BG: the floating nav pill's
+             glass is filled with it, and a glass that is not the page colour reads as a
+             bright square instead of a pane floating over the same sheet of paper. -->
+        <item name="android:windowBackground">#F0F1F3</item>
+        <!-- Without the action bar the top of the window is the status bar itself, so its
+             icons have to be dark: the light default is white on a #FFFBFE background. -->
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+
+        <!-- Cold start, taken over unchanged from the legacy app except for the direction of
+             the drawing: the centre dot appears first and the two rings open outwards from it
+             (0 / 110 / 230 ms in res/animator/). Same artwork, same background, same
+             1000 ms window.
+
+             The dark variant lives in values-night/themes.xml and repeats every item here:
+             a style is selected whole, never merged item by item, so a night style that only
+             listed the differing lines would silently drop the rest. -->
+        <item name="android:windowSplashScreenBackground">@color/ic_launcher_background</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_icon_anim</item>
+        <item name="android:windowSplashScreenAnimationDuration">1000</item>
+    </style>
+</resources>

@@ -1,0 +1,13 @@
+[package]
+name = "opairdrop-airdrop"
+description = "The AirDrop request and response contract: plist bodies, transfer ids, endpoint paths"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+opairdrop-bplist = { path = "../bplist" }
+opairdrop-cpio = { path = "../cpio" }
+opairdrop-http = { path = "../http" }

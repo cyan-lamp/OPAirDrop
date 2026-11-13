@@ -1,0 +1,25 @@
+#!/bin/sh
+# Validate the installed sender page contract offline; no vendor assets are redistributed.
+set -eu
+root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+upk=${1:?usage: run-sending-assets.sh /absolute/path/to/OShareSending2.0.upk}
+sdk=${OSHARE_ANDROID_SDK:-$HOME/Library/Android/sdk}
+json_jar=${OSHARE_JSON_JAR:-}
+if [ -z "$json_jar" ]; then
+    json_jar=$(rg --files "$HOME/.gradle/caches/modules-2/files-2.1/org.json/json" -g '*.jar' | head -n 1)
+fi
+if [ ! -f "$json_jar" ]; then
+    echo "Set OSHARE_JSON_JAR to a local org.json JAR" >&2
+    exit 1
+fi
+work=$(mktemp -d)
+# Deletion needs the POSIX form of the path even when everything else uses this one.
+. "$root/tools/unixpath.sh"
+work_rm=$(unixpath "$work")
+trap 'rm -rf "$work_rm"' EXIT
+classpath="$json_jar:$sdk/platforms/android-37.0/android.jar"
+javac -encoding UTF-8 -cp "$classpath" -d "$work" \
+    "$root/tests/android/com/oshare/airdrop/Entry.java" \
+    "$root/app/src/main/java/com/oshare/airdrop/OShareSendingAssets.java" \
+    "$root/tests/OShareSendingAssetsTest.java"
+java -cp "$work:$classpath" com.oshare.airdrop.OShareSendingAssetsTest "$upk"

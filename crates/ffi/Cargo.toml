@@ -1,0 +1,38 @@
+[package]
+name = "opairdrop-ffi"
+description = "The C and JNI boundary Android calls: bytes in, bytes out, nothing structured"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# `cdylib` for the device, `rlib` so the boundary can be tested on the host without a
+# JVM in the loop.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The JNI ABI's type and vtable definitions, and nothing else. This crate declares no
+# linked symbols, so an unused `JNI_CreateJavaVM` never has to resolve: the direction we
+# need (a JVM calling into us) goes through the function table it passes in.
+#
+# 0.3 rather than 0.4: 0.4 puts a proc macro over the table that regroups its entries into
+# per-version unions, so every call site has to name a group and read a union field to reach
+# something the C header declares flat. See the module docs in `src/jni.rs`.
+jni-sys = "0.3.1"
+
+opairdrop-airdrop = { path = "../airdrop" }
+# Discovery: the query is built and the answers are read here, because a DNS message is
+# name compression and a `u16` at the wrong endian, and the crate that already has tests for
+# both is not worth re-writing in Java. Java owns the socket and nothing else.
+opairdrop-mdns = { path = "../mdns" }
+# Sending needs the archive writer, not only the reader: an upload is a cpio stream inside
+# a DVZip block sequence, and both halves are built here rather than in Java. The
+# dependency used to be dev-only, when this crate could only receive.
+opairdrop-cpio = { path = "../cpio" }
+# The boundary is the composition root: it is the one place that knows both what the
+# protocol can be told to do and what the person asked for in the settings screen.
+opairdrop-settings = { path = "../settings" }
+
+[dev-dependencies]

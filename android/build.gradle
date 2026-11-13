@@ -1,0 +1,4 @@
+// Nothing to build here: the plugins are resolved once, in the module that uses them.
+plugins {
+    id 'com.android.application' version '8.9.0' apply false
+}
