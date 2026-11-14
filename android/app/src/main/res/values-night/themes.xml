@@ -26,10 +26,23 @@
          退回平台默认值，而平台默认的深色是 Theme.Material 的深灰，不是这一页的 #1F1F1F。
 
          系统栏图标反过来（windowLightStatusBar=false）：深色玻璃上的深色图标等于没有。 -->
-    <style name="SendPanelTheme" parent="@android:style/Theme.Material.NoActionBar">
+    <style name="SendPanelTheme" parent="@android:style/Theme.Translucent.NoTitleBar">
+         <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowAnimationStyle">@style/PanelAnimation</item>
+        <!-- 系统栏区域透明：见 values/themes.xml 同名样式里的注释。深色主题里这个默认值
+             本来就是黑的，所以不显眼；但它同样是一块「自己画上去的东西」，深浅两套要一致。 -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+    </style>
+
+    <!-- 面板窗口的深色版。样式是整条选中的，所以每一条都要重写一遍。 -->
+    <style name="SendPanelDialog" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowIsFloating">false</item>
         <item name="android:windowIsTranslucent">true</item>
         <item name="android:windowBackground">@android:color/transparent</item>
         <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowNoTitle">true</item>
         <item name="android:backgroundDimEnabled">false</item>
         <item name="android:windowAnimationStyle">@style/PanelAnimation</item>
         <item name="android:windowLightStatusBar">false</item>

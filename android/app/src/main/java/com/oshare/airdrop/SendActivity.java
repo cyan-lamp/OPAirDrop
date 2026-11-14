@@ -1,6 +1,8 @@
 package com.oshare.airdrop;
 
+import android.animation.ValueAnimator;
 import android.app.Activity;
+import android.app.Dialog;
 import android.content.res.Configuration;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -101,11 +103,36 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     /** 回弹的时长。 */
     private static final int SPRING_MS = 240;
 
+    /**
+     * 跟手的阻尼：每个输入事件把「还差的距离」走掉这么多。
+     *
+     * <p>匀速拖动时它有一个恒定的稳态误差，大小是「每个事件走过的位移 × (1−k)/k」。这里取
+     * 0.5，也就是误差等于一个事件的位移：以每秒 1000 像素拖、120Hz 输入算，约 8 像素，不到
+     * 半个指甲盖；慢慢拖时误差不到 1 像素。手指一停，目标不再移动，这个误差在几个事件内归零
+     * ——所以它是「跟得上但有一点分量」，不是「一直落后一截」。
+     *
+     * <p>为什么必须有它：输入事件是离散的，屏幕是 120Hz，而手指不是。没有阻尼，位置就是每来
+     * 一个事件跳一下；有了它，位置是连续的。这也是「阻尼调大一点」能被感知到的唯一方式。
+     */
+    private static final float FOLLOW = 0.5f;
+
     /** 面板顶部的圆角。和导航胶囊同一个数。 */
     private static final float CORNER_DP = 28f;
 
     /** 面板顶部那圈模糊的半径。系统模糊，单位是屏幕像素。 */
     private static final float BLUR_DP = 28f;
+
+    /**
+     * 往下拖出去多远才算「要关」。按面板高度的比例算，不是固定像素——这块面板在不同分辨率上
+     * 高度差很多，写死像素在小屏上会变成「一碰就走」。
+     *
+     * <p>一开始是 0.18（不到五分之一）。太浅了：手指在面板上往下带一下、想够到下面的内容，
+     * 只要越过这条线、抬手时又带了一点速度，面板就关掉了。而「我要关掉」和「我想往下看看」
+     * 在中段本来就是分不清的，得过了三成才算意图明确。
+     *
+     * <p>甩动（速度过阈值）不看这一条：短促、方向明确，没有「想够内容」这种解释。
+     */
+    private static final float LEAVE_FRACTION = 0.28f;
 
     private Scheme S;
     private float density;
@@ -141,6 +168,25 @@ public final class SendActivity extends Activity implements Peers.Watcher {
 
     /** 正在滑出。防止连按两次返回键跑两遍动画。 */
     private boolean closing;
+    /** 面板的窗口。它不参与任务栈，也就不会被系统摆成小窗、不会在最近任务里留一张卡。 */
+    private Dialog panel;
+
+    /** 正在跑的那段位移（上滑、回弹、滑出）。按下时要能把它停掉。 */
+    private ValueAnimator slide;
+
+    /**
+     * 面板**应当**画在哪（相对它自己的自然位置 0）。位置只有这一个真相。
+     *
+     * <p>{@code top} 和 {@code translationY} 都是它的投影，见 {@link #apply()}。
+     *
+     * <p>为什么需要一个字段而不是读 {@code getTop()}：视图的位置不是只有我们在改。布局一遍
+     * ——到 inset、换主题、设备列表重建、文字变了要重新量——父容器就会把子视图摆回它自己算出来
+     * 的那个位置，也就是 0。之前 {@link #place} 拿 {@code getTop()} 当「现在在哪」，于是一次
+     * 布局之后，下一帧算出「从 0 走到 y」的整段差，把面板又整个推回去：屏幕上就是上滑到一半
+     * 突然顿一下、甚至来回弹。
+     */
+    private float placed;
+
     /** 面板背景的实时模糊；{@code null} 表示这台机器给不了，走纯色退路。 */
     private PanelGlass glass;
     /** 盖在模糊之上的染色层。模糊只给「看到背后」，可读性由它保证。 */
@@ -153,12 +199,45 @@ public final class SendActivity extends Activity implements Peers.Watcher {
 
         S = schemeOf(getResources().getConfiguration());
         density = getResources().getDisplayMetrics().density;
-        applyWindow();
 
         buildShell();
+        showPanel();
         slideIn();
 
         new Thread(this::intake, "opairdrop-intake").start();
+    }
+
+    /**
+     * 把面板放进一个独立窗口。
+     *
+     * <p># 为什么是 Dialog，而不是 Activity 自己的窗口
+     *
+     * <p>Activity 的窗口归系统的窗口管理摆布：从相册分享进来时会被塞进自由窗口（小窗），离开后
+     * 还会在最近任务里留一张卡。Dialog 的窗口不参与这套逻辑——它只是浮在当前 Activity 之上的
+     * 一层，没有任务、不进最近任务。一加互传也是这么做的：`IOSShareActivity` 是 Activity，
+     * 面板由 `COUIBottomSheetDialog` 承载；那个 Dialog 的窗口是 `setLayout(-1,-1)` 全屏，和
+     * 我们这里一样。
+     *
+     * <p>Activity 自己用 {@code windowNoDisplay}，屏幕上一个像素都不画。
+     */
+    private void showPanel() {
+        panel = new Dialog(this, R.style.SendPanelDialog);
+        Window window = panel.getWindow();
+        if (window != null) {
+            window.setBackgroundDrawable(
+                    new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+            // 面板会移到屏幕下方再滑上来，布局不能把它裁在窗口里。
+            window.addFlags(WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+        }
+        panel.setContentView(sheet);
+        // 点外面不关：这一页满屏，外面没有可点的地方；而且误触一下就把传输面板关掉很糟。
+        panel.setCanceledOnTouchOutside(false);
+        panel.setOnDismissListener(dismissed -> finish());
+        panel.show();
+
+        applyWindowBars();
+        // 玻璃要等 attach 之后才装得上（模糊 Drawable 由 ViewRootImpl 创建）。
+        sheet.post(this::installGlass);
     }
 
     @Override
@@ -200,17 +279,6 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     // ------------------------------------------------------------------ 窗口
 
     /**
-     * 窗口本身保持透明，什么模糊都不加。
-     *
-     * <p>模糊挪到面板那个 View 上去了（{@link PanelGlass}）：窗口级模糊会把面板以外整片屏幕
-     * 一起糊掉，而且每帧重采整屏。窗口这一层只要透明，让圆角外面能透出背后的界面。
-     */
-    private void applyWindow() {
-        Window window = getWindow();
-        window.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
-    }
-
-    /**
      * 给面板装上那块会跟着它走的玻璃。
      *
      * <p>必须在 attach 之后：模糊 Drawable 由 {@code ViewRootImpl} 创建，而它是 attach 的产物。
@@ -228,18 +296,22 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             return;
         }
         glass = panel;
-        panel.radius(dp(BLUR_DP));
-        panel.corners(dp(CORNER_DP), 0f);
+        // 两条都靠反射，都可能被 ROM 静默拒掉；把结果打出来，省得下次又只能靠眼睛猜
+        // 「圆角是不是没生效」。
+        boolean round = panel.corners(dp(CORNER_DP), 0f);
+        boolean blur = panel.radius(dp(BLUR_DP));
         // 只设模糊，不染色：叠色自己盖一层 {@link #tint}（理由见 buildShell 里的注释）。
         sheet.setBackground(panel.drawable());
         tintSheet();
         android.util.Log.i("OPAirDrop", "panel glass: " + panel.source()
-                + " radius=" + dp(BLUR_DP) + " corner=" + dp(CORNER_DP));
+                + " radius=" + dp(BLUR_DP) + (blur ? "" : "(rejected)")
+                + " corner=" + dp(CORNER_DP) + (round ? "" : "(rejected)"));
     }
 
-    /** 系统栏图标跟着深浅走。主题里那两条只在 Activity 创建时生效一次。 */
+    /** 系统栏图标跟着深浅走。主题里那两条只在窗口创建时生效一次。 */
     private void applyWindowBars() {
-        WindowInsetsController controller = getWindow().getInsetsController();
+        Window window = panel == null ? null : panel.getWindow();
+        WindowInsetsController controller = window == null ? null : window.getInsetsController();
         if (controller == null) {
             return;
         }
@@ -345,13 +417,9 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             return insets;
         });
 
-        setContentView(sheet);
-        applyWindowBars();
-        // 玻璃要等 attach 之后才装得上（模糊 Drawable 由 ViewRootImpl 创建），post 正好等到那一刻。
-        sheet.post(this::installGlass);
+        // 面板不交给 Activity 的窗口——它在 {@link #showPanel} 里被放进自己的 Dialog。
         rebuild();
     }
-
     /** 把内容整棵重建。配置变更、以及第一次搭骨架时都走这里。 */
     private void rebuild() {
         if (content == null) {
@@ -394,32 +462,51 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         sheet.setVisibility(View.INVISIBLE);
         sheet.post(() -> {
             int height = sheet.getHeight();
-            sheet.setTranslationY(height > 0 ? height : dp(600));
+            place(height > 0 ? height : dp(600));
             sheet.setVisibility(View.VISIBLE);
             layer(true);
-            sheet.animate()
-                    .translationY(0f)
-                    .setDuration(ENTER_MS)
-                    .setInterpolator(new DecelerateInterpolator(1.6f))
-                    .withEndAction(() -> layer(false))
-                    .start();
+            slideTo(offset(), 0f, ENTER_MS, new DecelerateInterpolator(1.6f),
+                    () -> layer(false));
         });
     }
 
     /**
-     * 把面板提升成一个硬件层，或还回去。
+     * 把面板从当前位置动画到 {@code to}。
      *
-     * <p># 为什么位移必须走层
-     *
-     * <p>{@code setTranslationY} 不是一次「搬动」，它会让这个 View 连同整棵子树重新绘制一遍：
-     * 每一帧都要重新栅格化这块 1440×3168 上的全部文字、再走一遍那条全屏圆角描边路径。文字在
-     * 每一帧落到略微不同的亚像素位置上，抗锯齿结果就跟着变——肉眼看到的就是**字在抖**，同时
-     * 帧预算被烧光。
-     *
-     * <p>硬件层之后，内容只栅格化一次，之后每帧只是把这张纹理挪个位置，由合成器完成。代价是
-     * 一张全屏纹理（约 18 MB），所以只在移动期间拿着，停下就还回去——常驻的话它和窗口模糊
-     * 抢同一块 GPU 内存，反而更慢。
+     * <p>用 {@link ValueAnimator} 而不是 {@code sheet.animate()}：后者只会写 {@code translationY}，
+     * 而位移必须走 {@link #place}（真正的 top），否则模糊不跟着面板走。
      */
+    private void slideTo(float from, float to, int duration, android.animation.TimeInterpolator curve,
+                         Runnable end) {
+        cancelSlide();
+        ValueAnimator animator = ValueAnimator.ofFloat(from, to);
+        animator.setDuration(duration);
+        animator.setInterpolator(curve);
+        animator.addUpdateListener(frame -> place((Float) frame.getAnimatedValue()));
+        animator.addListener(new android.animation.AnimatorListenerAdapter() {
+            @Override
+            public void onAnimationEnd(android.animation.Animator animation) {
+                if (slide == animator) {
+                    slide = null;
+                }
+                if (end != null) {
+                    end.run();
+                }
+            }
+        });
+        slide = animator;
+        animator.start();
+    }
+
+    /** 停掉正在跑的位移。按下时要做的第一件事就是它。 */
+    private void cancelSlide() {
+        if (slide != null) {
+            ValueAnimator running = slide;
+            slide = null;
+            running.cancel();
+        }
+    }
+
     /**
      * 把面板提升成一个硬件层，或还回去。
      *
@@ -770,8 +857,19 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         private final int slop;
         private final int fling;
         private final VelocityTracker tracker = VelocityTracker.obtain();
-        private float downY;
-        private float downX;
+        /**
+         * 按下那一刻的**屏幕**坐标，不是视图坐标。
+         *
+         * <p>这是整段手势里唯一必须小心的地方：`event.getY()` 是相对**接住事件的这个视图**算的，
+         * 而拖动时移动的恰恰就是这个视图。于是面板每往下走一像素，后续事件的 `getY()` 就少一像素，
+         * 手指的真实位移被自己抵消掉一半——手指走 800 像素，面板只走 400。更要紧的是这个抵消带
+         * 反馈：本帧算出来的位移会影响下一帧读到的坐标，手指有一像素噪声，面板就来回荡一像素。
+         * 这就是「整个界面上下抖动」，和模糊、硬件层、雷达都无关，关掉哪一个都还在。
+         *
+         * <p>`getRawX/Y()` 相对屏幕，视图怎么移动都不变，反馈回路从根上没有了。
+         */
+        private float downRawY;
+        private float downRawX;
         /**
          * 按下那一刻面板已经在的位置。
          *
@@ -780,7 +878,14 @@ public final class SendActivity extends Activity implements Peers.Watcher {
          * 第一个 MOVE 就会把它从半路拽回顶部——看起来是手指一按，面板自己跳了一下，接着怎么
          * 拖都对不上。真机上撞到的就是这个。
          */
-        private float startY;
+        private float startTop;
+        /**
+         * 按下去之后真正画出来的位置（{@code getTop()}）。
+         *
+         * <p>它只在「往下走」和「明显往回拖」时更新，小幅回退保持不动——见 MOVE 分支里的注释。
+         * 和 {@link #startTop} 分开是因为两者含义不同：一个是基准，一个是当前落点。
+         */
+        private float shown;
         /** 这一次触摸里模糊是否已经关掉了。只在第一帧 MOVE 上做一次，不是每帧。 */
         private boolean moving;
 
@@ -792,34 +897,78 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             fling = configuration.getScaledMinimumFlingVelocity() * 3;
         }
 
+        /**
+         * 布局之后把位置按住。
+         *
+         * <p>父容器每次布局都会把子视图摆到它算出来的位置——对这个面板来说是 0。上滑、回弹、
+         * 滑出、跟手这四段位移全部写成「真实的 top」，所以一次布局就是一次打回原点：面板正在
+         * 往上滑，屏幕中间忽然闪一帧回到最上面，再被下一帧推回来。一次手势里只要夹进两次布局，
+         * 读起来就是「抖」。
+         *
+         * <p>这些布局从外面来，不由我们决定：系统栏 inset 到达、发现设备后中部重建、标题下那行
+         * 小字从「正在准备……」变成「1 个文件 · 5 B」——每条都发生在上滑那 340 毫秒里。
+         *
+         * <p>所以位置不交给父容器：它想摆在哪不重要，{@link #placed} 说了算。这里用
+         * {@code onLayout} 收拾，是因为 {@code ViewGroup.layout} 是 final——框架在把 frame
+         * 设成 0 之后才回调到这里，正好剩下最后一步能改。
+         */
+        @Override
+        protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+            super.onLayout(changed, left, top, right, bottom);
+            apply();
+            if (android.util.Log.isLoggable("OPAirDrop", android.util.Log.DEBUG)
+                    && (slide != null || dragging)) {
+                android.util.Log.d("OPAirDrop", "layout during motion: asked=" + top
+                        + " kept=" + getTop() + " slide=" + (slide != null));
+            }
+        }
+
+        /**
+         * 把事件换算到屏幕坐标再交给速度追踪器。
+         *
+         * <p>理由和 {@link #downRawY} 一样：`VelocityTracker` 看到的是事件自带的坐标，而事件坐标
+         * 是相对当前 `top` 的。拖动中 `top` 一直在变，直接喂进去算出来的「速度」里混着面板自己
+         * 抵消掉的那一半，甩一下会被判成没甩。加上此刻的 `top` 就还原成屏幕坐标，位移纯粹来自
+         * 手指。
+         *
+         * <p>用副本是因为 `offsetLocation` 会改写事件本身，而事件还要继续往下传。
+         */
+        private void track(MotionEvent event) {
+            MotionEvent copy = MotionEvent.obtain(event);
+            copy.offsetLocation(getLeft(), getTop());
+            tracker.addMovement(copy);
+            copy.recycle();
+        }
+
         @Override
         public boolean onInterceptTouchEvent(MotionEvent event) {
             switch (event.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN -> {
-                    downX = event.getX();
-                    downY = event.getY();
+                    downRawX = event.getRawX();
+                    downRawY = event.getRawY();
                     moving = false;
-                    // 上一个回弹或上滑可能还在跑。它每帧都往 translationY 里写一个值，和手指
-                    // 写进去的那个互相覆盖——同一帧里先被动画拉回、再被手指推开，读起来就是
-                    // 整个窗口在上下摆。先让它停，位置从此只由手指决定。
-                    animate().cancel();
+                    // 上一个回弹或上滑可能还在跑。它每帧都在写位置，和手指写的那个互相覆盖
+                    // ——同一帧里先被动画拉回、再被手指推开，读起来就是整个窗口在上下摆。
+                    // 先让它停，位置从此只由手指决定。
+                    cancelSlide();
                     // 上一段滑出被这一下按停，closing 要放掉：见 onTouchEvent 里的同名分支。
                     closing = false;
                     // 按下就建层：见 {@link #layer} 里「为什么在按下时就建」。
                     layer(true);
-                    // 停在哪就从哪接着拖：见 {@link #startY}。
-                    startY = getTranslationY();
+                    // 停在哪就从哪接着拖：见 {@link #startTop}。
+                    startTop = offset();
+                    shown = startTop;
                     tracker.clear();
-                    tracker.addMovement(event);
+                    track(event);
                     return false;
                 }
                 case MotionEvent.ACTION_MOVE -> {
-                    float dy = event.getY() - downY;
-                    float dx = Math.abs(event.getX() - downX);
+                    float dy = event.getRawY() - downRawY;
+                    float dx = Math.abs(event.getRawX() - downRawX);
                     // 只接管「明显向下、且比横向更竖」的移动。横向留给以后可能加的翻页，
                     // 而点击（位移不到 slop）根本不进这里。
                     if (dy > slop && dy > dx) {
-                        tracker.addMovement(event);
+                        track(event);
                         // 一旦确认是要拖，就把面板提升成硬件层：见 {@link #layer}。
                         if (!moving) {
                             moving = true;
@@ -843,20 +992,21 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             if (closing && event.getActionMasked() != MotionEvent.ACTION_DOWN) {
                 return true;
             }
-            tracker.addMovement(event);
+            track(event);
             switch (event.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN -> {
-                    downX = event.getX();
-                    downY = event.getY();
+                    downRawX = event.getRawX();
+                    downRawY = event.getRawY();
                     moving = false;
-                    animate().cancel();
+                    cancelSlide();
                     // 上一段滑出被这一下按停：把 closing 放掉，否则它会一直为真，而上面那个
                     // 判断会把此后**每一次**触摸都吞掉——面板从此完全不动，看起来就是卡死。
                     // 这是只能靠真机发现的：`close()` 的 finish 挂在动画的 end action 上，
                     // 动画被取消，那个 end action 就永远不会跑。
                     closing = false;
                     layer(true);
-                    startY = getTranslationY();
+                    startTop = offset();
+                    shown = startTop;
                     return true;
                 }
                 case MotionEvent.ACTION_MOVE -> {
@@ -868,13 +1018,29 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                         dragging = true;
                         layer(true);
                     }
-                    // 只往下拖。往上推没有对应语义（这一页已经在最上面了），硬跟手会读成失灵。
+                    // 只往下拖。往上推没有对应语义（这一页已经在最上面了）。
                     //
-                    // 1:1，不做平滑。试过指数平滑（固定 0.6、后来改成自适应的 0.92/0.45），
-                    // 两种都被否掉：任何平滑都会让面板落后手指一截，而人对手感的第一判断就是
-                    // 「它跟不跟得上」。输入事件的几像素回跳由系统自己也会补，宁可要跟手。
-                    float dy = Math.max(0f, event.getY() - downY);
-                    setTranslationY(startY + dy);
+                    // 坐标必须是屏幕坐标：见 {@link #downRawY}。
+                    //
+                    // 这里曾经有一个「小幅回退不跟」的死区，本意是滤掉手指的几像素回跳。它带来
+                    // 两个问题：手指慢慢往回走时面板先纹丝不动、攒够了再一下跳过去（读起来就是
+                    // 「慢慢滑会跳变」）；而且这个跳跃在换向时最明显。放弃死区，改用阻尼——阻尼
+                    // 是连续的，任何输入都对应一个连续的位置，不存在「攒着」这回事。
+                    float dy = Math.max(0f, event.getRawY() - downRawY);
+                    float target = startTop + dy;
+                    shown += (target - shown) * FOLLOW;
+                    if (Math.abs(target - shown) < 0.35f) {
+                        shown = target;
+                    }
+                    place(shown);
+                    // 常开的调试钩子：跟手这类东西只能靠数字判断（手指走了多少、面板走了多少、
+                    // 有没有反向）。release 里默认不输出，需要时 `adb shell setprop
+                    // log.tag.OPAirDrop DEBUG` 打开。
+                    if (android.util.Log.isLoggable("OPAirDrop", android.util.Log.DEBUG)) {
+                        android.util.Log.d("OPAirDrop", "drag finger=" + dy
+                                + " panel=" + (shown - startTop) + " top=" + sheet.getTop()
+                                + " frac=" + sheet.getTranslationY());
+                    }
                     return true;
                 }
                 case MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
@@ -889,7 +1055,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     }
                     tracker.computeCurrentVelocity(1000);
                     float velocity = tracker.getYVelocity();
-                    boolean leave = getTranslationY() > getHeight() * 0.18f || velocity > fling;
+                    boolean leave = offset() > getHeight() * LEAVE_FRACTION || velocity > fling;
                     if (leave) {
                         close();
                     } else {
@@ -905,12 +1071,58 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     }
 
     private void springBack() {
-        sheet.animate()
-                .translationY(0f)
-                .setDuration(SPRING_MS)
-                .setInterpolator(new DecelerateInterpolator(1.6f))
-                .withEndAction(() -> layer(false))
-                .start();
+        slideTo(offset(), 0f, SPRING_MS, new DecelerateInterpolator(1.6f),
+                () -> layer(false));
+    }
+
+    /**
+     * 把面板放到 y（相对它在父容器里的自然位置 0）。
+     *
+     * <p># 为什么不用 translationY
+     *
+     * <p>面板背景是一块系统给的 {@code BackgroundBlurDrawable}，它按**视图的 bounds** 去采样
+     * 背后那块区域。`translationY` 只是渲染层的偏移：`top` 没变，bounds 没变，于是模糊采样的
+     * 还是原来那一块，只是被 canvas 平移了——背景和内容对不上，而且每一帧对不上的量都不同，
+     * 读起来就是「整个界面在抖」。
+     *
+     * <p>`offsetTopAndBottom` 改的是视图真正的 `top`，bounds 跟着变，模糊跟着走。一加互传那个
+     * 底部弹层拖动时用的也是这一条（`COUIBottomSheetBehavior` 里就是 offset）。
+     *
+     * <p>代价是它只活到下一次布局：父容器一布局就把 `top` 摆回 0。所以这里不拿 `top` 当位置的
+     * 真相，而是先记进 {@link #placed}，由 {@link #apply} 每帧重新投影——布局把 `top` 冲掉了，
+     * 下一帧（以及 {@link Sheet#onLayout} 里那一次）再按 `placed` 摆回去。
+     */
+    private void place(float y) {
+        if (y != y) {
+            return;   // NaN：动画被取消时出现过一次，别把它写进位置
+        }
+        placed = y;
+        apply();
+    }
+
+    /**
+     * 把 {@link #placed} 投影到 {@code top} 和 {@code translationY} 上。
+     *
+     * <p>布局之后必须再调一次：一次布局会把 {@code top} 摆回 0（面板在父容器里的自然位置）。
+     * {@link Sheet#onLayout} 里就干这件事。
+     */
+    private void apply() {
+        // 整数部分给 top：模糊按视图的 bounds 采样，bounds 必须是整数像素，否则每帧都要替
+        // 视图取一次整，模糊区域会在两个像素之间跳。
+        int whole = (int) Math.floor(placed);
+        int delta = whole - sheet.getTop();
+        if (delta != 0) {
+            sheet.offsetTopAndBottom(delta);
+        }
+        // 小数部分给渲染层。1400 像素高的面板，手指慢速拖动时每个事件只走零点几像素，全压进
+        // top 就只能取整：走三帧才动一像素，读起来是「一格一格地跳」。这不到一像素的余量交给
+        // translationY，合成器按亚像素插值，位移就是连续的。
+        sheet.setTranslationY(placed - whole);
+    }
+
+    /** 面板此刻真正画在哪。就是 {@link #placed}——不读 {@code getTop()}，理由见那里。 */
+    private float offset() {
+        return placed;
     }
 
     /** 滑出屏幕再结束。返回键与下滑走同一条路，读起来是同一个动作。 */
@@ -921,20 +1133,25 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         closing = true;
         // 返回键那条路没有拖动过，层还没建；滑出去的这段同样要走层。
         layer(true);
-        sheet.animate()
-                .translationY(sheet.getHeight())
-                .setDuration(EXIT_MS)
-                .setInterpolator(new AccelerateInterpolator(1.4f))
-                .withEndAction(this::finish)
-                .start();
+        slideTo(offset(), sheet.getHeight(), EXIT_MS,
+                new AccelerateInterpolator(1.4f), this::dismissPanel);
         // 兜底。上面那个 end action 挂在动画上，而动画是可以被下一次按下取消的——那一刻
         // finish 就永远不会来，页面停在一半、closing 一直为真。带着 closing 再判一次：中途
         // 被按停时那个标记已经被清掉，这一下什么也不做。
         sheet.postDelayed(() -> {
             if (closing) {
-                finish();
+                dismissPanel();
             }
         }, EXIT_MS + 150);
+    }
+
+    /** 关掉面板窗口，Activity 随之结束（Dialog 的 dismiss 回调里 finish）。 */
+    private void dismissPanel() {
+        if (panel != null && panel.isShowing()) {
+            panel.dismiss();
+        } else {
+            finish();
+        }
     }
 
     @Override

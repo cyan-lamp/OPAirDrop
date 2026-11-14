@@ -24,10 +24,30 @@ import java.lang.reflect.Method;
  *   <li>面积只有面板那么大，代价与整屏无关。</li>
  * </ul>
  *
- * <p>那条 Drawable 在 AOSP 里叫 {@code BackgroundBlurDrawable}，由
- * {@code ViewRootImpl.createBackgroundBlurDrawable()} 创建（Android 12 起），ColorOS 只是把
- * 它包了一层材质参数。两者都要用反射：它们是 {@code @hide}，编译期不在 SDK 里，运行期在系统
- * 里。
+ * <p># 参数设在谁身上：这里踩过一次坑
+ *
+ * <p>拿到那个 Drawable 之后，自然会以为半径、圆角、颜色都设在 Drawable 上——AOSP 的
+ * {@code BackgroundBlurDrawable} 确实如此。但这台机器上不是：它的
+ * {@code com.android.internal.graphics.drawable.BackgroundBlurDrawable} 公开方法里**一个模糊
+ * 相关的都没有**，只有 Drawable 的通用接口（{@code setAlpha}、{@code setBounds}……）。
+ *
+ * <p>所有参数都在 {@code com.oplus.view.ViewRootManager} 上：
+ *
+ * <pre>
+ *   setBlurRadius(int)
+ *   setCornerRadius(float)                     // 四角同值
+ *   setCornerRadius(float,float,float,float)   // 四角各自设
+ *   setColor(int)
+ *   setBlurParams(OplusBlurParam)
+ * </pre>
+ *
+ * <p>之前的版本把这几条反射发给了 Drawable，于是每一条都静默失败——{@link #invoke} 对「方法
+ * 不存在」是返回 false 而不是抛异常，因为它必须容忍 ROM 差异。模糊看起来还在，因为系统给了
+ * 一个默认半径；但**圆角一直是 0**，面板顶上两角就是方的，而圆角恰是唯一看得见的那一项。
+ * 症状与原因隔了一层，只有把方法表打出来才看得见。
+ *
+ * <p>所以这里把「控制对象」和「接收背景的对象」分开：Drawable 只能当 background，参数一律
+ * 发给 {@code target}——ColorOS 是 manager，AOSP 是 Drawable 自己。
  *
  * <p># 拿不到是什么样
  *
@@ -40,19 +60,22 @@ final class PanelGlass {
     private final Drawable drawable;
     /** 这条 Drawable 是从哪个入口拿到的：{@code coloros} / {@code aosp}。只用于日志。 */
     private final String source;
-    private final Method setColor;
+    /**
+     * 参数发给谁。ColorOS 是 {@code ViewRootManager}，AOSP 是 Drawable 自己。见类注释。
+     */
+    private final Object target;
     private final Method setBlurRadius;
     private final Method setCornerRadius;
     private final Method setCornerRadiusOne;
 
-    private PanelGlass(Drawable drawable, String source) {
+    private PanelGlass(Drawable drawable, String source, Object target) {
         this.drawable = drawable;
         this.source = source;
-        this.setColor = method(drawable, "setColor", int.class);
-        this.setBlurRadius = method(drawable, "setBlurRadius", int.class);
-        this.setCornerRadius = method(drawable, "setCornerRadius",
+        this.target = target;
+        this.setBlurRadius = method(target, "setBlurRadius", int.class);
+        this.setCornerRadius = method(target, "setCornerRadius",
                 float.class, float.class, float.class, float.class);
-        this.setCornerRadiusOne = method(drawable, "setCornerRadius", float.class);
+        this.setCornerRadiusOne = method(target, "setCornerRadius", float.class);
     }
 
     /**
@@ -64,12 +87,15 @@ final class PanelGlass {
      * @return 拿不到就 {@code null}，调用方要走纯色退路
      */
     static PanelGlass attach(View host) {
-        Drawable drawable = fromColorOs(host);
-        if (drawable != null) {
-            return new PanelGlass(drawable, "coloros");
+        Object manager = colorOsManager(host);
+        if (manager != null) {
+            Drawable drawable = invokeDrawable(manager, "getBackgroundBlurDrawable");
+            if (drawable != null) {
+                return new PanelGlass(drawable, "coloros", manager);
+            }
         }
-        drawable = fromAosp(host);
-        return drawable == null ? null : new PanelGlass(drawable, "aosp");
+        Drawable drawable = fromAosp(host);
+        return drawable == null ? null : new PanelGlass(drawable, "aosp", drawable);
     }
 
     /** 走的是哪条反射路径。真机上「没模糊」时，第一件事是看它。 */
@@ -82,41 +108,50 @@ final class PanelGlass {
         return drawable;
     }
 
-    /** 模糊半径，屏幕像素。 */
-    void radius(int px) {
-        invoke(setBlurRadius, px);
-    }
-
-    /** 叠在模糊之上的颜色。给它页底色的半透明版：既压住背后的杂乱，又让模糊透上来。 */
-    void color(int argb) {
-        invoke(setColor, argb);
+    /** 模糊半径，屏幕像素。@return 这个 ROM 认不认这条参数 */
+    boolean radius(int px) {
+        return invoke(setBlurRadius, px);
     }
 
     /**
      * 圆角。先试四个角各自设（面板是「上两角圆、下两角方」），不行就退回四个角一样。
      *
      * <p>底部那两角在屏幕外面，圆不圆看不出来——所以退回单值时直接用顶部的值，不是妥协。
+     *
+     * <p>这一条是**看得见的**那一条：模糊由合成器按这块区域的矩形算，圆角只影响这块矩形的
+     * 四角。参数发错地方（见类注释），面板顶上两角就是方的——内容被 {@code clipToOutline}
+     * 裁成了圆的，模糊却从方角里溢出来一圈，看起来像一层没对齐的雾。
+     *
+     * @return 这个 ROM 认不认这条参数
      */
-    void corners(float top, float bottom) {
+    boolean corners(float top, float bottom) {
         if (invoke(setCornerRadius, top, top, bottom, bottom)) {
-            return;
+            return true;
         }
-        invoke(setCornerRadiusOne, top);
+        return invoke(setCornerRadiusOne, top);
     }
 
     // ------------------------------------------------------------------ 反射
 
     /**
-     * ColorOS 的入口。一加互传用的就是它，所以这台机器上一定有。
+     * ColorOS 的入口：{@code new ViewRootManager(View)}。
      *
-     * <p>{@code ViewRootManager(View)} 构造，{@code getBackgroundBlurDrawable()} 取 Drawable。
-     * 取到之后半径与圆角仍然设在 Drawable 自己身上，和 AOSP 那条路一致。
+     * <p>返回的是 **manager** 而不是 Drawable——参数要发给它，所以这个引用必须留着。
+     * 一加互传用的也是它，所以这台机器上一定有。
      */
-    private static Drawable fromColorOs(View host) {
+    private static Object colorOsManager(View host) {
         try {
             Class<?> type = Class.forName("com.oplus.view.ViewRootManager");
-            Object manager = type.getConstructor(View.class).newInstance(host);
-            Object drawable = type.getMethod("getBackgroundBlurDrawable").invoke(manager);
+            return type.getConstructor(View.class).newInstance(host);
+        } catch (Throwable missing) {
+            return null;
+        }
+    }
+
+    /** 在 manager 上取那条 Drawable。拿不到就是「这个 ROM 没接上」，走 AOSP。 */
+    private static Drawable invokeDrawable(Object manager, String name) {
+        try {
+            Object drawable = manager.getClass().getMethod(name).invoke(manager);
             return drawable instanceof Drawable ? (Drawable) drawable : null;
         } catch (Throwable missing) {
             return null;
@@ -142,23 +177,49 @@ final class PanelGlass {
         }
     }
 
+    /**
+     * 按名字和签名找方法。
+     *
+     * <p>先走 {@code getMethod}（只找 public）。找不到再翻整条继承链上的 declared——ColorOS
+     * 那几个 setter 平时不出现在公开文档里，不一定被标成 public，而「没标」和「不存在」在
+     * 调用方看来是一样的静默失败，正是上一次踩坑的形状。
+     */
     private static Method method(Object target, String name, Class<?>... signature) {
+        if (target == null) {
+            return null;
+        }
         try {
             Method found = target.getClass().getMethod(name, signature);
             found.setAccessible(true);
             return found;
         } catch (Throwable missing) {
-            return null;
+            // 掉到下面翻私有方法。
         }
+        for (Class<?> level = target.getClass(); level != null && level != Object.class;
+             level = level.getSuperclass()) {
+            for (Method candidate : level.getDeclaredMethods()) {
+                if (!candidate.getName().equals(name)
+                        || !java.util.Arrays.equals(candidate.getParameterTypes(), signature)) {
+                    continue;
+                }
+                try {
+                    candidate.setAccessible(true);
+                    return candidate;
+                } catch (Throwable hidden) {
+                    return null;
+                }
+            }
+        }
+        return null;
     }
 
     /** 调一次，成功返回 true。任何异常都是「这个 ROM 没这个方法」，不是错误。 */
-    private boolean invoke(Method target, Object... arguments) {
-        if (target == null) {
+    private boolean invoke(Method method, Object... arguments) {
+        if (method == null) {
             return false;
         }
         try {
-            target.invoke(drawable, arguments);
+            method.invoke(target, arguments);
             return true;
         } catch (Throwable missing) {
             return false;

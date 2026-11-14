@@ -31,21 +31,47 @@
         <item name="android:windowSplashScreenAnimationDuration">1000</item>
     </style>
 
-    <!-- 发送面板：一块从底边上滑的玻璃，不是一个新建的页面。
+    <!-- 发送页的宿主：一个全屏透明的空壳。
 
-         windowIsTranslucent + 透明窗口背景，是为了让 Window.setBackgroundBlurRadius
-         有东西可模糊：系统模糊的是**这个窗口后面**的那个窗口，而窗口背景不透明时它模糊的
-         只是自己，什么也看不见。分享面板还开在下面时，透出来的就是它。
+         面板在下面那个 Dialog 的窗口里——和一加互传一样：它的 `IOSShareActivity` 也是 Activity，
+         面板由 `COUIBottomSheetDialog` 承载。分开的理由是窗口归属：Activity 的窗口会被系统的
+         自由窗口/分屏逻辑接管（从相册分享时就被塞进小窗），Dialog 的窗口不会。
 
-         整套窗口动画都换成 0 时长（@anim/none）：面板自己负责上滑与下滑，平台再叠一层
-         淡入或缩放，读起来就是两段互不相干的移动同时发生。
+         不用 `windowNoDisplay`：那样确实一个像素都不画，但平台在 resume 时会要求 Activity 有一个
+         窗口，拿不到就抛 `Unable to resume activity`——真机上撞到过。 -->
+    <style name="SendPanelTheme" parent="@android:style/Theme.Translucent.NoTitleBar">
+         <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowAnimationStyle">@style/PanelAnimation</item>
+        <!-- 这条窗口自己一个像素都不画，但它的**系统栏区域**会画。
 
-         backgroundDimEnabled=false 同理：压暗一层会把模糊让位给一块灰板，读起来像系统
-         弹了个对话框，而不是这个应用浮在自己那一层上。 -->
-    <style name="SendPanelTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+             平台的默认值是「状态栏底色 = colorPrimaryDark」，而这里继承的
+             Theme.Translucent 属于深色系，于是那个默认值是黑的。窗口是全屏的，它就真的在
+             顶部涂了一条 160 像素高的实心黑——面板在底下挡着时看不出来，一旦面板往下滑开，
+             上面露出的就是这条黑带，而不是本该透出来的桌面。
+
+             透明之后这条窗口才真的是「什么都没有」，整个页面由上面那个 Dialog 的窗口画。 -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <!-- 上面那两条只在 SDK 34 及以下有用：从 Android 15 起状态栏一律走边到边，
+             statusBarColor 被平台忽略（这台机器是 SDK 37，写什么都是空转）。
+
+             真正决定这条带子画不画的是这个 flag。没有它，SystemUI 认为这个窗口不负责系统栏
+             底色，就按默认值——黑色——自己补一条；有了它，系统栏交还给窗口，而窗口是透明的，
+             露出来的就是桌面。桌面自己（com.android.launcher）正是这么声明的：它的 fl 里有
+             DRAWS_SYSTEM_BAR_BACKGROUNDS。 -->
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+    </style>
+
+    <!-- 面板自己的窗口。全屏、透明、不压暗、不带动画：位移全部由代码做（上滑、跟手、回弹、
+         滑出），平台再叠一层淡入或缩放就读成两段动作。
+
+         windowIsFloating=false 是关键：Dialog 默认是一个带边距的小浮窗，那样面板永远铺不满。 -->
+    <style name="SendPanelDialog" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowIsFloating">false</item>
         <item name="android:windowIsTranslucent">true</item>
         <item name="android:windowBackground">@android:color/transparent</item>
         <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowNoTitle">true</item>
         <item name="android:backgroundDimEnabled">false</item>
         <item name="android:windowAnimationStyle">@style/PanelAnimation</item>
         <item name="android:windowLightStatusBar">true</item>

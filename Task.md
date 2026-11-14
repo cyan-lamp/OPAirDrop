@@ -378,6 +378,59 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 ## 13. 变更日志（新的在上）
 
+- **2026-11-14 12:50**：三条，都是「看起来在生效、其实一直被静默丢掉」。
+  **① 模糊的圆角一直是 0 —— 因为参数发给了错的对象。** `PanelGlass` 一直把
+  `setBlurRadius` / `setCornerRadius` 反射调用在**系统造出来的那个 Drawable** 上；这台机器给的是
+  AOSP 的 `com.android.internal.graphics.drawable.BackgroundBlurDrawable`，它**自有的公开方法只有
+  `draw` / `getOpacity` / `toString`**，一个模糊 setter 都没有。真正的 setter 全在
+  `com.oplus.view.ViewRootManager`（`setBlurRadius(int)`、`setCornerRadius(float,float,float,float)`、
+  `setBlurParams(OplusBlurParam)`）。`invoke` 的设计是「方法不存在就返回 false 而不是抛」，于是
+  六条参数全部静默失败了一整天。模糊看着还在，是因为系统给了默认半径——**只有圆角这一项是肉眼
+  可见的**，症状和原因就这么隔了一层。修法：`PanelGlass` 引入 `target` 字段，把「控制对象」
+  （ColorOS 是 manager，AOSP 是 Drawable 自己）和「接收 background 的对象」分开；`method()` 增加
+  翻继承链 `getDeclaredMethods()` 的兜底（隐藏 API 不一定标 public，而「没标」和「不存在」在调用
+  方看来都是静默失败）；`radius()` / `corners()` 改成返回 boolean，`installGlass()` 据此打
+  `(rejected)` 后缀。现在日志是 `panel glass: coloros radius=112 corner=112`，两个参数都被接受。
+  **教训**：反射配静默失败，等于把「参数生效了」和「方法名打错了」变成同一件事。要么打日志，
+  要么第一次就把方法表 dump 出来看。
+  **② 状态栏那条 160px 实心黑带。** 主题里写了 `statusBarColor=transparent` 一直是空转：
+  **从 Android 15 起状态栏一律走边到边，`statusBarColor` 被平台忽略**（这台是 SDK 37）。
+  真正决定这条带子画不画的是 `WindowManager.LayoutParams` 的 `DRAWS_SYSTEM_BAR_BACKGROUNDS`。
+  `dumpsys window` 对照很清楚：桌面窗口 `fl=` 里有它；我们 Dialog 窗口也有；而 Activity 自己的
+  窗口（`ty=BASE_APPLICATION`）**没有** → SystemUI 按默认值补黑。修法：两套 `SendPanelTheme`
+  都加 `android:windowDrawsSystemBarBackgrounds=true`（样式整条选中，`values` 与 `values-night`
+  必须各写一份）。验证：`dumpsys` 里该窗口 `fl=` 已含该 flag；按住面板下拖后截图，第 0–60 行
+  均值约 180（壁纸蓝）、60–120 行 min 11–13（深色图标），黑带消失。
+  **量化的坑**：之前那张「看起来已修好」的截图是面板顶到 0、把黑带盖住了——必须**按住面板拖开**
+  再截才看得见。`input swipe` 不行，松手会回弹；要用 `input motionevent DOWN/MOVE`…截图…`UP`。
+  **③ 滑动关闭的阈值从 0.18 提到 0.28。** 0.18（不到五分之一）在真机上太浅：手指往下带一下、
+  想够到下面的内容，越过这条线、抬手时又带一点速度，面板就没了。改成命名常量
+  `LEAVE_FRACTION = 0.28f`。甩动（速度过 `fling`）**不看**这条——短促、方向明确，没有「想够
+  内容」这种解释。真机验证：慢拖 +600px 抬手 → 回弹、面板还在；慢拖 +1000px → 关闭；
+  快甩 350px → 仍然关闭（`topResumedActivity` 从 `SendActivity` 变回 `launcher`）。
+- **2026-11-14 11:40**：三处修正，都来自真机反馈。
+  **① 跟手的平滑整个撤掉。** 先后试过固定 0.6 和自适应（>8dp 用 0.92、否则 0.45），两种都
+  被否：任何平滑都让面板落后手指一截，而人对手感的第一判断就是「它跟不跟得上」。回到 1:1：
+  `setTranslationY(startY + 手指位移)`。**教训**：滞后不是抖动的解药，只是把抖动换成了延迟。
+  （**后续**：这一条又被推翻了。`setTranslationY` 只改渲染层，`top` 没变 → 模糊按视图 bounds
+  采样的还是原来那块，背景和内容每帧都对不上；而且死区一旦去掉、位移又靠 `getY()` 读，会形成
+  「面板走一像素、手指读数少一像素」的反馈回路。真正的解法是 `offsetTopAndBottom` 改真实 `top`
+  + `getRawY()` + 0.5 的连续阻尼，见下方 12:xx 各条。）
+  **② 抖动回归的根因**：为了不让第一帧移动卡顿，把 `setLayerType(HARDWARE)` 提前到了**按下**
+  那一刻，但「停雷达呼吸」还留在第一次 MOVE 里。于是从按下到移动之间，层已经存在而雷达仍在
+  每 32ms invalidate —— 层里每一次 invalidate 都要重画整块 1440×3168 的纹理，等于每秒三十次
+  全屏重绘，与拖动叠加起来就是「整个界面在抖」。修法：`layer(true)` 里顺手把 `dragging` 也置
+  位，按下即停雷达，还层时再唤醒。实测 89 帧、0 janky、50th 5ms / 90th 7ms。
+  **③ 圆角只留一个来源。** 之前模糊 Drawable、染色层、面板背景各设了一套圆角，而
+  `BackgroundBlurDrawable.setCornerRadius` 只有单一半径（这台机器上四参数那版调不通），面板要
+  的却是「上圆下方」——于是顶部两个角出现两条半径不同的弧。改成 `sheet.setClipToOutline(true)`
+  + 自定义 `OutlineProvider`（`Path` 上圆下方、`setConvexPath`），模糊层与染色层都不再管圆角，
+  从结构上不可能再对不上。放大截图确认：一条弧、外侧壁纸清晰、无模糊溢出。
+  **④ 小窗**：加 `android:resizeableActivity="false"`。从相册分享时系统会把这个页面放进自由
+  窗口，那是 `resizeableActivity` 的行为，不是「因为它是 Activity」——一加互传那个页面
+  （`IOSShareActivity`）**本身也是 Activity**，只是内部用 `COUIBottomSheetDialog` 承载面板；
+  而那个 Dialog 的窗口是 `window.setLayout(-1,-1)` 全屏，所以它的「窗口外不模糊」靠的也不是
+  窗口小，是模糊绑在视图上。
 - **2026-11-14 11:00**：**模糊的作用域改对了 —— 从「窗口」挪到「面板视图」。** 之前一直在调
   `Window.setBackgroundBlurRadius`，那是整窗模糊：窗口是全屏的，所以面板以外整片屏幕一起糊，
   而且每一帧都要重采整屏。表现是「不跟手、拖动时抖」，而 `gfxinfo` 一直报 0 janky、5ms ——
