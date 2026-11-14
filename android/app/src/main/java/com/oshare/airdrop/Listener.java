@@ -650,6 +650,10 @@ final class Listener {
                             // The connection died while the offer was being drawn; the read
                             // that follows reports it, and this bound no longer matters.
                         }
+                        // 谁想发什么。这三个字段（名字、件数、字节数）只在此时存在：连接一结束
+                        // 就没有任何地方还记得它，而对端到底在分享面板里叫什么，是「别人能不能
+                        // 找到我们」这件事唯一能留下证据的地方。
+                        Log.i(TAG, "offer from " + summary.replace('\t', ' '));
                         return Confirmation.ask(context, summary);
                     });
             // A discovery probe and an empty share both come back empty; neither is worth a

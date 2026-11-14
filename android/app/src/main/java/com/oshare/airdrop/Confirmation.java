@@ -6,6 +6,7 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.util.Log;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -31,10 +32,13 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p># 为什么超时按拒绝算
  *
- * <p>没有回答不等于同意。三十分钟不回答就收下一个没人看过的文件，比错过一次传输糟得多——
- * 后者对面可以再发一次，前者收下的东西没人认领。
+ * <p>没有回答不等于同意。三十秒不回答就收下一个没人看过的文件，比错过一次传输糟得多——
+ * 后者对面可以再发一次，前者收下的东西没人认领。三十秒这个数比发送端自己的超时早一点，
+ * 好让框在对面放弃之前就消失；晚一点就只剩「按了接受，那边早走了」。
  */
 final class Confirmation {
+
+    private static final String TAG = "OPAirDrop";
 
     /** 广播的动作：同意与拒绝。 */
     static final String ACCEPT = "com.oshare.airdrop.CONFIRM_ACCEPT";
@@ -79,16 +83,29 @@ final class Confirmation {
         Waiter waiter = new Waiter(summary);
         OPEN.put(id, waiter);
         int notification = NOTIFICATION_BASE + (NEXT.get() % 32);
+        long askedAt = System.currentTimeMillis();
         try {
             post(context, id, notification, summary);
             waiter.latch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            Log.i(TAG, "confirm " + id + " " + (waiter.accepted ? "accepted" : "declined")
+                    + " after " + (System.currentTimeMillis() - askedAt) + " ms");
             return waiter.accepted;
         } catch (InterruptedException interrupted) {
             // 接收端正在被关掉：按拒绝处理，并把中断还回去，让上层知道它该退出。
+            //
+            // 这一行也留着：服务端只有一条线程，中断标志一旦被置上就没人清，之后每一次
+            // `await` 都会立刻抛出来——症状是「每个传输都被拒收」，而原因在这一行里。
+            Log.i(TAG, "confirm " + id + " interrupted after "
+                    + (System.currentTimeMillis() - askedAt) + " ms");
             Thread.currentThread().interrupt();
             return false;
         } catch (RuntimeException unavailable) {
             // 通知发不出去（渠道被禁用、系统拒收）：没有人会被问，所以不能收。
+            //
+            // 这一行是必须的，不是顺手加的：走这条路的结果是「每一次传输都被拒收」，
+            // 而对端只会看到 503，本机什么也不显示。没有它，故障现场只剩一个「怎么发
+            // 都发不过来」的抱怨。
+            Log.w(TAG, "confirm " + id + " could not be shown: " + unavailable, unavailable);
             return false;
         } finally {
             OPEN.remove(id);
@@ -102,6 +119,7 @@ final class Confirmation {
         if (waiter == null) {
             return;
         }
+        Log.i(TAG, "confirm " + id + (accepted ? " accepted" : " declined") + " by the person");
         waiter.accepted = accepted;
         waiter.latch.countDown();
     }
@@ -114,6 +132,8 @@ final class Confirmation {
     private static void post(Context context, String id, int notification, String summary) {
         NotificationManager manager = context.getSystemService(NotificationManager.class);
         if (manager == null) {
+            // 没有通知服务就是没有人会被问到，和发不出去是同一件事，但这里的现场更早。
+            Log.w(TAG, "confirm " + id + ": no notification manager");
             return;
         }
         if (manager.getNotificationChannel(CHANNEL) == null) {
@@ -137,6 +157,8 @@ final class Confirmation {
                 .addAction(new Notification.Action.Builder(
                         null, "拒绝", action(context, id, false, notification)).build());
         manager.notify(notification, builder.build());
+        Log.i(TAG, "confirm " + id + " posted as " + notification + ": "
+                + summary.replace('\t', ' '));
     }
 
     private static PendingIntent action(Context context, String id, boolean accepted, int notification) {
@@ -167,16 +189,34 @@ final class Confirmation {
     /** 正文说清几件、多大。 */
     private static String detail(String summary) {
         String[] field = summary.split("\t", -1);
-        String count = field.length > 1 && !field[1].isBlank() ? field[1] : "?";
-        long bytes = 0;
-        if (field.length > 2) {
-            try {
-                bytes = Long.parseLong(field[2].trim());
-            } catch (NumberFormatException notANumber) {
-                bytes = 0;
-            }
+        long files = count(field, 1);
+        long bytes = Math.max(count(field, 2), 0);
+        long links = Math.max(count(field, 3), 0);
+        // 纯链接分享是一个 `Files` 为空、`Items` 非空的 offer。只说件数会把它写成「0 个
+        // 文件」——一句「没东西可收」的话，而人正是在这一刻决定收不收。
+        StringBuilder what = new StringBuilder();
+        if (files != 0 || links == 0) {
+            what.append(files < 0 ? "?" : Long.toString(files)).append(" 个文件");
         }
-        return count + " 个文件" + (bytes > 0 ? " · " + size(bytes) : "") + "，30 秒内不回答就当作拒绝。";
+        if (links > 0) {
+            if (what.length() > 0) {
+                what.append("、");
+            }
+            what.append(links).append(" 个链接");
+        }
+        return what + (bytes > 0 ? " · " + size(bytes) : "") + "，30 秒内不回答就当作拒绝。";
+    }
+
+    /** 摘要里第 {@code at} 个字段的值；缺字段或者不是数字都给 -1，让调用方自己决定说法。 */
+    private static long count(String[] field, int at) {
+        if (field.length <= at || field[at].isBlank()) {
+            return -1;
+        }
+        try {
+            return Long.parseLong(field[at].trim());
+        } catch (NumberFormatException notANumber) {
+            return -1;
+        }
     }
 
     private static String size(long bytes) {

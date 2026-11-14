@@ -279,6 +279,19 @@ AirDrop 用自签证书，TXT 记录里有指纹（我们发布的名字是 `h`�
 救回），`Task.md` 被清空（git 里也是空的，只能重建）。改代码一律逐处精确替换、一次一处、
 改完立刻编译；文档同样。**仓库必须始终有可回滚的提交。**
 
+**2026-11-15 追加一条**：**`dumpsys` 的输出里，「还活着」和「曾经有过」常常挨在一起，中间不给
+分隔线。** `dumpsys notification` 的 `Notification List:` 段是活的、`mArchive=` 段是历史归档；
+在那 5 条 id 2593–2597 上，`grep "想给你发文件"` 匹配的全是归档里的死记录，于是一整夜的轮询都在
+追一个早已被取消的东西。同类还有 `dumpsys activity` 的 recent 与 running。**判据要么来自我们
+自己的日志**（`confirm N posted as M` 这种），要么必须先把输出按段截断再 grep：
+
+```bash
+dumpsys notification | awk '/Notification List:/,/^  mArchive=/'
+```
+
+推论比这条具体命令重要：**能被归档的东西不能当「当前状态」的证据**，而任何靠文案匹配系统 UI 的
+判断，都要先问一句「这段文字是谁写的、什么时候写的」。
+
 ---
 
 ## 7. KernelSU → LSPosed：结论
@@ -341,13 +354,13 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 ---
 
-## 9. 当前进度（2026-11-15 00:45）
+## 9. 当前进度（2026-11-15 03:10）
 
 ### 已完成并验证
 
 | 项 | 证据 |
 | --- | --- |
-| Rust 八 crate | `src/` 合计 20774 行，`cargo test --workspace` **376 passed**（1 ignored），clippy 零 warning |
+| Rust 八 crate | `src/` 合计 21300 行，`cargo test --workspace` **377 passed**（1 ignored），clippy 零 warning |
 | 接收端 TLS | 真机 `openssl s_client`：`TLSv1.3` / `TLS_AES_256_GCM_SHA384`，握手 **10 ms**（七次实测 9–33 ms）；证书 `CN=PJZ110`，2036 年到期 |
 | 发布的指纹就是出示的指纹 | `tcpdump -i awdltun0` 抓到公告 TXT `h=D07F4814…C7E8CA`；同刻 `openssl x509 -fingerprint -sha256` 得到**同一串**。这条不成立时，每个发送端都会在对方屏幕上被拒且无从解释 |
 | 接收端在真机上应答 | 经 TLS 发 `POST /Discover` → `HTTP/1.1 200` + `Server: AirDrop/1.0` + `Content-Length: 138` + 合法 bplist（`ReceiverComputerName=青`、`IsAirDropable=True`、`{"Version":1}`），`Connection: keep-alive` 且连接保持 |
@@ -355,7 +368,7 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 | 前台服务 | `oshare_state=1` → `ReceiveService` 以 `isForeground=true types=0x10` 起来、8770 在听；`=0` → 服务与端口都归零 |
 | 分享面板注入 | 真机确认：一加互传分享面板的设备列表里出现「发送到 iPhone」 |
 | 发送链路 | `Peers`（mDNS 浏览）+ `ShareIntake`（URI→cache）+ `SendActivity`（TLS + 三请求 + **真实进度**） |
-| 接收确认 | `/Ask` 读完后问一次（通知两键，30 秒超时按拒绝）；拒绝回 503 且不弹确认 |
+| 接收确认（`/Ask` 三支齐） | 读完 offer 后问一次人（通知两键，30 秒超时按拒绝）。真机新包实测：**接受** → `200` + 106 字节 `AskAnswer`（`ReceiverComputerName=青`、`ReceiverModelName=iPhone 18`）；**拒绝** → `503`，日志 `confirm 3 declined by the person` / `declined after 1448 ms`；**超时** → 同样 `503`，但日志里是等满 30 秒而非早应答。三种结局在 wire 上只用 `200`/`503` 两个码，所以**判据必须是日志，不能只看状态码** |
 | 射频共享开关 | 功能页一张卡，读写 `files/radio-share`/`radio-state`；真机四态（共享/独占/正在开/无回执）逐个拍过；`RadioCheck` **48 项** |
 | 驱动随包 | `assets/kernel/` 五个二进制 + `SHA256SUMS` 进 APK；`DriverSetup` 按 §7.3 序列加载，`boot_id` 标记防重复；真机报 `AWDL_LINK_UP iface=wonder0 freq=5745`、`tun=up`、`stack already swapped this boot` |
 | mDNS 应答器 | 真机抓包 `hlim 255`、3.000 s 节奏、`0*- [0q] 4/0/0` 四条记录、TXT `"h" "fl=137" "flags=137"`；自造 `(QM)` 查询后 0.9 ms 四条应答 |
@@ -365,9 +378,11 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 - **iPhone 分享面板里出现本机**：本侧该做的都做了、都抓包看过了（见 §13 本轮记录），这一步只能由
   人手拿一台 iPhone 看一眼，**没有第二台苹果设备可自证**。
-- **接收第三档（真机端到端）**：`/Discover` 与 `/Ask` 的应答已在桌面侧验过，但「iPhone 发一张图、
-  文件真的落到 `receive.directory`」还没跑过——这一条需要那台 iPhone，以及本机 root 提权在手
-  （临时 root，冷重启后要手动 `su`）。
+- **接收第三档（真机端到端）**：**机制已全部跑通，只差对面那台真 iPhone**。`/Ask` 三支（接受 /
+  拒绝 / 超时）与 `/Upload` 逐字节落盘都在真机上验过（证据见 §13）；探针发的就是 iPhone 的 wire 形状
+  （bplist、`Files`+`Items`、`TransferType` 两种）。仍缺的一步是「iPhone 发一张图、文件真的落到
+  `receive.directory`」——这一步只能人拿 iPhone 做，且需要本机 root 在手（临时 root，冷重启后要
+  手动 `su`）。
 - **流体云卡片**：已定为「承载真实传输」。信道：offer 走广播（我们 → 互传进程），决定走
   `Settings.System`（互传进程 → 我们，因为普通应用写不了它）。卡片本体未写。
 - **自有发送面板**：要仿 `IOSShareActivity`（全屏、圆形返回键 + 「与 iPhone 互传」+「本设备：×」、
@@ -390,9 +405,9 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 | --- | --- | --- | --- |
 | 1 | 驱动打包：`assets/kernel/` + `su -c insmod` + boot_id 标记 | 冷启动后 `wonder0` up | ✅ 已随包，`DriverSetup` 按 §7.3 序列 |
 | 2 | mDNS 应答器（本侧发得出、答得上） | 抓包里 3 s 节奏、`hlim 255`、四条记录、TXT 三键 | ✅ 真机实测，见 §13 |
-| 3 | **接收第一档：iPhone 分享面板里能找到本机** | 人眼在 iPhone 上看见本机名字，点得进去 | ⏳ 待实测（本侧无法自证） |
+| 3 | **接收第一档：iPhone 分享面板里能找到本机** | 人眼在 iPhone 上看见本机名字，点得进去 | ⏳ 待实测（本侧无法自证）。**已有的抓包线索**：02:25:07 一条 `handshake from fe80::84a8:a1ff:fe43:3eb8%awdltun0 failed after 496 ms: Connection reset` —— 对面**已经连上来过**，说明公告被发现了、TXT/SRV 被读走了。下一步只差在它再来的那一刻看 `offer from …` 那一行 |
 | 4 | 接收第二档：接收端 TLS（`Identity` + `h=` + `SSLServerSocket`） | `openssl s_client` 能握手；`/Discover` 有应答 | ✅ 真机：`TLSv1.3`/`AES_256_GCM`、10 ms；`/Discover` → `200` + 138 字节 bplist；TXT `h` 与出示证书指纹逐位相同 |
-| 5 | 接收第三档：文件真的落到 `receive.directory` | iPhone 发一张图，`Download/` 里出现同字节文件 | 未开始 |
+| 5 | 接收第三档：文件真的落到 `receive.directory` | iPhone 发一张图，`Download/` 里出现同字节文件 | ✅ **机制已验证**：`/Ask` 三支 + `/Upload` 逐字节（含 `photos/`、`假期/` 两级中文路径）。⏳ 待真实 iPhone 复验 |
 | 6 | 接收三处提示：确认弹窗 + 通知栏 + 流体云 | 三个入口同一份状态，接受/拒绝都回写 | 弹窗有雏形，另两处未写 |
 | 7 | 自有发送面板（仿 `IOSShareActivity`） | 与参照同构；浅/深；弹出动画；环状进度随真实字节走 | `SendActivity` 是临时形态 |
 | 8 | 发送端接入 `SendActivity`（用户点名的第二刀） | 从我们自己的面板发起一次完整发送 | 未开始 |
@@ -409,10 +424,10 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 | 指标 | 值 | 说明 |
 | --- | --- | --- |
-| 单元 + 集成测试 | **376 passed**（1 ignored） | 无设备；clippy 零 warning |
+| 单元 + 集成测试 | **377 passed**（1 ignored） | 无设备；clippy 零 warning |
 | JVM 断言 | **363 条** | `bash crates/ffi/jvm/check.sh`，桌面 JVM + `-Xcheck:jni`，不是真机 |
-| Rust 行数 | 20774 | 八 crate；`src/` 合计 |
-| Java 行数 | 11896 | 29 个类：三页 + 发送 + 确认 + 服务 + 钩子 + 身份/射频/链路 |
+| Rust 行数 | 21300 | 八 crate；`src/` 合计 |
+| Java 行数 | 11940 | 29 个类：三页 + 发送 + 确认 + 服务 + 钩子 + 身份/射频/链路 |
 | 真机库 | `libopairdrop_ffi.so` **681 712 字节** | `aarch64-linux-android`，linker 35（含 mDNS 三个入口） |
 | APK | **14 204 955 字节**（debug，含 `assets/kernel/`） | 内核资产合计约 38 MB 未压缩，压后约 13.5 MB；不含资产的 clean 包仍是 88 万级 |
 | 接收吞吐 | 80–88 KB/s | 受对端 31.2% 占空比限制，**不是 KPI** |
@@ -433,6 +448,118 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 ---
 
 ## 13. 变更日志（新的在上）
+
+- **2026-11-15 03:10**：**第 3 档收口——`/Ask` 三支与 `/Upload` 在真机上全部走通；同时查清上一轮为什么
+  白跑一整夜（`grep` 命中的是通知历史归档），并顺手修掉真实设备那条「0 个文件」的通知。**
+
+  **一、为什么上一轮白跑。** `dumpsys notification` 的输出里，`Notification List:` 之后是**活着的**
+  通知，`mArchive=` 之后是**历史归档**。上一轮那 5 条 id 2593–2597 全落在
+  `mArchive=Archive (49 notifications)` 段里，`grep "想给你发文件"` 因此永远在匹配过去——每条都已经
+  被取消了，脚本却把它们当成「还没决定」。正确的截断方式：
+
+  ```bash
+  dumpsys notification | awk '/Notification List:/,/^  mArchive=/'
+  ```
+
+  教训写在 §6.5 之外，也写在这里：**通知的判据不要靠文案 grep，要靠我们自己的日志**。改法见下一条。
+
+  **二、`id` 与通知 id 的换算（现在唯一可靠的定位方式）。** `Confirmation` 里
+  `notification = NOTIFICATION_BASE + (NEXT.get() % 32)`，`NOTIFICATION_BASE = 0x0A20 = 2592`，
+  而 `id = Integer.toString(NEXT.incrementAndGet())`，于是
+
+  ```
+  id = 通知id − 2592
+  ```
+
+  日志行就是这条关系的现场：`confirm 1 posted as 2593`、`confirm 2 posted as 2594`、
+  `confirm 3 posted as 2595`。所以流程变成「先读日志拿精确 id，再单发广播」，
+  **不再盲扫一段 id**——上一轮盲扫时把**并发存在的别人的 waiter 一起答掉了**，那才是「真实设备那条
+  通知被莫名接受」的真正原因。`answer()` 对未知 id 是无害空操作（`if (waiter == null) return;`），
+  这一点让盲扫「看起来能用」，但它的代价是别人的 waiter。
+
+  **三、`/Ask` 三支，原文如下（真机、新包）。**
+
+  接受 —— 无人值守可复现，`200` + `AskAnswer`：
+
+  ```
+  命中：confirm 2 posted as 2594
+  Broadcast completed: result=0
+  recv     HTTP/1.1 200 OK
+  recv     Content-Length: 106
+  plist    {'ReceiverComputerName': '青', 'ReceiverModelName': 'iPhone 18'}
+  ```
+
+  拒绝 —— `503`：
+
+  ```
+  命中：confirm 3 posted as 2595
+  recv     HTTP/1.1 503 Error
+  11-15 02:35:35.762 I OPAirDrop: offer from 探针 1 0
+  11-15 02:35:37.210 I OPAirDrop: confirm 3 declined by the person
+  11-15 02:35:37.210 I OPAirDrop: confirm 3 declined after 1448 ms
+  ```
+
+  超时 —— 也是 `503`，但日志是 `declined after …` 里等满 30 秒，**而 `503` 有两个来源**：
+  `answers_ask_early()` 为真时的早应答（不产生 503）之外，产生 503 的只有 `accept(&parsed)`
+  返回 false（人拒绝 / 超时 / `decide` 异常）。所以「得到 503」本身证明链路走到了问人那一步；
+  反过来，**`200` 不能单独当作接受分支的证据**——早应答（`decide.is_none()`）与「问了人、人同意」
+  都回 `200`。本轮就是靠「拒绝广播应得 503 却得到 200」这个反常，反过来发现当时前端根本没问人。
+
+  **四、`DecisionReceiver` 是 `exported=false`，`am broadcast -p` 进不去。** 可行路径只有一条：
+
+  ```bash
+  adb shell su -c 'am broadcast -n com.oshare.airdrop/.DecisionReceiver \
+      -a com.oshare.airdrop.DECISION --es id 3 --ez accepted false'
+  ```
+
+  **五、「0 个文件」的成因与修法。** 真实设备那条通知正文写的是「0 个文件」，可它发的是一次链接
+  分享（`BundleID: com.apple.mobilesafari`、`Files: []`、`Items: ["https://…"]`）。根因在
+  `crates/ffi/src/serve.rs` 的 `summary_of`：它只数 `files`，纯链接分享必然算出 0。而这句话出现在
+  **人正在决定收不收的那一刻**，「0 个文件」读起来就是「没东西可收」。修法是把摘要从三字段扩到四
+  字段 `sender\tfiles\tbytes\tlinks`——`payload::Ask::summary()` 本来就区分 files/links，只是
+  `summary_of` 没用它。实测第四字段一路走到通知正文：
+
+  ```
+  11-15 02:41:42.785 I OPAirDrop: offer from 链接探针 0 0 2
+  android.text=String (2 个链接，30 秒内不回答就当作拒绝。)
+  ```
+
+  `Confirmation.detail()` 里用 `if (files != 0 || links == 0)` 守住「纯链接时别提文件数」，所以
+  「0 个文件」被整个省掉了。
+
+  **六、`Confirmation` 补了三条日志，把两个原本静默的出口照亮。** 这不是顺手加的：
+  - `post()` 里 `manager == null` 原本是静默 `return`，`notify()` 失败则抛 `RuntimeException`
+    被 `ask()` 的 `catch (RuntimeException)` 吃掉且不留痕——两条路的共同结果是**每一次传输都被
+    拒收**，而对端只看到 503，本机屏幕上什么都不显示。
+  - `InterruptedException` 分支会 `Thread.currentThread().interrupt()` 把标志还回去，而
+    `Listener` 只有一条长期复用的线程 `opairdrop-listener`，标志一旦置上没人清，之后每次
+    `latch.await` 都立刻抛——症状同样是「每个传输都被拒收」，原因却在这一行里。顺带确认
+    `Listener.stop()` 只 `closeQuietly(open)` 关 socket、**不 `interrupt()`**，所以「线程被打断」
+    在这个仓里没有来源（全仓只有 `Confirmation` 自己与 `Responder.java:843` 调 `interrupt()`）。
+
+  **七、`Listener` 加了一行 `offer from …`。** 第 3 档能不能成，唯一能留下的证据就是这一刻的
+  `SenderComputerName` / 件数 / 字节数 / 链接数——连接一结束，这份信息在仓里任何地方都不再存在。
+
+  **八、`/Upload` 逐字节复验。** 清空下载目录后重跑 843 字节 ODC 归档，三级路径（含中文目录）全部
+  同字节：
+
+  ```
+  /sdcard/Android/data/com.oshare.airdrop/files/Download/hello.txt
+  /sdcard/Android/data/com.oshare.airdrop/files/Download/photos/one.jpg
+  /sdcard/Android/data/com.oshare.airdrop/files/Download/假期/照片.jpg
+  e77174a4729d21ec6e202718385b6cde  hello.txt
+  b31c7cec2ef6a2c572c48e509613df2e  photos/one.jpg
+  d03d864b7f43db9ce34df5f720509d0e  假期/照片.jpg
+  ```
+
+  落点不需要存储权限——`/sdcard/Android/data/<pkg>/files/` 是应用自己的外部目录。
+
+  **九、还没解释的一件事。** 老进程上出现过一次「约 4 秒就回 503、且通知没出现在任何地方」。中断
+  来源已排除（见上），新包会带堆栈把这条路径记下来，等它再现。
+
+  **十、`Confirmation` 类注释自相矛盾。** 注释写「三十分钟」，而 `TIMEOUT_MS = 30_000` 是三十秒。
+  已改，并说明为什么这个数要比发送端自己的超时早一点：好让框在对面放弃之前消失，否则只剩「按了
+  接受、那边早走了」。
 
 - **2026-11-15 00:45**：**接收端握手通过、`/Discover` 有应答；同时推翻上一轮那条「TLS 握手失败」的
   结论——它从来不是握手的问题。**

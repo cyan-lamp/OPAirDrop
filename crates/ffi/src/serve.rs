@@ -69,10 +69,10 @@ use crate::settings;
 /// accepted is in the body it is about to read, and the sender's name is cosmetic.
 /// Asks a person whether a transfer should be taken.
 ///
-/// Called with a one-line summary (`sender<TAB>files<TAB>bytes`, UTF-8) after the offer has
-/// been read and before `/Ask` is answered. A positive return accepts; zero refuses; a
-/// negative value is the caller's own error code and is treated as a refusal, because the
-/// only safe reading of "the prompt broke" is "do not take what nobody saw".
+/// Called with a one-line summary (`sender<TAB>files<TAB>bytes<TAB>links`, UTF-8) after the
+/// offer has been read and before `/Ask` is answered. A positive return accepts; zero
+/// refuses; a negative value is the caller's own error code and is treated as a refusal,
+/// because the only safe reading of "the prompt broke" is "do not take what nobody saw".
 pub type DecideCallback =
     unsafe extern "C" fn(context: *mut c_void, summary: *const u8, len: usize) -> i32;
 
@@ -97,9 +97,20 @@ impl Decide {
 ///
 /// Tab-separated rather than pretty-printed, because the caller renders it and knows the
 /// language: three numbers and a name do not deserve a sentence assembled down here.
+///
+/// The fourth field is the link count, and it is not decoration. A share from Safari is a
+/// links offer — `Files` empty, `Items` full — so a three-field summary describes it as
+/// "0 files", which reads as "there is nothing to take" on the one prompt where the person
+/// is deciding. A real peer asked exactly that way; the count alone could not say so.
 fn summary_of(offer: &Ask) -> String {
     let bytes: u64 = offer.files.iter().filter_map(|file| file.size).sum();
-    format!("{}	{}	{}", offer.display_name(), offer.files.len(), bytes)
+    format!(
+        "{}\t{}\t{}\t{}",
+        offer.display_name(),
+        offer.files.len(),
+        bytes,
+        offer.links.len()
+    )
 }
 
 pub(crate) struct Store {
@@ -547,7 +558,7 @@ mod tests {
             String::from_utf8_lossy(&answers).starts_with("HTTP/1.1 503"),
             "the peer is told, in the one place it is still listening"
         );
-        assert_eq!(summary, "Ada 的 iPhone\t1\t7");
+        assert_eq!(summary, "Ada 的 iPhone\t1\t7\t0");
     }
 
     #[test]
@@ -571,7 +582,35 @@ mod tests {
 
         assert_eq!(code, status::OK);
         assert!(String::from_utf8_lossy(&answers).starts_with("HTTP/1.1 200"));
-        assert_eq!(summary, "Mac\t1\t7");
+        assert_eq!(summary, "Mac\t1\t7\t0");
+    }
+
+    #[test]
+    fn a_links_offer_says_links_rather_than_zero_files() {
+        // The bug this guards: a Safari share offers no files, only `Items`. A three-field
+        // summary counts `files` and reports zero, so the one prompt where the person decides
+        // reads "0 files" — which says there is nothing to take. A real peer asked that way.
+        let root = scratch("decided-links");
+        let links = [
+            "https://example.com/a".to_string(),
+            "https://example.com/b".to_string(),
+        ];
+        let body = opairdrop_airdrop::ask_request(
+            &opairdrop_airdrop::Sender::new("链接探针", "iPhone18,1", "id"),
+            &opairdrop_airdrop::TransferId::from_bytes16(&[7u8; 16]),
+            &[],
+            &links,
+        );
+
+        let (_, _, summary) = serve_decided(
+            root.to_str().expect("UTF-8"),
+            "",
+            "OPPO PJZ110",
+            post("/Ask", "application/x-apple-binary-plist", &body),
+            false,
+        );
+
+        assert_eq!(summary, "链接探针\t0\t0\t2", "the link count is the fourth field");
     }
 
     #[test]
