@@ -210,6 +210,8 @@ AirDrop 用自签证书，TXT 记录里有 `phash`（证书指纹）。**我们�
 | 发送页一打开就闪退 | `setBackgroundBlurRadius` 在 `setContentView` 之前调用，平台直接对**惰性创建**的 `DecorView` 下手 → NPE | 放到 `setContentView` 之后（`applyGlass()`） |
 | 发送页窗口有 surface 却一片空白 | `onPreDraw` 里 `return false` 取消首帧，动画的 invalidate 被一起吞掉 | `INVISIBLE` + `post`（窗口本就透明，先不可见一帧看不出） |
 | 拖动面板时**字在抖**、整个窗口上下摆 | ① `setTranslationY` 让整棵子树重绘（全屏圆角描边 + 全部文字每帧重栅格化）；② 层里的雷达每 32ms invalidate 逼整块纹理重画；③ 上一次回弹动画还在跑，和手指抢着写 `translationY`；④ 位移取整制造 1 像素台阶 | 移动期 `setLayerType(HARDWARE)`、拖动时停雷达呼吸、`ACTION_DOWN` 里 `animate().cancel()`、位移保留小数 |
+| 面板里的模糊要么盖住整屏，要么一动就卡 | 用了 `Window.setBackgroundBlurRadius`——**整窗**模糊，成本在合成线程 | 改成 View 级：`BackgroundBlurDrawable` 设成面板 background（见 13 节的 11:00 条） |
+| `gfxinfo` 报 0 janky、5ms，用户却说卡 | 跨窗口模糊的开销在 SurfaceFlinger 合成，`gfxinfo` 只统计应用线程 | 判据换人：这类问题看合成帧率（`dumpsys SurfaceFlinger --latency`）或直接上手 |
 
 ### 6.4 构建与工具链
 
@@ -376,6 +378,39 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 ## 13. 变更日志（新的在上）
 
+- **2026-11-14 11:00**：**模糊的作用域改对了 —— 从「窗口」挪到「面板视图」。** 之前一直在调
+  `Window.setBackgroundBlurRadius`，那是整窗模糊：窗口是全屏的，所以面板以外整片屏幕一起糊，
+  而且每一帧都要重采整屏。表现是「不跟手、拖动时抖」，而 `gfxinfo` 一直报 0 janky、5ms ——
+  **因为那一项花的是合成线程的时间，应用线程测不到**。这是判据选错了，不是参数没调好。
+  **反编译证据**（一加互传 17.2.36）：
+  · `ShareActivity.V0()` 造的是 `COUIBottomSheetDialog`，随后一行
+    `dialog.setBackgroundBlur(utils.s.a())`；
+  · `utils.s.a()` 只回答「这个 ROM 支不支持」（`COUIMaterialStateManager.t() && !p() && n()`）；
+  · `COUIBottomSheetDialog.setBackgroundBlur` 交给 `BackgroundBlurBuilder`（混淆名 `t4.b`），
+    后者做的是 `ViewRootManager.getBackgroundBlurDrawable()` → 设成**某个 View 的 background**，
+    再 `setBlurParams(OplusBlurParam)` / `setBlurRadius` / `setCornerRadius`。
+  也就是说：模糊的范围是**那个 View 的边界**，不是窗口。于是面板之外一个像素都不糊，面板
+  移动时模糊跟着走（所以它能做到「拖动也实时模糊」），面积只有面板那么大。
+  对应到 AOSP：`View.getViewRootImpl().createBackgroundBlurDrawable()`（Android 12 起，
+  ColorOS 只是包了一层材质参数）。
+  **我们的实现**：新增 `PanelGlass`（反射，两条路）——① `com.oplus.view.ViewRootManager` 的
+  `getBackgroundBlurDrawable()`（一加互传用的那条，这台机器上一定有）；② AOSP 的
+  `ViewRootImpl.createBackgroundBlurDrawable()`。拿到 Drawable 后 `setBlurRadius(28dp)`、
+  `setColor(页底 192/255)`、`setCornerRadius(上两角 28dp、下两角 0)`，再
+  `sheet.setBackground(drawable)`。窗口级模糊整个删掉，窗口只保留透明（让圆角外透出背后）。
+  拿不到就退回不透明页底，并打一行 `OPAirDrop: panel glass: unavailable`。
+  **真机验证（已通过）**：日志 `panel glass: coloros radius=112 corner=112`；把面板向下拖到
+  一半截图，屏幕上方露出的壁纸**清晰**（云纹可见），面板内部是模糊的深色玻璃，圆角在，
+  文字清晰。拖动段 `gfxinfo`：51 帧、0 janky、50th 5ms / 90th 8ms。这就是「窗口内模糊、
+  窗口外不模糊、拖动也实时」。
+  **两个必须自己做的细节**：
+  ① `BackgroundBlurDrawable.setColor` 在这台机器上**没有任何效果**（模糊出来了，叠色没上，
+  深色主题的白字直接落在浅色壁纸上，读不清）。改成自己盖一层 `tint` View（页底 208/255，
+  上圆下方形），模糊只负责「看到背后」，可读性由它保证。
+  ② 跟手平滑改成自适应：手指一次移动超过 8dp 视为在拖，系数 0.92（几乎 1:1，滞后约 8%）；
+  不到 8dp 视为手抖，系数 0.45。固定系数做不到两件事——大了抖，小了黏。
+  **教训**：判据要选对测点。跨窗口模糊的成本在合成线程，`gfxinfo` 只量应用线程；「0 janky
+  但用户觉得卡」这个矛盾本身就说明测错了地方。
 - **2026-11-14 03:30**：发送面板改成**从底边上滑的一块玻璃**，并修掉三个只有真机才看得出的问题。
   **形态**：`SendPanelTheme`（`windowIsTranslucent` + 透明窗口背景 + `@anim/none` 的零时长
   窗口动画）+ `Window.setBackgroundBlurRadius(28dp)` —— 跨窗口实时模糊，因为这一页背后是

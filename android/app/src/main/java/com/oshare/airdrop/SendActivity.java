@@ -6,6 +6,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.LinearGradient;
+import android.graphics.Outline;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RectF;
@@ -99,14 +100,6 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     private static final int EXIT_MS = 220;
     /** 回弹的时长。 */
     private static final int SPRING_MS = 240;
-
-    /**
-     * 手抖的判定线：一次移动不到这个距离，就认为不是人在拖，而是输入噪声。
-     *
-     * <p>真机上量到的回跳是 3–8 像素。8dp（这台机器 32 像素）留了足够余量：正常的拖动每帧
-     * 远超这个数，只有噪声落在下面。
-     */
-    private static final float JITTER_DP = 8f;
 
     /** 面板顶部的圆角。和导航胶囊同一个数。 */
     private static final float CORNER_DP = 28f;
@@ -303,6 +296,30 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         float radius = dp(CORNER_DP);
         sheet.setBackground(shape(sheetColor()));
 
+        // 圆角只有一个来源：这个裁剪。
+        //
+        // 模糊层（系统给的 Drawable）和染色层（{@link #tint}）之前各设了一套圆角，而
+        // BackgroundBlurDrawable 只认单一半径、面板要的是「上圆下方」——两边对不上，屏幕上
+        // 就是顶部两个角出现两条半径不同的弧。改成把 sheet 自己裁成那个轮廓，两层都不用再管
+        // 圆角，也再不可能对不上。
+        sheet.setClipToOutline(true);
+        sheet.setOutlineProvider(new android.view.ViewOutlineProvider() {
+            private final RectF box = new RectF();
+            private final Path path = new Path();
+
+            @Override
+            public void getOutline(View view, Outline outline) {
+                float corner = dp(CORNER_DP);
+                box.set(0f, 0f, view.getWidth(), view.getHeight());
+                path.reset();
+                path.addRoundRect(box,
+                        new float[]{corner, corner, corner, corner, 0f, 0f, 0f, 0f},
+                        Path.Direction.CW);
+                // 上圆下方是凸的，可以走 setConvexPath；Outline 自己的 setRoundRect 只能四角同值。
+                outline.setConvexPath(path);
+            }
+        });
+
         // 染色层：盖在模糊之上、内容之下。
         //
         // 不用 BackgroundBlurDrawable.setColor 做这件事——那个方法在这台机器上没有任何效果
@@ -422,9 +439,14 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      */
     private void layer(boolean on) {
         sheet.setLayerType(on ? View.LAYER_TYPE_HARDWARE : View.LAYER_TYPE_NONE, null);
+        // 建层的那一刻就停雷达，不是等第一次 MOVE。
+        //
+        // 层里的任何一次 invalidate 都要把整块 1440×3168 的纹理重画一遍。雷达每 32ms 叫一次，
+        // 于是只要「层已建好、雷达还在转」，就已经是每秒三十次全屏重绘——拖动再叠上来，读起来
+        // 就是整个界面在抖。按下到第一次移动之间通常有几十毫秒，正好够它抖一下。
+        dragging = on;
         if (!on) {
-            dragging = false;
-            // 拖动期间雷达停了呼吸（理由见 {@link Radar#onDraw}），还回层之后要把它叫醒。
+            // 还回层之后把雷达叫醒。
             sheet.invalidate();
         }
     }
@@ -759,15 +781,6 @@ public final class SendActivity extends Activity implements Peers.Watcher {
          * 拖都对不上。真机上撞到的就是这个。
          */
         private float startY;
-        /**
-         * 当前真正画在屏幕上的位移。
-         *
-         * <p>它不是 {@code startY + 手指位移}：输入事件本身是抖的。同一串 MOVE 里相邻两个
-         * 采样点会出现「先到 1254、退回 1251、再到 1288」这种回跳，幅度 3–8 像素；1:1 照抄
-         * 就是把手指的抖动原样画出来，读起来是面板在颤。这里用指数平滑把它压掉：每帧朝目标
-         * 走 60%，滞后约一帧（16ms），人感觉不到，抖动能滤掉大半。
-         */
-        private float shown;
         /** 这一次触摸里模糊是否已经关掉了。只在第一帧 MOVE 上做一次，不是每帧。 */
         private boolean moving;
 
@@ -796,7 +809,6 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     layer(true);
                     // 停在哪就从哪接着拖：见 {@link #startY}。
                     startY = getTranslationY();
-                    shown = startY;
                     tracker.clear();
                     tracker.addMovement(event);
                     return false;
@@ -845,7 +857,6 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     closing = false;
                     layer(true);
                     startY = getTranslationY();
-                    shown = startY;
                     return true;
                 }
                 case MotionEvent.ACTION_MOVE -> {
@@ -859,20 +870,11 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     }
                     // 只往下拖。往上推没有对应语义（这一页已经在最上面了），硬跟手会读成失灵。
                     //
-                    // 不取整：层已经建好，小数位移只是把纹理放到下一个十六分之一像素上，由
-                    // 合成器插值，本来就平滑；取整反而把它变成 1 像素一级的台阶——手指每帧
-                    // 移动不到一像素时，那正是「整个窗口在抖」的来源。
+                    // 1:1，不做平滑。试过指数平滑（固定 0.6、后来改成自适应的 0.92/0.45），
+                    // 两种都被否掉：任何平滑都会让面板落后手指一截，而人对手感的第一判断就是
+                    // 「它跟不跟得上」。输入事件的几像素回跳由系统自己也会补，宁可要跟手。
                     float dy = Math.max(0f, event.getY() - downY);
-                    float target = startY + dy;
-                    // 自适应：手指一次移动超过 8dp，那是人在拖，几乎原样跟（0.92 只留一点缓冲）；
-                    // 不到 8dp 的是手抖（真机上量到 3–8 像素的回跳），压到 0.45。
-                    // 固定系数做不到两件事：大了抖，小了黏。
-                    float delta = target - shown;
-                    shown += delta * (Math.abs(delta) > dp(JITTER_DP) ? 0.92f : 0.45f);
-                    if (Math.abs(target - shown) < 0.5f) {
-                        shown = target;
-                    }
-                    setTranslationY(shown);
+                    setTranslationY(startY + dy);
                     return true;
                 }
                 case MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
