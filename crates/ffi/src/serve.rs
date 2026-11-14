@@ -61,12 +61,6 @@ use crate::api::{
 use crate::buffer::{fill, OpairdropBuffer};
 use crate::settings;
 
-/// A receiver that answers from the settings and stores what arrives.
-///
-/// The trait's other three methods have defaults, and this type is the reason two of them
-/// exist: `saw_ask` and `saw_sender` are for a caller that wants to *watch* a conversation
-/// — a log, a notification, a progress bar. Nothing here watches. The offer it already
-/// accepted is in the body it is about to read, and the sender's name is cosmetic.
 /// Asks a person whether a transfer should be taken.
 ///
 /// Called with a one-line summary (`sender<TAB>files<TAB>bytes<TAB>links`, UTF-8) after the
@@ -113,6 +107,12 @@ fn summary_of(offer: &Ask) -> String {
     )
 }
 
+/// A receiver that answers from the settings and stores what arrives.
+///
+/// The trait's other three methods have defaults, and this type is the reason two of them
+/// exist: `saw_ask` and `saw_sender` are for a caller that wants to *watch* a conversation
+/// — a log, a notification, a progress bar. Nothing here watches yet: the offer it already
+/// accepted is in the body it is about to read, and the sender's name is cosmetic.
 pub(crate) struct Store {
     /// What both answers call this device.
     name: String,
