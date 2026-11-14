@@ -24,7 +24,11 @@ echo "== rust: aarch64-linux-android =="
 # working directory, so running this script from somewhere else would build without the
 # linker, the archiver and the page-size flag declared there — a build that succeeds and
 # produces a library the device refuses.
-(cd "$root" && "$cargo_bin" build --release --target aarch64-linux-android -p opairdrop-ffi)
+#
+# Two packages, because the APK carries both: the library the JVM loads and the daemon the
+# bring-up script starts. The daemon is staged into the assets by `stageKernelAssets`, which
+# stops the build with the command to build it if it is missing.
+(cd "$root" && "$cargo_bin" build --release --target aarch64-linux-android -p opairdrop-ffi -p opairdrop-awdl)
 
 echo "== app: $task =="
 JAVA_HOME=$java_home "$gradle_bin" -p "$here" --no-daemon --console=plain "$task"

@@ -1,0 +1,27 @@
+[package]
+name = "opairdrop-awdl"
+description = "The link layer: 802.11 frames, AWDL's data header, the availability-window schedule"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# `rlib` only. This crate is a library with a small driver binary (`awdld`), and every
+# frame it builds is testable on the host because the wire format does not change with the
+# platform.
+crate-type = ["rlib"]
+
+[dependencies]
+
+# The socket and TUN syscalls. Scoped to the target rather than to a feature so that a
+# host `cargo test` on any platform still compiles the codec, which is the part with the
+# tests worth keeping.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "awdld"
+path = "src/bin/awdld.rs"
+required-features = []

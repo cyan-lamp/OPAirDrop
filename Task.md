@@ -49,6 +49,7 @@ Rust 重构**，参考 [t4t5/owly](https://github.com/t4t5/owly) 的 Rust 化路
 | `cpio` | 1422 | cpio `odc`/`newc` 读写 + DVZip 块编解码 + gzip 识别 | 28 |
 | `mdns` | 957 | DNS 报文编解码（名字压缩、`\.` 转义、TXT） | 18 |
 | `http` | 1985 | 请求/应答双向流式解析、`Content-Length` 与 chunked 分帧、`100-continue` | 62 |
+| `awdl` | 4477 | AWDL 数据面：16 槽调度、PSF/MIF、选举、对端信道表、帧编解码、`/dev/tun` 与 `AF_PACKET`、`bin/awdld` | 83 |
 | `airdrop` | 3542 | 三端点语义、客户端、服务端、收件箱、loopback 测试 | 79 |
 | `settings` | 845 | 参数表：常量 + 区间 + 文案三合一，界面从表里画 | 17 |
 | `ffi` | 4199 | C ABI + JNI，Android 唯一入口 | 38 |
@@ -114,8 +115,41 @@ Rust 重构**，参考 [t4t5/owly](https://github.com/t4t5/owly) 的 Rust 化路
 
 ### 4.5 证书与信任（当前缺口）
 
-AirDrop 用自签证书，TXT 记录里有 `phash`（证书指纹）。**我们目前接受任何证书**，把「是不是
-那台设备」交给对面手机上的一次人工确认。按 `phash` 校验还没做；写在这里是为了不被当成已完成。
+AirDrop 用自签证书，TXT 记录里有指纹（我们发布的名字是 `h`，见 `Responder.txt()`）。**我们目前接受
+任何证书**，把「是不是那台设备」交给对面手机上的一次人工确认。按指纹校验还没做；写在这里是为了
+不被当成已完成。
+
+分工要说清：**接收端不需要校验对方的证书**——它连证书都不索取（`setNeedClientAuth(false)`，理由见
+`Listener` 类注释：TLS 1.3 下被索要证书的 iPhone 不是出示，而是直接放弃）。所以这一节讲的缺口
+只在**发送端**：我们发起连接时要按对方公告的指纹拒绝不匹配的手握。
+
+### 4.6 mDNS 的四条 legacy 约定（都踩过，别再推导）
+
+这一节的存在理由是：这四条每一条都能靠「讲道理」得出**错误**答案，而且得出之后代码会安静地
+不对——不报错，只是对面看不见我们。
+
+1. **`unicast` 只看问题里的 QU 位，不看查询的源端口。** 应答来自临时端口（比如 54270）时，
+   直觉会认为该单播回给来源；legacy 不是这样做的：
+
+   ```
+   ask.unicast |= question.unicast;                                        // :742
+   int id = ask.unicast ? message.id() : 0;                                // :748
+   transmit(reply.packet, reply.unicast ? incoming.getSocketAddress() : null);  // :688 / :839
+   ```
+
+   只有带 QU 的问题才回给来源，其余一律组播。**别把 `:603–608` 那段注释当反例**——那段讲的是
+   我们**自己发问**（`Peers` 浏览侧）该带 QU，因为 bridge 只转发单播帧。
+
+2. **实例名里的转义反斜杠要原样上 wire。** 名字里的空格和点在 mDNS 里写作 `\` 转义；如果解析时
+   剥掉、发送时忘了加回，我们公告的名字与自己应答的名字就不是同一个字符串，peer 会看到两个设备。
+
+3. **`Record::target()` 只对 SRV 有意义。** 在 PTR/TXT/AAAA 上取它拿到的是「碰巧位于同一偏移
+   的那几个字节」，不是名字。用它统一处理四条记录，PTR 会指到一个不存在的实例。
+
+4. **legacy 的 `close()` 撤回是死代码。** `AirDropLink.close()` 调 `advertising.withdraw(current)`，
+   而 `withdraw()` 第一句是 `oldInstance.equals(instance) → return true`——名字永远相等，所以永远
+   直接返回。这不是抄漏，是那份代码本来就没在关的时候撤回。我们要撤回（崩溃半写留下的旧名字会
+   在别人缓存里活 75 分钟），就得自己写 `withdraw(held, name)`，不能顺着这条调用链走。
 
 ---
 
@@ -307,45 +341,67 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 ---
 
-## 9. 当前进度（2026-11-14 02:45）
+## 9. 当前进度（2026-11-15 00:45）
 
 ### 已完成并验证
 
 | 项 | 证据 |
 | --- | --- |
-| Rust 七 crate | 7456 行，`cargo test --workspace` **260 passed**，clippy 零 warning |
-| 接收端在真机上应答 | `POST /Discover` → `HTTP/1.1 200` + `Server: AirDrop/1.0` + 合法 bplist（`ReceiverComputerName=PJZ110`、`IsAirDropable`、`{"Version":1}`） |
+| Rust 八 crate | `src/` 合计 20774 行，`cargo test --workspace` **376 passed**（1 ignored），clippy 零 warning |
+| 接收端 TLS | 真机 `openssl s_client`：`TLSv1.3` / `TLS_AES_256_GCM_SHA384`，握手 **10 ms**（七次实测 9–33 ms）；证书 `CN=PJZ110`，2036 年到期 |
+| 发布的指纹就是出示的指纹 | `tcpdump -i awdltun0` 抓到公告 TXT `h=D07F4814…C7E8CA`；同刻 `openssl x509 -fingerprint -sha256` 得到**同一串**。这条不成立时，每个发送端都会在对方屏幕上被拒且无从解释 |
+| 接收端在真机上应答 | 经 TLS 发 `POST /Discover` → `HTTP/1.1 200` + `Server: AirDrop/1.0` + `Content-Length: 138` + 合法 bplist（`ReceiverComputerName=青`、`IsAirDropable=True`、`{"Version":1}`），`Connection: keep-alive` 且连接保持 |
+| 死对端不再打死进程 | 强 RST 三型（空转 / 写中 / 半截 body）+ 优雅断开后 `pidof` 均存活；桌面 `-Xcheck:jni` 对照：拿掉防线即 2 条 `JNI call made with exception pending` 并让 `check.sh` 退出 1，恢复后零警告 |
 | 前台服务 | `oshare_state=1` → `ReceiveService` 以 `isForeground=true types=0x10` 起来、8770 在听；`=0` → 服务与端口都归零 |
 | 分享面板注入 | 真机确认：一加互传分享面板的设备列表里出现「发送到 iPhone」 |
 | 发送链路 | `Peers`（mDNS 浏览）+ `ShareIntake`（URI→cache）+ `SendActivity`（TLS + 三请求 + **真实进度**） |
 | 接收确认 | `/Ask` 读完后问一次（通知两键，30 秒超时按拒绝）；拒绝回 503 且不弹确认 |
+| 射频共享开关 | 功能页一张卡，读写 `files/radio-share`/`radio-state`；真机四态（共享/独占/正在开/无回执）逐个拍过；`RadioCheck` **48 项** |
+| 驱动随包 | `assets/kernel/` 五个二进制 + `SHA256SUMS` 进 APK；`DriverSetup` 按 §7.3 序列加载，`boot_id` 标记防重复；真机报 `AWDL_LINK_UP iface=wonder0 freq=5745`、`tun=up`、`stack already swapped this boot` |
+| mDNS 应答器 | 真机抓包 `hlim 255`、3.000 s 节奏、`0*- [0q] 4/0/0` 四条记录、TXT `"h" "fl=137" "flags=137"`；自造 `(QM)` 查询后 0.9 ms 四条应答 |
 | 六项 UI 修改 | 首页开场白卡删除、底栏三只图标重画、刷新按钮删除、设置页跟手动画、回弹以被拉边为轴、震动权限 |
 
 ### 明确未完成
 
-- **驱动打包**（7.2 形态）。不做这条，真机永远只到「shell 打本机」。
+- **iPhone 分享面板里出现本机**：本侧该做的都做了、都抓包看过了（见 §13 本轮记录），这一步只能由
+  人手拿一台 iPhone 看一眼，**没有第二台苹果设备可自证**。
+- **接收第三档（真机端到端）**：`/Discover` 与 `/Ask` 的应答已在桌面侧验过，但「iPhone 发一张图、
+  文件真的落到 `receive.directory`」还没跑过——这一条需要那台 iPhone，以及本机 root 提权在手
+  （临时 root，冷重启后要手动 `su`）。
 - **流体云卡片**：已定为「承载真实传输」。信道：offer 走广播（我们 → 互传进程），决定走
   `Settings.System`（互传进程 → 我们，因为普通应用写不了它）。卡片本体未写。
 - **自有发送面板**：要仿 `IOSShareActivity`（全屏、圆形返回键 + 「与 iPhone 互传」+「本设备：×」、
   中部雷达喻体、底部说明卡），浅/深两套、弹出动画、**点头像才出**蓝色「等待对方接受」、
   接受后进度绕头像圆环走。现有 `SendActivity` 只是临时形态。
 - **通知栏与流体云显示发送进度**。
-- **`phash` 证书校验**。
-- **设置表里 8 行未接到读值处**（`receive.directory`、`device.name`、各超时、`http.response_limit` 等）。
+- **`phash` 证书校验**（发送端侧；接收端侧的 `h` 已发布且与出示证书一致）。
+- **设置表里 15 行未接到读值处**（`receive.directory`、`device.name`、`device.model`、各超时、
+  `http.response_limit` 等）。
 - `git` 已初始化并有提交，但首个提交晚于事故，历史不含更早状态。
 
 ---
 
 ## 10. 下一步（按顺序，每条可验收）
 
-| # | 任务 | 验收 |
-| --- | --- | --- |
-| 1 | 驱动打包：`assets/kernel/` + `su -c insmod` + boot_id 标记 | 冷启动后 `wonder0` up、iPhone 能看到本机 |
-| 2 | 自有发送面板（仿 `IOSShareActivity`） | 与参照同构；浅/深；弹出动画；环状进度随真实字节走 |
-| 3 | 通知栏 + 流体云显示发送进度 | 与面板同一份进度，不各算一套 |
-| 4 | 流体云确认卡（接收） | 有文件发过来时卡片出现，接受/拒绝回写，结束自毁 |
-| 5 | `phash` 校验 | 指纹不符时不发，且给出可读原因 |
-| 6 | 8 行设置接线 | 每接一行删一个 `DEFAULT_*` 常量；键名只出现在 `settings.rs` |
+**互通阶段的顺序是用户定的：先接收，后发送。** 接收有三档，一档不成立就别看下一档——
+「找不到」和「发不过来」和「发过来了但没提示」是三件不同的事，混在一起修只会浪费时间。
+
+| # | 任务 | 验收 | 状态 |
+| --- | --- | --- | --- |
+| 1 | 驱动打包：`assets/kernel/` + `su -c insmod` + boot_id 标记 | 冷启动后 `wonder0` up | ✅ 已随包，`DriverSetup` 按 §7.3 序列 |
+| 2 | mDNS 应答器（本侧发得出、答得上） | 抓包里 3 s 节奏、`hlim 255`、四条记录、TXT 三键 | ✅ 真机实测，见 §13 |
+| 3 | **接收第一档：iPhone 分享面板里能找到本机** | 人眼在 iPhone 上看见本机名字，点得进去 | ⏳ 待实测（本侧无法自证） |
+| 4 | 接收第二档：接收端 TLS（`Identity` + `h=` + `SSLServerSocket`） | `openssl s_client` 能握手；`/Discover` 有应答 | ✅ 真机：`TLSv1.3`/`AES_256_GCM`、10 ms；`/Discover` → `200` + 138 字节 bplist；TXT `h` 与出示证书指纹逐位相同 |
+| 5 | 接收第三档：文件真的落到 `receive.directory` | iPhone 发一张图，`Download/` 里出现同字节文件 | 未开始 |
+| 6 | 接收三处提示：确认弹窗 + 通知栏 + 流体云 | 三个入口同一份状态，接受/拒绝都回写 | 弹窗有雏形，另两处未写 |
+| 7 | 自有发送面板（仿 `IOSShareActivity`） | 与参照同构；浅/深；弹出动画；环状进度随真实字节走 | `SendActivity` 是临时形态 |
+| 8 | 发送端接入 `SendActivity`（用户点名的第二刀） | 从我们自己的面板发起一次完整发送 | 未开始 |
+| 9 | `phash` 校验 | 指纹不符时不发，且给出可读原因 | 未开始 |
+| 10 | 15 行设置接线 | 每接一行删一个 `DEFAULT_*` 常量；键名只出现在 `settings.rs` | 未开始 |
+
+第 3 档不成立时的排查方向，**不是改参数猜**：先 `tcpdump` 同时抓 `awdltun0` 上我们的公告与 iPhone
+实际发问的时刻分布。如果 iPhone 从不发问，问题在链路（Apple 的 AWDL 只在它自己要发时才醒）；
+如果它问了而我们没出现在结果里，问题在记录内容（这种情况才回去看 TXT/SRV）。
 
 ---
 
@@ -353,12 +409,12 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 | 指标 | 值 | 说明 |
 | --- | --- | --- |
-| 单元 + 集成测试 | **260 passed** | 无设备；clippy 零 warning |
-| JVM 断言 | **179 条** | `bash crates/ffi/jvm/check.sh`，桌面 JVM，不是真机 |
-| Rust 行数 | 7456 | 七 crate 合计 |
-| Java 行数 | 8089 | 20 个类：三页 + 发送 + 确认 + 服务 + 钩子 |
-| 真机库 | `libopairdrop_ffi.so` **652 616 字节** | `aarch64-linux-android`，linker 35 |
-| APK | **885 949 字节**（clean） | 增量打包会虚高到 1.5 MB，见 6.4 |
+| 单元 + 集成测试 | **376 passed**（1 ignored） | 无设备；clippy 零 warning |
+| JVM 断言 | **363 条** | `bash crates/ffi/jvm/check.sh`，桌面 JVM + `-Xcheck:jni`，不是真机 |
+| Rust 行数 | 20774 | 八 crate；`src/` 合计 |
+| Java 行数 | 11896 | 29 个类：三页 + 发送 + 确认 + 服务 + 钩子 + 身份/射频/链路 |
+| 真机库 | `libopairdrop_ffi.so` **681 712 字节** | `aarch64-linux-android`，linker 35（含 mDNS 三个入口） |
+| APK | **14 204 955 字节**（debug，含 `assets/kernel/`） | 内核资产合计约 38 MB 未压缩，压后约 13.5 MB；不含资产的 clean 包仍是 88 万级 |
 | 接收吞吐 | 80–88 KB/s | 受对端 31.2% 占空比限制，**不是 KPI** |
 | 发送吞吐 | 1.06–1.13 MB/s | 同上 |
 
@@ -377,6 +433,542 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 ---
 
 ## 13. 变更日志（新的在上）
+
+- **2026-11-15 00:45**：**接收端握手通过、`/Discover` 有应答；同时推翻上一轮那条「TLS 握手失败」的
+  结论——它从来不是握手的问题。**
+
+  **一、错在哪里。** 上一轮记的是「客户端写 1549 字节、服务端读 0、`error:0A000126`」，据此判为握手
+  参数不当。实际是两件事叠在一起：第一次尝试时接收端根本没在听（`pidof` 为空，进程已被系统回收），
+  `adb forward` 在 connect 那一刻才去连设备端口，连不上就直接关掉这条连接，客户端看到的就是「写满
+  了、读 0、EOF」；而之后每一次真正的握手都成功，只是**握手成功后进程被 tick 掉了**。两种成因在
+  客户端侧长得一模一样，所以判据只有一条：**握手之后立刻查设备侧进程是否还活着**，再谈参数。
+
+  **二、进程怎么死的。** `adb logcat -b crash`：
+
+  ```
+  Abort message: 'JNI DETECTED ERROR IN APPLICATION: JNI NewByteArray called with pending exception
+      java.net.SocketException: Connection reset
+      in call to NewByteArray'
+  #00 libc  Fatal signal 6 (SIGABRT) in tid (opairdrop-liste)
+  #03 CheckJNI::NewPrimitiveArray
+  #04 Java_com_oshare_airdrop_Native_serveDecided+1112
+  ```
+
+  CheckJNI 的规则是硬的：任何一次跨 JNI 的调用（`NewByteArray`、`SetByteArrayRegion`、
+  `CallVoidMethod`…）**在已有 pending exception 时被调用，abort 整个进程**，不是抛异常。而「对端
+  半路消失」这个场景必然走到该状态：`/Discover` 先应答再读 body，`read_control` 把读失败**吞成**
+  `(空, false)`（`crates/airdrop/src/server.rs:426`），`drain` 也吞（`:491`），于是端点返回**成功**、
+  内容为空，而读回调把 `SocketException` 原样留在 JVM 里——正好撞在 `new_bytes` 的 `NewByteArray` 上。
+
+  **三、修法：同一条规则写五遍。** `crates/ffi/src/jni.rs` 里每个「即将跨 JNI」的入口都先看
+  `pending(env)`——`new_bytes`（:1684，返回 null，把这个异常留给 Java 自己抛）、`read_stream`
+  （:1075）、`write_sink`、`report_progress`、`decide_java`（人要做的决定不能替异常做；同时把
+  `DeleteLocalRef` 提到提前返回之前，否则漏掉局部引用）。`finish()` 的 OK 分支只补了一段解释：
+  「成功」与「有异常」并不矛盾——对端中途关闭时，「什么都没存」和「I/O 失败」两句话同时为真。
+
+  **四、怎么证明修好了——这一节的方法比结论值钱。** adb 上的试探不可靠：`timeout 3 openssl
+  s_client` 发的是 `close_notify`，服务端走 EOF 而不是 reset；用 `SO_LINGER(1,0)` 造的真 RST 三种
+  形态（空转、写中、半截 body）也只换来「进程存活」，进不了异常分支。于是把案子搬回桌面：
+  `RoundTrip.aVanishingPeerIsOneConnectionAndNotTheProcess` 用一条声明 `Content-Length: 200` 却只给
+  12 字节、随后抛 `SocketException` 的流，确定性复现同一状态。**关键在于 `check.sh` 加了
+  `-Xcheck:jni`**：Android 的 CheckJNI 默认开着，HotSpot 默认根本不看，所以这类 bug 在桌面上从来
+  不可见。对照实验：
+
+  | 构建 | 结果 |
+  | --- | --- |
+  | 拿掉两处防线 | 2 条 `WARNING in native method: JNI call made with exception pending`，`check.sh` 退出 1 |
+  | 恢复防线 | 零警告，全部通过 |
+
+  两个 JVM 对「事实」一致、对「罚则」不一致（警告 vs abort），所以脚本把这个警告**提升为失败**。
+  一个坑：这行警告走的是 **stdout**，只 grep stderr 会漏掉——第一版就是这么漏的。
+
+  **五、真机三项证据。**
+  - `openssl s_client`：`TLSv1.3` / `TLS_AES_256_GCM_SHA384`，握手 **10 ms**（七次 9–33 ms）。
+  - 经 TLS 发 `POST /Discover`：`HTTP/1.1 200` + `Server: AirDrop/1.0` + `Content-Length: 138`，
+    bplist 为 `{ReceiverComputerName: 青, ReceiverMediaCapabilities: {"Version": 1},
+    IsAirDropable: True}`，`Connection: keep-alive` 且连接保持。
+  - `tcpdump -i awdltun0` 抓到公告 TXT `h=D07F48146C5A2D215427D04C29DC62AC158ED0B493E25F52D47C3123D8C7E8CA`
+    `fl=137` `flags=137`，间隔 3.004 s；同刻 `openssl x509 -fingerprint -sha256` 得到**同一串**。
+    「发布一份证书、出示另一份」这个一直在文档里被担心的失败模式，现在有实测反证。
+
+  **六、日志。** `Listener` 的 tag 与 legacy 同名（`OPAirDrop`），两代可以一起 grep；握手成功/失败、
+  连接结束各一行，页面上什么都不加——页是给人看「有没有问题」的，日志是给「没人能复现」用的。
+  `routine()` 顺 cause 链找 `SocketException`（比 legacy 的字符串匹配稳：`SSLException` 包着
+  `SocketException` 也认得出），命中就只记日志、不上报。
+
+- **2026-11-14 22:40**：**本机在 AWDL 上开始说话了，而且说的是 legacy 的方言。** 驱动打包之后一直
+  卡在「iPhone 能不能看见我们」——我们连一句 mDNS 都没发过。这一节补上应答器：`crates/ffi/src/respond.rs`
+  的 `mdnsRecords`/`mdnsAnnounce`/`mdnsReply` 三个入口、`MulticastHop`（把 `IP_MULTICAST_TTL` 换成
+  `hlim 255`，legacy 的路由需要的不是 TTL 而是跳数）、`ServiceId`（12 位 hex 名字 + 最多 8 个旧名字）、
+  `Responder`（公告 3 s 一次、应答走 `mdnsReply`）、以及 `Listener` 的接线。
+
+  **一、抓包原文（`tcpdump -i awdltun0`，真机）。** 这一段是这一节的全部价值，参数不是猜的：
+
+  ```
+  22:28:24.036332 IP6 (flowlabel 0x6a11d, hlim 255, next-hop UDP) fe80::6410:37ff:fe63:44fb.5353 > ff02::fb.5353:
+     0*- [0q] 4/0/0 _airdrop._tcp.local. PTR 75bdacd4227c._airdrop._tcp.local.,
+              75bdacd4227c._airdrop._tcp.local. SRV pjz110.local.:8770 0 0,
+              75bdacd4227c._airdrop._tcp.local. TXT "h" "fl=137" "flags=137",
+              pjz110.local. AAAA fe80::6410:37ff:fe63:44fb (244)
+  22:28:27.039 / 22:28:30.048 / 22:28:33.052 / 22:28:36.058 …（同一形态）
+  ```
+
+  四个判据一次读出来：节奏是**严格的 3.000 s**（不是 60 s，也不是 8 s）；`hlim 255` 证明
+  `MulticastHop.raise` 真的改了跳数；`0*-`、`[0q]`、id 0 是**组播应答**的正确形态；TXT 三键
+  `h`/`fl`/`flags` 与 legacy 一字不差。日志另一头对应 `announcing 75bdacd4227c at pjz110.local:8770 on awdltun0`。
+
+  **二、应答路径也实测过，不只是公告。** 自己造一条 PTR 查询（`ff02::fb%awdltun0:5353`，源端口
+  54270），0.9 ms 后收到四条应答：
+
+  ```
+  22:29:54.961677 ... 54270 > ff02::fb.5353: 0 PTR (QM)? _airdrop._tcp.local. (37)
+  22:29:54.962564 ... .5353 > ff02::fb.5353: 0*- [0q] 4/0/0 …（四条）
+  ```
+
+  `54.962` 不落在 `54.184 + 3 s` 的公告网格上，所以它只能是应答，不是顺带的公告。
+
+  **三、「回组播还是回单播」的判据是 QU 位，不是源端口。** 这一段差点写错：查询来自 54270（临时端口），
+  直觉会认为该回给来源。回 legacy 核对（`legacy/.../core/MdnsResponder.java`）：
+
+  ```
+  :742  ask.unicast |= question.unicast;
+  :748  int id = ask.unicast ? message.id() : 0;
+  :688  transmit(reply.packet, reply.unicast ? incoming.getSocketAddress() : null);
+  ```
+
+  只由问题里的 QU 位决定。本次查询是 `(QM)`（无 QU），所以回组播**与 legacy 一致**。`:603–608` 那段
+  注释（「the bridge forwards unicast frames only … RFC 6762 §6.7 … the question is asked from an
+  ephemeral port」）讲的是**我们自己发问**时该带 QU（`Peers` 浏览侧），与本端应答无关。这条别再推导一次。
+
+  **四、`mdnsAnnounce` 没有 `throws`，`mdnsReply` 有。** `Native.java:232` 与 `:259` 的差别让
+  `catch (IOException | RuntimeException)` 在同一份代码里一处能过、一处编译不过。公告/撤回两处因此
+  只捕 `RuntimeException`——地址写错是我们自己的 bug，不是值得等待的条件。
+
+  **五、`Responder` 归 `Listener` 所有，不归三个开关点。** 「能接受连接」和「别人看得见」是同一句话，
+  所以 `beginAnnouncing()` 放在 `bind()` **成功之后**，`endAnnouncing()` 放在 `finally` 的**第一句**
+  （撤回必须从即将消失的那个 socket 发出去）。`FeaturePage`/`HomePage`/`ReceiveService` 三个入口
+  于是自动全覆盖，没有第二处会漂移。
+
+  **六、绑定失败要说出来，而且要能再拨一次。** 本机最常见的失败是「AWDL 链路还没建」，而人正是修好
+  之后会再拨一次。所以 `open()` 的失败路径必须 `opener = null`，否则守卫看见一个已结束的 opener，
+  第二次拨动会以沉默作答。失败本身不阻止接收端继续跑（Mac 用旧地址或 `nc` 仍能连），但必须经
+  `aside()` 拼进功能页那一行——「在收听但没人找得到我」是只有这一行能说的错。
+
+  **七、`ServiceId.stale` 必须有人撤回。** 它记得最多 8 个旧名字，正是为了「崩溃半写 → 新 ID →
+  旧 ID 还留在别人缓存里 75 分钟」这一刻。撤回只能在 socket 起来后发，所以 `ghosts` 在第一次公告
+  **之前**清空。legacy 的 `AirDropLink.close() → advertising.withdraw(current)` 是**死代码**
+  （`withdraw()` 第一句 `oldInstance.equals(instance) → return true`），所以这里绕开它，`withdraw(held, name)`
+  是另一个重载：一个按 3 s 节奏发，一个只在某件事结束时发。
+
+  **八、`socket` 是 `volatile`，`open()` 的交接在一把锁里。** receive / tick / transmit 三条路径读它时
+  不持锁（锁只保护状态迁移）；`opener = null` 与 `socket = opened` 分两次写会留一个两者皆 null 的瞬间，
+  此时 `start()` 会去 bind 一个已被占用的端口。
+
+  **尚未自证的最后一步**：iPhone 分享面板里真的出现本机。本侧能做的（公告形态、应答、TXT、hlim、
+  节奏）全部实测过了，剩下的只能由人手拿一台 iPhone 看一眼。
+
+- **2026-11-14 20:20**：**开关落到了功能页，而且它不是一条设置。** 上一节说「UI 不能承诺百分比」，
+  这一节把那句话变成代码：`crates/ffi/jvm/com/oshare/airdrop/RadioShare.java`（纯 Java、零 Android
+  类型，App 与桌面检查共用）、功能页一张专用卡、`RadioCheck` 48 项、真机四态各拍一次。
+
+  **一、没有进 `CATALOG`，这是刻意的。** 原定的下一步是「在 `crates/settings` 的表里加一条
+  `radio.share_wifi`（`Kind::Switch`）」。读过三条既有事实之后否掉了：
+
+  - `settings.conf` 是 App 自己拥有的值；射频开关是**对另一个进程的请求**，回执由别人写回。存进
+    表里，同一件事就有两个家，而无线电只认 `files/radio-share` → 页面可以显示「共享中」而守护
+    进程正在独占。
+  - `sectionOf()` 没有 `radio` 前缀的归口，会落进 `SettingsScreen.UNSORTED`，而 `SettingsCheck`
+    断言那一段为空 → 加一行就让 JVM 检查变红。这是设计好的闸，不是巧合。
+  - `SettingsPage` 本来就 `skip(Control.SWITCH)`（「开关在功能页，因为拨一下就生效」），加进表也
+    只是为了让它在功能页出现；而功能页的开关循环按 `true`/`false` 写 `settings.conf`，对这个开关
+    是错的写入路径。
+
+  所以这个开关只读写那两个文件，别处一概不碰。
+
+  **二、失败不把开关拨回去，和设置类开关正好相反。** `addSwitch()` 失败时 `setChecked(before)`，
+  因为「留着它拨过去的样子，等于让人以为设置生效了」。射频开关失败**不**拨回：拨回等于悄悄把人
+  的偏好改成相反的，下一次 `start` 会照那个相反的来做（脚本与 daemon 都读那个文件）。失败是射频
+  没做到，不是人没要求 → 开关留在原处，回执行变红并说出原因，要重试就再拨一次。只有**写不进
+  文件**才弹回——那是磁盘问题，不是射频问题，第二行写「写不进请求文件：…」。
+
+  **三、原子改名是承重的。** daemon 每 250ms 读一次那个文件并照着做，截断的写会被看见 → 读到空
+  文件 → `share failed unknown request ""`，那是一条描述竞态的回执，不是描述无线电的回执。所以
+  写同级 `radio-share.new` 再 `ATOMIC_MOVE`；桌面 Windows 不允许 rename 到已存在的文件，退回
+  `REPLACE_EXISTING` 的 move，注释写明手机永远走不到那条路。
+
+  **四、回执分两层，陈旧的不采用。** 上面一句人话（`State.subtitle()`），下面一行原始记录
+  （`receipt().line()`，灰的、失败转红）。人话不能改写原始记录：落在哪个信道、失败原文都在下面。
+  陈旧回执**引用**而不**采用**——`已请求独占，回执还停在「share confirmed sta=5220」`——并且
+  `staMhz()` 此时返回 0，否则页面会为一个不在那个信道上的射频印出一个信道。`asked` 判的是
+  **文件在不在**，不是文件非空：空文件是「有人写了但没写成」，当成「从没人问过」会把坏文件藏进
+  默认值。
+
+  **五、真机四态**（一加 13 / PJZ110，`awdld --uid 10415 --name AirBox --burst 4 --ctl
+  /data/data/com.oshare.airdrop/files` 在跑）：
+
+  | 拨动 | 盘上 | 页面第二行 | Wi-Fi |
+  |---|---|---|---|
+  | 冷开（文件已存在） | `share` / `share confirmed sta=5745` | 共享中：Wi-Fi 在 5745 MHz，与 AWDL 共用射频 | 开 |
+  | 关 | `exclusive` / `exclusive confirmed` | 独占中：Wi-Fi 已关闭，手机没有 Wi-Fi 网络 | 关 |
+  | 开（抓到了过渡态） | `share pending` | 正在开 Wi-Fi，等 STA 拿到信道 | 开 |
+  | 删掉 `radio-state` 再进页 | `share` / 无回执 | 已请求共享，还没有回执——守护进程可能没在运行 | 开 |
+
+  App 写进去的那份是 `u0_a415:u0_a415 0600`（原子改名把 root 组的旧文件换掉了），daemon 以 root
+  读，不受影响。两次共享都落在 5745——信道有粘性，又一次印证。
+
+  **六、设备上抓到两个真 bug，都不是编译能发现的。**
+
+  1. **`pending` 被当成了答案，页面冻在「正在开 Wi-Fi」。** 拨回共享后 daemon 在一个轮询内写了
+     `share pending`；`followAnswer` 的退出条件当时是 `answered()`，而「回执在谈论盘上这次请求」
+     对 `pending` 也为真 → 循环当场停。四十秒后盘上是 `share confirmed sta=5745`、Wi-Fi 早开了，
+     页面还停在 pending。修法：加 `State.settled()`（答上了**而且**是 `confirmed`/`failed`），
+     `followAnswer` 改用它。关的那一向没暴露，是因为 `svc wifi disable` 比 250ms 快，第一次重试
+     就已经是终态——**只有慢的那一向会露**。
+  2. **回执消失时旧原文留在屏幕上。** `followAnswer` 原来只在 `receipt().present()` 时才写那一行，
+     于是「已请求共享，还没有回执」下面还挂着上一次的 `share confirmed sta=5745`，两句里有一句是
+     假的。改成每次都照盘面重写（含空串 + `GONE`）。
+
+  **七、检查 45 → 48 项**（`bash crates/ffi/jvm/check.sh` → `ok, 48 checks`，连带 `RoundTrip` 与
+  `SettingsCheck` 全绿）。新增三项都针对第 6 条那类「句子会不会撒谎」：
+  `pending is answered but not settled` / `and that is a settled answer, so the page stops asking` /
+  `a failure is settled`。`RadioCheck.java` 与 `SettingsCheck.java` 同样从 APK 里排除
+  （`build.gradle` 的 `java.exclude`）。
+
+  **八、`awdl-stack.sh` 头部那段 45% 的归因改了。** 原来写「45% 是 149 与 5220 之间那道缝的宽度；
+  碰上正好在 149 的 AP，同一个测试量到 10%」——后来同一测试 10/10 落在 149（`sta=5745`），本轮两次
+  也是 5745。信道是 AP 定的、有粘性，所以改成「45% 不是共享的属性，是一对信道的属性」，并写明 UI
+  里不印百分比、只印 `sta=` 的 MHz。
+
+- **2026-11-14 19:15**：**「WiFi 与 AWDL 共存开关」可以做，但提案里「开启后自动拆-改频-重建」这半句
+  是假的。** 起因是想在 App 功能页加一个「WiFi 和 AWDL 同时可用 开/关」，默认关，开启后自动跟随 STA
+  拆建。先验证后半句，结论是**能力问题，不是代价问题**。
+
+  **一、驱动只认 5745，而且是硬编码。** `legacy/kernel/driver/wma_opairshare_pas_mgmt.h:580`
+  `opairshare_pas_rx_fixed_channel()` 开头就是：
+
+  ```c
+  if (freq != 5745) {
+      pr_info("OPAIRSHARERXAUTO: unsupported request freq=%u bandwidth_enum=%u\n", freq, bandwidth);
+      return -EOPNOTSUPP;
+  }
+  ```
+
+  它自己的注释就写死了性质：`/* Fixed149 profile: this does not establish general hopping support. */`
+  拒绝点在 `wonder_start` 内部，即 `wonder-ven feed` 已经返回 ok **之后**——所以「feed 成功」和
+  「`ip link set wonder0 up` 报 Operation not supported」会同时出现，dmesg 里是
+  `OPAIRSHARERXAUTO: unsupported request freq=5220 ... bandwidth_enum=0` 紧跟 `Vendor init failed: -95`。
+
+  **二、运行中换频三条路全部失败**（`awdld` 存活、链路正常时实测，2026-11-14）：
+
+  | 走法 | 结果 |
+  |---|---|
+  | 原地 retune 5745→5220 | `up` 失败 -95，`wondertap0` 消失、`awdld` 退出、重建后 MAC 变化 |
+  | `iw dev del` + `interface add` 到 5220 | 同上 |
+  | `rmmod wonder` + `insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0` | 新 vif 上 5220 仍 -95（排除「加载时锁频」） |
+
+  由此**重解 18:47 的「72%」**：那不是「跟随了但丢包」，而是「根本没跟随」——tap 一直待 149，STA 走了，
+  两者之间从来就没有能移动 tap 的代码路径。同理 18:47 那句「跟随 = 每次漫游拆了重入」也不成立，
+  拆了也回不来，只会更糟。
+
+  **三、热开 WiFi 是可行的，代价完全取决于 STA 落在哪个信道。** 同一二进制、同一 iPhone，
+  `ping6 -c 12..20 -i 0.2 %awdltun0`，`awdld` 全程不重启：
+
+  | 阶段 | 丢包 | min RTT | tap ifindex / awdld | STAT |
+  |---|---|---|---|---|
+  | 独占（WiFi 关） | 0% | 38 ms | 141 / 不变 | `phy=149` |
+  | `svc wifi enable`，STA 落 **5220** | **45%** | 27 ms | 141 / 不变 | `phy=149`（无 `!`） |
+  | 再 `disable` | 0% | 6.4 ms | 141 / 不变 | `phy=149` |
+  | 独占（另一轮基线） | 0% | 88 ms | 141 / 30396 | `CHANNEL own=149` |
+  | `share`，STA 落 **5745**（同信道） | **0%** | 7.8 ms | 141 / 30396 / MAC 不变 | 同上 |
+  | 再 `exclusive` | 0% | 7.3 ms | 141 / 30396 / MAC 不变 | 同上 |
+
+  两条结论叠起来：**开关成立，而且比提案简单得多**——它就是个 `svc wifi enable/disable` 的热切换，
+  不重建链路、不重启 daemon、不改 MAC。但**代价不由我们决定**：STA 自己漫游到 44 就是 45% 丢包，
+  落到 149 就是 0%。所以 UI 不能叫「WiFi 和 AWDL 同时可用」，那是承诺一件我们控制不了的事；
+  应该叫「WiFi 共享射频」，并在开的时候明说「丢包取决于手机连的 AP 在哪个信道」。
+
+  **四、`awdl-stack.sh` 本轮改动**（`sh -n` OK，28625 字节 / 620 行）：
+
+  1. `pick_freq()` 不再跟随 STA，永远返回 `SOCIAL_FREQ`；`<source>` 降级为纯报告字段
+     （`no-sta` / `sta` / `sta-on-<mhz>`），只为让 `status` 和 `STAT` 的 `phy=` 能对读。
+  2. `link_up()` 的 retune 段由「拆了重设」改为**拒绝并保持**：`refuse retune <here> -> <freq>`。
+     活着的错频链路还能过帧，死链路一帧都过不了，还会带走 App 的 TUN。
+  3. **新增 `share` / `exclusive` 两个子命令**——就是给功能页那个开关用的接口。不动驱动、不
+     `force-stop` App、幂等、把最后一次请求写进 `$STATE/radio-share`（`stop` 时清掉，`status` 里
+     以 `radio=` 打印）。实测这两条命令跑完 tap ifindex 141 / awdld 30396 / MAC 全部不变。
+  4. **修 `cmd_start` 的守卫顺序 bug**：`for m in wonder opairshare_wonder_provider; do loaded && die`
+     原本跑在 `same_boot` 幂等分支**之前**，于是同一 boot 里第二次 `start` 必然
+     `ERROR: unexpected live module wonder`——而「模块已加载」正是第二次 start 的定义。现场被它挡过
+     两次，两次都是绕道 `link`，等于跳过了这个函数存在的意义（WiFi 记账）。现在幂等分支在前，
+     守卫只作用于冷路径。
+  5. 删掉 `WONDER_FREQS`（已无调用者）；重写文件头与 `AWDL_FREQ` / `KEEP_WIFI` 三处注释块，
+     把上面这些实测证据和「72% 的真正含义」写进去。
+
+  **顺手记一条待验**：`WifiNetworkSuggestion.Builder.setBssid()` 可以把 STA 钉在
+  `f8:ce:21:60:00:94`（5745）。若成立，共享模式就能从 45% 回到接近 0%——价值不在「让 tap 追 STA」，
+  而在「让 STA 迁就 tap」，方向正好相反。半小时可验。
+
+- **2026-11-14 18:47**：**「连不上」是我自己造的污染态；但「跟随 STA」当默认值是错的。** 这一轮把
+  18:31 那批改动上机验证完，结论分两半。
+
+  **第一半：`REASON_1X_AUTH_FAILURE` 与驱动无关。** 之前为了测密码我用 `connect-network` 传过一个
+  猜的 `Lingbai@2024`，把 `百灵青年公寓13楼-5G` 写成坏 PMK，随后连续四次握手失败让系统把它置成
+  `NETWORK_SELECTION_TEMPORARY_DISABLED`（配置库里 PSK 后来虽已是正确的 `12345678`，这个状态仍在）。
+  `forget-network 59` + 重新保存**不足以**清掉：dmesg 里仍是 `Assoc rsp RX` → `Connect ... is SUCCESS`
+  → 4 s 后 `reason:23`。真正清掉它的是 `awdl-stack.sh stop`（停 HAL → 换回原厂驱动 → `svc wifi enable`），
+  之后一次连上：`192.168.13.69`、5220 MHz、286 Mbps。
+  由此否掉 18:15 的猜测：**wonder.ko 不会打断 4-way 握手**——在原厂驱动连上后再 `start` 加载 wonder 并把
+  `wonder0` 拉起来，STA 在 5745 稳定保持 24 s 以上（`-34 dBm`），无一次重连。
+
+  **第二半：「跟随 STA」不能当默认值。** 三组测量，同一二进制、同一对端（iPhone `2a:d8:dc:5d:8c:5a`），
+  每组 `ping6 -c 40 -i 0.2`：
+
+  | 配置 | 丢包 | 佐证 |
+  |---|---|---|
+  | STA 在 5745、tap 在 5745（同信道） | 10%（18/20 那组 min RTT 6.6 ms） | `phy=149` |
+  | 跑到一半 STA 漫游到 5220，tap 仍在 5745 | **72%**（11/40） | `phy=44!5220MHz` |
+  | WiFi 关闭、射频独占 | **0%**（40/40，min RTT 5.8 ms） | `phy=149` |
+
+  中间那行是关键：这栋楼把多个 AP 放在同一 SSID 上（`f8:ce:21:60:00:94`=5745、`...:97`=5220），手机按
+  信号自己漫游；而 **tap 一旦 up 就不能改频**——18:22 逐个试 `WONDER_FREQS` 时，除当前所在频率外全部
+  返回 `-95 EOPNOTSUPP`。所以「跟随」的真实含义是「每次漫游都把 IBSS 拆了重入」，每次拆都要让对端丢掉
+  我们的 map 好几秒（`STAT` 里 `anchored` 直接重置就是证据）。跟随只在 STA 被钉死在一个信道上时才成立，
+  而我们没有钉死它的手段。顺便：daemon 侧的 `phy=44!` 与 `CHANNEL_MISMATCH` 这次**如实报出了漂移**，
+  这条观测手段本身是有效的。
+
+  因此 `awdl-stack.sh` 三处改动（`sh -n` OK，22088 字节）：
+  1. 新增 `KEEP_WIFI=${KEEP_WIFI:-0}`。`cmd_start` 不再无条件把 WiFi 恢复：默认保持关闭，射频独占；
+     `KEEP_WIFI=1 awdl-stack.sh start` 才恢复共享（并在 `link_up` 之前恢复，好让 `pick_freq` 看得到 STA）。
+     注释里写进了上面三行数据作为选择依据。
+  2. `cmd_stop` 补齐「把 WiFi 还回来」：按 `$STATE/wifi-before` 恢复。之前 `stop` 之后手机一直是离线的，
+     得手动去点快捷开关（实测 `wifi=0` → 修后 `wifi=1`）。
+  3. `wait_sta 15` 收进 `if [ "$KEEP_WIFI" = 1 ]`。原来 wifi 本来就没开时白等 15 秒去问一个已知答案；
+     `link` 的耗时从 15 s+ 降到 **0.36 s**。
+
+  **当前可复现参考态**（默认 `start` → `link` → `awdld` 不带 `--channel`）：
+  `link_freq=5745 source=no-sta`、`CHANNEL own=149 src=link-freq`、`phy=149`（无 `!`）、
+  `rx` 持续增长、`peer=2a:d8:dc:5d:8c:5a`、`ping6 -c 40` **0% 丢包**。
+  注意 `avg RTT 271 ms` / `+114 duplicates` 是 `--burst 4` 的四份副本各自被回了一次，不是链路时延；
+  真实时延看 `min`。
+
+- **2026-11-14 18:31**：**5745 不是驱动钉死的，是脚本选的。** 这一条把 17:53 的「我们没有选信道的
+  权力」再修一半：权力有，只是**一处**——`wonder-ven feed <freq>`。回 `legacy/kernel/` 正查 `5745`，
+  命中项全部与 wonder 无关：
+  `wonder/band_config.c:105` 只是 5 GHz 信道表里的一条（同表还有 2437/5180/5200/5220/5240/5745/
+  5765/5785/5805）；`driver/wlan_hdd_wondertap.c` 里所有频率都来自 `params->freq`，经
+  `__wlan_hdd_set_wondertap_channel()` → `hdd_validate_channel_and_bandwidth()` →
+  `req.target_chan_freq = params->freq` 原样下发；唯一那句 `if (freq != 5745 || ...)`（第 166 行）在
+  `opairshare_prepare_sta_dbs()` 里，且被首行 `if (!passthru_sta_force_dbs) return 0;` 挡着（默认关），
+  与建链无关。**所以 5745 是 `awdl-stack.sh` 那行常量的一个选择，不是设备属性。**
+- **2026-11-14 18:31**：**建链脚本改成「跟随 STA」，并把「谁决定频率」写进文件。** 常量的注释原本
+  写的是「wonder.ko 把射频钉在 5745」——不成立，改成三条来源：
+  ① 显式 `AWDL_FREQ`（`override`）；② `wlan0` 实际频率（`sta`）；③ 社会信道兜底（`no-sta`）。
+  另加 `WONDER_FREQS` 白名单，因为喂一个 wiphy 不列的信道会让 `hdd_validate_channel_and_bandwidth`
+  直接拒绝、**tap 永远停在 DOWN**（比 join 失败难查得多）。四种来源都会明说，实测确实触发过
+  `source=not-in-wiphy(2462)`——`wlan0` 连在 ch11，而 wonder 的 2.4 G 表里只有 2437（ch6）。
+  **`link-freq` 便条**：由建链脚本写、daemon 从 `current_exe().parent()/link-freq` 读回。理由是
+  「`--channel` 由启动进程的人拼，射频由喂 tap 的人决定」，两个进程各自凭记忆拼同一个数字就是
+  宣告与射频分家的机制；让决定的那一方写下来。`--channel` 仍可覆盖（`channel_given` 区分
+  「输入 149」与「默认恰好是 149」），`CHANNEL own= src=` 打出 `flag`/`link-freq`/`social-guess`，
+  最后一档额外往 stderr 喊一句。**实测**（`run11.sh`，故意不带 `--channel`）：
+  `CHANNEL own=149 src=link-freq`，便条这条路通了。
+- **2026-11-14 18:31**：**`wait_sta` 是必需品，不是保险。** `cmd_start` 是
+  `svc wifi disable → 暂停 HAL → 换驱动 → 恢复 HAL → svc wifi enable` 后立刻 `link_up`，此刻
+  supplicant 还在扫描认证，`iw dev wlan0 info` 里**根本没有 `channel` 行**，`sed` 输出空串，解析
+  等于「没有 STA」，链路被钉回社会信道——要消灭的行为只是从「常量写死」变成了「时序写死」。
+  上机第一次 `start` 就命中了（`source=no-sta`，而同一次 `status` 已打出 `sta_freq=5745`，STA 只是
+  晚了一步）。修法是 `wait_sta 15`，超时才说
+  `wlan0 has no channel after 15s; the link cannot follow it`。
+- **2026-11-14 18:31**：**跑起来之后射频漂走，要看得见。** 启动时一次性 `CHANNEL_MISMATCH`
+  （只打一次，每 5 秒一条没人读的日志等于没有），加上每 5 秒 `STAT ... phy=` 的 `!` 记号，覆盖
+  「启动时就已不一致」和「跑起来之后才漂走」两种情形。`STAT` 里的 `own=` 与 `phy=` 是同一件事的
+  两个说法，摆在一起才看得出分家。
+- **2026-11-14 18:31**：**推翻我自己 18:0x 的一个假设：`REASON_1X_AUTH_FAILURE` 与 wonder/驱动无关。**
+  现场是 `Assoc rsp RX` → `Connect ... is SUCCESS` → 4 ms 后 `[wonder][mac80211] RX filter configured`
+  → 4 s 后 `reason:23 REASON_1X_AUTH_FAILURE`，太像 wonder 抢了 EAPOL。做了对照：`iw dev wonder0 del`
+  之后（dmesg 有 `wonder_flush()` / `Removed virtual interface` / `HW stopped`），重连**仍然是**
+  `reason:23`，且不再出现任何 `RX filter` 行。真因在配置库里：
+  `WifiConfigStore.xml` 只有 `百灵青年公寓12楼-2.4G`（PSK `12345678`），**没有 `13楼-5G` 这条**，
+  supplicant 拿不到 PSK，4-way 握手必然失败（`WPA: 4-Way Handshake failed - pre-shared key may be
+  incorrect`）。现在 `wlan0` 实际连的是 `12楼-2.4G`（ch11 / 2462 MHz / 192.168.12.15）。
+  **教训**：`REASON_1X_AUTH_FAILURE` 先查「这条网络有没有 PSK」，再怀疑驱动。
+- **2026-11-14 18:31**：**`filter` 是 BSSID 过滤器，`foreign=0` 不能用来判断收包路径。**
+  `wonder-ven` 的用法是 `<ifname> feed [freq] [bssid] [cc]`，脚本喂的是 Apple 固定 BSSID
+  `00:25:00:ff:94:73`，所以非 AWDL 流量在固件层就被滤掉了——`other=0 / foreign=0` 只说明
+  「没有 AWDL 帧到达」，不说明收不到包。18:08 那次 `other=2965 anchored=2715 peer=2a:d8:dc:5d:8c:5a`
+  已经证明收包是通的；本次 `rx=0 phy=? peer=none` 的原因是 iPhone 的 AWDL 没在发（分享面板没开）。
+  **验收时的前提要写清**：判 `rx=` 之前必须先确认对端 AWDL 是活的。
+  度量：`cargo test -p opairdrop-awdl` 92 passed；`clippy --target aarch64-linux-android
+  --all-targets` 零 warning；`awdld` **399 744 字节**；`awdl-stack.sh` 17 495 字节。
+- **2026-11-14 17:53**：**`--channel` 从来没进过射频。收音机上真正坐着哪个频率，驱动写在 radiotap 里，读出来是 5745。**
+  这一条把 17:30 的「信道选错」再往下钉了一层：不是我们选错了信道，是**我们根本没有选信道的权力**。
+
+  **判据的来历。** `wondertap0` 抓到的是 linktype 127（radiotap），头里 `IEEE80211_RADIOTAP_CHANNEL`
+  字段是驱动在收帧那一刻写的，不是我们伪造的。`rtchan.py` 一开始输出「320 MHz」，那不是信道，是我把
+  `struct ieee80211_radiotap_channel { u16 freq; u16 flags; }` 的两个 u16 读反了——`71 16 40 01` 里
+  `0x1671` = **5745**（ch 149），`0x0140` 才是 flags（OFDM + 20 MHz）。改正后的两个抓包：
+
+  | 抓包 | 5745 MHz（ch 149） | 5220 MHz（ch 44） |
+  | --- | --- | --- |
+  | `c44.pcap`（`awdld --channel 44` 期间） | **10 帧** | 4 帧 |
+  | `cap9-149.pcap`（`--channel 149` 期间） | 11 帧 | **23 帧** |
+
+  **`--channel 44` 跑着的时候，空口进来的帧绝大多数仍在 5745。** 同时两组都出现两种频率，说明 phy
+  在抓包过程中**来回跳**。跳的方向跟着 `wlan0`——本机连着 AP 的那个 STA vif。`iw dev wonder0 info`
+  报 149 是对的，`--channel` 只是个打印用的标签：`args.channel` 只被 `NodeInfo::master_of` 与
+  `LINK_UP` 拿去显示，`Radio` trait 里连 `set_channel` 都没有。`iw dev wonder0 set channel 44` 在
+  IBSS 下直接 `-16 busy`。
+
+  **顺带把「哪些帧带 radiotap 频率」也分类清楚了**，否则「14/120 帧有信道字段」会被误读成抓包残缺：
+
+  | radiotap 长度 | present | FC | 帧数 | 是什么 |
+  | --- | --- | --- | --- | --- |
+  | 48 | `0x4000086f` | `0x00d0` | 14 | **空口来的**，驱动全头，带频率 |
+  | 9 | `0x00000004` | `0x00d0` | 95 | 我们自己注入的 announce，只有 RATE（`0x48` = 36 Mb/s） |
+  | 9 | `0x00000004` | `0x0088` | 4 | 我们自己的数据帧 |
+  | 9 | `0x00000000` | `0x0008` | 7 | 无字段 |
+
+  所以「带信道的帧少」不等于抓包残缺，等于**大部分记录是我们自己的回环**。以后看频率只看 48 字节那批。
+
+  **legacy 为什么没这个问题——它把 STA 拆了。** `Entry.java:566-577` 那段注释写得毫不含糊：
+
+  > mosey's network bring-up hard-depends on tearing the STA down first
+  > (**single radio, dbs=0**)
+
+  单射频、没有双频同时工作，所以 legacy 在开 AWDL 期间**主动断掉 `wlan0` 的关联**，phy 独占，信道由
+  mosey 自己设，不存在两套上下文打架；会话结束再由 `hookWifiRestore` 把 STA 拉回来。配套的
+  `DiscoveryChannels.java:8-14` 只在 STA 连着 5 GHz 时才把发现信道钉成 `149`——这是给部署版的
+  `fixed149` 兜底，不是让它去改射频。
+
+  **我们现在的处境**：`wlan0` 保持连着，`wonder0` 挂在同一个 phy 上，mac80211 只能让两边轮流用
+  射频。于是 announce 里写的 16 槽时间表在物理上是假的：一半的窗口 phy 待在 AP 的信道上。44 那组
+  18/20 之所以好看，是 `wlan0` 当时恰好在 44，两边同信道不需要切换；换成 149 而 `wlan0` 在 44，
+  就变成 11/20。
+
+  **两条出路，二选一，别再靠巧合：**
+  1. **跟随**：启动时读 `wlan0` 的实际频率，`--channel` 默认取它，STAT 里把 `phy=`（真实）与
+     `own=`（宣告）并排打出来。phy 不动就不丢帧，代价是 AWDL 只能待在 AP 的信道上。
+  2. **独占**：照 legacy 断 STA，再显式 `set_channel`。链路质量最好，代价是会话期间没有网。
+
+  先做第 1 条，因为它不需要动内核也不打断用户的网，而且它能让「信道」这个变量立刻从噪声变成常量；
+  第 2 条等 TCP 数据面通了再作为可选开关。
+
+- **2026-11-14 17:30**：**抓包抓到 iPhone 自己 announce 的信道序列，「槽选错」这条结论要改口径——真正大一级的是「信道选错」。**
+
+  **判据不是我们的解析器，是空中的字节。** `tcpdump_odm -i wondertap0 -c 400 -w cap9-149.pcap` 抓下
+  284 帧动作帧，按发送者 MAC 分组（`ana-cap9b.py`），直接从 TLV 里读 `0f 03` 之后那 32 个
+  (channel, class) 对。iPhone（`2a:d8:dc:5d:8c:5a`）的 34 帧里出现两种形状：
+
+  ```
+  23x  44 44 149 0 0 0 0 44 6 44 149 44 0 0 0 44    class 128 128 128 0 0 0 0 128 81 128 128 128 0 0 0 128
+  11x  44  0 149 0 0 0 0  0 6  0 149  0 0 0 0  0    class 128   0 128 0 0 0 0   0 81   0 128   0 0 0 0   0
+  ```
+
+  **它在 44 上有 6 个槽，在 149 上只有 2 个，在 6 上有 1 个。** 而我们整轮都坐在 149 上——理论上限
+  就是 2/16 = 12.5%，实测 7/20 = 35% 已经超过这个上限（接收端并不严格按这张表听），但量级已经
+  注定。16:40 那条记的 `map=149,149,149,0,0,0,0,0,6,149,149,0,0,0,0,0`「五个槽在 149」只在某一种
+  轮转姿态下成立：两种形状在同一个抓包里交替出现，2 个 44 的那 11 帧正是被我们当成「全表」的那一态。
+
+  **同信道 A/B，同一份二进制、同一个 iPhone，只改 `--channel`：**
+
+  | 我们的信道 | ping | 平均 RTT | `rx` | duplicates |
+  | --- | --- | --- | --- | --- |
+  | 149 | 7/20（65% loss） | 491 ms（`min` 213 ms） | 8p / 832 B | +1 |
+  | **44** | **15/20（25% loss）** | 410 ms（**`min` 6.5 ms**） | **46p / 4784 B** | **+31** |
+
+  收包量差 **5.75 倍**，`+31 duplicates` 是「对端在 44 上发得比 149 上多得多」的直接指纹；
+  `min=6.5 ms` 说明链路本身通得极快，卡的是槽对不上而不是射频不通。**这一条改了优先级：信道是
+  一级变量，槽内份数是二级变量。**
+
+  **顺带读到 legacy 真正在做什么（`AwdlFrame.java:606-629` `offerSequence`）。** 我们把「采纳对端
+  信道表」实现成了整表照抄（`if theirs.contains(&ours) { self.schedule.set_slots(theirs) }`），legacy
+  是逐槽判断、**只采纳对端落在「本信道」上的槽，其余槽保留本机信道**：
+
+  ```java
+  for (int i = 0; i < SLOTS; i++) {
+      if (seq[i] == channel) { if (slots[i] != channel) { slots[i] = channel; adopted++; } }
+      else { divergent++; }   // 对端在别的信道上，但我们不是；只能宣布我们在哪
+  }
+  ```
+
+  外加三道闸：`isMaster()` 不采纳、`from != sync` 不采纳（`"not-sync"`）、`SEQ_CONFIRM = 3` 帧一致
+  才信、`SEQ_HOLD_US = 1_100_000`（两改之间至少隔一个完整序列）。**整表照抄的后果是把可发槽从
+  15/16 砍到 5/16 甚至 1/16**，等于自己把自己静音。这是已定位、未修的缺陷，下一步先修它。
+
+  **结论：`map=` 不是我们自己的回读，是对端真实序列。** 以后凡「槽对不对」的判断一律以抓包为准，
+  不接受解析器自证。
+
+- **2026-11-14 16:40**：**AWDL 数据面进了 Rust，并且「为什么只有 3/20」被查成了两个互不替代的原因。**
+
+  **结果**：新增 `crates/awdl`（4477 行，`cargo test -p opairdrop-awdl` **83 passed**，clippy 零
+  warning）。`bin/awdld` 一个进程把 `/dev/tun` 与 `wondertap0` 接起来：`link.rs` 管队列、窗口与
+  副本，`schedule.rs` 管 16 槽 / AW / PSF / 跟随，`action.rs` 管 PSF/MIF/选举/对端信道表，
+  `frame.rs` + `mac.rs` 管字节，`linux/{packet,tun}` 管两端 socket。真机判据从基线 **3/20** 提到
+  **12/20**。
+
+  **这条路是用 legacy 的注释一条条对出来的，不是猜的。** `AwdlData.java` 里每处「这么做，因为
+  某次实测如此」都带了数字，我们此前把它们全丢了，于是把老实现已经踩过的坑重踩了一遍。四条：
+
+  | 发现 | legacy 出处 | 我们原来的状态 | 补上之后的量级 |
+  | --- | --- | --- | --- |
+  | 小包要在**一个槽的四个 AW 里各发一份**（`awBurst = 4`） | `:112-148`、`:169`（`burstMaxBytes=496`） | 无队列，单发 | 0/20 → 4/20 |
+  | 副本必须**各带新序号**（同序号副本在 MAC 之上被当重复丢掉） | `:2812-2820` | —— | 每份现建帧 |
+  | 发送前有**信道闸门**（对端那张 16 槽表的当前槽不是本信道就不发） | `:2505-2509` | 16 槽恒为 149，等价于永久可发 | 4/20 → **12/20** |
+  | 窗口是**瞄准而非许可**（`edgeWaitUs`） | `:4088-4152` | 无 | 见下 |
+
+  **结论一：丢包主因是槽选错，不是重复不够。** 这是本轮最有价值的一条。把对端 PSF 里的那张表
+  解出来之后，iPhone 实际的 16 槽长这样：
+
+  ```
+  map=149,149,149,0,0,0,0,0,6,149,149,0,0,0,0,0
+  ```
+
+  **只有 5 个槽在 149，1 个在 6，另外 10 个是 0（空槽）。** legacy 的注释写的是「它自己序列里空着的
+  那七个槽」，实测是十个。**（17:30 ⚠️ 此读数已作废：抓包显示同一台 iPhone 在 44 上有 6 槽、149 上
+  只有 2 槽，这张「五个 149」只是它的两态之一。见上一条。）** 我们此前 16 槽全发，等于 **11/16 的时间在对着空气喊**——而且这一半的
+  损失用重发是补不回来的：同一个槽里发四份、八份，四份八份共享这一个槽的命运。这正是为什么
+  「每槽几份」扫不出峰值、「跨过几个槽」才有翻倍的实测形状：
+
+  | 副本数（闸门未接） | 结果 | 帧数 |
+  | --- | --- | --- |
+  | 1 | 0/20 | 19 |
+  | 2 | 0/20 | 48 |
+  | 4 | 1/20 | 96 |
+  | 8 | 2/20 | 192 |
+
+  八份 = 128 TU = 跨两个槽，成果正好是四份的两倍。**成功率跟着「跨了几个槽」走，不跟着「每槽几
+  份」走**——这就是闸门缺失的指纹。
+
+  **结论二：槽对了之后，槽内四份又变成主要贡献。** 同一套代码接上闸门再扫：`burst=1` → 1/20，
+  `burst=4` → **12/20**。两条缺一不可，而且顺序不能反：先保证槽在 149，再保证槽内四个 AW 各一份。
+  另外那张表**在两次运行之间会变**（另一次读到 `44,0,149,…`），说明 iPhone 的社交槽在轮转——所以
+  它必须每帧重读，不能缓存一次用到底。
+
+  **结论三：一份突发必须整个装进一个窗口，装不下就整包推迟。** `burst=6` 比 4 更差（丢包回到
+  60%，平均 RTT 4.7 s，另有 11 个重复包）：六份 = 80 TU，而窗口只有 53 TU 宽（`WINDOW_LAST_TU=56`
+  减 `UNICAST_GUARD_TU=3`），尾巴必然越界落进下一个槽，而下一个槽可能不在 149 上——那份副本花的
+  是射频时间，买的是零。所以 `flush` 现在会先算「第一份能发、最后一份会不会越界」，会越界就把整包
+  推到下一个本机槽的 guard 边，并计入新计数器 `tx_deferred`。两个边界条件写死：
+  **`burst_fits` 为假时一律不推迟**（宽到任何时刻都装不下，推迟就是队列永不排空；多播 guard 16 TU
+  + 3×16 = 64 > 53，天生如此）；**推迟只发生在第一份之前**，已经发出的副本不回收。
+
+  **结论四（已排除）：`elect=self` / `err=-3~-4tu` 不是瓶颈，不要再往这里查。** 曾怀疑
+  「听到了帧却从不跟随时钟」。三条证据把它否掉了：`anchored` 每秒涨 3–4，说明帧在收、跟随在写；
+  `error_tu` 与 `follow` 严格互逆（测试里跟随后立刻测误差为 0），所以 -3/-4 TU 是**固定偏置**而不是
+  「没跟上」；窗口宽 53 TU，偏 4 TU（≈4 ms）在窗口之内。真正吃包的是槽选错，量级差了一个数量级。
+
+  **两条被实测否掉的错法，记在这里免得再试一次：**
+  ① 不要「等到 guard 就发」（只等 1–3 TU）：9.43 s → 10.22 s，客户端卡顿 1304 → 2090 ms；
+  ② 不要用 `ping6 -I <ifname>` 判链路：IPv6 链接本地必须写作用域 `fe80::…%awdltun0`，`-I` 走的是
+  `IPV6_PKTINFO` 另一条路径，直接 `EINVAL`，会让人以为「连不上」。同理
+  `opairsharerx0` 只覆盖约 13% 的空中帧，「抓包里没有我们」不能当判据。
+
+  **设备侧工具**：`run7.sh` / `run8.sh`（`--burst N` 扫副本数，`ping6 -c 20 …%awdltun0`，前后各打一次
+  `STAT`）。`--burst` 是有意留成运行期开关的：副本数该不该跟对端的槽表联动，是个只能问射频的问题，
+  答案要能一次问完而不重编。
+
+  **下一步**：先把 TCP 跑通（8770 服务端 + `nc`），再补 mDNS 应答器——这两层不补，§10 第 1 条的
+  「iPhone 能看到本机」仍然不成立，理由见 13:10 那条。
 
 - **2026-11-14 13:10**：**手动拉起链路成功，但「iPhone 能看到本机」这个验收前提被推翻了。**
   照 §7.3 的序列把整条栈拉起来了（`tools/awdl-stack.sh`，见下），并且在本机把业务面也验到了：

@@ -69,22 +69,80 @@ javac -d "$classes" \
   "$here"/com/oshare/airdrop/Native.java \
   "$here"/com/oshare/airdrop/Report.java \
   "$here"/com/oshare/airdrop/RoundTrip.java \
+  "$here"/com/oshare/airdrop/RadioShare.java \
+  "$here"/com/oshare/airdrop/RadioCheck.java \
+  "$here"/com/oshare/airdrop/StackState.java \
+  "$here"/com/oshare/airdrop/StackCheck.java \
   "$here"/com/oshare/airdrop/SettingsScreen.java \
-  "$here"/com/oshare/airdrop/SettingsCheck.java
+  "$here"/com/oshare/airdrop/SettingsCheck.java \
+  "$here"/com/oshare/airdrop/Der.java \
+  "$here"/com/oshare/airdrop/Identity.java \
+  "$here"/com/oshare/airdrop/IdentityStore.java \
+  "$here"/com/oshare/airdrop/IdentityCheck.java
 
 # The two entry points take different arguments, so they cannot share a command line: the
 # round-trip is handed the fixture it was built for, the settings page only a scratch
 # directory to write its own file into.
 run_java() {
-  java -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8 \
+  java -Xcheck:jni -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8 \
     -Djava.library.path="$(native "$target")" \
     -cp "$classes" "$@"
 }
 
+# HotSpot answers a JNI call made while an exception is pending with a warning; Android's
+# CheckJNI aborts the process over the same call, and did — a peer that reset mid-request left
+# `SocketException: Connection reset` pending from the reader and `NewByteArray` took the whole
+# app down, in `adb logcat -b crash`. The two JVMs disagree about the penalty, not about the
+# finding, so the finding is promoted to the penalty here: a build that warns on this desktop
+# kills that phone, and this is the only place the warning can be seen before it ships.
+#
+# `-Xcheck:jni` is what makes the check possible at all. Without it HotSpot does not look, and
+# every case below passes on a library that would crash on the device.
+run_checked() {
+  local out="$work/jvm.out" log="$work/jvm.err"
+  if ! run_java "$@" >"$out" 2>"$log"; then
+    cat "$out" "$log" >&2
+    echo "the JVM exited non-zero" >&2
+    exit 1
+  fi
+  cat "$out"
+  cat "$log" >&2
+  # Both streams: HotSpot writes this particular warning to stdout, where it would otherwise
+  # be read as part of the checks' own output.
+  if grep -q 'JNI call made with exception pending' "$out" "$log"; then
+    echo "a JNI call was made while an exception was pending; Android aborts the process for" >&2
+    echo "this, so the warning above is treated as a failure here" >&2
+    exit 1
+  fi
+}
+
 echo "running the round-trip"
 mkdir -p "$work/scratch"
-run_java com.oshare.airdrop.RoundTrip "$archive" "$inbox" "$names" "$(native "$work/scratch")"
+run_checked com.oshare.airdrop.RoundTrip "$archive" "$inbox" "$names" "$(native "$work/scratch")"
 
 echo "running the settings page"
 mkdir -p "$work/settings"
-run_java com.oshare.airdrop.SettingsCheck "$(native "$work/settings")"
+run_checked com.oshare.airdrop.SettingsCheck "$(native "$work/settings")"
+
+# The identity is the one thing a peer pins by value: publish a hash and serve another and
+# every receiver sees a device that does not match its advertisement. Its DER is built by hand,
+# so `verify()` — which recomputes the signature over our TBS — is the only check that would
+# notice a wrong length or a field out of order. The directory is fresh per run, because the
+# interesting cases are the ones a second run would not reach: what a truncated file leaves
+# behind, and whether the identity that replaces it is still coherent.
+echo "running the identity"
+mkdir -p "$work/identity"
+run_java com.oshare.airdrop.IdentityCheck "$(native "$work/identity")"
+
+# The radio switch is two files and a sentence, and it is driven with a directory of its own
+# rather than the settings one: the daemon watches that directory on the phone, and a check
+# that wrote a request into a fixture would be describing a phone that is really being asked.
+echo "running the radio switch"
+mkdir -p "$work/radio"
+run_java com.oshare.airdrop.RadioCheck "$(native "$work/radio")"
+
+# The bring-up receipt is the only thing the app is allowed to say about the link, so its
+# shapes are driven here too: `stack up`, `stack partial`, `stack failed`, and no file at all.
+echo "running the bring-up receipt"
+mkdir -p "$work/stack"
+run_java com.oshare.airdrop.StackCheck "$(native "$work/stack")"

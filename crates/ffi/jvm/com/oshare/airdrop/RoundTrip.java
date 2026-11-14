@@ -5,6 +5,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -46,6 +47,7 @@ public final class RoundTrip {
         receiveLandsEveryMember(archive, inbox, expected);
         serveAnswersAPeerAndStoresWhatItSends(archive, scratch, expected);
         aStreamThatGivesUpKeepsItsOwnException(archive, inbox);
+        aVanishingPeerIsOneConnectionAndNotTheProcess(scratch);
         aMissingStreamIsRefusedRatherThanDereferenced(inbox);
         aSettingOutsideItsRangeIsRefusedBeforeAByteIsRead(archive, scratch);
         overwritingReplacesRatherThanNumbering(archive, scratch);
@@ -171,6 +173,67 @@ public final class RoundTrip {
         }
     }
 
+    /**
+     * A peer that vanishes mid-request must cost one connection, not the process.
+     *
+     * <p>The endpoint answers before it reads a body, so a request that promises a body and
+     * then loses its peer is answered {@code 200} <em>and</em> fails: the answer has already
+     * left, the body never arrived, and the reader is holding the exception that says why.
+     * Both are true at once, and the call still ends with an empty report — which is the state
+     * that used to be unrepresentable across the JNI boundary. {@code NewByteArray} was called
+     * with that {@link SocketException} still pending, and CheckJNI aborts the whole process on
+     * any JNI call made in that state, so this conversation killed a phone rather than ending a
+     * connection. Measured there, in {@code adb logcat -b crash}:
+     *
+     * <pre>
+     * Abort message: 'JNI DETECTED ERROR IN APPLICATION: JNI NewByteArray called with
+     *     pending exception java.net.SocketException: Connection reset in call to NewByteArray'
+     * </pre>
+     *
+     * <p>None of this is Android-specific — a desktop JVM refuses the same call the same way,
+     * by aborting — which is why the case belongs here as well as in a probe on a device. What
+     * is asserted is the shape a receiver needs: the peer is answered, nothing is stored, the
+     * caller gets the socket's own exception rather than a substitute, and the checks after
+     * this one still get to run.
+     */
+    private static void aVanishingPeerIsOneConnectionAndNotTheProcess(Path scratch)
+            throws Exception {
+        Path inbox = Files.createDirectories(scratch.resolve("vanishing"));
+        // `/Discover` and not `/Upload`: the answer does not depend on the body, so the whole
+        // sequence — answer, then fail on the body — happens without a decision being asked.
+        String head = "POST /Discover HTTP/1.1\r\n"
+                + "Host: air\r\n"
+                + "Content-Type: application/x-apple-binary-plist\r\n"
+                + "Content-Length: 200\r\n\r\n";
+        ByteArrayOutputStream requests = new ByteArrayOutputStream();
+        requests.write(head.getBytes(StandardCharsets.US_ASCII));
+        requests.write(new byte[12], 0, 12);
+
+        String marker = "Connection reset";
+        ByteArrayOutputStream answers = new ByteArrayOutputStream();
+        Throwable stopped = null;
+        byte[] frame = null;
+        try (InputStream in = new VanishingStream(requests.toByteArray(), marker)) {
+            frame = Native.serveDecided(inbox.toString(), "", "Pixel Test", in, answers,
+                    summary -> true);
+        } catch (Throwable error) {
+            stopped = error;
+        }
+
+        String answer = new String(answers.toByteArray(), StandardCharsets.ISO_8859_1);
+        check("a peer is answered before its body fails",
+                answer.startsWith("HTTP/1.1 200"),
+                answer.lines().findFirst().orElse("nothing was written"));
+        check("the socket's own exception reaches the caller",
+                stopped instanceof SocketException && marker.equals(stopped.getMessage()),
+                String.valueOf(stopped));
+        check("an abandoned control body stores nothing",
+                frame == null || Report.of(frame).names().isEmpty(),
+                "report named " + (frame == null ? "<none>" : Report.of(frame).names().toString()));
+        check("an abandoned control body leaves no temporary file behind",
+                listTemporaries(inbox).isEmpty(), "found " + listTemporaries(inbox));
+    }
+
     private static void aMissingStreamIsRefusedRatherThanDereferenced(Path inbox) {
         try {
             Native.receiveArchive(inbox.toString(), null, null);
@@ -278,6 +341,47 @@ public final class RoundTrip {
                 throw new IOException(message);
             }
             int count = Math.min(length, cut - at);
+            System.arraycopy(bytes, at, buffer, offset, count);
+            at += count;
+            return count;
+        }
+    }
+
+    /**
+     * Delivers its bytes and then fails the way a reset socket does, every time it is read.
+     *
+     * <p>The type is the point. {@link SocketException} is what a peer that goes away arrives
+     * as, and it is the type the receiving connection treats as routine rather than
+     * reportable, so a test that threw a plain {@link IOException} would walk the same JNI
+     * path and prove less about the decision at the end of it.
+     *
+     * <p>It keeps throwing rather than answering end-of-stream once spent, because that is
+     * what a dead socket does: the endpoint drains an abandoned body, and the second read is
+     * the one that found the pending-exception bug.
+     */
+    private static final class VanishingStream extends InputStream {
+        private final byte[] bytes;
+        private final String message;
+        private int at;
+
+        VanishingStream(byte[] bytes, String message) {
+            this.bytes = bytes;
+            this.message = message;
+        }
+
+        @Override
+        public int read() throws IOException {
+            byte[] one = new byte[1];
+            int got = read(one, 0, 1);
+            return got < 0 ? -1 : (one[0] & 0xff);
+        }
+
+        @Override
+        public int read(byte[] buffer, int offset, int length) throws IOException {
+            if (at >= bytes.length) {
+                throw new SocketException(message);
+            }
+            int count = Math.min(length, bytes.length - at);
             System.arraycopy(bytes, at, buffer, offset, count);
             at += count;
             return count;

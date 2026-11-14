@@ -4,3 +4,8 @@ android/build/
 android/app/build/
 .tmp/
 *.log
+
+# Working notes for a session: screenshots, `uiautomator dump` output, one-off probes.
+# Kept on disk because they answer "what did the screen actually look like", which is
+# the one question a log cannot. Never worth a commit.
+.workbuddy/

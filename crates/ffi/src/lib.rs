@@ -45,6 +45,7 @@ pub mod api;
 pub mod browse;
 pub mod buffer;
 pub mod jni;
+pub mod respond;
 pub mod send;
 pub mod serve;
 pub mod settings;

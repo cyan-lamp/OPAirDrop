@@ -210,6 +210,62 @@ public final class Native {
     public static native byte[] mdnsRecords(byte[] packet) throws IOException;
 
     /**
+     * Builds one announcement: the records that make this device visible to a peer browsing.
+     *
+     * <p>{@code instance} is the bare label — the name the other phone shows — and is escaped
+     * here, so a name containing a dot stays one name. {@code host} is the full
+     * {@code something.local} the SRV record targets and the AAAA records are owned by.
+     * {@code txt} is {@code key=value} per entry, in the order the record should carry them;
+     * {@code addresses} is one textual IPv6 address per entry, and any entry that does not
+     * parse is left out rather than failing the announcement.
+     *
+     * <p>{@code id} is zero for an announcement and the query's id for a unicast reply.
+     * {@code types} is a mask of {@link Responder}'s {@code RECORD_*} bits, so a caller can
+     * announce the address alone or withdraw everything. {@code ttl} is
+     * {@link Responder#TTL_AS_PUBLISHED} for each record's own lifetime, and {@code 0} to
+     * withdraw: a record sent with a zero lifetime is how RFC 6762 §10.1 says "delete this",
+     * and a responder that only stops announcing is remembered for seventy-five minutes.
+     *
+     * @return the DNS message as bytes
+     * @throws IOException if an address or a name cannot be put on the wire
+     */
+    public static native byte[] mdnsAnnounce(
+            String instance,
+            String host,
+            int port,
+            String[] txt,
+            String[] addresses,
+            int id,
+            int types,
+            int ttl);
+
+    /**
+     * Answers one query packet, or answers nothing when the packet asks nothing of ours.
+     *
+     * <p>The result carries a one-byte header before the message: {@code 0} means multicast
+     * it to {@code ff02::fb:5353}, {@code 1} means send it back to the address the query came
+     * from — which RFC 6762 §6.7 requires when the querier asked from a port other than 5353.
+     * An empty array means there is nothing to say, which is the ordinary answer to another
+     * device's own announcement and not an error.
+     *
+     * <p>The mask of records is decided here rather than by the caller: a {@code PTR} question
+     * for the service gets the whole instance, an {@code SRV} question brings the TXT and the
+     * address with it because an SRV without a certificate hash is a peer nobody can connect
+     * to, and a {@code TXT} or {@code AAAA} question gets exactly what it asked for.
+     *
+     * @return one flag byte and the DNS message, or an empty array
+     * @throws IOException if the packet is not a DNS message at all
+     */
+    public static native byte[] mdnsReply(
+            byte[] packet,
+            String instance,
+            String host,
+            int port,
+            String[] txt,
+            String[] addresses)
+            throws IOException;
+
+    /**
      * Sends {@code paths} to the peer on the far end of {@code input}/{@code output}.
      *
      * <p>The connection has to be established already — address, port and, for AirDrop, the

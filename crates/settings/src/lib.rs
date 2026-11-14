@@ -131,7 +131,14 @@ pub const CATALOG: &[Setting] = &[
         kind: Kind::Text { max_len: 200 },
         default: "",
         title: "AirDrop 名称",
-        summary: "对端在列表里看到的名字。留空则使用手机型号。",
+        summary: "对端在列表里看到的名字。留空则使用下面的机型。",
+    },
+    Setting {
+        key: "device.model",
+        kind: Kind::Text { max_len: 200 },
+        default: "",
+        title: "AirDrop 机型",
+        summary: "对端在探测应答里读到的机型。留空则使用系统报告的型号。",
     },
     Setting {
         key: "receive.directory",
@@ -706,6 +713,27 @@ mod tests {
             assert!(matches!(error, Error::Unstorable { .. }), "{bad:?} gave {error:?}");
         }
         assert!(values.set("receive.directory", "Download/Air").is_ok());
+    }
+
+    #[test]
+    fn the_model_row_is_blank_by_default_and_blank_means_use_the_system() {
+        // Blank is not "no model", it is the instruction to fall back to whatever the
+        // operating system reports — which is why the default is empty and why an empty value
+        // has to be legal rather than something the table refuses.
+        let mut values = Values::new();
+        assert_eq!(values.get("device.model"), Some(""));
+        values.set("device.model", "iPhone 18").unwrap();
+        assert_eq!(values.get("device.model"), Some("iPhone 18"));
+        // The space is the interesting character: it is what makes the SRV target differ from
+        // the name, so the table must not be the layer that refuses it.
+        assert!(values.set("device.model", "iPhone 18 Pro").is_ok());
+        // A tab still breaks the storage line, here as everywhere.
+        assert!(matches!(
+            values.set("device.model", "iPhone\t18").unwrap_err(),
+            Error::Unstorable { .. }
+        ));
+        // And the refusal left the previous value alone.
+        assert_eq!(values.get("device.model"), Some("iPhone 18 Pro"));
     }
 
     #[test]

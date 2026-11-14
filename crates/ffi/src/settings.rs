@@ -47,6 +47,9 @@ const OVERWRITE: &str = "receive.overwrite";
 /// Key of the name this device answers a peer with.
 const DEVICE_NAME: &str = "device.name";
 
+/// Key of the model this device answers a peer with.
+const DEVICE_MODEL: &str = "device.model";
+
 /// Suffix of the sibling a save is written to before it is renamed into place.
 const PARTIAL: &str = ".part";
 
@@ -214,17 +217,48 @@ pub(crate) fn limits(values: &Values) -> Limits {
     }
 }
 
-/// The name to answer a peer with: `device.name`, or `model` when that is blank.
+/// The name to answer a peer with: `device.name`, or the model when that is blank.
 ///
-/// The fallback is here rather than at the call site because the table already promises it
-/// — the row's summary is 留空则使用手机型号 — and a promise the code does not keep is the
-/// kind of setting this file exists to avoid. `model` comes from the caller because the
-/// operating system is the only thing that knows it; it is not a row, and putting it in one
-/// would invite a person to rename their phone model.
-pub(crate) fn name(values: &Values, model: &str) -> String {
-    match values.get(DEVICE_NAME).map(str::trim) {
-        Some(entered) if !entered.is_empty() => entered.to_string(),
-        _ => model.to_string(),
+/// The fallback goes through [`model`] rather than straight to the caller's argument, so a
+/// person who has set a model but not a name is called by the model they chose. Two answers to
+/// one question — the row, and whatever this function decided — is the drift this file exists
+/// to prevent.
+pub(crate) fn name(values: &Values, system: &str) -> String {
+    match trimmed(values, DEVICE_NAME) {
+        Some(entered) => entered.to_string(),
+        None => model(values, system),
+    }
+}
+
+/// The model to answer a peer with: `device.model`, or the one the system reports when blank.
+///
+/// `system` is the caller's `Build.MODEL` — the only thing in the process that knows what the
+/// phone is — and the row being blank means "use it", exactly as blank in `device.name` means
+/// "use the model". A row nobody has touched changes nothing a peer sees.
+///
+/// This used to be an argument only, with the reason written down: a row for the model would
+/// invite a person to rename their phone. That is precisely what it is for. The field is
+/// display-only on both sides of the protocol — nothing parses it, nothing branches on it, no
+/// sender decides anything from it — and a device that wants to say `iPhone 18` has no other
+/// way to say it. What the row cannot change is the capability blob in the `/Discover` answer:
+/// that is [`opairdrop_airdrop::MEDIA_CAPABILITIES`], a constant shared with every other
+/// implementation, and it says `{"Version": 1}` rather than naming a device at all.
+pub(crate) fn model(values: &Values, system: &str) -> String {
+    match trimmed(values, DEVICE_MODEL) {
+        Some(entered) => entered.to_string(),
+        None => system.to_string(),
+    }
+}
+
+/// The value of `key` when it is present and not blank after trimming.
+///
+/// Blank is how the table spells "not set" for both device rows, so the emptiness has to be
+/// decided in one place: a name of three spaces is a name a person cannot see on the peer's
+/// screen, which is a worse outcome than falling back.
+fn trimmed<'a>(values: &'a Values, key: &str) -> Option<&'a str> {
+    match values.get(key).map(str::trim) {
+        Some(entered) if !entered.is_empty() => Some(entered),
+        _ => None,
     }
 }
 
@@ -391,5 +425,39 @@ mod tests {
     fn text_that_is_not_utf8_is_refused_with_an_explanation() {
         let message = values_from(&[0xff, 0xfe]).expect_err("not UTF-8");
         assert!(message.contains("UTF-8"), "{message}");
+    }
+
+    #[test]
+    fn a_blank_name_falls_back_through_the_model_row_to_the_system_one() {
+        let mut values = Values::new();
+        // Nothing set: the caller's own model is the answer, which is what an untouched
+        // installation has always shown a peer.
+        assert_eq!(name(&values, "pjz110"), "pjz110");
+        assert_eq!(model(&values, "pjz110"), "pjz110");
+
+        // Model set, name not: both answers become the model, because a peer that draws the
+        // name and the model in the same panel should not see two different devices.
+        values.set(DEVICE_MODEL, "iPhone 18").expect("a text row");
+        assert_eq!(model(&values, "pjz110"), "iPhone 18");
+        assert_eq!(name(&values, "pjz110"), "iPhone 18");
+
+        // Name set: it wins the name answer, and the model answer keeps its own row.
+        values.set(DEVICE_NAME, "书桌旁的手机").expect("a text row");
+        assert_eq!(name(&values, "pjz110"), "书桌旁的手机");
+        assert_eq!(model(&values, "pjz110"), "iPhone 18");
+    }
+
+    #[test]
+    fn whitespace_only_counts_as_not_set_and_surrounding_space_is_trimmed() {
+        let mut values = Values::new();
+        // Spaces are legal in a text row and invisible on the peer's screen, so a row holding
+        // nothing but spaces has to fall back like an empty one rather than answer with them.
+        values.set(DEVICE_NAME, "   ").expect("spaces are text");
+        values.set(DEVICE_MODEL, "  ").expect("spaces are text");
+        assert_eq!(name(&values, "pjz110"), "pjz110");
+        assert_eq!(model(&values, "pjz110"), "pjz110");
+
+        values.set(DEVICE_NAME, "  书房  ").expect("a text row");
+        assert_eq!(name(&values, "pjz110"), "书房");
     }
 }

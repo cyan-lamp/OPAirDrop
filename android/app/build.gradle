@@ -9,6 +9,19 @@ def repoRoot = rootProject.projectDir.parentFile
 def rustTarget = 'aarch64-linux-android'
 def rustSo = new File(repoRoot, "target/${rustTarget}/release/libopairdrop_ffi.so")
 
+// The kernel payload: four modules that are not ours, one vendor helper, and the bring-up
+// script. They are checked in gzipped (11 MB instead of 38) under `android/kernel-assets/`,
+// and staged into an asset root at build time so the APK carries them uncompressed-in-name
+// but deflated-in-zip, which is what `AssetManager.open` gives back as the original bytes.
+//
+// Generated into a build directory rather than kept in `src/main/assets` for the same reason
+// as the Rust library: they are artefacts, and a 38 MB copy in the source tree is a copy
+// nobody refreshes. `android/kernel-assets/README.md` says where each byte came from.
+def kernelSrc = new File(repoRoot, 'android/kernel-assets')
+def kernelAssetDir = layout.buildDirectory.dir('kernelAssets')
+def awdld = new File(repoRoot, "target/${rustTarget}/release/awdld")
+def stackScript = new File(repoRoot, 'tools/awdl-stack.sh')
+
 // Where the built library is put for the APK to pick up. A build directory rather than a
 // checked-in `jniLibs/`: a 455 KB binary in the source tree is a binary nobody rebuilds, and
 // the first symptom of a stale one is a transfer that fails on a device for no visible
@@ -42,12 +55,20 @@ android {
     sourceSets {
         main {
             // The Java half of the FFI layer, compiled from where the Rust side's tests
-            // already compile it from. The two entry points are excluded: they have `main`
-            // methods and belong to the checks, not to the app.
+            // already compile it from. The entry points are excluded: they have `main`
+            // methods and belong to the checks, not to the app. Each one added to that
+            // directory is another class the APK would otherwise carry for nothing.
             java.srcDirs += [new File(repoRoot, 'crates/ffi/jvm')]
             java.exclude '**/SettingsCheck.java'
+            java.exclude '**/RadioCheck.java'
             java.exclude '**/RoundTrip.java'
+            java.exclude '**/IdentityCheck.java'
+            java.exclude '**/StackCheck.java'
             jniLibs.srcDirs += [jniDir.get().asFile]
+            // The kernel payload and the script that loads it. A second asset root rather than
+            // files in `src/main/assets/kernel`: the `.ko.gz` inputs live outside the APK's
+            // asset tree, so they cannot be packed twice by accident.
+            assets.srcDirs += [kernelAssetDir.get().asFile]
         }
     }
 
@@ -89,6 +110,85 @@ def copyRustSo = tasks.register('copyRustSo', Copy) {
 
 tasks.named('preBuild').configure {
     dependsOn copyRustSo
+}
+
+// SHA-256 as lowercase hex. Used for the payload manifest, which is what the app checks its
+// extraction against and what `sha256sum -c` checks on the device.
+def sha256 = { File file ->
+    def digest = java.security.MessageDigest.getInstance('SHA-256')
+    file.withInputStream { input ->
+        byte[] buffer = new byte[1 << 16]
+        int n
+        while ((n = input.read(buffer)) > 0) {
+            digest.update(buffer, 0, n)
+        }
+    }
+    def hex = new StringBuilder()
+    digest.digest().each { b -> hex.append(String.format('%02x', b & 0xff)) }
+    hex.toString()
+}
+
+// Stages the kernel payload into an asset root: gunzip the four modules, copy the vendor
+// helper, the daemon and the bring-up script, and write a manifest of what landed.
+//
+// The manifest is generated rather than checked in because one of the files is `awdld`, which
+// changes with every `cargo build`. A stale hash would make the on-device `sha256sum -c`
+// refuse a payload that is in fact the one just built — and the script would then load the
+// previous daemon, which is the failure mode this whole task exists to make impossible.
+def stageKernelAssets = tasks.register('stageKernelAssets') {
+    def outDir = kernelAssetDir.map { it.dir('kernel') }
+    inputs.files(fileTree(kernelSrc) { include '*.ko.gz', 'wonder-ven' })
+    inputs.file(stackScript)
+    // Not `inputs.file(awdld)`: Gradle rejects a missing declared input before any code of
+    // this task runs, and the message worth printing is the command that builds it.
+    inputs.property('awdld', awdld.isFile() ? "${awdld.length()}@${awdld.lastModified()}" : 'missing')
+    outputs.dir(outDir)
+    doLast {
+        if (!awdld.isFile()) {
+            throw new GradleException(
+                    "the daemon is missing: ${awdld}\n" +
+                    "build it first: cargo build --release --target ${rustTarget} -p opairdrop-awdl")
+        }
+        File dir = outDir.get().asFile
+        // This directory is the task's output, so anything left in it from an older build
+        // would be packed into the APK without anything having asked for it.
+        if (dir.exists() && !dir.deleteDir()) {
+            throw new GradleException("cannot clear ${dir}")
+        }
+        if (!dir.mkdirs()) {
+            throw new GradleException("cannot create ${dir}")
+        }
+        FileTree gz = fileTree(kernelSrc) { include '*.ko.gz' }
+        if (gz.isEmpty()) {
+            throw new GradleException(
+                    "no module payloads in ${kernelSrc}\n" +
+                    "see android/kernel-assets/README.md for where they come from")
+        }
+        gz.each { File source ->
+            String name = source.name.substring(0, source.name.length() - '.gz'.length())
+            new File(dir, name).withOutputStream { out ->
+                new java.util.zip.GZIPInputStream(new FileInputStream(source)).withStream { input ->
+                    input.transferTo(out)
+                }
+            }
+        }
+        [new File(kernelSrc, 'wonder-ven'), stackScript, awdld].each { File source ->
+            new File(dir, source.name).withOutputStream { out ->
+                source.withInputStream { input -> input.transferTo(out) }
+            }
+        }
+        List<String> manifest = []
+        dir.listFiles().sort { it.name }.each { File file ->
+            manifest << sha256(file) + '  ' + file.name
+        }
+        new File(dir, 'SHA256SUMS').text = manifest.join('\n') + '\n'
+        logger.lifecycle("kernel payload: ${manifest.size()} files, " +
+                "${dir.listFiles().sum { it.length() } ?: 0} bytes in ${dir}")
+    }
+}
+
+tasks.named('preBuild').configure {
+    dependsOn stageKernelAssets
 }
 
 dependencies {

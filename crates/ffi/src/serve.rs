@@ -21,12 +21,21 @@
 //!
 //! # Why the answers come from the settings and not from the caller
 //!
-//! The name in the `/Discover` and `/Ask` answers is `device.name`, with the phone's model
-//! as the fallback the table already promises. Passing it as another argument would mean
+//! The name in the `/Discover` and `/Ask` answers is `device.name`, with the model as the
+//! fallback the table already promises, and the model in the `/Ask` answer is `device.model`
+//! falling back in turn to what the caller passes. Passing them as another argument would mean
 //! two answers to one question — the row on the settings screen, and whatever the caller
-//! decided to pass — and the screen would be the one that lost. The model is an argument
-//! because it is the one thing here that is not a setting: the operating system knows it,
-//! and a row for it would invite a person to rename their phone.
+//! decided to pass — and the screen would be the one that lost.
+//!
+//! The model used to be only an argument, on the grounds that it is the one thing here the
+//! operating system knows and a row for it would invite a person to rename their phone. It is
+//! still the one thing the operating system knows; what changed is that renaming it turns out
+//! to be a reasonable thing to want. `ReceiverModelName` is display-only on both sides of the
+//! protocol — no parser reads it, no sender branches on it — so what a person enters here
+//! travels verbatim, and blank means the caller's own value, which is what keeps an untouched
+//! row invisible. What must *not* follow it is anything a peer acts on: the capability blob in
+//! the `/Discover` answer is a constant, and the certificate and the mDNS record are built by
+//! the caller from the same name, not from this string.
 //!
 //! # Why a failed upload still leaves its files
 //!
@@ -327,7 +336,7 @@ unsafe fn serve(
 
     let mut server = Server::new(Store {
         name: settings::name(&values, model),
-        model: model.to_string(),
+        model: settings::model(&values, model),
         directory: PathBuf::from(directory),
         limits: settings::limits(&values),
         landed: Report::default(),
@@ -563,6 +572,37 @@ mod tests {
         assert_eq!(code, status::OK);
         assert!(String::from_utf8_lossy(&answers).starts_with("HTTP/1.1 200"));
         assert_eq!(summary, "Mac\t1\t7");
+    }
+
+    #[test]
+    fn the_model_row_travels_in_the_ask_answer() {
+        let root = scratch("model-row");
+        let files = [opairdrop_airdrop::Item::new("a.pdf").with_size(7)];
+        let body = opairdrop_airdrop::ask_request(
+            &opairdrop_airdrop::Sender::new("Ada 的 iPhone", "iPhone14,3", "id"),
+            &opairdrop_airdrop::TransferId::from_bytes16(&[7u8; 16]),
+            &files,
+            &[],
+        );
+        let settings = format!(
+            "{}\ndevice.model=iPhone 18\ndevice.name=书房\n",
+            opairdrop_settings::HEAD
+        );
+
+        let (code, answers, _) = serve_decided(
+            root.to_str().expect("UTF-8"),
+            &settings,
+            "OPPO PJZ110",
+            post("/Ask", "application/x-apple-binary-plist", &body),
+            true,
+        );
+
+        assert_eq!(code, status::OK);
+        let answer = AskAnswer::parse(body_of(&answers)).expect("the answer is a plist");
+        // The row wins over the caller's model, and the name is the one the person typed
+        // rather than the model standing in for it.
+        assert_eq!(answer.model_name, "iPhone 18");
+        assert_eq!(answer.computer_name, "书房");
     }
 
     /// The bytes of one request: a head with its `Content-Length`, then its body.

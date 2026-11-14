@@ -951,7 +951,7 @@ public final class MainActivity extends Activity {
         } catch (IOException | RuntimeException failed) {
             return brokenFeaturePage(failed);
         }
-        return new FeaturePage(this, chrome, listener, screen).view();
+        return new FeaturePage(this, chrome, listener, screen, this::refresh).view();
     }
 
     private View brokenFeaturePage(Exception failed) {

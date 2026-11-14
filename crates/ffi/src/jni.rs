@@ -333,6 +333,183 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_mdnsRecords(
     unsafe { finish(env, outcome, &mut report) }
 }
 
+/// Builds one announcement of `types` as a DNS response.
+///
+/// Returns the packet, or throws and returns null. `txt` is `key=value` per line in the
+/// order the records should carry them; `addresses` is one textual IPv6 address per line.
+/// `id` is zero for an announcement, and `ttl` is `-1` for each record's published lifetime
+/// or `0` for the withdrawal of RFC 6762 §10.1.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv` and arguments of the declared types.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_mdnsAnnounce(
+    env: *mut JNIEnv,
+    _class: jclass,
+    instance: jstring,
+    host: jstring,
+    port: jint,
+    txt: jobjectArray,
+    addresses: jobjectArray,
+    id: jint,
+    types: jint,
+    ttl: jint,
+) -> jbyteArray {
+    if env.is_null() {
+        return ptr::null_mut();
+    }
+    if instance.is_null() || host.is_null() {
+        // SAFETY: `env` was checked non-null.
+        unsafe {
+            throw(
+                env,
+                "java/lang/NullPointerException",
+                "an instance name and a host name are required",
+            )
+        };
+        return ptr::null_mut();
+    }
+
+    // SAFETY: the arguments are live references of the declared types.
+    let (Some(instance), Some(host), Some(txt), Some(addresses)) = (unsafe {
+        (
+            read_string(env, instance),
+            read_string(env, host),
+            read_lines(env, txt),
+            read_lines(env, addresses),
+        )
+    }) else {
+        return ptr::null_mut();
+    };
+
+    let (txt_pointer, txt_len) = region(&txt);
+    let (addresses_pointer, addresses_len) = region(&addresses);
+
+    let mut report = OpairdropBuffer::EMPTY;
+    // SAFETY: every region outlives the call and `report` is a zeroed buffer on this frame.
+    let outcome = unsafe {
+        crate::respond::opairdrop_mdns_announce(
+            instance.as_ptr(),
+            instance.len(),
+            host.as_ptr(),
+            host.len(),
+            port as u16,
+            txt_pointer,
+            txt_len,
+            addresses_pointer,
+            addresses_len,
+            id as u16,
+            types as u32,
+            ttl,
+            &mut report,
+        )
+    };
+    // SAFETY: as above, filled one way or the other.
+    unsafe { finish(env, outcome, &mut report) }
+}
+
+/// Answers one query packet, or answers nothing when the packet asks nothing of ours.
+///
+/// The result carries a one-byte header: `0` for "multicast this to `ff02::fb:5353`", `1`
+/// for "send it back to the address the query came from", which RFC 6762 §6.7 requires when
+/// the querier asked from a port other than 5353. An empty array means there is nothing to
+/// say, which is the common case and not an error.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv` and arguments of the declared types.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_mdnsReply(
+    env: *mut JNIEnv,
+    _class: jclass,
+    packet: jbyteArray,
+    instance: jstring,
+    host: jstring,
+    port: jint,
+    txt: jobjectArray,
+    addresses: jobjectArray,
+) -> jbyteArray {
+    if env.is_null() {
+        return ptr::null_mut();
+    }
+    if packet.is_null() || instance.is_null() || host.is_null() {
+        // SAFETY: `env` was checked non-null.
+        unsafe {
+            throw(
+                env,
+                "java/lang/NullPointerException",
+                "a packet, an instance name and a host name are required",
+            )
+        };
+        return ptr::null_mut();
+    }
+
+    // SAFETY: the arguments are live references of the declared types.
+    let (Some(packet), Some(instance), Some(host), Some(txt), Some(addresses)) = (unsafe {
+        (
+            read_bytes(env, packet),
+            read_string(env, instance),
+            read_string(env, host),
+            read_lines(env, txt),
+            read_lines(env, addresses),
+        )
+    }) else {
+        return ptr::null_mut();
+    };
+
+    let (txt_pointer, txt_len) = region(&txt);
+    let (addresses_pointer, addresses_len) = region(&addresses);
+
+    let mut report = OpairdropBuffer::EMPTY;
+    let mut unicast = 0u8;
+    // SAFETY: every region outlives the call and `report` is a zeroed buffer on this frame.
+    let outcome = unsafe {
+        crate::respond::opairdrop_mdns_reply(
+            packet.as_ptr(),
+            packet.len(),
+            instance.as_ptr(),
+            instance.len(),
+            host.as_ptr(),
+            host.len(),
+            port as u16,
+            txt_pointer,
+            txt_len,
+            addresses_pointer,
+            addresses_len,
+            &mut report,
+            &mut unicast,
+        )
+    };
+
+    // SAFETY: the call filled `report`, and nothing has released it.
+    let content = unsafe { report.as_slice() }.to_vec();
+    // SAFETY: the contents were copied out first.
+    unsafe { opairdrop_buffer_free(&mut report) };
+
+    if outcome != status::OK {
+        let message = String::from_utf8_lossy(&content).into_owned();
+        // SAFETY: `env` is valid.
+        if unsafe { pending(env) } {
+            return ptr::null_mut();
+        }
+        // SAFETY: `env` is valid.
+        unsafe { throw(env, class_for(outcome), &message) };
+        return ptr::null_mut();
+    }
+    if content.is_empty() {
+        // SAFETY: `env` is valid.
+        return unsafe { new_bytes(env, &[]) };
+    }
+
+    let mut framed = Vec::with_capacity(content.len() + 1);
+    framed.push(unicast);
+    framed.extend_from_slice(&content);
+    // SAFETY: `env` is valid.
+    unsafe { new_bytes(env, &framed) }
+}
+
 /// Sends `paths` to the peer reachable through `input`/`output`.
 ///
 /// Returns a two-line `key<TAB>value` frame on success — `peer` and `bytes` — the same
@@ -780,6 +957,11 @@ unsafe fn finish(env: *mut JNIEnv, outcome: i32, report: &mut OpairdropBuffer) -
     unsafe { opairdrop_buffer_free(report) };
 
     if outcome == status::OK {
+        // Success copies the buffer out — unless a callback left an exception pending on the
+        // way here, which is not a contradiction: the endpoint reports "nothing was stored"
+        // as an empty frame and an I/O failure as a thrown exception, and both are true of a
+        // peer that closed mid-request. `new_bytes` refuses to touch the JVM in that state
+        // and answers null, so the precise exception reaches Java instead of a process abort.
         // SAFETY: `env` is valid.
         return unsafe { new_bytes(env, &content) };
     }
@@ -886,6 +1068,14 @@ unsafe extern "C" fn read_stream(context: *mut c_void, buf: *mut u8, len: usize)
         return -1;
     }
     // SAFETY: `stream.env` is the valid environment the stream was made with.
+    //
+    // Checked before anything else crosses: a callback can be entered again after an earlier
+    // failure left its exception pending, and calling `InputStream.read` then aborts the
+    // process under CheckJNI instead of failing this connection.
+    if unsafe { pending(stream.env) } {
+        stream.failed = true;
+        return -1;
+    }
     let table = unsafe { table(stream.env) };
 
     let want = len.min(READ_CHUNK) as jsize;
@@ -1008,6 +1198,13 @@ unsafe extern "C" fn write_sink(context: *mut c_void, buf: *const u8, len: usize
         return -1;
     }
     // SAFETY: `sink.env` is the valid environment the sink was made with.
+    //
+    // Same rule as the reader: a pending exception from the other half of this connection
+    // would turn the first `SetByteArrayRegion` below into a process abort.
+    if unsafe { pending(sink.env) } {
+        sink.failed = true;
+        return -1;
+    }
     let table = unsafe { table(sink.env) };
 
     let mut written = 0;
@@ -1108,6 +1305,15 @@ unsafe extern "C" fn report_progress(context: *mut c_void, phase: i32, sent: u64
     if gauge.failed {
         return;
     }
+    // SAFETY: `gauge.env` is valid.
+    //
+    // A pending exception — from a write that failed a moment ago, say — makes the call
+    // below abort the process. The transfer is not abandoned for this; the meter simply
+    // stops being told.
+    if unsafe { pending(gauge.env) } {
+        gauge.failed = true;
+        return;
+    }
     let table = unsafe { table(gauge.env) };
     // SAFETY: `report` is `Progress.report(IJJ)V` on the object the caller handed over.
     unsafe {
@@ -1185,6 +1391,14 @@ unsafe extern "C" fn decide_java(context: *mut c_void, summary: *const u8, len: 
     // SAFETY: the caller passes the `Decider` this layer created, on the thread serving
     // one connection, so the borrow cannot alias.
     let decider = unsafe { &mut *(context as *mut Decider) };
+    // SAFETY: `decider.env` is valid.
+    //
+    // A prompt is a person's decision and must never be asked on behalf of an exception:
+    // the body before it may already have failed, and `NewStringUTF` below would abort the
+    // process rather than return a refusal.
+    if unsafe { pending(decider.env) } {
+        return 0;
+    }
     let bytes = unsafe { std::slice::from_raw_parts(summary, len) };
     // A sender name may be any text the other phone allows; invalid UTF-8 is replaced
     // rather than dropped, because a prompt with a mangled name still describes a transfer
@@ -1209,13 +1423,15 @@ unsafe extern "C" fn decide_java(context: *mut c_void, summary: *const u8, len: 
             argument,
         )
     };
-    // SAFETY: `argument` is a local reference this frame owns.
-    unsafe { (entry!(table, DeleteLocalRef))(decider.env, argument) };
+    // SAFETY: `decider.env` is valid.
     if unsafe { pending(decider.env) } {
         // The Java exception stays pending: it is the caller's, and it says more than a
-        // refusal code would.
+        // refusal code would. The local reference is left to the frame, which releases every
+        // local when the native call returns.
         return 0;
     }
+    // SAFETY: `argument` is a local reference this frame owns.
+    unsafe { (entry!(table, DeleteLocalRef))(decider.env, argument) };
     // `CallBooleanMethod` answers a `jboolean`: 0 or 1, not `false`/`true`.
     i32::from(answer != 0)
 }
@@ -1356,6 +1572,62 @@ unsafe fn read_paths(env: *mut JNIEnv, array: jobjectArray) -> Option<String> {
     Some(joined)
 }
 
+/// Reads a `String[]` as one newline-separated blob.
+///
+/// Both of the arrays the responder takes are lines — TXT entries as `key=value`, addresses
+/// as text — and neither a key nor an address can hold a newline, so this needs no escaping
+/// where [`read_paths`] needs NUL. A null array is the empty list rather than an error: a
+/// device with no address yet publishes what it has.
+///
+/// # Safety
+///
+/// `env` must be valid and `array` a live `java.lang.String[]` or null.
+unsafe fn read_lines(env: *mut JNIEnv, array: jobjectArray) -> Option<String> {
+    if array.is_null() {
+        return Some(String::new());
+    }
+    // SAFETY: `env` is valid for the whole call.
+    let table = unsafe { table(env) };
+    // SAFETY: `array` is a live array.
+    let length = unsafe { (entry!(table, GetArrayLength))(env, array) };
+
+    let mut joined = String::new();
+    for index in 0..length {
+        // SAFETY: `index` is inside the array, and the element is a live reference this
+        // frame owns from here on.
+        let element = unsafe { (entry!(table, GetObjectArrayElement))(env, array, index) };
+        if element.is_null() {
+            // SAFETY: `env` is valid.
+            unsafe {
+                throw(
+                    env,
+                    "java/lang/NullPointerException",
+                    "an entry in the array is null",
+                )
+            };
+            return None;
+        }
+        // SAFETY: the elements of a `String[]` are `java.lang.String`s, per the signature.
+        let text = unsafe { read_string(env, element as jstring) };
+        // SAFETY: `element` is a local reference made above.
+        unsafe { (entry!(table, DeleteLocalRef))(env, element) };
+        if index > 0 {
+            joined.push('\n');
+        }
+        joined.push_str(&text?);
+    }
+    Some(joined)
+}
+
+/// The pointer and length a C ABI call takes for `text`, or null for an empty one.
+fn region(text: &str) -> (*const u8, usize) {
+    if text.is_empty() {
+        (ptr::null(), 0)
+    } else {
+        (text.as_ptr(), text.len())
+    }
+}
+
 /// Copies a `byte[]` into a `Vec<u8>`.
 ///
 /// A packet is copied rather than pinned: the C ABI wants a plain region, and the copy is a
@@ -1400,6 +1672,18 @@ unsafe fn read_bytes(env: *mut JNIEnv, array: jbyteArray) -> Option<Vec<u8>> {
 ///
 /// `env` must be valid.
 unsafe fn new_bytes(env: *mut JNIEnv, bytes: &[u8]) -> jbyteArray {
+    // A JNI call made while an exception is already waiting aborts the process: CheckJNI
+    // answers "JNI NewByteArray called with pending exception" and the whole app goes down,
+    // not just this connection. Measured — a peer that reset after the handshake left
+    // `SocketException: Connection reset` pending from the reader and killed the process
+    // here while copying out an empty report.
+    //
+    // Returning null keeps that exception, which is the one the Java caller should see. The
+    // array is not made, so nothing is leaked: the caller gets null and throws.
+    // SAFETY: `env` is valid.
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
     // SAFETY: `env` is valid for the whole call.
     let table = unsafe { table(env) };
     // SAFETY: a fresh local array of the given length.
