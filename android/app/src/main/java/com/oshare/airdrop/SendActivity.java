@@ -100,15 +100,18 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     /** 回弹的时长。 */
     private static final int SPRING_MS = 240;
 
+    /**
+     * 跟手位移每帧朝目标走多少。
+     *
+     * <p>0.6 是「跟手」与「不抖」之间的取舍：1.0 完全跟手，但把输入事件的 3–8 像素回跳也
+     * 一起画出来；0.3 很稳。0.6 的滞后约一帧。
+     */
+    private static final float SMOOTH = 0.6f;
+
     /** 面板顶部的圆角。和导航胶囊同一个数。 */
     private static final float CORNER_DP = 28f;
 
-    /**
-     * 窗口背后那块模糊的半径。
-     *
-     * <p>比导航胶囊的 5f 大得多，因为量纲不同：导航胶囊那一个模糊的是同进程里一张已经录好
-     * 的 {@code RenderNode}，半径以「scratch 像素」计；这里交给系统，半径以屏幕像素计。
-     */
+    /** 面板顶部那圈模糊的半径。系统模糊，单位是屏幕像素。 */
     private static final float BLUR_DP = 28f;
 
     private Scheme S;
@@ -143,10 +146,10 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     private final Map<String, Nick> nicks = new LinkedHashMap<>();
     private final Map<String, TextView> stateViews = new LinkedHashMap<>();
 
-    /** 窗口是否真的在做背景模糊。不成立时底色要完全不透明，否则会看见底下没被遮住的东西。 */
-    private boolean blurred;
     /** 正在滑出。防止连按两次返回键跑两遍动画。 */
     private boolean closing;
+    /** 面板背景的实时模糊；{@code null} 表示这台机器给不了，走纯色退路。 */
+    private PanelGlass glass;
     private volatile boolean sending;
 
     @Override
@@ -202,30 +205,40 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     // ------------------------------------------------------------------ 窗口
 
     /**
-     * 把窗口变成一块可以透出后景的玻璃。
+     * 窗口本身保持透明，什么模糊都不加。
      *
-     * <p>透明窗口背景必须在 {@link Window#setBackgroundBlurRadius} 之前——那个半径模糊的是
-     * 窗口**背后**的窗口，而一个还在画自己不透明底色的窗口，模糊结果会被自己的底色整个盖住，
-     * 看起来像「模糊没生效」。
-     *
-     * <p>模糊半径本身要等 {@code setContentView} 之后再设：平台上那条路径直接对
-     * {@code DecorView} 调用同名方法，而 DecorView 是等有人要它的时候才建的。在
-     * {@code onCreate} 开头设，拿到的是一个空引用，整个 Activity 起不来。真机上撞到过一次。
+     * <p>模糊挪到面板那个 View 上去了（{@link PanelGlass}）：窗口级模糊会把面板以外整片屏幕
+     * 一起糊掉，而且每帧重采整屏。窗口这一层只要透明，让圆角外面能透出背后的界面。
      */
     private void applyWindow() {
         Window window = getWindow();
         window.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
-
-        WindowManager manager = getSystemService(WindowManager.class);
-        blurred = manager != null && manager.isCrossWindowBlurEnabled();
     }
 
-    /** 窗口有了 DecorView 之后才做得成的两件事：模糊半径与系统栏图标。 */
-    private void applyGlass() {
-        if (blurred) {
-            getWindow().setBackgroundBlurRadius(dp(BLUR_DP));
+    /**
+     * 给面板装上那块会跟着它走的玻璃。
+     *
+     * <p>必须在 attach 之后：模糊 Drawable 由 {@code ViewRootImpl} 创建，而它是 attach 的产物。
+     * {@link View#post} 恰好满足这一点——视图还没 attach 时，排进去的 Runnable 会等到 attach
+     * 之后才跑。
+     *
+     * <p>拿不到就什么也不做，面板保持 {@link #sheetColor()} 那个不透明页底：一块实心的纸，
+     * 不是玻璃，但读得清、拖得动。
+     */
+    private void installGlass() {
+        PanelGlass panel = PanelGlass.attach(sheet);
+        if (panel == null) {
+            // 这台机器没有那两条隐藏路径。面板留在不透明页底上——能读、能拖，只是不是玻璃。
+            android.util.Log.i("OPAirDrop", "panel glass: unavailable, solid background");
+            return;
         }
-        applyWindowBars();
+        glass = panel;
+        panel.radius(dp(BLUR_DP));
+        panel.color(glassTint());
+        panel.corners(dp(CORNER_DP), 0f);
+        sheet.setBackground(panel.drawable());
+        android.util.Log.i("OPAirDrop", "panel glass: " + panel.source()
+                + " radius=" + dp(BLUR_DP) + " corner=" + dp(CORNER_DP));
     }
 
     /** 系统栏图标跟着深浅走。主题里那两条只在 Activity 创建时生效一次。 */
@@ -240,21 +253,34 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     }
 
     /**
-     * 这层玻璃自己的染色。
+     * 面板自己的颜色：不透明页底。
      *
-     * <p>模糊生效时留一点透明度，让下面的东西透上来；不生效时填死，因为那时底下是别人的
-     * 界面，透出来是一团读不出重点的乱码。
+     * <p>它是**拿不到模糊时的退路**，也是玻璃装好之前那一瞬的底色。留透明没有意义——背后
+     * 什么都没有，半透明只会让那一下闪出背后的界面。
      */
     private int sheetColor() {
-        // 浅色 224/255、深色 230/255，比导航胶囊的 240 更透一点。那一块玻璃背后是同色的
-        // 卡片内容，240 还看得出层次；这一块背后是桌面——壁纸和图标，遮到 240 就只剩一块白板，
-        // 模糊等于白做。再薄就会让标题压到别人的图标上，所以停在这两个数。
-        int alpha = S.light ? 0xE0 : 0xE6;
-        return blurred ? (S.bg & 0x00FFFFFF) | (alpha << 24) : S.bg;
+        return S.bg;
     }
 
+    /**
+     * 叠在模糊之上的那层染色。
+     *
+     * <p>{@code BackgroundBlurDrawable.setColor} 画在模糊结果之上，alpha 决定「能透多少」。
+     * 比导航胶囊的 240 更透：那一块背后是同色的卡片，240 还看得出层次；这一块背后是壁纸，
+     * 遮到 240 就只剩一块白板。再薄就会让标题压到别人的图标上。
+     */
+    private int glassTint() {
+        int alpha = S.light ? 0xC0 : 0xC8;
+        return (S.bg & 0x00FFFFFF) | (alpha << 24);
+    }
+
+    /** 换配色时重刷玻璃的染色；没有玻璃就刷退路底色。 */
     private void tintSheet() {
         if (sheet == null) {
+            return;
+        }
+        if (glass != null) {
+            glass.color(glassTint());
             return;
         }
         Drawable background = sheet.getBackground();
@@ -291,7 +317,9 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         });
 
         setContentView(sheet);
-        applyGlass();
+        applyWindowBars();
+        // 玻璃要等 attach 之后才装得上（模糊 Drawable 由 ViewRootImpl 创建），post 正好等到那一刻。
+        sheet.post(this::installGlass);
         rebuild();
     }
 
@@ -363,10 +391,27 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * 一张全屏纹理（约 18 MB），所以只在移动期间拿着，停下就还回去——常驻的话它和窗口模糊
      * 抢同一块 GPU 内存，反而更慢。
      */
+    /**
+     * 把面板提升成一个硬件层，或还回去。
+     *
+     * <p># 为什么位移必须走层
+     *
+     * <p>{@code setTranslationY} 不是一次「搬动」，它会让这个 View 连同整棵子树重新绘制一遍：
+     * 每一帧都要重新栅格化这块 1440×3168 上的全部文字、再走一遍那条全屏圆角描边路径。文字在
+     * 每一帧落到略微不同的亚像素位置上，抗锯齿结果就跟着变——肉眼看到的就是**字在抖**。
+     *
+     * <p>层之后，内容只栅格化一次，之后每帧只是把这张纹理挪个位置，由合成器完成。
+     *
+     * <p># 为什么在按下时就建，而不是第一帧移动时
+     *
+     * <p>建层本身要渲染一遍整棵树、再分配一张全屏纹理——几十毫秒。放在移动的第一帧做，那几
+     * 十毫秒就变成了「手指先动了、面板没跟上」。按下到开始移动之间通常有几十毫秒的空档，正好
+     * 用掉它：那一刻画面还没位移，慢一点也看不出来。
+     */
     private void layer(boolean on) {
         sheet.setLayerType(on ? View.LAYER_TYPE_HARDWARE : View.LAYER_TYPE_NONE, null);
-        dragging = on;
         if (!on) {
+            dragging = false;
             // 拖动期间雷达停了呼吸（理由见 {@link Radar#onDraw}），还回层之后要把它叫醒。
             sheet.invalidate();
         }
@@ -693,6 +738,24 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         private final VelocityTracker tracker = VelocityTracker.obtain();
         private float downY;
         private float downX;
+        /**
+         * 按下那一刻面板已经在的位置。
+         *
+         * <p>位移必须相对**这里**算，不能相对 0：一次没滑走的手势结束后，回弹动画的最后一帧
+         * 和下一次按下之间可能只隔了几十毫秒，面板停在半路；若还按「手指位移 = 面板位移」，
+         * 第一个 MOVE 就会把它从半路拽回顶部——看起来是手指一按，面板自己跳了一下，接着怎么
+         * 拖都对不上。真机上撞到的就是这个。
+         */
+        private float startY;
+        /**
+         * 当前真正画在屏幕上的位移。
+         *
+         * <p>它不是 {@code startY + 手指位移}：输入事件本身是抖的。同一串 MOVE 里相邻两个
+         * 采样点会出现「先到 1254、退回 1251、再到 1288」这种回跳，幅度 3–8 像素；1:1 照抄
+         * 就是把手指的抖动原样画出来，读起来是面板在颤。这里用指数平滑把它压掉：每帧朝目标
+         * 走 60%，滞后约一帧（16ms），人感觉不到，抖动能滤掉大半。
+         */
+        private float shown;
         /** 这一次触摸里模糊是否已经关掉了。只在第一帧 MOVE 上做一次，不是每帧。 */
         private boolean moving;
 
@@ -715,6 +778,13 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     // 写进去的那个互相覆盖——同一帧里先被动画拉回、再被手指推开，读起来就是
                     // 整个窗口在上下摆。先让它停，位置从此只由手指决定。
                     animate().cancel();
+                    // 上一段滑出被这一下按停，closing 要放掉：见 onTouchEvent 里的同名分支。
+                    closing = false;
+                    // 按下就建层：见 {@link #layer} 里「为什么在按下时就建」。
+                    layer(true);
+                    // 停在哪就从哪接着拖：见 {@link #startY}。
+                    startY = getTranslationY();
+                    shown = startY;
                     tracker.clear();
                     tracker.addMovement(event);
                     return false;
@@ -729,6 +799,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                         // 一旦确认是要拖，就把面板提升成硬件层：见 {@link #layer}。
                         if (!moving) {
                             moving = true;
+                            dragging = true;
                             layer(true);
                         }
                         return true;
@@ -743,7 +814,9 @@ public final class SendActivity extends Activity implements Peers.Watcher {
 
         @Override
         public boolean onTouchEvent(MotionEvent event) {
-            if (closing) {
+            // 滑出的过程中不接受新的拖动，但**按下**例外：见下面那一支——滑到一半又把手按
+            // 回来是「我不想关」，不是「失灵」。
+            if (closing && event.getActionMasked() != MotionEvent.ACTION_DOWN) {
                 return true;
             }
             tracker.addMovement(event);
@@ -752,6 +825,15 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     downX = event.getX();
                     downY = event.getY();
                     moving = false;
+                    animate().cancel();
+                    // 上一段滑出被这一下按停：把 closing 放掉，否则它会一直为真，而上面那个
+                    // 判断会把此后**每一次**触摸都吞掉——面板从此完全不动，看起来就是卡死。
+                    // 这是只能靠真机发现的：`close()` 的 finish 挂在动画的 end action 上，
+                    // 动画被取消，那个 end action 就永远不会跑。
+                    closing = false;
+                    layer(true);
+                    startY = getTranslationY();
+                    shown = startY;
                     return true;
                 }
                 case MotionEvent.ACTION_MOVE -> {
@@ -760,6 +842,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     // 也做一次，否则从标题或雷达上开始拖，整段都还在每帧重绘。
                     if (!moving) {
                         moving = true;
+                        dragging = true;
                         layer(true);
                     }
                     // 只往下拖。往上推没有对应语义（这一页已经在最上面了），硬跟手会读成失灵。
@@ -768,11 +851,24 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     // 合成器插值，本来就平滑；取整反而把它变成 1 像素一级的台阶——手指每帧
                     // 移动不到一像素时，那正是「整个窗口在抖」的来源。
                     float dy = Math.max(0f, event.getY() - downY);
-                    setTranslationY(dy);
+                    float target = startY + dy;
+                    shown += (target - shown) * SMOOTH;
+                    if (Math.abs(target - shown) < 0.5f) {
+                        shown = target;
+                    }
+                    setTranslationY(shown);
                     return true;
                 }
                 case MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    boolean dragged = moving;
                     moving = false;
+                    if (!dragged) {
+                        // 只是点了一下（或者按在空白处又抬手）：层是按下时建的，这里还回去，
+                        // 否则它会和雷达的呼吸动画长期叠在一起——层里每一次 invalidate 都要
+                        // 重画整块纹理。
+                        layer(false);
+                        return true;
+                    }
                     tracker.computeCurrentVelocity(1000);
                     float velocity = tracker.getYVelocity();
                     boolean leave = getTranslationY() > getHeight() * 0.18f || velocity > fling;
@@ -813,6 +909,14 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                 .setInterpolator(new AccelerateInterpolator(1.4f))
                 .withEndAction(this::finish)
                 .start();
+        // 兜底。上面那个 end action 挂在动画上，而动画是可以被下一次按下取消的——那一刻
+        // finish 就永远不会来，页面停在一半、closing 一直为真。带着 closing 再判一次：中途
+        // 被按停时那个标记已经被清掉，这一下什么也不做。
+        sheet.postDelayed(() -> {
+            if (closing) {
+                finish();
+            }
+        }, EXIT_MS + 150);
     }
 
     @Override
