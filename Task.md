@@ -354,7 +354,7 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 ---
 
-## 9. 当前进度（2026-11-15 03:10）
+## 9. 当前进度（2026-11-15 03:30）
 
 ### 已完成并验证
 
@@ -373,6 +373,8 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 | 驱动随包 | `assets/kernel/` 五个二进制 + `SHA256SUMS` 进 APK；`DriverSetup` 按 §7.3 序列加载，`boot_id` 标记防重复；真机报 `AWDL_LINK_UP iface=wonder0 freq=5745`、`tun=up`、`stack already swapped this boot` |
 | mDNS 应答器 | 真机抓包 `hlim 255`、3.000 s 节奏、`0*- [0q] 4/0/0` 四条记录、TXT `"h" "fl=137" "flags=137"`；自造 `(QM)` 查询后 0.9 ms 四条应答 |
 | 六项 UI 修改 | 首页开场白卡删除、底栏三只图标重画、刷新按钮删除、设置页跟手动画、回弹以被拉边为轴、震动权限 |
+| 接收进度通路（Rust + JNI） | `crates/ffi/src/serve.rs` 新增 `LandingCallback`/`Watcher` 与第三个导出 `opairdrop_serve_watched`，`jni.rs` 新增 `Java_..._serveWatched` + `report_landing`。`cargo check --lib` 通过；`cargo test --workspace` **380 passed**（1 ignored），含两条新测试：端到端那条断言「只有 `/Upload`、没有前置 `/Ask`」时全程 `total == 0`（诚实的不声明），单元那条断言未声明尺寸的成员贡献 0 而非把总和拉小（7+11+0 = 18） |
+| 接收进度通知栏 | `ReceiveService` 新增固定 id `0x0A40` 的传输通知（`0x0A1D` 是服务、`0x0A20–0x0A3F` 是确认框）；`Listener` 改用 `Native.serveWatched`，`Meter` 按 200 ms 节流投递。`gradle :app:compileDebugJavaWithJavac` **BUILD SUCCESSFUL**。⏳ 未上真机 |
 
 ### 明确未完成
 
@@ -408,7 +410,7 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 | 3 | **接收第一档：iPhone 分享面板里能找到本机** | 人眼在 iPhone 上看见本机名字，点得进去 | ⏳ 待实测（本侧无法自证）。**已有的抓包线索**：02:25:07 一条 `handshake from fe80::84a8:a1ff:fe43:3eb8%awdltun0 failed after 496 ms: Connection reset` —— 对面**已经连上来过**，说明公告被发现了、TXT/SRV 被读走了。下一步只差在它再来的那一刻看 `offer from …` 那一行 |
 | 4 | 接收第二档：接收端 TLS（`Identity` + `h=` + `SSLServerSocket`） | `openssl s_client` 能握手；`/Discover` 有应答 | ✅ 真机：`TLSv1.3`/`AES_256_GCM`、10 ms；`/Discover` → `200` + 138 字节 bplist；TXT `h` 与出示证书指纹逐位相同 |
 | 5 | 接收第三档：文件真的落到 `receive.directory` | iPhone 发一张图，`Download/` 里出现同字节文件 | ✅ **机制已验证**：`/Ask` 三支 + `/Upload` 逐字节（含 `photos/`、`假期/` 两级中文路径）。⏳ 待真实 iPhone 复验 |
-| 6 | 接收三处提示：确认弹窗 + 通知栏 + 流体云 | 三个入口同一份状态，接受/拒绝都回写 | 弹窗有雏形，另两处未写 |
+| 6 | 接收三处提示：确认弹窗 + 通知栏 + 流体云 | 三个入口同一份状态，接受/拒绝都回写 | 弹窗 ✅ 真机三支已验；通知栏进度 ✅ 通路打通、编译通过（`0x0A40`，200 ms 节流，`total==0` 走不确定态）。⏳ 未上真机；流体云未写 |
 | 7 | 自有发送面板（仿 `IOSShareActivity`） | 与参照同构；浅/深；弹出动画；环状进度随真实字节走 | `SendActivity` 是临时形态 |
 | 8 | 发送端接入 `SendActivity`（用户点名的第二刀） | 从我们自己的面板发起一次完整发送 | 未开始 |
 | 9 | `phash` 校验 | 指纹不符时不发，且给出可读原因 | 未开始 |
@@ -424,10 +426,10 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 | 指标 | 值 | 说明 |
 | --- | --- | --- |
-| 单元 + 集成测试 | **377 passed**（1 ignored） | 无设备；clippy 零 warning |
-| JVM 断言 | **363 条** | `bash crates/ffi/jvm/check.sh`，桌面 JVM + `-Xcheck:jni`，不是真机 |
-| Rust 行数 | 21300 | 八 crate；`src/` 合计 |
-| Java 行数 | 11940 | 29 个类：三页 + 发送 + 确认 + 服务 + 钩子 + 身份/射频/链路 |
+| 单元 + 集成测试 | **380 passed**（1 ignored） | 无设备；clippy 零 warning |
+| JVM 断言 | **368 条** | `bash crates/ffi/jvm/check.sh`，桌面 JVM + `-Xcheck:jni`，不是真机 |
+| Rust 行数 | 21362 | 八 crate；`src/` 合计 |
+| Java 行数 | 12133 | 29 个类：三页 + 发送 + 确认 + 服务 + 钩子 + 身份/射频/链路 |
 | 真机库 | `libopairdrop_ffi.so` **681 712 字节** | `aarch64-linux-android`，linker 35（含 mDNS 三个入口） |
 | APK | **14 204 955 字节**（debug，含 `assets/kernel/`） | 内核资产合计约 38 MB 未压缩，压后约 13.5 MB；不含资产的 clean 包仍是 88 万级 |
 | 接收吞吐 | 80–88 KB/s | 受对端 31.2% 占空比限制，**不是 KPI** |
@@ -448,6 +450,81 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 ---
 
 ## 13. 变更日志（新的在上）
+
+- **2026-11-15 03:30**：**接收进度从写盘循环一路接到通知栏。** Rust 侧新增第三个导出与一个
+  `Landing` 回调，Java 侧 `Listener` 换用它、`ReceiveService` 多一条随字节走的通知。按约定
+  **流体云仍未动，单独一轮**。
+
+  **一、为什么是第三个导出，而不是给第二个加参数。** `opairdrop_serve_decided` 当初就是「不改
+  `opairdrop_serve` 的签名」才存在的，`opairdrop_serve_watched` 同理：`dlsym` 找不到符号比函数
+  指针签名变了更难诊断。三个导出并存，旧调用方一行不改。JNI 侧对应 `serveDecided` /
+  `serveWatched` 两个 native 方法，共享一个 `serve_for_java`，两者只差最后一个参数（`landing`
+  可为 null）。
+
+  **二、`serve()` 改成 `pub(crate)`。** JNI 层手上已经有 `Decide` / `Watcher` 这样的成对句柄，
+  没必要再拆成原始参数表绕一圈 C ABI。为此补了 `Decide::new` / `Watcher::new` 两个
+  `pub(crate)` 构造器，两个结构体也一并放开可见性——否则 `jni.rs` 报 `E0603: struct is private`。
+
+  **三、接收侧的进度类型叫 `LandingCallback`，不叫 `ProgressCallback`。** `send.rs` 里已经有一个
+  `ProgressCallback(context, phase, sent, total)`（发送侧四阶段）。接收侧没有阶段可言：要么在读
+  offer，要么在落字节，只有后者产生数字。同名不同签名会被读者当成同一个东西。
+
+  **四、分母（`declared`）必须在 `accept()` 里取。** 字节开始落地时 offer 已被消费，
+  `Store::upload()` 拿不到它。所以 `accept(&mut self, offer: &Ask)` 顺手把
+  `offer.files.iter().filter_map(|f| f.size).sum()` 存进 `self.declared`。未声明尺寸的成员贡献
+  **0**，而不是把总和拉小——这条有单元测试（7 + 11 + 未声明 = 18）。
+
+  **五、`total == 0` 是一个语义，不是一个错误。** 对端可以什么都不声明。此时通知栏走不确定态
+  （`setProgress(0, 0, true)`），而不是一个分母为零的假比例。端到端测试专门验了这一支：只有
+  `/Upload`、没有前置 `/Ask` 时全程 `total == 0`。
+
+  **六、`done` 只数 payload，`total` 是对端声明的**，所以两者能直接比；`done` 可以超过 `total`
+  （对端多发），显示时按 `total` 封顶——一条 100% 的进度条比一条 112% 的有用。
+
+  **七、Java 侧的节流是必要条件，不是优化。** 回调按落地块调用，一次传输成千上万次，每次
+  `notify` 都是一次 binder 事务，全落在正在读字节的那条线程上。`Meter.INTERVAL_MS = 200`；
+  第一条立刻投出去，否则前两百毫秒里一个小文件已经收完了，人什么都没看见。
+
+  **八、收尾不在回调里，在 native 调用返回之后。** 回调不知道哪一块是最后一块——`total` 是可以
+  少发的声明。`meter.finished()` 在 `serveWatched` 返回且 `report` 非空时调用；`finally` 里
+  `meter.abandon()` 收掉走到一半的进度条。`abandon` 只在「自己画过 且 没有结果」时动手：一次
+  握手失败或者一次空探测，不该把上一个传输留下的「接收完成」抹掉。
+
+  **九、`failed` 标志：一次抛异常的监听器不能被回叫成千上万次。** 长传输上那就是成千上万个挂起
+  异常。置 `failed` 后停止上报，但**不中断接收**——进度条不是丢传输的理由。异常本身保持 pending，
+  那是 Java 调用方该看到的诚实报告。
+
+  **十、通知 id 从 `0x0A40` 起。** `0x0A1D` 是服务的身份，整个生命周期都是 ongoing；进度条只跟
+  一次传输同生共死。合成一条的话，「服务还在这儿」的凭据就要看一次传输有没有发生过，而人把收完
+  的那条结果划掉，就等于划掉了前台服务的证明。固定值不分槽，因为接收端一次只服务一个对端
+  （`Listener` 类注释「Why one thread and not a pool」），同一时刻最多一条传输。
+
+  **十一、`jni.rs` 是 `w/crlf`，同目录其余 8 个是 `w/lf`。** `git ls-files --eol` 显示这是
+  `core.autocrlf=true` 造成的既有不一致。任何用 LF 写的锚点在 `jni.rs` 上匹配 **0 次**。改法：
+  patch 脚本先探测目标是否含 `\r\n`，含则把锚点与替换文本整体转成 CRLF。
+
+  **十二、`Edit` 工具这一轮连续失败**（`ModifyBackup failed … sandbox.backup.modify_backup`），
+  连两行探针都写不进，而同一路径 `Bash` 的 `printf >>` 完全正常——是编辑器工具的备份通道问题，
+  不是文件权限。绕法是「唯一锚点 + 命中次数必须等于 1 + `newline=''` 不翻译行尾」的 Python 精确
+  替换，锚点与替换文本放 sidecar 文件里（避开 shell 引号与多行字符串）。**没有用「读全文 →
+  批量 replace → 整篇写回」**，§6.5 的纪律不变。
+
+  **十三、JVM 断言必须为新的 native 出口加一条。** `cargo test` 链的是 rlib，符号名写错在那里
+  编译得过，只有在真机第一次连接时才炸成 `UnsatisfiedLinkError`——而那行日志没有人读。
+  `RoundTrip` 里因此加了 `serveWatchedReportsWhatItLands`（5 条断言）：调用一发生，符号当场解析；
+  顺便把 Rust 那两条测试的结论在 JVM 边界上重述一遍（最后一数等于真正落地的字节数、不倒退、
+  `total` 全程为 0 因为这次没有前置 `/Ask`）。断言总数 **363 → 368**。
+
+  **十四、`check.sh` 在 GBK 宿主机上根本编不过。** 这台机器的 JDK 17 默认源码编码是平台编码
+  （GBK），而这些源文件是 UTF-8 且一半带中文，`javac` 报 196 处「编码GBK的不可映射字符」——
+  看起来像代码错误，其实不是。脚本里的 `java` 早就带了 `-Dfile.encoding=UTF-8`，`javac` 漏了
+  `-encoding UTF-8`，补上即可。
+
+  **验证**：`cargo check -p opairdrop-ffi --lib` 通过；`cargo test --workspace` **380 passed**
+  （1 ignored），含 `a_watched_endpoint_counts_what_it_lands_and_says_nothing_was_declared` 与
+  `an_offer_s_sizes_are_the_denominator_a_watcher_is_given`；
+  `crates/ffi/jvm/check.sh` **368 条全过**（含新加的 5 条）；
+  `gradle :app:compileDebugJavaWithJavac` **BUILD SUCCESSFUL**。⏳ 全部未上真机。
 
 - **2026-11-15 03:10**：**第 3 档收口——`/Ask` 三支与 `/Upload` 在真机上全部走通；同时查清上一轮为什么
   白跑一整夜（`grep` 命中的是通知历史归档），并顺手修掉真实设备那条「0 个文件」的通知。**

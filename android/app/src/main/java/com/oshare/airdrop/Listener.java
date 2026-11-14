@@ -631,10 +631,13 @@ final class Listener {
         }
 
         String directory = directoryOf(screen);
+        // 谁在看进度。每条连接一个，因为接收端一次只服务一个对端（见类注释「Why one
+        // thread and not a pool」），所以进度条上最多只有一条连接的数字。
+        Meter meter = new Meter(context);
         try {
             // 有人要发东西过来时问一次。问的是人，所以这条线程会停在这里等——它本来也只
             // 服务这一个连接，等的时候没有别的事该做。
-            byte[] frame = Native.serveDecided(
+            byte[] frame = Native.serveWatched(
                     directory,
                     screen.stored(),
                     Build.MODEL,
@@ -655,13 +658,18 @@ final class Listener {
                         // 找到我们」这件事唯一能留下证据的地方。
                         Log.i(TAG, "offer from " + summary.replace('\t', ' '));
                         return Confirmation.ask(context, summary);
-                    });
+                    },
+                    meter);
             // A discovery probe and an empty share both come back empty; neither is worth a
             // line on the page, and leaving the previous transfer up is the truthful state
             // of "nothing new arrived".
             Report report = Report.of(frame);
             if (!report.empty()) {
                 last = summarize(report, directory);
+                // 通知上那句话就是页面上那句话，一次传输只有一种说法。收尾在这里而不是在
+                // 回调里：回调不知道哪一块是最后一块——total 是对端声明的，它可以少发，
+                // 也可以什么都不声明，所以「最后一块」只有 native 调用返回才成立。
+                meter.finished(last);
                 setState("正在监听 " + PORT + "，等待附近设备", false);
             }
         } catch (IOException | RuntimeException refused) {
@@ -674,6 +682,11 @@ final class Listener {
                 return;
             }
             setState("接收失败：" + describe(refused), true);
+        } finally {
+            // 走到一半的连接：进度条还挂着「正在接收」，而它已经不会再动一分一毫了。收回去。
+            // 一次都没落地过字节的连接不会碰任何通知——这次握手失败或者这次探测，不该把
+            // 上一个传输留下的结果一起抹掉。
+            meter.abandon();
         }
     }
 
@@ -734,8 +747,14 @@ final class Listener {
         return "收到 " + count + " 个文件，共 " + size + "，存到 " + where + "/";
     }
 
-    /** A byte count in the largest unit that keeps it readable. */
-    private static String bytes(long total) {
+    /**
+     * A byte count in the largest unit that keeps it readable.
+     *
+     * <p>Package-private because the transfer notification prints the same numbers: one rule
+     * for how a byte count reads, not two — the same reason the name chain above is not
+     * duplicated in the view that shows it.
+     */
+    static String bytes(long total) {
         if (total < 1024) {
             return total + " B";
         }
@@ -765,6 +784,71 @@ final class Listener {
     /** How long something took, in whole milliseconds, for a log line. */
     private static long millis(long startedAt) {
         return (System.nanoTime() - startedAt) / 1_000_000L;
+    }
+
+    /**
+     * 把库里报的字节数变成至多每秒五条的通知，并且知道自己屏幕上还有没有东西要收回去。
+     *
+     * <p># 为什么必须节流
+     *
+     * <p>{@link Native.Landing#landed} 是按落地块调用的，一次传输就是成千上万次，而每一条
+     * 通知都是一次 binder 事务，全都发生在正在读字节的那条线程上——传输在等它。进度条每秒
+     * 重画超过五次，人眼也读不出区别，所以这里选的是「够快」而不是「最快」。
+     *
+     * <p># 为什么收尾不在这里的回调里
+     *
+     * <p>回调不知道哪一块是最后一块。{@code total} 是对端声明的，它可以少发、也可以什么都
+     * 不声明，所以「收完了」这件事只有 native 调用返回才成立，由 {@link #finished} 接手。
+     */
+    private static final class Meter implements Native.Landing {
+
+        /** 两次投递之间的最小间隔。 */
+        private static final long INTERVAL_MS = 200;
+
+        private final Context context;
+
+        /** 上次投递的时刻（{@link System#nanoTime}）；0 表示一次都还没投递过。 */
+        private long postedAt;
+
+        /** 屏幕上有没有一条属于这次连接的进度条。 */
+        private boolean showing;
+
+        /** 这次连接有没有结果。有结果之后就不再收尾。 */
+        private boolean settled;
+
+        Meter(Context context) {
+            this.context = context;
+        }
+
+        @Override
+        public void landed(long done, long total) {
+            long now = System.nanoTime();
+            // 第一条立刻投出去：否则前两百毫秒里一个小文件已经收完了，人什么都没看见。
+            if (postedAt != 0 && now - postedAt < INTERVAL_MS * 1_000_000L) {
+                return;
+            }
+            postedAt = now;
+            showing = true;
+            ReceiveService.progress(context, done, total);
+        }
+
+        /** 有结果了：把进度条换成那句话。 */
+        void finished(String text) {
+            settled = true;
+            ReceiveService.finished(context, text);
+        }
+
+        /**
+         * 把属于这次连接的进度条收回去。
+         *
+         * <p>只收自己画过的那条。一次都没落地过字节的连接——握手失败的、设置读不出来的、
+         * 对端只是来探测一下的——不该把上一个传输留下的结果抹掉。
+         */
+        void abandon() {
+            if (showing && !settled) {
+                ReceiveService.abandon(context);
+            }
+        }
     }
 
     private void setState(String text, boolean failed) {

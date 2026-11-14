@@ -42,6 +42,21 @@ public final class ReceiveService extends Service {
     private static final String CHANNEL = "receive";
 
     /**
+     * 传输进度通知的 id。
+     *
+     * <p>另起一段而不是复用 {@link #NOTIFICATION}：那一条是服务的身份，它整个生命周期都
+     * 得挂着、都得是 ongoing；进度条只跟一次传输同生共死。合成一条的话，服务「我在这儿」
+     * 的凭据就要看一次传输有没有发生过，而人把收完的那条结果划掉，就等于划掉了前台服务
+     * 的证明。id 空间本来也分得开：{@code 0x0A1D} 是服务，{@code 0x0A20}–{@code 0x0A3F}
+     * 是 {@link Confirmation} 的确认框，这条从 {@code 0x0A40} 起。
+     *
+     * <p>固定值而不是像确认框那样分槽：接收端一次只服务一个对端（见 {@link Listener} 的
+     * 类注释「Why one thread and not a pool」），所以同一个时刻最多只有一条传输，不需要
+     * 第二个号。
+     */
+    private static final int TRANSFER = 0x0A40;
+
+    /**
      * 手动开关的位置。
      *
      * <p>「已经在收」不能当作「该收」的理由：窗口打开时接收端本来就在收，于是窗口一到期的
@@ -158,27 +173,121 @@ public final class ReceiveService extends Service {
 
     private Notification notification() {
         NotificationManager manager = getSystemService(NotificationManager.class);
-        if (manager != null && manager.getNotificationChannel(CHANNEL) == null) {
-            NotificationChannel channel = new NotificationChannel(
-                    CHANNEL, "接收", NotificationManager.IMPORTANCE_LOW);
-            // 这一条不是要人做什么，只是一个必须存在的凭据：前台服务不挂通知就不算前台。
-            // 关掉声音与角标，免得每十分钟窗口到期时响一次。
-            channel.setShowBadge(false);
-            channel.setSound(null, null);
-            manager.createNotificationChannel(channel);
+        if (manager != null) {
+            ensureChannel(manager);
         }
-
-        PendingIntent open = PendingIntent.getActivity(
-                this, 0, new Intent(this, MainActivity.class),
-                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
 
         return new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentTitle("正在接收")
                 .setContentText(line())
-                .setContentIntent(open)
+                .setContentIntent(open(this))
                 .setOngoing(true)
                 .build();
+    }
+
+    /** 点通知去哪儿：主界面。服务那条与传输那条共用同一个 {@link PendingIntent}。 */
+    private static PendingIntent open(Context context) {
+        return PendingIntent.getActivity(
+                context, 0, new Intent(context, MainActivity.class),
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+    }
+
+    /**
+     * 这条渠道，第一次用到时建。服务身份与传输进度都发在它上面。
+     *
+     * <p>低优先级、无声音、无角标：这条渠道上的东西都不是请人做什么的请求，一个是「我
+     * 在这儿」的凭据，一个是正在走的字节数。代价是「接收完成」也是安静的——只在通知栏里
+     * 留一句话，不当场响。面板上那行字才是主要的告知处，通知是它迟到的副本。
+     */
+    private static void ensureChannel(NotificationManager manager) {
+        if (manager.getNotificationChannel(CHANNEL) != null) {
+            return;
+        }
+        NotificationChannel channel = new NotificationChannel(
+                CHANNEL, "接收", NotificationManager.IMPORTANCE_LOW);
+        channel.setShowBadge(false);
+        channel.setSound(null, null);
+        manager.createNotificationChannel(channel);
+    }
+
+    /**
+     * 画一条正在走的进度，或者更新它。
+     *
+     * <p>从服务这个连接的那条线程调用，所以这里除了组装并投递一条通知什么都不做：格式化
+     * 以外的活都落在正在读字节的线程上，而那条线程正被传输等着。
+     *
+     * <p>{@code total == 0} 是「对端什么都没声明」，不是「零字节」。这时画不确定态——一条
+     * 转着的进度条——而不是一个分母为零的假比例。{@code done} 超过 {@code total} 是按
+     * {@code total} 封顶显示的：对端可以多发，一条 100% 的进度条比一条 112% 的有用。
+     */
+    static void progress(Context context, long done, long total) {
+        NotificationManager manager = context.getSystemService(NotificationManager.class);
+        if (manager == null) {
+            return;
+        }
+        ensureChannel(manager);
+
+        Notification.Builder builder = new Notification.Builder(context, CHANNEL)
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentTitle("正在接收")
+                .setContentText(soFar(done, total))
+                .setContentIntent(open(context))
+                .setOngoing(true)
+                // 一条传输会往同一个 id 上投很多条通知。少了这个，每一条都是一次全新的
+                // 提醒，而不是同一条状态的更新。
+                .setOnlyAlertOnce(true);
+        if (total > 0) {
+            // 千分之一而不是字节：setProgress 收的是 int，而这两个数是 long。一个 4 GiB
+            // 的传输用 int 装不下，用千分数就永远装得下，而且进度条本来也只需要三位
+            // 有效数字。
+            double fraction = Math.min(done, total) / (double) total;
+            builder.setProgress(1000, (int) Math.round(fraction * 1000), false);
+        } else {
+            builder.setProgress(0, 0, true);
+        }
+        manager.notify(TRANSFER, builder.build());
+    }
+
+    /** 进度条下面那句话：有分母就说走到哪儿了，没有就说到现在收了多少。 */
+    private static String soFar(long done, long total) {
+        if (total > 0) {
+            return Listener.bytes(Math.min(done, total)) + " / " + Listener.bytes(total);
+        }
+        return "已收到 " + Listener.bytes(done);
+    }
+
+    /**
+     * 收完了：把进度条换成结果，并让它能被划掉。
+     *
+     * <p>不再是 ongoing，这条通知已经不需要为任何还在进行的事作证了，而人划掉它就是
+     * 「我看过了」。点开仍然回主界面：收件目录的路径就在那句话里，而这个应用还没有一套
+     * 浏览目录的入口，凭空造一个 {@code FileProvider} 只为让通知能点开一个文件夹，
+     * 不值得。
+     */
+    static void finished(Context context, String text) {
+        NotificationManager manager = context.getSystemService(NotificationManager.class);
+        if (manager == null) {
+            return;
+        }
+        ensureChannel(manager);
+        manager.notify(TRANSFER, new Notification.Builder(context, CHANNEL)
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentTitle("接收完成")
+                .setContentText(text)
+                .setStyle(new Notification.BigTextStyle().bigText(text))
+                .setContentIntent(open(context))
+                .setAutoCancel(true)
+                .setOnlyAlertOnce(true)
+                .build());
+    }
+
+    /** 把进度条收回去：连接结束了，但它没有结果可报。 */
+    static void abandon(Context context) {
+        NotificationManager manager = context.getSystemService(NotificationManager.class);
+        if (manager != null) {
+            manager.cancel(TRANSFER);
+        }
     }
 
     /** 通知上那句话：窗口开着就说还剩多久，否则说跟着互传。 */

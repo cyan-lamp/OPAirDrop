@@ -146,14 +146,36 @@ public final class Native {
      * waits: the peer is in the middle of asking, and the answer it gets is the answer this
      * returns.
      *
-     * <p>{@code summary} is {@code sender<TAB>files<TAB>bytes}, UTF-8. Three fields rather
-     * than a sentence because the wording belongs to whoever shows it.
+     * <p>{@code summary} is {@code sender<TAB>files<TAB>bytes<TAB>links}, UTF-8. Four fields
+     * rather than a sentence because the wording belongs to whoever shows it — and the fourth
+     * is not decoration: a share from Safari is a links-only offer, so a three-field summary
+     * describes it as "0 files", which reads as "there is nothing to take" on the one prompt
+     * where somebody is deciding.
      *
      * <p>Returning {@code false}, throwing, or throwing {@link InterruptedException} all
      * mean the same thing downstream: the transfer is refused.
      */
     public interface Decision {
         boolean accept(String summary);
+    }
+
+    /**
+     * Told how far a receive has got.
+     *
+     * <p>Called on the thread serving the connection, from inside the inbox's write loop:
+     * once per landed chunk, so as often as bytes arrive. It must not block and must not do
+     * real work — the transfer is waiting on it. Marshal to the UI thread and return.
+     *
+     * <p>{@code done} and {@code total} are payload bytes, which is the unit an offer's sizes
+     * are in, so {@code done} can be held against what the sender announced. {@code total} is
+     * what it declared and it is not a promise: a peer may send more or less than it said,
+     * and a {@code total} of zero means it declared nothing at all — show motion rather than
+     * a fraction in that case.
+     *
+     * <p>Throwing stops the reports. It does not stop the transfer.
+     */
+    public interface Landing {
+        void landed(long done, long total);
     }
 
     /**
@@ -178,6 +200,32 @@ public final class Native {
             InputStream input,
             OutputStream output,
             Decision decision)
+            throws IOException;
+
+    /**
+     * Serves one connection, asking {@code decision} before every transfer and reporting how
+     * far the bytes have got to {@code landing}.
+     *
+     * <p>{@link #serveDecided} with a watcher. A separate method rather than two more
+     * parameters on that one, for the same reason that one is separate from {@link #serve}: a
+     * caller built against an older signature keeps working.
+     *
+     * @param decision asked once per offer; never null
+     * @param landing told how many bytes have landed, and how many the offer declared; never
+     *     null
+     * @return the report frame described in the class comment
+     * @throws IOException if a stream fails or a member cannot be written
+     * @throws IllegalArgumentException if the settings cannot be read, or the directory is
+     *     empty or not a string
+     */
+    public static native byte[] serveWatched(
+            String directory,
+            String settings,
+            String model,
+            InputStream input,
+            OutputStream output,
+            Decision decision,
+            Landing landing)
             throws IOException;
 
     /**

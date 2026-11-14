@@ -65,7 +65,11 @@ echo "building the fixture archive"
 
 echo "compiling the Java side"
 mkdir -p "$work/classes"
-javac -d "$classes" \
+# `-encoding` and not the platform default: these sources are UTF-8 and half of them have
+# Chinese in them. A JDK 17 on a GBK host (this one) reads them as mojibake and refuses to
+# compile, which looks like a code error and is not one. The `run_java` below already says
+# `-Dfile.encoding=UTF-8` for the same reason.
+javac -encoding UTF-8 -d "$classes" \
   "$here"/com/oshare/airdrop/Native.java \
   "$here"/com/oshare/airdrop/Report.java \
   "$here"/com/oshare/airdrop/RoundTrip.java \

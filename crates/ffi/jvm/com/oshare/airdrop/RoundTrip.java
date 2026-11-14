@@ -46,6 +46,7 @@ public final class RoundTrip {
 
         receiveLandsEveryMember(archive, inbox, expected);
         serveAnswersAPeerAndStoresWhatItSends(archive, scratch, expected);
+        serveWatchedReportsWhatItLands(archive, scratch, expected);
         aStreamThatGivesUpKeepsItsOwnException(archive, inbox);
         aVanishingPeerIsOneConnectionAndNotTheProcess(scratch);
         aMissingStreamIsRefusedRatherThanDereferenced(inbox);
@@ -157,6 +158,76 @@ public final class RoundTrip {
         // next byte would be read as a new request.
         check("the whole request was consumed", in.available() == 0,
                 in.available() + " byte(s) of the request were never read");
+    }
+
+    /**
+     * The same connection as {@link #serveAnswersAPeerAndStoresWhatItSends}, through the export
+     * that also reports progress.
+     *
+     * <p>This is the assertion {@code cargo test} cannot make. A Rust test links the rlib, so a
+     * mistyped JNI symbol name compiles there and fails on a phone instead, at the first
+     * connection, as an {@code UnsatisfiedLinkError} in a log line nobody is reading. Calling
+     * the method resolves the symbol the moment this class is linked.
+     *
+     * <p>The numbers are held against the report rather than against a constant, because that
+     * is the only promise a watcher gets: its last number is what actually landed, and it never
+     * goes backwards on the way there. {@code total} is zero throughout since no `/Ask` came
+     * first, so nothing declared a size — the honest answer, not a missing one.
+     */
+    private static void serveWatchedReportsWhatItLands(
+            Path archive, Path scratch, List<String> expected) throws Exception {
+        Path inbox = Files.createDirectories(scratch.resolve("watched"));
+        byte[] body = Files.readAllBytes(archive);
+        String head = "POST /Upload HTTP/1.1\r\n"
+                + "Host: air\r\n"
+                + "Content-Type: application/x-cpio\r\n"
+                + "Content-Length: " + body.length + "\r\n\r\n";
+        ByteArrayOutputStream requests = new ByteArrayOutputStream();
+        requests.write(head.getBytes(StandardCharsets.US_ASCII));
+        requests.write(body);
+
+        List<long[]> seen = new ArrayList<>();
+        ByteArrayOutputStream answers = new ByteArrayOutputStream();
+        byte[] frame;
+        ByteArrayInputStream in = new ByteArrayInputStream(requests.toByteArray());
+        try {
+            frame = Native.serveWatched(inbox.toString(), "", "Pixel Test", in, answers,
+                    summary -> true, (done, total) -> seen.add(new long[] {done, total}));
+        } finally {
+            in.close();
+        }
+
+        Report report = Report.of(frame);
+        check("a watched connection stores what it was sent", report.names().equals(expected),
+                "expected " + expected + ", got " + report.names());
+        check("a watcher on a transfer that landed bytes is told something", !seen.isEmpty(),
+                "the callback was never made");
+
+        boolean backwards = false;
+        boolean claimedATotal = false;
+        for (int step = 0; step < seen.size(); step++) {
+            if (step > 0 && seen.get(step)[0] < seen.get(step - 1)[0]) {
+                backwards = true;
+            }
+            if (seen.get(step)[1] != 0) {
+                claimedATotal = true;
+            }
+        }
+        long last = seen.isEmpty() ? -1 : seen.get(seen.size() - 1)[0];
+        check("a watcher is never told the transfer went backwards", !backwards, describe(seen));
+        check("a watcher's last number is what actually landed", last == report.bytes(),
+                "last " + last + ", landed " + report.bytes());
+        check("nothing declared a size, so nothing may be claimed", !claimedATotal,
+                describe(seen));
+    }
+
+    /** A watcher's log as one line, for a failure message: {@code done/total}, in order. */
+    private static String describe(List<long[]> seen) {
+        StringBuilder line = new StringBuilder();
+        for (long[] step : seen) {
+            line.append(line.length() == 0 ? "" : ", ").append(step[0]).append('/').append(step[1]);
+        }
+        return line.toString();
     }
 
     private static void aStreamThatGivesUpKeepsItsOwnException(Path archive, Path inbox)

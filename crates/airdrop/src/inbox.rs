@@ -47,6 +47,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use opairdrop_cpio::{self, Sink};
 
@@ -142,6 +143,24 @@ enum Settlement {
     Unwritten(io::Error),
 }
 
+/// Told how many payload bytes have landed, as they land.
+///
+/// The count is the whole transfer's, not one member's: a person watching a receive thinks
+/// in "how much of this has arrived", and a number that restarts at every file is not that
+/// number. It also counts only payload — header overhead and members that were dropped are
+/// excluded — so it is directly comparable with the sizes the sender declared in its offer,
+/// which is the only total available before the archive is drained.
+///
+/// Takes a [`u64`] rather than a fraction because the caller is the one holding the total,
+/// and it may be wrong: an offer names sizes, and a peer is free to send something else.
+///
+/// `Arc` rather than a borrowed `&mut dyn FnMut` on purpose. The hook is reached from
+/// [`Member::write`], which runs behind a `&mut dyn Write` the extractor holds for the
+/// length of a member — there is nowhere to thread a borrow through that without giving
+/// [`Inbox`] a lifetime parameter and making every caller carry it. A shared, `'static`
+/// handle costs one atomic per chunk and keeps the type where it is.
+pub type Progress = Arc<dyn Fn(u64) + Send + Sync>;
+
 /// A member that is currently being written.
 struct Member {
     name: String,
@@ -154,10 +173,19 @@ struct Member {
     allowed: u64,
     limit: u64,
     failure: Option<Error>,
+    /// Where to say how far the transfer has got, and what to add to this member's own
+    /// count to say it: the bytes earlier members already published.
+    progress: Option<(Progress, u64)>,
 }
 
 impl Member {
-    fn open(root: &Path, name: String, allowed: u64, limit: u64) -> Result<Member, Error> {
+    fn open(
+        root: &Path,
+        name: String,
+        allowed: u64,
+        limit: u64,
+        progress: Option<(Progress, u64)>,
+    ) -> Result<Member, Error> {
         let target = root.join(&name);
         let parent = target.parent().unwrap_or(root).to_path_buf();
         fs::create_dir_all(&parent).map_err(Error::Io)?;
@@ -178,6 +206,7 @@ impl Member {
             allowed,
             limit,
             failure: None,
+            progress,
         })
     }
 
@@ -241,6 +270,11 @@ impl Write for Member {
         // what was actually stored.
         file.write_all(bytes)?;
         self.written += bytes.len() as u64;
+        // After the write, not before: a chunk that failed did not arrive, and a bar that
+        // counts what a full disk refused is worse than no bar.
+        if let Some((say, earlier)) = &self.progress {
+            say(earlier.saturating_add(self.written));
+        }
         Ok(bytes.len())
     }
 
@@ -271,6 +305,8 @@ pub struct Inbox {
     discard: io::Sink,
     /// First refusal, reported once the archive has been drained.
     failure: Option<Error>,
+    /// Where to report landing bytes, if anybody is watching.
+    progress: Option<Progress>,
 }
 
 impl Inbox {
@@ -301,7 +337,18 @@ impl Inbox {
             member: None,
             discard: io::sink(),
             failure: None,
+            progress: None,
         })
+    }
+
+    /// Reports landing bytes to `progress` as they are written.
+    ///
+    /// A builder method rather than an argument to [`Inbox::with_limits`]: watching is a
+    /// property of this one receive, and the two callers that do not watch would otherwise
+    /// pass `None` to say nothing.
+    pub fn watched(mut self, progress: Progress) -> Inbox {
+        self.progress = Some(progress);
+        self
     }
 
     /// The directory members are unpacked into.
@@ -442,7 +489,13 @@ impl Sink for Inbox {
             }
         };
         let allowed = self.limit.saturating_sub(self.total);
-        match Member::open(&self.root, name.clone(), allowed, self.limit) {
+        // `total` is what earlier members published, which is the offset this member's own
+        // count has to be added to before it means anything to a watcher.
+        let progress = self
+            .progress
+            .as_ref()
+            .map(|say| (Arc::clone(say), self.total));
+        match Member::open(&self.root, name.clone(), allowed, self.limit, progress) {
             Ok(member) => {
                 self.taken.insert(name);
                 self.member = Some(member);
@@ -496,6 +549,26 @@ pub fn receive_with<R: Read>(
     archive: R,
 ) -> Result<Received, Error> {
     let mut inbox = Inbox::with_limits(directory, limits)?;
+    drain(&mut inbox, archive)
+}
+
+/// [`receive_with`], saying how many bytes have landed as they land.
+///
+/// The hook sees payload bytes only, which is what makes it comparable with the sizes an
+/// offer declared. It is not allowed to fail: whatever it does with the number, the
+/// receive goes on — a progress bar is not a reason to drop a transfer.
+pub fn receive_watched<R: Read>(
+    directory: impl AsRef<Path>,
+    limits: Limits,
+    archive: R,
+    progress: Progress,
+) -> Result<Received, Error> {
+    let mut inbox = Inbox::with_limits(directory, limits)?.watched(progress);
+    drain(&mut inbox, archive)
+}
+
+/// Unpacks into an open inbox and reports what landed, refusal first.
+fn drain<R: Read>(inbox: &mut Inbox, archive: R) -> Result<Received, Error> {
     let landed = inbox.receive(archive);
     let received = Received {
         names: inbox.names().to_vec(),
@@ -568,6 +641,45 @@ mod tests {
             listing(&root),
             ["note.txt", "photos", "photos/one.jpg"],
             "no temporary is left behind"
+        );
+    }
+
+    #[test]
+    fn a_watched_receive_counts_the_whole_transfer_rather_than_each_member() {
+        let root = scratch("watched");
+        let bytes = archive(&[
+            Entry::file("note.txt", b"the quick brown fox".to_vec()),
+            Entry::file("photos/one.jpg", b"jpeg".to_vec()),
+        ]);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+
+        let received = receive_watched(
+            &root,
+            Limits::default(),
+            bytes.as_slice(),
+            Arc::new(move |done| {
+                log.lock().expect("the log is not poisoned").push(done);
+            }),
+        )
+        .expect("the archive is accepted");
+
+        let reported = seen.lock().expect("the log is not poisoned").clone();
+        assert!(
+            reported.windows(2).all(|pair| pair[0] <= pair[1]),
+            "a bar that goes backwards is worse than none: {reported:?}"
+        );
+        assert_eq!(
+            reported.last().copied(),
+            Some(received.bytes),
+            "the last number a watcher sees is what actually landed"
+        );
+        // 19 is the first member's size. A hook that reported each member's own count would
+        // stop there and start again at 4, so anything past it is the second member being
+        // added to the first rather than counted alone.
+        assert!(
+            reported.iter().any(|&done| done > 19),
+            "the second member must count on from the first: {reported:?}"
         );
     }
 

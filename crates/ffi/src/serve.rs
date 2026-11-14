@@ -49,6 +49,7 @@
 use std::ffi::c_void;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use opairdrop_airdrop::inbox::{self, Error as InboxError, Limits};
 use opairdrop_airdrop::payload::Ask;
@@ -71,12 +72,20 @@ pub type DecideCallback =
     unsafe extern "C" fn(context: *mut c_void, summary: *const u8, len: usize) -> i32;
 
 /// A [`DecideCallback`] with the context it was built for.
-struct Decide {
+pub(crate) struct Decide {
     callback: DecideCallback,
     context: *mut c_void,
 }
 
 impl Decide {
+    /// A decider built from a callback and the context it was made for.
+    ///
+    /// For this crate's own callers — the JNI layer holds the pair already and has no reason
+    /// to round-trip it through the C ABI's argument list.
+    pub(crate) fn new(callback: DecideCallback, context: *mut c_void) -> Decide {
+        Decide { callback, context }
+    }
+
     /// Asks, and reads everything but a positive answer as a refusal.
     fn take(&self, offer: &Ask) -> bool {
         let summary = summary_of(offer);
@@ -84,6 +93,48 @@ impl Decide {
         // context for the duration of the call, and the bytes outlive the invocation.
         let answer = unsafe { (self.callback)(self.context, summary.as_ptr(), summary.len()) };
         answer > 0
+    }
+}
+
+/// Told how far a receive has got, so a caller can draw something.
+///
+/// `done` is payload bytes — the unit an offer's sizes are in — and `total` is what that
+/// offer declared. Neither is a promise: a peer may send more or less than it announced,
+/// and a `total` of zero means it announced nothing, which is the caller's cue to show
+/// motion rather than a fraction.
+///
+/// Called from inside the write loop of the inbox, so it runs on the thread serving the
+/// connection, as often as chunks arrive. It must be cheap and must not block: the transfer
+/// is waiting on it.
+pub type LandingCallback = unsafe extern "C" fn(context: *mut c_void, done: u64, total: u64);
+
+/// A [`LandingCallback`] with the context it was built for.
+#[derive(Clone, Copy)]
+pub(crate) struct Watcher {
+    callback: LandingCallback,
+    context: *mut c_void,
+}
+
+// SAFETY: `context` is opaque here — this layer never dereferences it, only hands it back to
+// `callback`, which the caller promised to keep valid for the duration of the call.
+//
+// The bounds are needed because the hook has to live in an `Arc` to be reachable from
+// `Member::write`, which sits behind a `&mut dyn Write` the extractor owns. Threading a
+// borrow down there instead would give `Inbox` a lifetime parameter and make every caller
+// carry it.
+unsafe impl Send for Watcher {}
+unsafe impl Sync for Watcher {}
+
+impl Watcher {
+    /// A watcher built from a callback and the context it was made for, for this crate's own
+    /// callers.
+    pub(crate) fn new(callback: LandingCallback, context: *mut c_void) -> Watcher {
+        Watcher { callback, context }
+    }
+
+    fn say(&self, done: u64, total: u64) {
+        // SAFETY: as `Decide::take`: the caller promised this pair for the whole call.
+        unsafe { (self.callback)(self.context, done, total) }
     }
 }
 
@@ -123,6 +174,12 @@ pub(crate) struct Store {
     directory: PathBuf,
     /// Who to ask before taking a transfer, or `None` to take every one.
     decide: Option<Decide>,
+    /// Who to tell how far a receive has got, or `None` to stay quiet.
+    watcher: Option<Watcher>,
+    /// What the offer in hand says the whole transfer weighs. The hook's denominator, and
+    /// the reason `accept` reads the sizes: by the time bytes are landing the offer has
+    /// been consumed.
+    declared: u64,
     /// The budget and the collision rule, both from the settings.
     limits: Limits,
     /// What the connection has stored so far, in the frame a caller reads.
@@ -148,6 +205,9 @@ impl Receiver for Store {
     }
 
     fn accept(&mut self, offer: &Ask) -> bool {
+        // Kept for the progress hook. A sender that declares no sizes leaves this at zero,
+        // and a zero total is a caller's cue to show motion rather than a fraction.
+        self.declared = offer.files.iter().filter_map(|file| file.size).sum();
         match &self.decide {
             None => true,
             Some(decide) => decide.take(offer),
@@ -164,8 +224,15 @@ impl Receiver for Store {
         // The body is de-chunked but still wrapped — gzip or DVZip blocks — and the inbox
         // sniffs and unwraps it. Doing that here would mean two places that know what an
         // upload looks like.
-        let received =
-            inbox::receive_with(&self.directory, self.limits, body).map_err(io::Error::other)?;
+        let received = match self.watcher {
+            None => inbox::receive_with(&self.directory, self.limits, body),
+            Some(watcher) => {
+                let total = self.declared;
+                let hook: inbox::Progress = Arc::new(move |done| watcher.say(done, total));
+                inbox::receive_watched(&self.directory, self.limits, body, hook)
+            }
+        }
+        .map_err(io::Error::other)?;
         self.landed.bytes += received.bytes;
         self.landed.names.extend(received.names);
         Ok(())
@@ -208,6 +275,7 @@ pub unsafe extern "C" fn opairdrop_serve(
             read,
             write,
             context,
+            None,
             None,
             report,
         )
@@ -260,6 +328,67 @@ pub unsafe extern "C" fn opairdrop_serve_decided(
                 callback: decide,
                 context: decide_context,
             }),
+            None,
+            report,
+        )
+    }
+}
+
+/// Serves one connection, asking `decide` before every transfer and reporting how far it
+/// has got to `progress`.
+///
+/// [`opairdrop_serve_decided`] with a watcher. It exists as a third export rather than as
+/// two more arguments on the second for the same reason the second exists: a caller built
+/// against an older signature keeps working, and `dlsym` failures on a missing symbol are a
+/// worse way to learn about an upgrade than an unchanged prototype.
+///
+/// `progress` is called from inside the write loop, once per landed chunk, with the bytes so
+/// far and the total the offer declared. Both are payload bytes, so they are comparable with
+/// the sizes a sender names. The transfer waits on the call: it must be cheap and it must
+/// not block. It is never allowed to fail the receive — a progress bar is not a reason to
+/// drop a transfer.
+///
+/// # Safety
+///
+/// As [`opairdrop_serve_decided`], plus: `progress` must be a valid function pointer whose
+/// `progress_context` stays valid for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn opairdrop_serve_watched(
+    directory: *const u8,
+    directory_len: usize,
+    settings_text: *const u8,
+    settings_len: usize,
+    model: *const u8,
+    model_len: usize,
+    read: ReadCallback,
+    write: WriteCallback,
+    context: *mut c_void,
+    decide: DecideCallback,
+    decide_context: *mut c_void,
+    progress: LandingCallback,
+    progress_context: *mut c_void,
+    report: *mut OpairdropBuffer,
+) -> i32 {
+    // SAFETY: as above, plus the second callback pair the caller promises.
+    unsafe {
+        serve(
+            directory,
+            directory_len,
+            settings_text,
+            settings_len,
+            model,
+            model_len,
+            read,
+            write,
+            context,
+            Some(Decide {
+                callback: decide,
+                context: decide_context,
+            }),
+            Some(Watcher {
+                callback: progress,
+                context: progress_context,
+            }),
             report,
         )
     }
@@ -282,8 +411,12 @@ pub unsafe extern "C" fn opairdrop_serve_decided(
 /// `settings` and `model` must point at their stated lengths of readable bytes, or be null;
 /// `read` and `write` must be valid function pointers whose `context` stays valid for the
 /// duration; `report` must point at a zeroed [`OpairdropBuffer`] that outlives the call.
+///
+/// `pub(crate)` rather than private so the JNI layer can hand over the callbacks it already
+/// holds as [`Decide`] and [`Watcher`] pairs, instead of re-deriving them from the raw
+/// argument lists the two outer exports take.
 #[allow(clippy::too_many_arguments)]
-unsafe fn serve(
+pub(crate) unsafe fn serve(
     directory: *const u8,
     directory_len: usize,
     settings_text: *const u8,
@@ -294,6 +427,7 @@ unsafe fn serve(
     write: WriteCallback,
     context: *mut c_void,
     decide: Option<Decide>,
+    watcher: Option<Watcher>,
     report: *mut OpairdropBuffer,
 ) -> i32 {
     if report.is_null() || directory.is_null() {
@@ -352,6 +486,8 @@ unsafe fn serve(
         limits: settings::limits(&values),
         landed: Report::default(),
         decide,
+        watcher,
+        declared: 0,
     });
 
     // SAFETY: the caller guarantees `read`, `write` and `context` for the duration of this
@@ -532,6 +668,57 @@ mod tests {
         // SAFETY: the call above filled the buffer, one way or the other.
         unsafe { crate::buffer::opairdrop_buffer_free(&mut out) };
         (outcome, wire.answers, verdict.summary)
+    }
+
+    /// What the test's own progress callback was told: `(done, total)` per call, in order.
+    unsafe extern "C" fn record_progress(context: *mut c_void, done: u64, total: u64) {
+        // SAFETY: every test passes the `Vec` it created as the context.
+        let seen = unsafe { &mut *(context as *mut Vec<(u64, u64)>) };
+        seen.push((done, total));
+    }
+
+    /// Like [`serve_decided`], but through the export that also reports progress. Returns
+    /// the status, the report frame, the answers, and what the hook was told, in order.
+    #[allow(clippy::type_complexity)]
+    fn serve_watched(
+        directory: &str,
+        settings: &str,
+        model: &str,
+        requests: Vec<u8>,
+        accept: bool,
+    ) -> (i32, Vec<u8>, Vec<u8>, Vec<(u64, u64)>) {
+        let mut wire = Wire::new(requests);
+        let mut verdict = Verdict {
+            accept,
+            summary: String::new(),
+        };
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        let mut out = OpairdropBuffer::EMPTY;
+        // SAFETY: the strings, the wire, the verdict and the log outlive the call; `out` is
+        // a zeroed buffer on this frame.
+        let outcome = unsafe {
+            opairdrop_serve_watched(
+                directory.as_ptr(),
+                directory.len(),
+                settings.as_ptr(),
+                settings.len(),
+                model.as_ptr(),
+                model.len(),
+                read_wire,
+                write_wire,
+                &mut wire as *mut Wire as *mut c_void,
+                decide_with,
+                &mut verdict as *mut Verdict as *mut c_void,
+                record_progress,
+                &mut seen as *mut Vec<(u64, u64)> as *mut c_void,
+                &mut out,
+            )
+        };
+        // SAFETY: the call above filled the buffer, one way or the other.
+        let bytes = unsafe { out.as_slice() }.to_vec();
+        // SAFETY: the buffer came from the call above.
+        unsafe { crate::buffer::opairdrop_buffer_free(&mut out) };
+        (outcome, bytes, wire.answers, seen)
     }
 
     #[test]
@@ -736,6 +923,75 @@ mod tests {
             std::fs::read(root.join("note.txt")).expect("the member is on disk"),
             payload
         );
+    }
+
+    #[test]
+    fn a_watched_endpoint_counts_what_it_lands_and_says_nothing_was_declared() {
+        let root = scratch("watched");
+        let payload = vec![7u8; 4096];
+        let body = archive("note.txt", &payload);
+
+        let (code, report, answers, seen) = serve_watched(
+            root.to_str().expect("UTF-8"),
+            "",
+            "OPPO PJZ110",
+            post("/Upload", "application/x-cpio", &body),
+            true,
+        );
+
+        assert_eq!(code, status::OK);
+        assert!(String::from_utf8_lossy(&answers).starts_with("HTTP/1.1 200"));
+        let report = Report::decode(&report).expect("a frame came back");
+        assert!(!seen.is_empty(), "a watcher on a receive that landed bytes saw none");
+        assert!(
+            seen.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "a bar that goes backwards is worse than none: {seen:?}"
+        );
+        assert_eq!(
+            seen.last().map(|&(done, _)| done),
+            Some(report.bytes),
+            "the last number a watcher sees is what actually landed: {seen:?}"
+        );
+        // No `/Ask` came first, so the offer this hook would have taken its denominator from
+        // never existed. Zero is the honest answer — and the caller's cue to show motion
+        // rather than a fraction, which is the whole reason both numbers are passed through
+        // a zero total. Inventing a denominator from the archive that is still arriving
+        // would be a lie the caller cannot detect.
+        assert!(
+            seen.iter().all(|&(_, total)| total == 0),
+            "nothing was declared, so nothing may be claimed: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn an_offer_s_sizes_are_the_denominator_a_watcher_is_given() {
+        let root = scratch("declared");
+        let ask = Ask {
+            files: vec![
+                opairdrop_airdrop::Item::new("a.jpg").with_size(7),
+                opairdrop_airdrop::Item::new("b.jpg").with_size(11),
+                // A sender that declares nothing for one member contributes nothing rather
+                // than a zero that would silently make the sum look smaller than the
+                // transfer this receiver is about to be shown.
+                opairdrop_airdrop::Item::new("c.jpg"),
+            ],
+            ..Ask::default()
+        };
+        let mut store = Store {
+            name: String::new(),
+            model: String::new(),
+            directory: root,
+            limits: Limits::default(),
+            landed: Report::default(),
+            decide: None,
+            watcher: None,
+            declared: 0,
+        };
+
+        // Asked with nobody to ask: every transfer is taken, and the sizes are read on the
+        // way past because `upload` runs after the offer has been consumed.
+        assert!(store.accept(&ask));
+        assert_eq!(store.declared, 18);
     }
 
     #[test]

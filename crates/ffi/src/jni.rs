@@ -49,6 +49,7 @@ use jni_sys::{
 
 use crate::api::{self, status};
 use crate::buffer::{opairdrop_buffer_free, OpairdropBuffer};
+use crate::serve::{serve, Decide, Watcher};
 use crate::settings;
 
 /// Bytes requested from the Java stream per crossing.
@@ -765,6 +766,76 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_serveDecided(
     output: jobject,
     decide: jobject,
 ) -> jbyteArray {
+    // SAFETY: the JVM's own call, and nothing is watching this one.
+    unsafe {
+        serve_for_java(
+            env,
+            directory,
+            settings_text,
+            model,
+            input,
+            output,
+            decide,
+            ptr::null_mut(),
+        )
+    }
+}
+
+/// Serves one connection, asking a person before every transfer and saying how far it got.
+///
+/// [`serveDecided`] with a watcher. `landing` is a `com.oshare.airdrop.Native$Landing`, whose
+/// `landed(long done, long total)` runs on the thread serving this connection, from inside
+/// the inbox's write loop: once per landed chunk, so as often as bytes arrive.
+///
+/// Both numbers are payload bytes, which is the unit an offer's sizes are in. `total` is
+/// what the sender declared and it is not a promise — a peer may send more or less than it
+/// announced — and a `total` of zero means it declared nothing, which is the caller's cue to
+/// show motion rather than a fraction.
+///
+/// The call happens while the transfer waits, so it must be cheap. It cannot fail the
+/// receive: a `landing` that throws stops being told and the bytes keep arriving.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv` and objects of the declared types.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_serveWatched(
+    env: *mut JNIEnv,
+    _class: jclass,
+    directory: jstring,
+    settings_text: jstring,
+    model: jstring,
+    input: jobject,
+    output: jobject,
+    decide: jobject,
+    landing: jobject,
+) -> jbyteArray {
+    // SAFETY: the JVM's own call.
+    unsafe {
+        serve_for_java(
+            env,
+            directory,
+            settings_text,
+            model,
+            input,
+            output,
+            decide,
+            landing,
+        )
+    }
+}
+
+/// The body of the two exports above. `landing` may be null, which means nobody is watching.
+unsafe fn serve_for_java(
+    env: *mut JNIEnv,
+    directory: jstring,
+    settings_text: jstring,
+    model: jstring,
+    input: jobject,
+    output: jobject,
+    decide: jobject,
+    landing: jobject,
+) -> jbyteArray {
     if env.is_null() {
         return ptr::null_mut();
     }
@@ -813,6 +884,17 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_serveDecided(
     let Ok(mut decider) = (unsafe { Decider::new(env, decide) }) else {
         return ptr::null_mut();
     };
+    // SAFETY: `landing` is null or a live `com.oshare.airdrop.Native$Landing`, per the JVM's
+    // call. Null means the caller wants no reports, which is `serveDecided`'s whole case and
+    // is not an error.
+    let mut landing = if landing.is_null() {
+        None
+    } else {
+        match unsafe { Landing::new(env, landing) } {
+            Ok(landing) => Some(landing),
+            Err(()) => return ptr::null_mut(),
+        }
+    };
 
     let (settings_pointer, settings_len) = match &settings_text {
         Some(text) => (text.as_ptr(), text.len()),
@@ -827,7 +909,7 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_serveDecided(
     // SAFETY: every byte slice outlives the call or is null, each callback is paired with
     // the context it was built for, and `report` is a zeroed buffer on this frame.
     let outcome = unsafe {
-        crate::serve::opairdrop_serve_decided(
+        serve(
             directory.as_ptr(),
             directory.len(),
             settings_pointer,
@@ -837,8 +919,13 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_serveDecided(
             read_connection,
             write_connection,
             &mut connection as *mut Connection as *mut c_void,
-            decide_java,
-            &mut decider as *mut Decider as *mut c_void,
+            Some(Decide::new(
+                decide_java,
+                &mut decider as *mut Decider as *mut c_void,
+            )),
+            landing
+                .as_mut()
+                .map(|landing| Watcher::new(report_landing, landing as *mut Landing as *mut c_void)),
             &mut report,
         )
     };
@@ -1434,6 +1521,100 @@ unsafe extern "C" fn decide_java(context: *mut c_void, summary: *const u8, len: 
     unsafe { (entry!(table, DeleteLocalRef))(decider.env, argument) };
     // `CallBooleanMethod` answers a `jboolean`: 0 or 1, not `false`/`true`.
     i32::from(answer != 0)
+}
+
+/// A Java object that is told how far a receive has got.
+///
+/// The mirror of [`Gauge`], which watches a send. It carries no phase because a receive has
+/// none worth reporting: an offer is either being read or bytes are landing, and only the
+/// second one produces a number.
+struct Landing {
+    env: *mut JNIEnv,
+    object: jobject,
+    /// Cached `Landing.landed(JJ)V`.
+    landed: jni_sys::jmethodID,
+    /// Set once the Java side threw. The receive is not abandoned for it, but the callback
+    /// is not made again either: one broken listener must not become thousands of
+    /// exceptions on a long transfer.
+    failed: bool,
+}
+
+impl Landing {
+    /// # Safety
+    ///
+    /// `env` must be valid and `object` a live `com.oshare.airdrop.Native$Landing`.
+    unsafe fn new(env: *mut JNIEnv, object: jobject) -> Result<Landing, ()> {
+        // SAFETY: `env` is valid for the whole call, and the table outlives it.
+        let table = unsafe { table(env) };
+        // SAFETY: `object` is a live object.
+        let class = unsafe { (entry!(table, GetObjectClass))(env, object) };
+        if class.is_null() {
+            return Err(());
+        }
+        let name = c_str("landed");
+        let signature = c_str("(JJ)V");
+        // SAFETY: `class` is the live class object made above, both strings outlive the call.
+        let landed = unsafe {
+            (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr())
+        };
+        // SAFETY: `class` is the local reference made above.
+        unsafe { (entry!(table, DeleteLocalRef))(env, class) };
+        if landed.is_null() || unsafe { pending(env) } {
+            return Err(());
+        }
+        Ok(Landing {
+            env,
+            object,
+            landed,
+            failed: false,
+        })
+    }
+}
+
+/// The C ABI's landing callback, backed by `Landing.landed`.
+///
+/// Runs on the thread serving the connection, from inside the inbox's write loop. A null
+/// context means nobody is watching, which is not an error: the two exports differ only in
+/// whether a `Landing` existed to hand over.
+///
+/// # Safety
+///
+/// `context` must point at a live [`Landing`].
+unsafe extern "C" fn report_landing(context: *mut c_void, done: u64, total: u64) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: the caller passes the `Landing` this layer created, on the thread serving one
+    // connection, so the borrow cannot alias.
+    let landing = unsafe { &mut *(context as *mut Landing) };
+    if landing.failed {
+        return;
+    }
+    // SAFETY: `landing.env` is valid.
+    //
+    // A pending exception — from a write that failed a moment ago, say — makes the call
+    // below abort the process. The receive is not abandoned for this; the meter simply
+    // stops being told.
+    if unsafe { pending(landing.env) } {
+        landing.failed = true;
+        return;
+    }
+    let table = unsafe { table(landing.env) };
+    // SAFETY: `landed` is `Landing.landed(JJ)V` on the object the caller handed over.
+    unsafe {
+        (entry!(table, CallVoidMethod))(
+            landing.env,
+            landing.object,
+            landing.landed,
+            done as jlong,
+            total as jlong,
+        )
+    };
+    // SAFETY: `landing.env` is valid.
+    if unsafe { pending(landing.env) } {
+        // The exception stays pending: it is the Java caller's, and it is the honest report.
+        landing.failed = true;
+    }
 }
 
 /// One connection: the stream it reads from and the stream it writes to.
