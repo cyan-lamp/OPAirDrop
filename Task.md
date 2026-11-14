@@ -378,6 +378,37 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 ## 13. 变更日志（新的在上）
 
+- **2026-11-14 13:10**：**手动拉起链路成功，但「iPhone 能看到本机」这个验收前提被推翻了。**
+  照 §7.3 的序列把整条栈拉起来了（`tools/awdl-stack.sh`，见下），并且在本机把业务面也验到了：
+  `grep -i ':2242' /proc/net/tcp6` 命中 `state 0A`（8770 绑在 `::`，注意 **8770 十进制 = 0x2242**，
+  上一轮 grep 成 `:2402` 得到的「空输出」是错的），随后
+  `curl --interface wonder0 "http://[fe80::…%25wonder0]:8770/Discover"` 回
+  `HTTP/1.1 200` + `Server: AirDrop/1.0` + 142 字节合法 `bplist00`
+  （`ReceiverComputerName=PJZ110N`、`ReceiverMediaCapabilities={"Version": 1}`、`IsAirDropable`）。
+  **但这只证明应用层和本机协议栈是通的，不证明空中往返**——那次 POST 的源地址和目标地址都在
+  wonder0 上，包根本没出射频。实测计数把这一点说得很直白：`wonder0 rx_packets=0 / rx_bytes=0`，
+  同期 `tx_packets=370`。所以「链路通」目前只到「网卡 up + 端口应答」为止。
+  **真正的阻塞是两处结构性缺口，都不是驱动问题：**
+  **① 没有 mDNS 应答器。** 全仓 `Builder::response()` 只出现在 `crates/ffi/src/browse.rs` 的
+  `#[cfg(test)]` 里，用途是**解析**别人发来的应答；`Peers` 只发查询；没有 `NsdManager`、
+  没有 `registerService`。AirDrop 的对端是靠「向 5353 查 `_airdrop._tcp.local`、接收方回答」
+  才在设备列表里出现的，我们从不回答，于是 iPhone 那一侧永远是空的。§4.1 写的
+  「主动发查询，或被动收广播」只覆盖了「我们找 iPhone」，漏了「iPhone 找我们」这一半。
+  **② 没有 AWDL 数据面。** `AwdlNode` / `AwdlData` / `AwdlFrame` / `AwdlInj` / `AwdlProbe` /
+  `AwdlTx`（AF_PACKET 与 `/dev/tun` 那一整套）**全都在 `legacy/` 下，当前仓库一份没有**。
+  而 `legacy/.../core/MdnsResponder.java` 的类注释记着一条同型号机器上的实测：
+  「35 秒里无线电收 9295 帧，`wonder0` 的接收计数只动了 8」——因为 `wonder0` 是 ethernet vif，
+  驱动几乎不往里回东西，往外发的也只是普通 802.11 数据帧，对端在 MAC 之上就丢了。
+  旧版因此把接收改成 tun：`AwdlNode` 用 `app_process` 开 `/dev/tun` 建 `awdltun0`，
+  `ip -6 addr flush dev wonder0` 再用 /128 路由把本机 link-local 流量导进 tun，
+  `MdnsResponder.DEFAULT_INTERFACE` 就是 `awdltun0`，注释明写「**永不是 wonder0**」。
+  **教训**：§10 第 1 条把「驱动打包」和「iPhone 能看到本机」写成一个验收，但它们根本不是一件事。
+  驱动只解决「无线电能收能发 AWDL 帧」，中间还隔着「帧要送进一个能收的接口」和「要有人回答 mDNS」
+  两层。打包 37.4 MB 之前就该把这两层补齐，否则包变大了，iPhone 仍然看不见。
+  本次新增 `tools/awdl-stack.sh`：从 `legacy/module/bin/control.sh` 裁出的最小加载器
+  （`start|stop|link|status`），去掉 `mosey_server`、QuickShare/provider plumbing、supervisor 与
+  callback bootstrap，把 `awdl-link.sh` 内联进来；保留 `boot_id` 标记（中断可续）与
+  「`swap_done` 之后失败禁止回滚到出厂驱动」这条禁令。
 - **2026-11-14 12:50**：三条，都是「看起来在生效、其实一直被静默丢掉」。
   **① 模糊的圆角一直是 0 —— 因为参数发给了错的对象。** `PanelGlass` 一直把
   `setBlurRadius` / `setCornerRadius` 反射调用在**系统造出来的那个 Drawable** 上；这台机器给的是
