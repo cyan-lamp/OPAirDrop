@@ -101,12 +101,12 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     private static final int SPRING_MS = 240;
 
     /**
-     * 跟手位移每帧朝目标走多少。
+     * 手抖的判定线：一次移动不到这个距离，就认为不是人在拖，而是输入噪声。
      *
-     * <p>0.6 是「跟手」与「不抖」之间的取舍：1.0 完全跟手，但把输入事件的 3–8 像素回跳也
-     * 一起画出来；0.3 很稳。0.6 的滞后约一帧。
+     * <p>真机上量到的回跳是 3–8 像素。8dp（这台机器 32 像素）留了足够余量：正常的拖动每帧
+     * 远超这个数，只有噪声落在下面。
      */
-    private static final float SMOOTH = 0.6f;
+    private static final float JITTER_DP = 8f;
 
     /** 面板顶部的圆角。和导航胶囊同一个数。 */
     private static final float CORNER_DP = 28f;
@@ -150,6 +150,8 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     private boolean closing;
     /** 面板背景的实时模糊；{@code null} 表示这台机器给不了，走纯色退路。 */
     private PanelGlass glass;
+    /** 盖在模糊之上的染色层。模糊只给「看到背后」，可读性由它保证。 */
+    private View tint;
     private volatile boolean sending;
 
     @Override
@@ -234,9 +236,10 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         }
         glass = panel;
         panel.radius(dp(BLUR_DP));
-        panel.color(glassTint());
         panel.corners(dp(CORNER_DP), 0f);
+        // 只设模糊，不染色：叠色自己盖一层 {@link #tint}（理由见 buildShell 里的注释）。
         sheet.setBackground(panel.drawable());
+        tintSheet();
         android.util.Log.i("OPAirDrop", "panel glass: " + panel.source()
                 + " radius=" + dp(BLUR_DP) + " corner=" + dp(CORNER_DP));
     }
@@ -270,23 +273,26 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * 遮到 240 就只剩一块白板。再薄就会让标题压到别人的图标上。
      */
     private int glassTint() {
-        int alpha = S.light ? 0xC0 : 0xC8;
-        return (S.bg & 0x00FFFFFF) | (alpha << 24);
+        // 208/255。比导航胶囊的 240 透，因为背后是壁纸而不是同色卡片；又不能不透，白字要靠
+        // 它压住浅色壁纸的亮部。深浅同值：透明度是结构，不是配色。
+        return (S.bg & 0x00FFFFFF) | 0xD0000000;
     }
 
-    /** 换配色时重刷玻璃的染色；没有玻璃就刷退路底色。 */
+    /** 换配色时重刷染色层；没有玻璃时它就是不透明的页底。 */
     private void tintSheet() {
-        if (sheet == null) {
+        if (tint == null) {
             return;
         }
-        if (glass != null) {
-            glass.color(glassTint());
-            return;
-        }
-        Drawable background = sheet.getBackground();
-        if (background instanceof GradientDrawable) {
-            ((GradientDrawable) background).setColor(sheetColor());
-        }
+        tint.setBackground(shape(glass != null ? glassTint() : sheetColor()));
+    }
+
+    /** 面板轮廓：上两角圆、下两角方——它是从底边长出来的一整块，底边在屏幕外面。 */
+    private GradientDrawable shape(int color) {
+        GradientDrawable shape = new GradientDrawable();
+        float radius = dp(CORNER_DP);
+        shape.setCornerRadii(new float[]{radius, radius, radius, radius, 0f, 0f, 0f, 0f});
+        shape.setColor(color);
+        return shape;
     }
 
     // ------------------------------------------------------------------ 骨架
@@ -294,12 +300,18 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     private void buildShell() {
         sheet = new Sheet(this);
 
-        GradientDrawable shape = new GradientDrawable();
         float radius = dp(CORNER_DP);
-        // 上两角圆、下两角方：它是从底边长出来的一整块，底边在屏幕外面。
-        shape.setCornerRadii(new float[]{radius, radius, radius, radius, 0f, 0f, 0f, 0f});
-        shape.setColor(sheetColor());
-        sheet.setBackground(shape);
+        sheet.setBackground(shape(sheetColor()));
+
+        // 染色层：盖在模糊之上、内容之下。
+        //
+        // 不用 BackgroundBlurDrawable.setColor 做这件事——那个方法在这台机器上没有任何效果
+        // （模糊出来了，叠色没上，深色主题的白字直接落在浅色壁纸上）。自己盖一层同名同义的
+        // 半透明页底，行为完全可控，也不再依赖那条反射是否被 ROM 实现。
+        tint = new View(this);
+        tint.setBackground(shape(sheetColor()));
+        sheet.addView(tint, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         content = new FrameLayout(this);
         sheet.addView(content, new FrameLayout.LayoutParams(
@@ -852,7 +864,11 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     // 移动不到一像素时，那正是「整个窗口在抖」的来源。
                     float dy = Math.max(0f, event.getY() - downY);
                     float target = startY + dy;
-                    shown += (target - shown) * SMOOTH;
+                    // 自适应：手指一次移动超过 8dp，那是人在拖，几乎原样跟（0.92 只留一点缓冲）；
+                    // 不到 8dp 的是手抖（真机上量到 3–8 像素的回跳），压到 0.45。
+                    // 固定系数做不到两件事：大了抖，小了黏。
+                    float delta = target - shown;
+                    shown += delta * (Math.abs(delta) > dp(JITTER_DP) ? 0.92f : 0.45f);
                     if (Math.abs(target - shown) < 0.5f) {
                         shown = target;
                     }
