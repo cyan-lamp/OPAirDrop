@@ -29,6 +29,13 @@
          simply not drawn. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- 接收界面（跑在互传进程里）通过回环 TCP 找过来，用的是上面那条 INTERNET。
+         没有 <service>，也没有 QUERY_ALL_PACKAGES：前者在这台 ROM 上根本到不了——互传的
+         targetSdk 是 37，它的 <queries> 里没有本包，bindService 过来时 resolveService 按
+         调用方 uid 过滤成空，AMS 只记一句 "not found"；后者解决的是「我们看得见别人」，
+         对被别人看见无效，实测 granted=true 之后那句 not found 一字未变。两处细节都在
+         BridgeMessenger 的类注释里。 -->
+
     <application
         android:name=".App"
         android:allowBackup="false"

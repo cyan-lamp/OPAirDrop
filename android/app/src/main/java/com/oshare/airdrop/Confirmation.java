@@ -21,7 +21,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p>这一刻应用十有八九没有可见的页面——手机可能在桌上、屏幕黑着。从后台启动 Activity 在
  * Android 10 之后是被禁止的，而 {@code AlertDialog} 又必须有窗口。通知是唯一一个「不需要
- * 谁的许可就能出现在人眼前、并且能带按钮」的表面。等流体云那张卡片接上之后，这里就是卡片
+ * 谁的许可就能出现在人眼前、并且能带按钮」的表面。流体云那张卡片接上之后，这里就是卡片
  * 不可用时的退路，消息内容不变。
  *
  * <p># 为什么答案要回到这里而不是就地处理
@@ -29,6 +29,14 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>问的人和被问的人不在同一个线程上：{@code serve} 的那条线程停在 {@link #ask} 里等答案，
  * 而按钮的回调是广播，跑在主线程。中间这个 {@link Waiter} 就是那根线——一个闩、一个布尔值，
  * 别的一概不做。
+ *
+ * <p># 为什么键是 session，不是自增号
+ *
+ * <p>同一个问题现在有两个可能的所在：这一条通知，或者互传进程里那张卡片。它们各自在自己的
+ * 进程、自己的线程上按下去，但必须松开同一个闩——否则人先在卡片上点了「接受」，通知还挂着
+ * 等三十秒，超时之后把这次接收判成拒绝。两个进程只能靠一个字符串对齐，那就是 {@code session}。
+ * 自增号只在本进程里有意义，所以这里改成按 {@code session} 索引，由 {@link ReceiveHost}
+ * 产生并同时交给两边。
  *
  * <p># 为什么超时按拒绝算
  *
@@ -44,7 +52,12 @@ final class Confirmation {
     static final String ACCEPT = "com.oshare.airdrop.CONFIRM_ACCEPT";
     static final String DECLINE = "com.oshare.airdrop.CONFIRM_DECLINE";
 
-    /** 广播里带的请求编号。 */
+    /**
+     * 广播里带的键。
+     *
+     * <p>名字还叫 {@code id}——它从第一天起就是这个意思，改名只会让
+     * {@link DecisionReceiver} 和已经装上的旧通知对不上。它现在装的是一个 session 字符串。
+     */
     static final String EXTRA_ID = "id";
 
     private static final String CHANNEL = "confirm";
@@ -55,140 +68,45 @@ final class Confirmation {
     /** 等人回答多久。AirDrop 的发送端自己也有超时，比它早一点放手更礼貌。 */
     private static final long TIMEOUT_MS = 30_000;
 
-    /** 正在等的那些问题，键是请求编号。 */
+    /** 正在等的那些问题，键是 session。 */
     private static final Map<String, Waiter> OPEN = new ConcurrentHashMap<>();
 
     private static final AtomicInteger NEXT = new AtomicInteger();
 
     private Confirmation() {}
 
-    /** 一个等着被回答的问题。 */
-    private static final class Waiter {
-        final String summary;
-        final CountDownLatch latch = new CountDownLatch(1);
-        volatile boolean accepted;
-
-        Waiter(String summary) {
-            this.summary = summary;
-        }
-    }
-
     /**
-     * 问一次，并阻塞到有人回答或超时。
+     * 一次邀请里人能读到的两句话。
      *
-     * <p>会阻塞调用线程：调用它的是服务连接的那条线程，不是主线程。
+     * <p>三个表面（通知、卡片、以及将来的任何一个）说的是同一件事，就必须说同样的话。所以
+     * 措辞不再散在 {@code post} 里，而是从摘要一次解析出来，谁要谁拿。{@code summary} 是库给
+     * 的那一行：{@code "名字\t件数\t字节数\t链接数"}。
      */
-    static boolean ask(Context context, String summary) {
-        String id = Integer.toString(NEXT.incrementAndGet());
-        Waiter waiter = new Waiter(summary);
-        OPEN.put(id, waiter);
-        int notification = NOTIFICATION_BASE + (NEXT.get() % 32);
-        long askedAt = System.currentTimeMillis();
-        try {
-            post(context, id, notification, summary);
-            waiter.latch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS);
-            Log.i(TAG, "confirm " + id + " " + (waiter.accepted ? "accepted" : "declined")
-                    + " after " + (System.currentTimeMillis() - askedAt) + " ms");
-            return waiter.accepted;
-        } catch (InterruptedException interrupted) {
-            // 接收端正在被关掉：按拒绝处理，并把中断还回去，让上层知道它该退出。
-            //
-            // 这一行也留着：服务端只有一条线程，中断标志一旦被置上就没人清，之后每一次
-            // `await` 都会立刻抛出来——症状是「每个传输都被拒收」，而原因在这一行里。
-            Log.i(TAG, "confirm " + id + " interrupted after "
-                    + (System.currentTimeMillis() - askedAt) + " ms");
-            Thread.currentThread().interrupt();
-            return false;
-        } catch (RuntimeException unavailable) {
-            // 通知发不出去（渠道被禁用、系统拒收）：没有人会被问，所以不能收。
-            //
-            // 这一行是必须的，不是顺手加的：走这条路的结果是「每一次传输都被拒收」，
-            // 而对端只会看到 503，本机什么也不显示。没有它，故障现场只剩一个「怎么发
-            // 都发不过来」的抱怨。
-            Log.w(TAG, "confirm " + id + " could not be shown: " + unavailable, unavailable);
-            return false;
-        } finally {
-            OPEN.remove(id);
-            cancel(context, notification);
+    static final class Offer {
+        /** 对面叫什么。它是「要不要收这个人的东西」的唯一判断依据。 */
+        final String sender;
+
+        private final String body;
+
+        private Offer(String sender, String body) {
+            this.sender = sender;
+            this.body = body;
+        }
+
+        String title() {
+            return sender + " 想给你发文件";
+        }
+
+        /** 正文说清几件、多大。 */
+        String body() {
+            return body;
         }
     }
 
-    /** 按钮的回调入口。重复回答、或者回答一个已经超时的问题，都不做任何事。 */
-    static void answer(String id, boolean accepted) {
-        Waiter waiter = OPEN.remove(id);
-        if (waiter == null) {
-            return;
-        }
-        Log.i(TAG, "confirm " + id + (accepted ? " accepted" : " declined") + " by the person");
-        waiter.accepted = accepted;
-        waiter.latch.countDown();
-    }
-
-    /** 这个请求还在等吗。给测试和排查用。 */
-    static boolean waiting(String id) {
-        return OPEN.containsKey(id);
-    }
-
-    private static void post(Context context, String id, int notification, String summary) {
-        NotificationManager manager = context.getSystemService(NotificationManager.class);
-        if (manager == null) {
-            // 没有通知服务就是没有人会被问到，和发不出去是同一件事，但这里的现场更早。
-            Log.w(TAG, "confirm " + id + ": no notification manager");
-            return;
-        }
-        if (manager.getNotificationChannel(CHANNEL) == null) {
-            NotificationChannel channel = new NotificationChannel(
-                    CHANNEL, "接收确认", NotificationManager.IMPORTANCE_HIGH);
-            // 高优先级是必要的：这一条过期就作废，人得当场看见。
-            channel.setShowBadge(false);
-            manager.createNotificationChannel(channel);
-        }
-
-        Notification.Builder builder = new Notification.Builder(context, CHANNEL)
-                .setSmallIcon(R.mipmap.ic_launcher)
-                .setContentTitle(title(summary))
-                .setContentText(detail(summary))
-                .setStyle(new Notification.BigTextStyle().bigText(detail(summary)))
-                .setOngoing(true)
-                .setAutoCancel(false)
-                .setOnlyAlertOnce(true)
-                .addAction(new Notification.Action.Builder(
-                        null, "接受", action(context, id, true, notification)).build())
-                .addAction(new Notification.Action.Builder(
-                        null, "拒绝", action(context, id, false, notification)).build());
-        manager.notify(notification, builder.build());
-        Log.i(TAG, "confirm " + id + " posted as " + notification + ": "
-                + summary.replace('\t', ' '));
-    }
-
-    private static PendingIntent action(Context context, String id, boolean accepted, int notification) {
-        Intent intent = new Intent(context, DecisionReceiver.class)
-                .setAction(accepted ? ACCEPT : DECLINE)
-                .putExtra(EXTRA_ID, id);
-        // 编号进 requestCode：两个动作、多个并发请求，用同一个 requestCode 会互相覆盖。
-        int requestCode = notification * 2 + (accepted ? 1 : 0);
-        return PendingIntent.getBroadcast(
-                context, requestCode, intent,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-    }
-
-    private static void cancel(Context context, int notification) {
-        NotificationManager manager = context.getSystemService(NotificationManager.class);
-        if (manager != null) {
-            manager.cancel(notification);
-        }
-    }
-
-    /** 标题里放对方的名字：这是唯一一个「要不要收这个人的东西」的判断依据。 */
-    private static String title(String summary) {
-        String[] field = summary.split("\t", -1);
+    /** 把库给的那一行摘要解析成两句人话。 */
+    static Offer parse(String summary) {
+        String[] field = summary == null ? new String[0] : summary.split("\t", -1);
         String sender = field.length > 0 && !field[0].isBlank() ? field[0] : "附近的设备";
-        return sender + " 想给你发文件";
-    }
-
-    /** 正文说清几件、多大。 */
-    private static String detail(String summary) {
-        String[] field = summary.split("\t", -1);
         long files = count(field, 1);
         long bytes = Math.max(count(field, 2), 0);
         long links = Math.max(count(field, 3), 0);
@@ -204,7 +122,151 @@ final class Confirmation {
             }
             what.append(links).append(" 个链接");
         }
-        return what + (bytes > 0 ? " · " + size(bytes) : "") + "，30 秒内不回答就当作拒绝。";
+        return new Offer(sender, what + (bytes > 0 ? " · " + size(bytes) : "")
+                + "，30 秒内不回答就当作拒绝。");
+    }
+
+    /** 问一次，并阻塞到有人回答或超时。没有 session 可用时（老路径）自己起一个。 */
+    static boolean ask(Context context, String summary) {
+        return ask(context, "confirm-" + NEXT.incrementAndGet(), summary);
+    }
+
+    /**
+     * 问一次，并阻塞到有人回答或超时。
+     *
+     * <p>会阻塞调用线程：调用它的是服务连接的那条线程，不是主线程。
+     *
+     * <p>{@code session} 是这个问题在两个进程里的同一个名字。同一个 session 再问一次会覆盖
+     * 上一次挂着的通知，而不是叠一条新的——重问只该改内容，不该多出一个框。
+     */
+    static boolean ask(Context context, String session, String summary) {
+        Offer offer = parse(summary);
+        Waiter waiter = new Waiter(session, offer,
+                NOTIFICATION_BASE + (NEXT.incrementAndGet() % 32));
+        Waiter previous = OPEN.put(session, waiter);
+        if (previous != null) {
+            // 上一次还挂着：让停在它上面的那条线程按拒绝走掉，别把同一个问题问两遍。
+            previous.accepted = false;
+            previous.latch.countDown();
+        }
+        long askedAt = System.currentTimeMillis();
+        try {
+            post(context, session, waiter.notification, offer);
+            waiter.latch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            Log.i(TAG, "confirm " + session + " " + (waiter.accepted ? "accepted" : "declined")
+                    + " after " + (System.currentTimeMillis() - askedAt) + " ms");
+            return waiter.accepted;
+        } catch (InterruptedException interrupted) {
+            // 接收端正在被关掉：按拒绝处理，并把中断还回去，让上层知道它该退出。
+            //
+            // 这一行也留着：服务端只有一条线程，中断标志一旦被置上就没人清，之后每一次
+            // `await` 都会立刻抛出来——症状是「每个传输都被拒收」，而原因在这一行里。
+            Log.i(TAG, "confirm " + session + " interrupted after "
+                    + (System.currentTimeMillis() - askedAt) + " ms");
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (RuntimeException unavailable) {
+            // 通知发不出去（渠道被禁用、系统拒收）：没有人会被问，所以不能收。
+            //
+            // 这一行是必须的，不是顺手加的：走这条路的结果是「每一次传输都被拒收」，
+            // 而对端只会看到 503，本机什么也不显示。没有它，故障现场只剩一个「怎么发
+            // 都发不过来」的抱怨。
+            Log.w(TAG, "confirm " + session + " could not be shown: " + unavailable, unavailable);
+            return false;
+        } finally {
+            OPEN.remove(session, waiter);
+            cancel(context, waiter.notification);
+        }
+    }
+
+    /**
+     * 按钮的回调入口。重复回答、或者回答一个已经超时的问题，都不做任何事。
+     *
+     * <p>两条来路：通知上的按钮走 {@link DecisionReceiver}，卡片上的按钮由
+     * {@link ReceiveHost} 送进来。它们带着同一串字符，所以这里不需要知道人在哪个表面上按的。
+     */
+    static void answer(String session, boolean accepted) {
+        if (session == null) {
+            return;
+        }
+        Waiter waiter = OPEN.remove(session);
+        if (waiter == null) {
+            return;
+        }
+        Log.i(TAG, "confirm " + session + (accepted ? " accepted" : " declined") + " by the person");
+        waiter.accepted = accepted;
+        waiter.latch.countDown();
+    }
+
+    /** 这个请求还在等吗。给测试和排查用。 */
+    static boolean waiting(String session) {
+        return session != null && OPEN.containsKey(session);
+    }
+
+    /** 一个等着被回答的问题。 */
+    private static final class Waiter {
+        final String session;
+        final Offer offer;
+        final int notification;
+        final CountDownLatch latch = new CountDownLatch(1);
+        volatile boolean accepted;
+
+        Waiter(String session, Offer offer, int notification) {
+            this.session = session;
+            this.offer = offer;
+            this.notification = notification;
+        }
+    }
+
+    private static void post(Context context, String session, int notification, Offer offer) {
+        NotificationManager manager = context.getSystemService(NotificationManager.class);
+        if (manager == null) {
+            // 没有通知服务就是没有人会被问到，和发不出去是同一件事，但这里的现场更早。
+            Log.w(TAG, "confirm " + session + ": no notification manager");
+            return;
+        }
+        if (manager.getNotificationChannel(CHANNEL) == null) {
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL, "接收确认", NotificationManager.IMPORTANCE_HIGH);
+            // 高优先级是必要的：这一条过期就作废，人得当场看见。
+            channel.setShowBadge(false);
+            manager.createNotificationChannel(channel);
+        }
+
+        Notification.Builder builder = new Notification.Builder(context, CHANNEL)
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentTitle(offer.title())
+                .setContentText(offer.body())
+                .setStyle(new Notification.BigTextStyle().bigText(offer.body()))
+                .setOngoing(true)
+                .setAutoCancel(false)
+                .setOnlyAlertOnce(true)
+                .addAction(new Notification.Action.Builder(
+                        null, "接受", action(context, session, true, notification)).build())
+                .addAction(new Notification.Action.Builder(
+                        null, "拒绝", action(context, session, false, notification)).build());
+        manager.notify(notification, builder.build());
+        Log.i(TAG, "confirm " + session + " posted as " + notification + ": "
+                + offer.title() + " / " + offer.body());
+    }
+
+    private static PendingIntent action(Context context, String session, boolean accepted,
+                                        int notification) {
+        Intent intent = new Intent(context, DecisionReceiver.class)
+                .setAction(accepted ? ACCEPT : DECLINE)
+                .putExtra(EXTRA_ID, session);
+        // 编号进 requestCode：两个动作、多个并发请求，用同一个 requestCode 会互相覆盖。
+        int requestCode = notification * 2 + (accepted ? 1 : 0);
+        return PendingIntent.getBroadcast(
+                context, requestCode, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+    }
+
+    private static void cancel(Context context, int notification) {
+        NotificationManager manager = context.getSystemService(NotificationManager.class);
+        if (manager != null) {
+            manager.cancel(notification);
+        }
     }
 
     /** 摘要里第 {@code at} 个字段的值；缺字段或者不是数字都给 -1，让调用方自己决定说法。 */

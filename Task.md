@@ -390,7 +390,7 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 ---
 
-## 9. 当前进度（2026-11-15 03:30）
+## 9. 当前进度（2026-11-15 18:45）
 
 ### 已完成并验证
 
@@ -411,6 +411,7 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 | 六项 UI 修改 | 首页开场白卡删除、底栏三只图标重画、刷新按钮删除、设置页跟手动画、回弹以被拉边为轴、震动权限 |
 | 接收进度通路（Rust + JNI） | `crates/ffi/src/serve.rs` 新增 `LandingCallback`/`Watcher` 与第三个导出 `opairdrop_serve_watched`，`jni.rs` 新增 `Java_..._serveWatched` + `report_landing`。`cargo check --lib` 通过；`cargo test --workspace` **380 passed**（1 ignored），含两条新测试：端到端那条断言「只有 `/Upload`、没有前置 `/Ask`」时全程 `total == 0`（诚实的不声明），单元那条断言未声明尺寸的成员贡献 0 而非把总和拉小（7+11+0 = 18） |
 | 接收进度通知栏 | `ReceiveService` 新增固定 id `0x0A40` 的传输通知（`0x0A1D` 是服务、`0x0A20–0x0A3F` 是确认框）；`Listener` 改用 `Native.serveWatched`，`Meter` 按 200 ms 节流投递。`gradle :app:compileDebugJavaWithJavac` **BUILD SUCCESSFUL**。⏳ 未上真机 |
+| 流体云接收弹窗（互传进程内钩子） | 三段复验连续三轮全绿：`ReceiveDialogActivity` 前台弹出并点拒绝 → `503`（**8.8 s**，不是 30 s 超时）；同一张卡退到后台仍在 `Hist #0`；再次邀请弹出并点接受 → `200 OK`（**8.7 s**）+ `/Upload` `200`（**9.2 s**）。判据日志串成一条：`bridge event out` → `bridge line` → `receive event incoming_transfer … phase=pending installed=true` → `invitation … present=true`，**同一毫秒**。**前置条件是 `cached_apps_freezer=disabled`**，否则钩子进程被 `cgroup.freeze` 冻住、事件永远读不出来（见 §13） |
 
 ### 明确未完成
 
@@ -446,7 +447,7 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 | 3 | **接收第一档：iPhone 分享面板里能找到本机** | 人眼在 iPhone 上看见本机名字，点得进去 | ⏳ 待实测（本侧无法自证）。**已有的抓包线索**：02:25:07 一条 `handshake from fe80::84a8:a1ff:fe43:3eb8%awdltun0 failed after 496 ms: Connection reset` —— 对面**已经连上来过**，说明公告被发现了、TXT/SRV 被读走了。下一步只差在它再来的那一刻看 `offer from …` 那一行 |
 | 4 | 接收第二档：接收端 TLS（`Identity` + `h=` + `SSLServerSocket`） | `openssl s_client` 能握手；`/Discover` 有应答 | ✅ 真机：`TLSv1.3`/`AES_256_GCM`、10 ms；`/Discover` → `200` + 138 字节 bplist；TXT `h` 与出示证书指纹逐位相同 |
 | 5 | 接收第三档：文件真的落到 `receive.directory` | iPhone 发一张图，`Download/` 里出现同字节文件 | ✅ **机制已验证**：`/Ask` 三支 + `/Upload` 逐字节（含 `photos/`、`假期/` 两级中文路径）。⏳ 待真实 iPhone 复验 |
-| 6 | 接收三处提示：确认弹窗 + 通知栏 + 流体云 | 三个入口同一份状态，接受/拒绝都回写 | 弹窗 ✅ 真机三支已验；通知栏进度 ✅ 通路打通、编译通过（`0x0A40`，200 ms 节流，`total==0` 走不确定态）。⏳ 未上真机；流体云未写 |
+| 6 | 接收三处提示：确认弹窗 + 通知栏 + 流体云 | 三个入口同一份状态，接受/拒绝都回写 | 弹窗 ✅ 真机三支已验；**流体云 ✅** 走互传进程内钩子（`ReceiveDialogActivity`），三段复验三轮全绿，前置是 `cached_apps_freezer=disabled`（见 §13）；通知栏进度 ✅ 通路打通、编译通过（`0x0A40`，200 ms 节流）。⏳ 未上真机 |
 | 7 | 自有发送面板（仿 `IOSShareActivity`） | 与参照同构；浅/深；弹出动画；环状进度随真实字节走 | `SendActivity` 是临时形态 |
 | 8 | 发送端接入 `SendActivity`（用户点名的第二刀） | 从我们自己的面板发起一次完整发送 | 未开始 |
 | 9 | `phash` 校验 | 指纹不符时不发，且给出可读原因 | 未开始 |

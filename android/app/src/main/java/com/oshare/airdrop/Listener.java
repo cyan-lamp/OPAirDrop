@@ -149,6 +149,29 @@ final class Listener {
      */
     private static final long CLOSING_DRAIN_NANOS = 1_000_000_000L;
 
+    /**
+     * The receive buffer: on this link it buys progress reporting and nothing else.
+     *
+     * <p>Left alone, the kernel sizes this from {@code tcp_rmem} and, on a link that never
+     * drops a packet, grows it to the top of that range. A 49.3 MB transfer measured on
+     * 2026-11-15 advertised 4.19 MB and never shrank it once. That window is what the sender's
+     * progress bar runs on, because the phone counts bytes it has handed to its socket, not
+     * bytes that arrived here: it read 100% with 7.4 MB still in flight, seventy-five seconds
+     * of 正在发送 after the last file had already landed. Half a megabyte puts that tail under
+     * five.
+     *
+     * <p>It costs no throughput, and the arithmetic says so plainly: this link carries
+     * 98.8 KB/s at a 24.5 ms round trip, so its bandwidth-delay product is 2.5 KB. A buffer two
+     * hundred times the pipe is still two hundred times the pipe. The legacy stack measured the
+     * same thing from the other side — 1 MB against the default, 118.0 and 119.9 KB/s, one and
+     * a half per cent — which is why it was dropped when this class was written. It is back for
+     * the reporting, not for the rate.
+     *
+     * <p>Set on the server socket before the bind: the window scale is fixed in the SYN-ACK,
+     * and a value set after accept would be capped by a scale chosen for the old size.
+     */
+    private static final int RECEIVE_BUFFER_BYTES = 512 * 1024;
+
     /** Told, on the listener's thread, that a line the page shows has changed. */
     interface Watcher {
         void listenerChanged();
@@ -392,11 +415,14 @@ final class Listener {
             //
             // The legacy server also set a 1 MB receive buffer here, before the bind, because
             // the window scale factor is fixed by the SYN-ACK and a value set after accept
-            // would be capped by a scale chosen for the old size. It is not carried over: that
-            // server measured it on two 5.1 MB transfers from the same phone and got 118.0 KB/s
-            // against 119.9 KB/s — one and a half per cent, which is noise. The window was
-            // never what paced this link.
+            // would be capped by a scale chosen for the old size. Its measurement — 118.0
+            // against 119.9 KB/s — is why the value was not carried over, and that half of the
+            // finding still holds: the window was never what paced this link. What the window
+            // does decide is how far the sender's progress bar can run ahead of what this side
+            // has actually taken in, and for that it is now set smaller. See
+            // RECEIVE_BUFFER_BYTES.
             bound.setReuseAddress(true);
+            bound.setReceiveBufferSize(RECEIVE_BUFFER_BYTES);
             bound.bind(new InetSocketAddress(PORT));
             // Never asked for, and this was measured on the legacy stack rather than assumed:
             // with setWantClientAuth(true) the log over seventy-five lines carried no
@@ -658,9 +684,12 @@ final class Listener {
         }
 
         String directory = directoryOf(screen);
+        // 一次接收，三个表面：本应用的通知、互传那张卡片、以及页面上的进度。它们说的是同一
+        // 件事，所以由同一个对象发出去，而不是各自在自己那一层里再算一遍（见 ReceiveHost）。
+        ReceiveHost.Attempt attempt = ReceiveHost.open(context, peer);
         // 谁在看进度。每条连接一个，因为接收端一次只服务一个对端（见类注释「Why one
         // thread and not a pool」），所以进度条上最多只有一条连接的数字。
-        Meter meter = new Meter(context);
+        Meter meter = new Meter(context, attempt);
         try {
             // 有人要发东西过来时问一次。问的是人，所以这条线程会停在这里等——它本来也只
             // 服务这一个连接，等的时候没有别的事该做。
@@ -684,7 +713,9 @@ final class Listener {
                         // 就没有任何地方还记得它，而对端到底在分享面板里叫什么，是「别人能不能
                         // 找到我们」这件事唯一能留下证据的地方。
                         Log.i(TAG, "offer from " + summary.replace('\t', ' '));
-                        return Confirmation.ask(context, summary);
+                        // 问在有卡片的时候是卡片，没卡片的时候是通知——两条路都落回同一个闩，
+                        // 所以这里不需要知道这一刻是哪一种。
+                        return attempt.decide(summary);
                     },
                     meter);
             // A discovery probe and an empty share both come back empty; neither is worth a
@@ -697,6 +728,9 @@ final class Listener {
                 // 回调里：回调不知道哪一块是最后一块——total 是对端声明的，它可以少发，
                 // 也可以什么都不声明，所以「最后一块」只有 native 调用返回才成立。
                 meter.finished(last);
+                // 卡片上要说的不是那句话，而是「存到哪儿了」和「每一份叫什么」——这个应用
+                // 没有浏览目录的入口，除了这里没有第二个地方会说出来。
+                attempt.delivered(report, directory);
                 setState("正在监听 " + PORT + "，等待附近设备", false);
             }
         } catch (IOException | RuntimeException refused) {
@@ -714,6 +748,9 @@ final class Listener {
             // 一次都没落地过字节的连接不会碰任何通知——这次握手失败或者这次探测，不该把
             // 上一个传输留下的结果一起抹掉。
             meter.abandon();
+            // 卡片那一侧同理，而且它还要从「还没结束的接收」那张表里退出去：一条握手失败的
+            // 连接从来没对外说过话，但它在表里占着一个位置，不收回来的话这张表只增不减。
+            attempt.abandon();
         }
     }
 
@@ -896,6 +933,15 @@ final class Listener {
 
         private final Context context;
 
+        /**
+         * 这一次接收的另一半：互传那张卡片。
+         *
+         * <p>进度要往两个地方走，因为这一刻人可能在看其中任何一个：本应用的通知（
+         * {@link ReceiveService}）和互传的原生弹窗与流体云卡片（{@link ReceiveHost}）。两者
+         * 不是二选一——卡片上画的时候通知也该在，人从哪儿看都该看见同一个数字。
+         */
+        private final ReceiveHost.Attempt attempt;
+
         /** 上次投递的时刻（{@link System#nanoTime}）；0 表示一次都还没投递过。 */
         private long postedAt;
 
@@ -905,8 +951,9 @@ final class Listener {
         /** 这次连接有没有结果。有结果之后就不再收尾。 */
         private boolean settled;
 
-        Meter(Context context) {
+        Meter(Context context, ReceiveHost.Attempt attempt) {
             this.context = context;
+            this.attempt = attempt;
         }
 
         @Override
@@ -919,6 +966,9 @@ final class Listener {
             postedAt = now;
             showing = true;
             ReceiveService.progress(context, done, total);
+            // 卡片没有那条节流后的进度条那么贵——它只是一段 JSON——但也跟着同一个节拍走，
+            // 免得一次传输在一秒里给另一个进程发五十次消息。
+            attempt.progress(done, total);
         }
 
         /** 有结果了：把进度条换成那句话。 */
