@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -291,36 +292,45 @@ final class ReceiveHost {
         }
 
         /**
-         * 收完了，文件已经在磁盘上。
+         * 收完了，文件已经在公共目录里。
          *
-         * <p>每个文件的字节数只在对端只发了一个文件时才是知道的——库给的是一个总数，把它
-         * 按文件数平均分下去是编造，所以多个文件时宁可说「共多少」，让人知道总量而不假装
-         * 知道每一份有多大。
+         * <p>每一份的字节数与落点都从发布结果里取，不再共用一份参数：一次接收可能同时进
+         * 相册和文档，两个目录，而这块卡片上「存到哪儿」是唯一一句人真正需要的话。
+         *
+         * <p>没存下的那几份只报件数，不把它们混进 files 里——卡片上一条文件应当指着一份
+         * 真的存在的东西。
          */
-        void delivered(Report report, String directory) {
+        void delivered(Publish.Result published) {
             if (!announced || settled) {
                 return;
             }
             settled = true;
             try {
                 JSONArray files = new JSONArray();
-                boolean single = report.names().size() == 1;
-                for (String name : report.names()) {
+                for (Publish.Entry entry : published.entries()) {
                     files.put(new JSONObject()
-                            .put("name", name)
-                            .put("size", single ? report.bytes() : -1L)
-                            .put("mime", mime(name))
+                            .put("name", entry.name)
+                            .put("size", entry.size)
+                            .put("mime", mime(entry.name))
                             // 存到哪儿是这块卡片上唯一一句人真正需要的话：这个应用没有浏览
                             // 目录的入口，除了这里没有第二个地方会说出来。
-                            .put("directory", directory));
+                            .put("directory", entry.directory));
                 }
                 JSONObject event = newEvent("complete", COMPLETE)
                         .put("progress", 100)
                         .put("terminal", true)
                         .put("published", true)
                         .put("files", files);
-                if (!single) {
-                    event.put("message", "共 " + Listener.bytes(report.bytes()));
+                List<String> notes = new ArrayList<>();
+                // 一张卡上已经有发送端自己报的那个总量了，再写一句「共 X」就是同一件事说两遍，
+                // 而且两边的单位还不一样（对方写 MB，我们写 MiB）。只有真丢了东西的时候这个
+                // 数才不一样、才有话说——那时候它说的是「存下来的到底有多少」。
+                if (!published.skipped().isEmpty()) {
+                    notes.add("存下 " + Listener.bytes(published.bytes()));
+                    notes.add(published.skipped().size() + " 个没存下");
+                }
+                if (!notes.isEmpty()) {
+                    event.put("message", String.join("，", notes));
                 }
                 emit(event);
             } catch (JSONException impossible) {

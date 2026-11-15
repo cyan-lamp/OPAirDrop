@@ -452,7 +452,7 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 ---
 
-## 9. 当前进度（2026-11-15 18:45）
+## 9. 当前进度（2026-11-15 20:45）
 
 ### 已完成并验证
 
@@ -475,6 +475,37 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 | 接收进度通知栏 | `ReceiveService` 新增固定 id `0x0A40` 的传输通知（`0x0A1D` 是服务、`0x0A20–0x0A3F` 是确认框）；`Listener` 改用 `Native.serveWatched`，`Meter` 按 200 ms 节流投递。**真机 48 MB 一轮**（`bash notifcheck.sh 48 2.5`）：`正在接收` + `android.progress` 千分数 11 → 88 → 164 → 240 → … → 943，正文 `528.0 KiB / 48.0 MiB` → `45.3 MiB / 48.0 MiB`；19.2 s 后切 `接收完成` + `收到「large (19).bin」，48.0 MiB，存到 Download/`，`flags` 收成 `AUTO_CANCEL` |
 | 流体云卡片跟随真实传输 | 与上一行**同一轮、同一次上传**：互传进程那张卡 `android.title=AirDrop · 正在接收 1%` → `8%` → … → `94%`，收尾切 `AirDrop · 接收完成`。**两条通知逐拍对应**：app 的千分数 11/88/164/240 与云上的 1/8/16/23 一一对齐（云 = 千分数 ÷ 10 向下取整），说明云上的百分比不是另算的，就是我们上报的字节数 |
 | 流体云接收弹窗（互传进程内钩子） | 三段复验连续三轮全绿：`ReceiveDialogActivity` 前台弹出并点拒绝 → `503`（**8.8 s**，不是 30 s 超时）；同一张卡退到后台仍在 `Hist #0`；再次邀请弹出并点接受 → `200 OK`（**8.7 s**）+ `/Upload` `200`（**9.2 s**）。判据日志串成一条：`bridge event out` → `bridge line` → `receive event incoming_transfer … phase=pending installed=true` → `invitation … present=true`，**同一毫秒**。**前置条件是 `cached_apps_freezer=disabled`**，否则钩子进程被 `cgroup.freeze` 冻住、事件永远读不出来（见 §13） |
+| 接收落盘按类型分五桶 | 八份混合文件一次 `/Upload`：五个 `OPAirDrop` 桶逐份对齐，`content query` 八行 `is_pending=0`、`_size` 与源相同、MIME 正确、**无一被改名**；`receive.directory=Documents/All` 时八份全进同一目录（`media_type=1/3/2/6/0`，即走 Files 集合）。完成卡与功能页同步改口（见下节） |
+
+### 接收落盘：按类型分五个桶（2026-11-15 20:40）
+
+先说清来路：用户要求「学一加互传按类型分目录」，而反编译看到的是**一加互传自己不分类**——
+`com/oplus/oshare/utils/x.B()` 直接返回 `/storage/emulated/0`，`la.a.g()` 按机型给
+`/OnePlus Share` 一类品牌目录，全部进一个。所以下面这张表是我们自己的取舍，不是模仿它。
+
+| 类型 | 目录 | 判据 |
+| --- | --- | --- |
+| 照片 | `Pictures/OPAirDrop` | `image/*` |
+| 视频 | `Movies/OPAirDrop` | `video/*` |
+| 音频 | `Music/OPAirDrop` | `audio/*` |
+| 文档 | `Documents/OPAirDrop` | text / pdf / office / ebook |
+| 其余（压缩包、apk、无扩展名） | `Download/OPAirDrop` | 剩下的一切 |
+
+- **都不再建子目录**：归档里的 `photos/one.jpg` 落成 `Pictures/OPAirDrop/one.jpg`，路径层级在
+  发布这一步被压平——留空是为了让人在相册/文件管理里一眼看见，而不是去猜当初的目录树。
+- **`receive.directory` 留空才分桶**；填了（如 `Documents/All`）则全部进那一个目录，桶判定为
+  null、走 `MediaStore.Files` 集合。这两条分支都在真机上跑过。
+- 落盘全程 `IS_PENDING=1` → `openOutputStream("w")` → 核对字节数 → `IS_PENDING=0` →
+  回查 `DISPLAY_NAME`/`RELATIVE_PATH`。**卡片上报的名字是回查到的真名**，不是我们提交的名字，
+  所以「加编号另存」之后卡上写的是 `IMG_0001 (1).jpg`——它没有撒谎，这是回查的意义。
+
+**三条 MediaStore 事实（真机实测，别重新发明）**：
+
+1. `RELATIVE_PATH` 写入时带尾斜杠合法，**回报里也带**，展示前要 `strip()`，否则拼出来是 `//`。
+2. 同名默认并排留两份（`IMG_0001.jpg` + `IMG_0001 (1).jpg`）；`receive.overwrite=true` 时先
+   `delete` 同目录同名行再插入 —— 名字干净、没有 `(2)`，但 `_id` 会换（5806 → 5832）。
+3. 扩展名猜不出 MIME 的（`noext`）落成 `application/octet-stream`，**没有被改名成
+   `xxx.bin.jpg`**。只有当 MIME 与扩展名互相矛盾时系统才补扩展名，这一版没有触发。
 
 ### 明确未完成
 
@@ -494,8 +525,8 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
   接受后进度绕头像圆环走。现有 `SendActivity` 只是临时形态。
 - **通知栏与流体云显示发送进度**。
 - **`phash` 证书校验**（发送端侧；接收端侧的 `h` 已发布且与出示证书一致）。
-- **设置表里 15 行未接到读值处**（`receive.directory`、`device.name`、`device.model`、各超时、
-  `http.response_limit` 等）。
+- **设置表里还有未接到读值处的行**（各超时、`http.response_limit` 等）。`receive.directory`、
+  `receive.overwrite`、`device.name`、`device.model` 已经接上，并且都在真机上验过读写。
 - `git` 已初始化并有提交，但首个提交晚于事故，历史不含更早状态。
 
 ---
@@ -528,12 +559,12 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 | 指标 | 值 | 说明 |
 | --- | --- | --- |
-| 单元 + 集成测试 | **384 passed**（1 ignored） | 无设备 |
-| JVM 断言 | **368 条** | `bash crates/ffi/jvm/check.sh`，桌面 JVM + `-Xcheck:jni`，不是真机 |
-| Rust 行数 | 21561 | 八 crate；`src/` 合计 |
-| Java 行数 | 12133 | 29 个类：三页 + 发送 + 确认 + 服务 + 钩子 + 身份/射频/链路 |
+| 单元 + 集成测试 | **388 passed**（1 ignored） | 无设备；2026-11-15 20:44 重跑（`cargo test --workspace`） |
+| JVM 断言 | **368 条** | `bash crates/ffi/jvm/check.sh`，桌面 JVM + `-Xcheck:jni`，不是真机；本轮未重跑 |
+| Rust 行数 | 21859 | 八 crate；`src/` 合计（`airdrop` 3654 / `awdl` 6064 / `bplist` 924 / `cpio` 1422 / `ffi` 5980 / `http` 1985 / `mdns` 957 / `settings` 873） |
+| Java 行数 | 16282 | **50 个类**：三页 + 发送 + 确认 + 服务 + 钩子 + 身份/射频/链路 + `Publish`（五种落桶） |
 | 真机库 | `libopairdrop_ffi.so` **685 344 字节** | `aarch64-linux-android`，linker 35（含 mDNS 三个入口） |
-| APK | **13 728 472 字节**（debug，含 `assets/kernel/`） | 内核资产合计约 38 MB 未压缩，压后约 13 MB；不含资产的 clean 包仍是 88 万级 |
+| APK | **17 334 740 字节**（debug，含 `assets/kernel/`） | 2026-11-15 20:26 构建实测；`src/main/assets` 是构建期生成，所以不同批次的包体积会随内核资产变 |
 | 接收吞吐 | 80–88 KB/s | 受对端 31.2% 占空比限制，**不是 KPI** |
 | 发送吞吐 | 1.06–1.13 MB/s | 同上 |
 | 自测环路天花板 | **25.6 MB/s** | `adb forward` → 本进程 8770；比真实接收高约 260 倍，只能当「本侧不是瓶颈」的证据，不能推接收端能力（见 §5.6） |
@@ -555,6 +586,55 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 ---
 
 ## 13. 变更日志（新的在上）
+
+- **2026-11-15 20:45**：**接收落盘按类型分五个桶；顺带认出「重装包之后卡片再也不弹」是个假象。**
+
+  **一、落桶。** 设计表与三条 MediaStore 事实在 §9「接收落盘：按类型分五个桶」一节。真机八份
+  混合（300 KiB 的 jpg、512 KiB 的 mp4、120 KiB 的 m4a、64 KiB 的 docx、1 KiB 的 txt、
+  200 KiB 的 zip、800 KiB 的 apk、2 KiB 的无扩展名）一次 `/Upload`，五个桶各自到位：
+
+  ```
+  Pictures/OPAirDrop    IMG_0001.jpg        307200
+  Movies/OPAirDrop      clip.mp4            524288
+  Music/OPAirDrop       song.m4a            122880
+  Documents/OPAirDrop   notes.txt             1024
+  Documents/OPAirDrop   报告（终版）.docx      65536
+  Download/OPAirDrop    app-release.apk     819200
+  Download/OPAirDrop    noext                 2048
+  Download/OPAirDrop    打包.zip            204800
+  ```
+
+  `content query` 八行 `is_pending=0`、`_size` 与源逐份相同、`mime_type` 分别是
+  `image/jpeg` / `video/mp4` / `audio/mpeg` / openxml / `text/plain` / `application/zip` /
+  `vnd.android.package-archive` / `application/octet-stream`，**没有一个带 `(1)`**。第二、三轮
+  把「重名并排留两份」与「`receive.overwrite=true` 时覆盖」也各验一遍（同名行 `_id` 5806 → 5832，
+  旧行被删、没有 `(2)` 副本）。指定目录那条分支单独跑一轮：`receive.directory=Documents/All`
+  → 八份全进同一个目录，`media_type` 依次 1/3/2/6/0，即图片/视频/音频仍进各自集合、
+  zip/apk/无扩展名落 Files。
+
+  **二、两处文案。** 完成卡上原本同时有发送端报的 `2.0 MB` 和我们补的「共 2.0 MiB」——
+  同一件事说两遍，单位还不一样。改成只在真丢了东西时才补一句「存下 X / N 个没存下」。
+  功能页那行是本应用自己的口径，「共」留着：现在读作「收到 8 个文件，共 2.0 MiB，
+  存到 Pictures、Movies、Music 等 5 处」，单桶时读作「收到「x」，N MiB，存到 Pictures/OPAirDrop/」。
+  真机复验：完成卡只剩 `… 2.0 MB` + 五行 `保存位置：`。
+
+  **三、「重装包之后卡片再也不弹」不是代码退步。** 现象：`offer` 到了、`attached=true`、日志里
+  有 `bridge event in main incoming_transfer`，屏幕上却什么都没有，30 秒后 503；而且**钩子侧一行
+  `invitation … present=` 都找不到**。这台机器上 `com.coloros.oshare` 是长期驻留的（`STARTUP`
+  那行报 uptime 近三小时），而它的类来自我们被 `install -r` 替换掉的 APK —— 旧进程配新包，
+  走到需要惰性加载的类就断在那里，四条判断一条都没打出来。修法是把钩子进程重启：
+
+  ```
+  adb shell su -c 'am start-foreground-service -n com.coloros.oshare/com.oplus.oshare.KeepForeService'
+  ```
+
+  重启后同一份代码同一轮：**2.5 s** 弹出 `ReceiveDialogActivity`，点「接受」→ `200 OK`、
+  `/Upload` `200`。以后凡是「重装包之后第一次发送不弹卡」，先重启互传进程再谈别的。
+
+  **四、验收脚本。** `mix.py` 里 `Hands.stop()` 定义了两遍，后一个把带诊断的那份覆盖掉了——
+  没人按按钮时只剩 `nobody touched it`，没有 `mCurrentFocus`。已删掉重复的那份。另外 Git Bash
+  会把 `adb shell ls /sdcard/…` 里的绝对路径改写成 Windows 路径，走 shell 的命令都要先
+  `export MSYS2_ARG_CONV_EXCL="*"`，否则报 `ls: D:/Program: No such file`。
 
 - **2026-11-15 19:40**：**接收三处提示在同一轮里同时对上了；顺带修掉验收脚本的两个假判据。**
 
@@ -869,6 +949,13 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
   ```
 
   落点不需要存储权限——`/sdcard/Android/data/<pkg>/files/` 是应用自己的外部目录。
+
+  > **这一段的落点已经过时（2026-11-15 20:40 改掉）。** 它当时只证明了「字节没写错」，但
+  > `/sdcard/Android/data/<pkg>/files/` 是应用私有外部目录，任何文件管理器里都翻不到；而那时的
+  > 完成卡偏偏写着「保存位置：`Download/`」——**那句话是假的**，用户按它去找文件只会扑空。
+  > 现在改为按 `media_type` 分五个系统可见的桶（`Pictures` / `Movies` / `Music` / `Documents` /
+  > `Download` 下的 `OPAirDrop/`），走 MediaStore 发布，卡片上报的真实 `RELATIVE_PATH`。
+  > 详见 §9「接收落盘：按类型分五个桶（2026-11-15 20:40）」。
 
   **九、还没解释的一件事。** 老进程上出现过一次「约 4 秒就回 503、且通知没出现在任何地方」。中断
   来源已排除（见上），新包会带堆栈把这条路径记下来，等它再现。

@@ -2,7 +2,6 @@ package com.oshare.airdrop;
 
 import android.content.Context;
 import android.os.Build;
-import android.os.Environment;
 import android.util.Log;
 
 import com.oshare.airdrop.Native;
@@ -18,6 +17,10 @@ import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
 
 import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLServerSocket;
@@ -330,9 +333,14 @@ final class Listener {
         return asideProblem;
     }
 
-    /** Where files go when {@code receive.directory} is blank. */
+    /**
+     * 留空时文件去哪儿，一句话，给设置页面那一行用。
+     *
+     * <p>不再是「应用自己的下载目录」——那个目录在 {@code Android/data/} 底下，
+     * Android 11 起连 MTP 都进不去，文件名管理器里也看不见（见 {@link Publish}）。
+     */
     String directory() {
-        return defaultDirectory().getAbsolutePath();
+        return Publish.describe();
     }
 
     /**
@@ -683,18 +691,23 @@ final class Listener {
             return;
         }
 
-        String directory = directoryOf(screen);
+        String configured = directoryOf(screen);
         // 一次接收，三个表面：本应用的通知、互传那张卡片、以及页面上的进度。它们说的是同一
         // 件事，所以由同一个对象发出去，而不是各自在自己那一层里再算一遍（见 ReceiveHost）。
         ReceiveHost.Attempt attempt = ReceiveHost.open(context, peer);
         // 谁在看进度。每条连接一个，因为接收端一次只服务一个对端（见类注释「Why one
         // thread and not a pool」），所以进度条上最多只有一条连接的数字。
         Meter meter = new Meter(context, attempt);
+        // 库里按路径写文件，而公共目录（Pictures、Movies…）在 targetSdk 37 下只能走媒体库，
+        // 所以先落到应用自己的暂存目录，收完再由 Publish 搬进公共目录并挂到媒体库上。
+        // 暂存目录只属于这一次连接，finally 里无条件删掉。
+        File staged = null;
         try {
+            staged = Publish.stage(context);
             // 有人要发东西过来时问一次。问的是人，所以这条线程会停在这里等——它本来也只
             // 服务这一个连接，等的时候没有别的事该做。
             byte[] frame = Native.serveWatched(
-                    directory,
+                    staged.getAbsolutePath(),
                     screen.stored(),
                     Build.MODEL,
                     peer.getInputStream(),
@@ -723,14 +736,17 @@ final class Listener {
             // of "nothing new arrived".
             Report report = Report.of(frame);
             if (!report.empty()) {
-                last = summarize(report, directory);
+                // 有的进了相册、有的进了文档：这一次接收的落点不再是一个目录，所以下面那句话
+                // 由发布结果算出来，而不是由手上这份配置算出来。
+                Publish.Result published = Publish.run(context, report, staged, configured, overwrite(screen));
+                last = summarize(published);
                 // 通知上那句话就是页面上那句话，一次传输只有一种说法。收尾在这里而不是在
                 // 回调里：回调不知道哪一块是最后一块——total 是对端声明的，它可以少发，
                 // 也可以什么都不声明，所以「最后一块」只有 native 调用返回才成立。
                 meter.finished(last);
                 // 卡片上要说的不是那句话，而是「存到哪儿了」和「每一份叫什么」——这个应用
                 // 没有浏览目录的入口，除了这里没有第二个地方会说出来。
-                attempt.delivered(report, directory);
+                attempt.delivered(published);
                 setState("正在监听 " + PORT + "，等待附近设备", false);
             }
         } catch (IOException | RuntimeException refused) {
@@ -744,6 +760,9 @@ final class Listener {
             }
             setState("接收失败：" + describe(refused), true);
         } finally {
+            // 暂存里的东西只有两种下场：搬进公共目录，或者被删掉。走到这里时两种都已经发生
+            // 过了，剩下的是空目录和搬失败的那几份——留着它们只是让 app 的数据目录一直长大。
+            Publish.discard(staged);
             // 走到一半的连接：进度条还挂着「正在接收」，而它已经不会再动一分一毫了。收回去。
             // 一次都没落地过字节的连接不会碰任何通知——这次握手失败或者这次探测，不该把
             // 上一个传输留下的结果一起抹掉。
@@ -843,34 +862,63 @@ final class Listener {
     }
 
     /**
-     * Where this connection writes, from the settings as they are now.
+     * 这个人指定的接收目录，没指定就是空。
      *
-     * <p>A blank {@code receive.directory} means "the app's own download folder" — the table
-     * says so, and it is the only default that needs no storage permission and is still
-     * reachable over USB. A value that names somewhere the app cannot write is not second-
-     * guessed here: the inbox reports the failure, and its message names the path.
+     * <p>空不再翻译成一个默认路径，而是交给 {@link Publish}：那里按扩展名分五桶。填了值
+     * 就全部进那一个目录——这条承诺写在设置表的 summary 里，也由 {@code Publish.run} 里
+     * 那一行 {@code fixed.isEmpty()} 守住。
      */
     private String directoryOf(SettingsScreen screen) {
         SettingsScreen.Setting setting = screen.setting("receive.directory");
-        String value = setting == null ? "" : setting.value().trim();
-        return value.isEmpty() ? directory() : value;
+        return setting == null ? "" : setting.value().trim();
     }
 
-    /** The app's own download folder, or a private one when external storage is absent. */
-    private File defaultDirectory() {
-        File external = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
-        return external != null ? external : new File(context.getFilesDir(), "Download");
+    /** 同名时覆盖。表里的开关是 {@code "true"}/{@code "false"} 两个字符串。 */
+    private boolean overwrite(SettingsScreen screen) {
+        SettingsScreen.Setting setting = screen.setting("receive.overwrite");
+        return setting != null && "true".equals(setting.value());
     }
 
-    /** One line for the page: what landed and where. */
-    private String summarize(Report report, String directory) {
-        int count = report.names().size();
-        String size = bytes(report.bytes());
-        String where = directory.substring(directory.lastIndexOf('/') + 1);
-        if (count == 1) {
-            return "收到「" + report.names().get(0) + "」，" + size + "，存到 " + where + "/";
+    /** 一行话：落了什么、落在哪儿。 */
+    private String summarize(Publish.Result published) {
+        List<Publish.Entry> entries = published.entries();
+        // 说不下的那几份要单独提一句：少了东西而不说，比多一句更难查。用「另有」起头，
+        // 是因为它挂在「存到 X/」后面——直接接「1 个没存下」读起来像在说那个目录本身。
+        String lost = published.skipped().isEmpty()
+                ? "" : "，另有 " + published.skipped().size() + " 个没存下";
+        if (entries.size() == 1) {
+            Publish.Entry entry = entries.get(0);
+            return "收到「" + entry.name + "」，" + bytes(entry.size)
+                    + "，存到 " + entry.directory + "/" + lost;
         }
-        return "收到 " + count + " 个文件，共 " + size + "，存到 " + where + "/";
+        return "收到 " + entries.size() + " 个文件，共 " + bytes(published.bytes())
+                + "，存到 " + where(entries) + lost;
+    }
+
+    /**
+     * 这一批落在哪几处。
+     *
+     * <p>五类分开存之后，「存到 X/」这句话可能同时有五个答案，而通知只有一行。一处就把
+     * 整个相对路径说出来（{@code Pictures/OPAirDrop/}）；两处点名；三处以上点名前三个加
+     * 总数——再多就不是一句话，而是一张表了。
+     */
+    private static String where(List<Publish.Entry> entries) {
+        Set<String> roots = new LinkedHashSet<>();
+        for (Publish.Entry entry : entries) {
+            // 只取第一段：五个桶共用一个 OPAirDrop 子目录，能区分它们的是前面那一层。
+            String directory = entry.directory;
+            int slash = directory.indexOf('/');
+            roots.add(slash < 0 ? directory : directory.substring(0, slash));
+        }
+        if (roots.size() == 1) {
+            return entries.get(0).directory + "/";
+        }
+        List<String> names = new ArrayList<>(roots);
+        if (names.size() == 2) {
+            return names.get(0) + "、" + names.get(1) + " 两处";
+        }
+        return names.get(0) + "、" + names.get(1) + "、" + names.get(2)
+                + " 等 " + names.size() + " 处";
     }
 
     /**
