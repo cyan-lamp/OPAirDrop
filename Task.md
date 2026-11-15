@@ -236,6 +236,42 @@ AirDrop 用自签证书，TXT 记录里有指纹（我们发布的名字是 `h`�
 吞吐，只买到进度滞后。**实验**：`SO_RCVBUF` 收到 512 KB（仍是 BDP 的 200 倍）后再传一批，
 若滞后按比例缩小，机制即坐实；窗口收缩对吞吐无影响（ACK 从不因窗口而停）。
 
+### 5.6 自测环路（`adb forward` → 8770）的上限，以及「1.8 MB/s」是怎么来的
+
+自测不经过空口：`ask.py` → PC `127.0.0.1:8770` →（`adb forward`）→ 设备 `127.0.0.1:8770` → `Listener`。
+三段各自的上限（同一台设备、同一条 forward、同一份 app）：
+
+| 环节 | 实测 | 判据 |
+| --- | --- | --- |
+| `adb push` 48 MB | **660.3 MB/s** | USB 物理通道不是瓶颈 |
+| `blast.py plain` → 设备 `nc`（64 KiB / 4 MiB sndbuf） | **186.5 / 192.4 MB/s** | `adb forward` 不是瓶颈 |
+| `blast.py tls` → 本机 `tlsd.py` | **146.0 MB/s**（cpu 0.41 s） | Python TLS、`sendall` 循环不是瓶颈 |
+| `askfast.py` 24 MB，循环内零采样 | **25.6 MB/s**（0.94 s，PC cpu 0.05 s = 5%） | 经 app 自身的上限 |
+| `askfast.py` 24 MB，每 4 MiB 采一次 | 11.6 MB/s（2.07 s） | 6 次采样 ≈ +1.1 s |
+| `askfast.py` 24 MB，每 512 KiB 采一次（= `ask.py` 的节奏） | **2.3 MB/s**（10.51 s） | 48 次采样 ≈ +9.6 s |
+| 设备 CPU / `wchar` / `recv-q`（快速传输下重采） | ≤11% / 25.3 MB 正常 / 峰值 359 KB、84% 为 0 | 手机不在忙，读侧无积压 |
+
+**根因：`ask.py` 的进度行每 512 KiB 调一次 `drive.describe(drive.ours("transfer"))`，它内部是
+`adb shell dumpsys notification`——单次 340–364 ms、1.1 MB 输出。** 24 MB = 48 次 ≈ 9.6 s，与
+`10.51 − 0.94 = 9.57 s` 的差额精确闭合。更早那个 1.77 MB/s 还要再慢一截，是因为当时
+`ratecheck.sh` 每秒在同一条 adbd 上采 `/proc`，两笔采样费叠在一起。
+
+**两条方法学（都是这一轮撞出来的）**：
+
+- **采样器不能待在被测链路的通道上。** adbd 是单通道，`dumpsys` 既吃 CPU（1.1 MB 文本要 Python 解析）
+  又是一个完整往返。要采就采到设备上跑、写设备文件、事后拉回（`sampler.sh` / `wsamp.sh`）。
+- **`recv-q` 恒 0 什么也证明不了。** 它只说明「没有滞留」：既不能推出「发送端没在发」，也不能推出
+  「读侧很快」。在 24.6 MB/s 的真快传输里它同样 84% 为 0。这一项只能用来排除「读侧堵塞」。
+
+**线程形态（快速传输下重采，56 轮 / 1349 行）**：`sk_wait_data` 一次都没出现；`opairdrop-liste` 在
+`do_sys_poll`（21）与 `futex_wait_queue`（17）之间来回，`OShare-BridgePe` 停在 `wait_woken`。
+这个 app 的 socket 等待走 Java 的 poll 路径（`sock_poll`），所以形态是 `do_sys_poll` 而不是
+`sk_wait_data`——早先那条「传输中没有任何线程在等数据」的异常，是**判据选错了字段**，不是链路空转。
+
+**结论：自测环路上限 25.6 MB/s，是真实接收（91.6–98.8 KB/s）的约 260 倍。它不构成产品瓶颈，也不能
+用来推断接收端能力；真实接收速率仍按 5.3/5.4 归因于 iPhone 的 AWDL 占空比。** 探针在 `tools-probe/`
+（`askfast.py` `runfast.sh` `blast.py` `tlsd.py` `sampler.sh` `fastq.sh` `wsamp.sh` `fastw.sh`，未入库）。
+
 ---
 
 ## 6. 问题场景与解决方法（总账）
@@ -489,6 +525,15 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 ## 13. 变更日志（新的在上）
 
+- **2026-11-15 19:22**：**「自己给自己传只有 1.8 MB/s」结案：慢的是量它的那把尺，不是链路。**
+  `ask.py` 的进度行每 512 KiB 调 `drive.describe(drive.ours("transfer"))`，而它内部是
+  `adb shell dumpsys notification`——单次 **340–364 ms、1.1 MB 输出**。24 MB 上传 = 48 次 ≈ 9.6 s；
+  把采样摘掉、其余一字不改（`askfast.py`）同一份代码同一条 forward 得到 **25.6 MB/s / 0.94 s**，
+  差额 9.57 s 与 48 × 0.20 s 闭合。分段实测：`adb push` 660 MB/s、`blast.py → 设备 nc` 186–192 MB/s、
+  Python TLS 146 MB/s、设备 CPU ≤11%、`recv-q` 84% 为 0（峰值 359 KB）——**六条都不是瓶颈**。
+  顺带修掉两个错判据：①`recv-q` 恒 0 不能拿来判「谁在拖」，它只说明没有滞留；
+  ②「传输中没有线程在 `sk_wait_data`」是字段选错——本 app 的读走 Java poll，形态是 `do_sys_poll`
+  （`opairdrop-liste` 在 `do_sys_poll` 与 `futex_wait_queue` 间交替）。详见 5.6。
 - **2026-11-15 18:45**：**流体云接收弹窗打通。卡了一整天的那一跳不是代码，是 `cgroup.freeze`。**
   钩子进程 `com.coloros.oshare` 由 `am startservice` 拉起后一秒内就掉到 `oom_score_adj=905`，
   而这台 ROM 的 `freezer_cutoff_adj` 是 **900** —— 于是它被冻进
