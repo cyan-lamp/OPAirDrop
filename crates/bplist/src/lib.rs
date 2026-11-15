@@ -160,7 +160,7 @@ pub enum Error {
     TooShort,
     /// The eight-byte magic is not `bplist00`.
     BadMagic,
-    /// A width field in the trailer is not 1, 2, 4 or 8.
+    /// A width field in the trailer is zero or wider than eight bytes.
     BadWidth(u8),
     /// The object count is zero or implausible.
     BadCount(u64),
@@ -254,8 +254,17 @@ impl<'a> Reader<'a> {
         let trailer = data.len() - TRAILER_SIZE;
         let offset_width = data[trailer + 6] as usize;
         let ref_width = data[trailer + 7] as usize;
+        // Both fields carry a *byte* count, not a bit count, and any value from
+        // 1 to 8 is legal: Apple's own reader (`_getSizedInt`) shifts the bytes
+        // in one at a time and never demands a power of two. Our writer only ever
+        // picks 1/2/4/8 (see `width_for`), but iOS widens to three bytes once an
+        // object table or an object index crosses 0xffff — which is exactly what
+        // a multi-megabyte `FileIcon` in an `/Ask` body does. This check used to
+        // mirror `validWidth()` in the legacy Java port and rejected those
+        // payloads with "bad field width 3"; the restriction was stricter than
+        // the format and was inherited, not required.
         for width in [offset_width, ref_width] {
-            if !matches!(width, 1 | 2 | 4 | 8) {
+            if !(1..=8).contains(&width) {
                 return Err(Error::BadWidth(width as u8));
             }
         }
@@ -805,6 +814,58 @@ mod tests {
         // The smallest legal payload: one 0xd0 object and a trailer that names
         // both widths as one byte.
         assert_eq!(parse(&hand_built(&[&[0xd0]], 0)).unwrap(), Value::Dict(Vec::new()));
+    }
+
+    #[test]
+    fn accepts_three_byte_field_widths() {
+        // iOS widens both trailer widths to three bytes once a multi-megabyte
+        // `FileIcon` in an `/Ask` body pushes the object table past 0xffff.
+        // Three is not a power of two, and the old guard — a straight port of
+        // `validWidth()` from the legacy Java implementation — rejected the
+        // whole payload with "bad field width 3", so any transfer of a few
+        // megabytes failed while small ones went through.
+        //
+        // Hand-built so the widths are exactly what the test claims: one
+        // dictionary with a single entry, both references three bytes wide, and
+        // a three-byte offset table.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        let dict_at = bytes.len();
+        bytes.push(0xd1); // dictionary with one entry
+        bytes.extend_from_slice(&[0, 0, 1]); // key   -> object 1
+        bytes.extend_from_slice(&[0, 0, 2]); // value -> object 2
+        let key_at = bytes.len();
+        bytes.push(0x51); // ASCII string, one character
+        bytes.push(b'k');
+        let value_at = bytes.len();
+        bytes.extend_from_slice(&[0x10, 0x01]); // integer 1
+        let table = bytes.len();
+        for at in [dict_at, key_at, value_at] {
+            bytes.extend_from_slice(&(at as u64).to_be_bytes()[5..]);
+        }
+        // [6 unused][offset width][ref width][count][top][table offset]
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 3, 3]);
+        bytes.extend_from_slice(&3u64.to_be_bytes());
+        bytes.extend_from_slice(&0u64.to_be_bytes());
+        bytes.extend_from_slice(&(table as u64).to_be_bytes());
+
+        assert_eq!(
+            parse(&bytes).unwrap(),
+            Value::dict([("k", Value::Integer(1))])
+        );
+    }
+
+    #[test]
+    fn still_rejects_impossible_field_widths() {
+        // Zero would make the offset table unreadable and anything past eight
+        // bytes cannot describe a payload that fits in memory, so the widened
+        // check keeps those out.
+        for width in [0u8, 9, 255] {
+            let mut bytes = hand_built(&[&[0xd0]], 0);
+            let trailer = bytes.len() - TRAILER_SIZE;
+            bytes[trailer + 6] = width;
+            assert_eq!(parse(&bytes), Err(Error::BadWidth(width)), "{width}");
+        }
     }
 
     #[test]
