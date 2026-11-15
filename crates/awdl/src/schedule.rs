@@ -210,6 +210,24 @@ impl Schedule {
         self.peer.believed.as_ref()
     }
 
+    /// Drop everything believed about the peer, so the next presence frame starts over.
+    ///
+    /// A belief outlives the device it describes, and that is the whole reason this exists.
+    /// iOS re-randomises its AWDL address between sessions: the node this link locked onto
+    /// at 03:36 can be gone by 09:00 while the gate still obeys its sixteen slots. A slot
+    /// map from a departed peer is worse than no map at all — [`Schedule::owns_now`] then
+    /// permits only the two slots that peer spent on this channel, and it permits them in a
+    /// superframe whose origin belongs to a phone that is no longer in the room. Against the
+    /// peer actually transmitting, those two windows land wherever the drift has left them,
+    /// and only the ones that happen to coincide with a slot the new peer spends on this
+    /// channel are heard — two in sixteen, with the other fourteen spent on silence.
+    ///
+    /// The origin is deliberately left alone. It is this node's own clock and it keeps
+    /// running; [`Schedule::follow`] snaps it to the new peer's on the first frame.
+    pub fn forget_peer(&mut self) {
+        self.peer = PeerMap::EMPTY;
+    }
+
     /// Slots in which the peer says it is somewhere other than this node's channel.
     ///
     /// The number to watch while on the wrong channel: it is how much of the sequence is
@@ -489,6 +507,31 @@ mod tests {
         assert!(s.owns_now(0));
         assert!(!s.owns_now(3 * SLOT_US), "slot 3 belongs to the other channel");
         assert!(s.owns_now(4 * SLOT_US));
+    }
+
+    #[test]
+    fn forgetting_the_peer_opens_every_slot_again() {
+        // The half of the stale-anchor fix that lives here. Releasing the identity without
+        // dropping the belief would leave the gate obeying a departed phone's slots — the
+        // state measured in the field, where a run that anchored at 03:36 permitted only
+        // two of sixteen slots at 09:00, at a phase the phone in the room had drifted clear
+        // of hours earlier.
+        let mut s = Schedule::anchored(0, 149);
+        let mut map = [149u8; SLOTS];
+        map[3] = 6;
+        assert_eq!(believe(&mut s, map), MapVerdict::Adopted);
+        assert!(!s.owns_now(3 * SLOT_US), "slot 3 is the departed peer's channel");
+
+        s.forget_peer();
+
+        assert_eq!(s.peer_map(), None, "no map survives the peer that made it");
+        assert_eq!(s.describe_peer(), "none", "and the status line says so");
+        for slot in 0..SLOTS {
+            assert!(
+                s.owns_now(slot as u64 * SLOT_US),
+                "slot {slot} is ours again with nothing believed"
+            );
+        }
     }
 
     #[test]

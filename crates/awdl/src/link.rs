@@ -109,6 +109,13 @@ pub struct Stats {
     pub mif: u64,
     /// Presence frames from the peer that the clock was adopted from.
     pub anchored: u64,
+    /// Anchors abandoned because the device they named went silent.
+    ///
+    /// The counter that would have made this defect visible at 03:40 rather than at 09:00.
+    /// A run whose `anchored` has stopped climbing while `rx_other` keeps rising is hearing
+    /// peers and refusing every one of them, and this number is what tells that apart from
+    /// the peers having genuinely left: it only rises when the release rule ran.
+    pub anchor_released: u64,
     /// Frames the radio refused.
     pub tx_errors: u64,
     /// Packets dropped for want of queue space while waiting for a window.
@@ -135,7 +142,7 @@ impl fmt::Display for Stats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "tx={}p/{}B/{}f rx={}p/{}B echo={} foreign={} other={} bad={} psf={} mif={} anchored={} txerr={} drop={} rxerr={} maps={}/{}/{}",
+            "tx={}p/{}B/{}f rx={}p/{}B echo={} foreign={} other={} bad={} psf={} mif={} anchored={} released={} txerr={} drop={} rxerr={} maps={}/{}/{}",
             self.tx_packets,
             self.tx_bytes,
             self.tx_frames,
@@ -148,6 +155,7 @@ impl fmt::Display for Stats {
             self.presence,
             self.mif,
             self.anchored,
+            self.anchor_released,
             self.tx_errors,
             self.tx_dropped,
             self.rx_errors,
@@ -167,6 +175,25 @@ impl fmt::Display for Stats {
 /// a clock that can never move again is a link that drifts out of phase and stays there,
 /// so the refusal is bounded rather than permanent.
 const ANCHOR_REJECT_LIMIT: u8 = 8;
+
+/// How long the node whose clock is kept may stay silent before the anchor is released.
+///
+/// A live peer sends a presence frame every [`PSF_INTERVAL_TU`](crate::schedule::PSF_INTERVAL_TU)
+/// — 110 time units, about 113 ms — so two seconds is eighteen missed frames. That is not a
+/// scheduling hiccup, it is a device that has gone; and it is short enough that a phone
+/// whose AWDL address was re-randomised while this daemon was up is followed again before
+/// the share sheet that opened on it finishes scanning.
+///
+/// Without a release the anchor is a one-way door. `peer` is set from the first action
+/// frame the process ever hears and, before this constant existed, was never cleared: a
+/// run that started at 03:35 and locked onto a phone one minute later was still naming
+/// that phone at 09:00, having dropped every one of the ~12 presence frames per second
+/// arriving from the device actually in the room. The visible symptom is not silence but
+/// a link that looks healthy — `err` frozen at its last good value, `phy` correct,
+/// `txerr=0`, a rising frame count — while every frame it permits goes out in one of the
+/// two slots of sixteen that the departed peer's map left open, at whatever phase drift
+/// has put there by now.
+const PEER_SILENCE_US: u64 = 2_000_000;
 
 /// AWDL-16: how far clear of the slot edge at its head a unicast frame must stay.
 ///
@@ -288,10 +315,19 @@ pub struct Link<R: Radio, T: Tunnel> {
     next_mif_us: Option<u64>,
     /// The node whose clock this link keeps, once one has been heard.
     ///
-    /// Chosen once and kept. Adopting every sender's phase in range would put us on a
+    /// One at a time. Adopting every sender's phase in range would put us on a
     /// superframe that no single peer is on, which is indistinguishable from being on
     /// none; the old implementation learned this the expensive way, one address per run.
+    ///
+    /// Not one *forever*, which is the correction: see [`PEER_SILENCE_US`]. An anchor that
+    /// can never be released is an anchor held for a device that has left, and the gate
+    /// keeps obeying that device's slot map while the phone in the room sends its presence
+    /// frames into the floor.
     peer: Option<Mac>,
+    /// When the node named by `peer` was last heard, in microseconds on the schedule's clock.
+    ///
+    /// Zero until one is chosen. Only meaningful while `peer` is `Some`.
+    last_anchor_us: u64,
     /// How far off the peer's boundary this node was, in TU, at the last frame.
     ///
     /// Positive means the peer's boundary is later than ours. The one number that says
@@ -335,6 +371,7 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
             last_presence_us: None,
             next_mif_us: None,
             peer: None,
+            last_anchor_us: 0,
             phase_err_tu: 0,
             phy_mhz: None,
             anchor_rejects: 0,
@@ -683,6 +720,17 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
         let Some((next_tu, aw_counter)) = action::clock_of(frame) else {
             return;
         };
+        // Before the identity test, because the whole point is that the identity may be
+        // stale: a device that has been silent for [`PEER_SILENCE_US`] has left, and the
+        // frame in hand is evidence of who is actually there. Released and re-locked in
+        // one step rather than dropped and picked up later, so the frame that proves the
+        // old anchor dead is also the frame the new one is taken from.
+        if self.peer.is_some() && now_us.saturating_sub(self.last_anchor_us) > PEER_SILENCE_US {
+            self.peer = None;
+            self.schedule.forget_peer();
+            self.anchor_rejects = 0;
+            self.stats.anchor_released += 1;
+        }
         if self.peer.is_none() {
             self.peer = Some(src);
         }
@@ -691,6 +739,10 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
             // not on, and following it would be following two schedules at once.
             return;
         }
+        // Reachable at all is proof of life, and it is refreshed before the clock is used
+        // rather than after: a frame from this node that this crate cannot read a clock
+        // out of is still a reason not to hand the anchor to somebody else.
+        self.last_anchor_us = now_us;
 
         if let Some(theirs) = action::election_of(frame) {
             if !self.node.outranks(&theirs) {
@@ -1591,9 +1643,52 @@ mod tests {
         l.radio.inbound.push(second);
         l.down(&mut buf, at).expect("down");
 
-        assert_eq!(l.peer(), Some(peer()), "the peer is chosen once and kept");
+        assert_eq!(
+            l.peer(),
+            Some(peer()),
+            "the peer is kept for as long as it is heard"
+        );
         assert_eq!(l.schedule().next_slot_tu(at), boundary);
         assert_eq!(l.stats().anchored, anchored);
+    }
+
+    #[test]
+    fn an_anchor_that_went_silent_is_handed_to_the_peer_that_is_still_there() {
+        // The defect this pins: `peer` used to be written once and never cleared, so a
+        // phone that re-randomised its AWDL address between sessions left this link
+        // following a superframe nobody was on, for the life of the daemon. Measured on
+        // this phone, a run that anchored at 03:36 was still naming that address at 09:00
+        // while dropping every one of the dozen presence frames per second arriving from
+        // the device in the room.
+        let at = 3_000_000u64;
+        let (frame, _) = peer_frame(peer(), at - 20 * TU_US, at);
+        let mut l = Link::new(Mock::new(), Mock::new(), node(), at, 36);
+        l.radio.inbound.push(frame);
+        let mut buf = [0u8; 2048];
+        l.down(&mut buf, at).expect("down");
+        assert_eq!(l.peer(), Some(peer()));
+
+        // The address the phone re-randomised to, arriving after the old one has been
+        // quiet for longer than a presence cadence can explain.
+        let later = at + PEER_SILENCE_US + 1;
+        let moved = Mac::parse("52:3e:14:c7:8c:ad").expect("valid");
+        let before = l.stats().anchored;
+        let (frame, _) = peer_frame(moved, at - 20 * TU_US, later);
+        l.radio.inbound.push(frame);
+        l.down(&mut buf, later).expect("down");
+
+        assert_eq!(l.peer(), Some(moved), "the anchor moved to the live peer");
+        assert_eq!(l.stats().anchor_released, 1, "and said so");
+        assert_eq!(
+            l.stats().anchored,
+            before + 1,
+            "the new peer's boundary is followed, which the old anchor could never do"
+        );
+        assert_eq!(
+            l.schedule().peer_map(),
+            None,
+            "the departed peer's slot map is not obeyed through the change"
+        );
     }
 
     #[test]
