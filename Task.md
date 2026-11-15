@@ -452,7 +452,7 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 ---
 
-## 9. 当前进度（2026-11-15 20:45）
+## 9. 当前进度（2026-11-15 21:00）
 
 ### 已完成并验证
 
@@ -542,12 +542,12 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 | 2 | mDNS 应答器（本侧发得出、答得上） | 抓包里 3 s 节奏、`hlim 255`、四条记录、TXT 三键 | ✅ 真机实测，见 §13 |
 | 3 | **接收第一档：iPhone 分享面板里能找到本机** | 人眼在 iPhone 上看见本机名字，点得进去 | ⏳ 待实测（本侧无法自证）。**已有的抓包线索**：02:25:07 一条 `handshake from fe80::84a8:a1ff:fe43:3eb8%awdltun0 failed after 496 ms: Connection reset` —— 对面**已经连上来过**，说明公告被发现了、TXT/SRV 被读走了。下一步只差在它再来的那一刻看 `offer from …` 那一行 |
 | 4 | 接收第二档：接收端 TLS（`Identity` + `h=` + `SSLServerSocket`） | `openssl s_client` 能握手；`/Discover` 有应答 | ✅ 真机：`TLSv1.3`/`AES_256_GCM`、10 ms；`/Discover` → `200` + 138 字节 bplist；TXT `h` 与出示证书指纹逐位相同 |
-| 5 | 接收第三档：文件真的落到 `receive.directory` | iPhone 发一张图，`Download/` 里出现同字节文件 | ✅ **机制已验证**：`/Ask` 三支 + `/Upload` 逐字节（含 `photos/`、`假期/` 两级中文路径）。⏳ 待真实 iPhone 复验 |
+| 5 | 接收第三档：文件真的落到该去的地方 | iPhone 发一张图，相册里出现同字节文件 | ✅ **机制已验证**：`/Ask` 三支 + `/Upload` 逐字节（含 `photos/`、`假期/` 两级中文路径）。落点自 2026-11-15 20:40 起改为**按类型分五个系统可见桶**（`Pictures`/`Movies`/`Music`/`Documents`/`Download` 下的 `OPAirDrop/`），八份混合文件真机逐份对上，见 §9。⏳ 待真实 iPhone 复验 |
 | 6 | 接收三处提示：确认弹窗 + 通知栏 + 流体云 | 三个入口同一份状态，接受/拒绝都回写 | **三处全部真机通过，且是同一轮 48 MB 里同时看到的**：弹窗 ✅（三支已验，前置 `cached_apps_freezer=disabled`）；通知栏 ✅（`0x0A40` 千分数 11→943→`接收完成`）；流体云 ✅（`AirDrop · 正在接收 1%→94%`→`AirDrop · 接收完成`，与千分数逐拍对应）。剩的是**版式**（云上那张卡仍是互传原生画的），不是通路 |
 | 7 | 自有发送面板（仿 `IOSShareActivity`） | 与参照同构；浅/深；弹出动画；环状进度随真实字节走 | `SendActivity` 是临时形态 |
 | 8 | 发送端接入 `SendActivity`（用户点名的第二刀） | 从我们自己的面板发起一次完整发送 | 未开始 |
 | 9 | `phash` 校验 | 指纹不符时不发，且给出可读原因 | 未开始 |
-| 10 | 15 行设置接线 | 每接一行删一个 `DEFAULT_*` 常量；键名只出现在 `settings.rs` | 未开始 |
+| 10 | 15 行设置接线 | 每接一行删一个 `DEFAULT_*` 常量；键名只出现在 `settings.rs` | 部分：`receive.directory`、`receive.overwrite`、`device.name`、`device.model` 已接上并在真机验过读写（`receive.directory` 两条分支都跑过）；各超时与 `http.response_limit` 仍未接到读值处 |
 
 第 3 档不成立时的排查方向，**不是改参数猜**：先 `tcpdump` 同时抓 `awdltun0` 上我们的公告与 iPhone
 实际发问的时刻分布。如果 iPhone 从不发问，问题在链路（Apple 的 AWDL 只在它自己要发时才醒）；
@@ -582,10 +582,66 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 - 出包：先 `cargo build --release --target aarch64-linux-android -p opairdrop-ffi`，
   再 `cd android && gradle clean assembleDebug`。
 - LSPosed 日志：`/data/adb/lspd/log/modules_*.log`（root 可读）。
+- **界面坐标（1440×3168，2026-11-15 21:00 重新点过一遍）**：
+
+  | 目标 | 坐标 | 备注 |
+  | --- | --- | --- |
+  | 底栏 首页 / 功能 / 设置 | `(357,2943)` / `(719,2943)` / `(1082,2943)` | `bounds` 高 71px，2508 那组是旧的 |
+  | 首页「接收端」卡片 | `(682,1078)` | 点一下在「已停止」↔「监听中」之间切 |
+  | 功能页「同名时覆盖」开关 | `(1196,1425)` | 第二屏；第一屏顶上还有「驱动」「接收」 |
+  | 设置页 `receive.directory` 输入框 | `(720,2338)` | `[144,2250][1296,2427]` |
+  | 设置页「保存」 | `(1034,2616)` | `[740,2528][1328,2704]` |
+  | 卡片「接受」/「完成」 | `(1024,2824)` | 同一个位置；「拒绝」在 `(416,2824)` |
+  | 功能页会吞掉底栏 | — | 滚到底再往回划才重新出现，`uiautomator dump` 里没有那三个标签时就先划回顶部 |
+
+- **改 `receive.directory` 的两条路**。一条是设置页输入框（见上）。另一条更快，本轮用的就是它：
+
+  ```
+  adb shell am force-stop com.oshare.airdrop
+  adb shell "run-as com.oshare.airdrop sed -i 's/^receive.directory=.*/receive.directory=/' files/settings.conf"
+  adb shell am start -n com.oshare.airdrop/.MainActivity
+  ```
+
+  先停进程是必需的：值在启动时读进内存，改文件只能改到下辈子。改完启动，功能页「接收目录」
+  那一行立刻变成「按类型分（都在 OPAirDrop 下）：……」——**这一行就是判据**，不用再去
+  `content query`。反方向的验证也做过：写 `Documents/All` 进去，那一行就变成 `Documents/All`。
+  注意 `am force-stop` 会顺手把接收端停掉（首页卡片回到「已停止」），点一下 `(682,1078)` 才重新监听。
 
 ---
 
 ## 13. 变更日志（新的在上）
+
+- **2026-11-15 21:00**：**收尾：把度量表改成实测数、把那条骗人的旧结论标掉、清完临时件、提交。**
+
+  **一、度量表（§11）原来全是过时数。** 这轮逐个重测：`cargo test --workspace` → **388 passed
+  / 1 ignored / 0 failed**（表里写 384）；Rust `src/` 合计 **21859** 行（写 21561）；Java
+  **16282 行 / 50 个类**（写 12133 / 29 个类——`Publish` 是新的，其余类也长了不少）；
+  debug APK **17 334 740 字节**（写 13 728 472）。最后这个数不是代码长出来的：
+  `android/app/src/main/assets` 是**构建期生成**的，内核资产的多少直接决定包体积，
+  所以这张表里它只能当「这一次构建有多大」看，不能当趋势。JVM 断言 368 条本轮没重跑，已在表里注明。
+
+  **二、§13 里 03:10 那条的「八、`/Upload` 逐字节复验」标为过时。** 它当时验的是
+  `/sdcard/Android/data/com.oshare.airdrop/files/Download/…`，结论写着「落点不需要存储权限」——
+  这句本身没错，但它**同时也是这一轮要修的那个 bug 的证据**：文件在应用私有外部目录里，
+  文件管理器看不见，而完成卡那句话说的是 `Download/`。两件事放在一起才是完整的事实，
+  所以那段现在带一个引用块，指向 §9「接收落盘：按类型分五个桶」，原来那几句留着不改。
+
+  **三、清理。** `tools-probe/` 从约 190 MB 降到 **777 KB**：删掉全部 `_*.txt` / `_*.log` /
+  `_*.png` / `_*.pem` 临时件、`_oshare.apk`（26 MB）、反编译目录 `_osh/`（159 MB）、
+  `blob48.bin`（48 MB，没有任何脚本引用它）。设备侧删掉 `/sdcard` 根下 36 个
+  `_*.xml` / `ui*.xml` / `*.png` 界面 dump 与 `/data/local/tmp/blob48.bin`；脚本留着，
+  下次要证据重跑一遍就有。仓库里那份未跟踪的 `Task - 副本.md` 是编辑途中的快照
+  （逐段 diff 确认它是当前 `Task.md` 的真子集），已删。
+
+  **四、提交 `5e0c505`**（`Publish.java` 405 行是新增，另两个类改 136 行）：五桶落盘 +
+  两处文案 + §9/§11/§13 的文档。提交后工作区干净。
+
+  **五、真机交回默认状态。** 上一轮的 `receive.directory=Documents/All` 其实还留在
+  `settings.conf` 里（总结里那句「已恢复」是错的）。这轮用 `am force-stop` + `run-as … sed -i`
+  改回空，重启后**功能页那一行复读为**「按类型分（都在 OPAirDrop 下）：照片 Pictures，视频
+  Movies，音乐 Music，文档 Documents，其他 Download」；`receive.overwrite=false`；五个桶
+  `ls -A` 全空，`/sdcard/Documents/All` 已不存在。接收端重新点开，`/proc/net/tcp6` 里
+  `:2242` state `0A`。两条操作要点已并进 §12。
 
 - **2026-11-15 20:45**：**接收落盘按类型分五个桶；顺带认出「重装包之后卡片再也不弹」是个假象。**
 
