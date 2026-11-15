@@ -64,6 +64,31 @@ mod device {
     const FRAME_BUF: usize = 4096;
     /// The largest packet the tunnel will hand up: an IPv6 packet at the link's MTU.
     const PACKET_BUF: usize = 2048;
+    /// The tunnel's MTU: the largest IPv6 packet the air actually carries.
+    ///
+    /// Not 1500, which is what this said and what the tun offers by default, and the
+    /// difference is the whole of the hole that made a notification take three seconds to
+    /// appear. A packet of `p` bytes leaves as an 802.11 frame of `p + 54` — radiotap, the
+    /// 802.11 header, QoS control, SNAP and the data head — and the driver refuses anything
+    /// past 1512 with `EMSGSIZE`, so 1458 is where the air stops accepting and every packet
+    /// above it is dropped on the way out with nothing said to TCP. Measured 2026-11-15,
+    /// receiving: the iPhone's first request carried 1428 bytes of payload — our advertised
+    /// 1440-byte segment less the 12-byte timestamp option, filling the 1500-byte tunnel
+    /// MTU — so the packet was 1500 on the wire and the frame 1554, and it did not arrive on
+    /// any of four connections. The peer then spent a retransmission timeout (3.1–3.6 s)
+    /// before splitting the same bytes into 1188-byte segments, which fit and went through.
+    /// That wait is the delay between tapping 隔空投送 and this phone showing the
+    /// notification.
+    ///
+    /// The sender's segment size is not ours to choose directly. It is whatever our SYN-ACK
+    /// advertises, and the kernel derives that from this number: MTU less 60 for IPv6 and
+    /// TCP. So the value is also the clamp — 1458 advertises 1398, and 1398 bytes leave as
+    /// exactly the 1512-byte frame the driver takes. `legacy/` arrived at the same 1398 from
+    /// the same arithmetic (`MSS_CEILING` in `AwdlData.java`, `MAX_TUN_PACKET - 60 - 3`),
+    /// and its notes are worth reading before changing this one: 512 was too small because
+    /// the peer sizes its receive window from the MSS it is given, and 200 stalled the link
+    /// outright.
+    const TUN_MTU: usize = 1458;
     /// How many to move per wakeup before returning to the poll. A cap rather than a loop
     /// to exhaustion, so a busy direction cannot starve the presence timer.
     const DRAIN: usize = 64;
@@ -305,8 +330,12 @@ mod device {
                 }
             }
             if ready[1] {
+                // One instant for the whole drain, for the reason the radio drain gives:
+                // every packet read here was waiting at the same moment, and stamping them
+                // one at a time would charge the later ones for the earlier ones' copies.
+                let stamp = now_us();
                 for _ in 0..DRAIN {
-                    match link.up(&mut packet_buf) {
+                    match link.up(&mut packet_buf, stamp) {
                         Ok(true) => {}
                         Ok(false) => break,
                         Err(err) => {
@@ -495,10 +524,12 @@ mod device {
     /// because `fe80::` also covers `wlan0`'s link-local and the router's, and an
     /// unconditional rule would drag those into a tunnel with no path to them.
     fn configure_tun(name: &str, mac: Mac, uid: Option<u32>) -> io::Result<()> {
-        // The tunnel's MTU is the packet size the framer can carry, and the kernel
-        // segments to it. Left at the tun default a sender writes 64 KB in one go and
-        // every one of those becomes a frame the driver rejects.
-        exec("ip", &["link", "set", name, "up", "mtu", "1500"])?;
+        // `mtu` is not a default worth leaving alone; see {@link TUN_MTU}. The kernel derives
+        // the MSS we advertise from it, so this single number is what keeps a sender's full
+        // segment inside the largest frame the driver accepts — and a sender that overshoots
+        // it loses the segment silently and waits out a retransmission timeout.
+        let mtu = TUN_MTU.to_string();
+        exec("ip", &["link", "set", name, "up", "mtu", &mtu])?;
         // DAD holds the address tentative for a second, and a listener that starts in that
         // second finds no address to bind.
         let dad = format!("/proc/sys/net/ipv6/conf/{name}/accept_dad");

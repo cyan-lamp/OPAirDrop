@@ -136,6 +136,25 @@ pub struct Stats {
     /// whose `held` climbs while `adopted` stays at one is a peer whose map is flapping
     /// between the shapes it announces.
     pub maps_refused: u64,
+    /// Total microseconds between a packet entering the queue and its first copy going
+    /// out, summed over packets.
+    ///
+    /// **This is the whole of this node's share of a round trip.** The kernel writes an
+    /// acknowledgement the instant a segment lands in the tunnel; the peer cannot send
+    /// again until that acknowledgement is on the air. Whatever happens between those two
+    /// instants — waiting for a window this node owns, queueing behind a copy that is not
+    /// due yet — is read by the peer as its own latency, and there is no way for it to
+    /// tell the difference.
+    ///
+    /// Measured 2026-11-15 rather than assumed: a run at 102 KB/s spent 24.4 ms per two
+    /// segments, and the question this answers is whether that is ours or the phone's.
+    pub tx_wait_sum_us: u64,
+    /// The longest single wait, which is what a stalled window looks like.
+    pub tx_wait_max_us: u64,
+    /// How many waits are in the sum.
+    pub tx_wait_n: u64,
+    /// Those waits, bucketed by [`WAIT_BUCKETS_US`]; the last bucket is "over the top".
+    pub tx_wait_buckets: [u64; 7],
 }
 
 impl fmt::Display for Stats {
@@ -162,7 +181,36 @@ impl fmt::Display for Stats {
             self.maps_adopted,
             self.maps_held,
             self.maps_refused
-        )
+        )?;
+        // Silent until something has actually been sent: a link that has never carried a
+        // packet should not print a row of zeroes that reads like a measurement.
+        if self.tx_wait_n > 0 {
+            let avg = self.tx_wait_sum_us / self.tx_wait_n;
+            let buckets: Vec<_> = self.tx_wait_buckets.iter().map(u64::to_string).collect();
+            write!(
+                f,
+                " wait={}us/{}us x{} [{}]",
+                avg,
+                self.tx_wait_max_us,
+                self.tx_wait_n,
+                buckets.join(",")
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Stats {
+    /// File one packet's wait under the bucket it belongs to.
+    fn record_wait(&mut self, wait_us: u64) {
+        self.tx_wait_sum_us += wait_us;
+        self.tx_wait_n += 1;
+        self.tx_wait_max_us = self.tx_wait_max_us.max(wait_us);
+        let slot = WAIT_BUCKETS_US
+            .iter()
+            .position(|&edge| wait_us < edge)
+            .unwrap_or(WAIT_BUCKETS_US.len());
+        self.tx_wait_buckets[slot] += 1;
     }
 }
 
@@ -215,7 +263,14 @@ const MULTICAST_GUARD_TU: u8 = 16;
 const WINDOW_LAST_TU: u8 = 56;
 
 /// How many frames one window will carry before the rest wait for the next.
-const WINDOW_FRAMES: usize = 16;
+///
+/// Not an airtime bound — [`Link::flush`] stops by itself when the window's airtime runs
+/// out, and the frames this limit actually governs are the small ones, which cost almost
+/// none. Sixteen was chosen for a link whose traffic was a handshake. A receiving transfer
+/// is a stream of acknowledgements instead: about 280 a second, against one window every
+/// slot (65.5 ms) — sixteen windows a second, so sixteen frames each is 245 and short of
+/// what arrives. Thirty-two leaves the room the acknowledgements need.
+const WINDOW_FRAMES: usize = 32;
 
 /// How many availability windows of one slot a small packet is repeated into.
 ///
@@ -257,6 +312,15 @@ const BURST_LIMIT: u8 = SLOT_TU / AW_PERIOD_TU;
 /// a slot at a time it buys a stall's worth of stale data.
 const QUEUE_LIMIT: usize = 64;
 
+/// The edges of the queue-wait histogram, in microseconds.
+///
+/// Eight milliseconds is the one that matters: a wait shorter than that is a frame that
+/// caught the window already open, and a wait longer than it is a frame that missed one.
+/// At the slot length — 65.5 ms, sixteen windows a second — a missed window costs at
+/// least a guard's worth of the next slot, so the two populations do not overlap and the
+/// split between them says which is happening without anyone having to reason about it.
+const WAIT_BUCKETS_US: [u64; 6] = [500, 1_000, 2_000, 4_000, 8_000, 16_000];
+
 /// The guard a frame of this class has to keep from the head of a slot.
 fn guard_tu(group: bool) -> u8 {
     if group {
@@ -266,7 +330,8 @@ fn guard_tu(group: bool) -> u8 {
     }
 }
 
-/// How many copies a packet of this size gets, when `burst` is the configured count.
+/// How many copies a packet of this size gets, when `burst` is the configured count and
+/// the link has air to spare. See [`Link::copies_now`] for the state that overrides it.
 fn copies_for(packet_len: usize, burst: u8) -> u8 {
     if packet_len <= BURST_MAX {
         burst
@@ -290,13 +355,27 @@ struct Pending {
     /// header whose parsing belongs to [`crate::mac`], and one caller already did it.
     dst: Mac,
     group: bool,
-    /// Copies still to be handed over, of the [`copies_for`] the packet started with.
+    /// How many copies this packet was given when it was queued.
+    ///
+    /// Remembered rather than recomputed, because it is a decision taken at one instant
+    /// about the state of the queue and read at another: a packet queued while the air
+    /// was busy has one copy and must not be mistaken for a burst whose first copy has
+    /// already gone.
+    copies: u8,
+    /// Copies still to be handed over, of that number.
     remaining: u8,
     /// The instant the next copy may start, or zero for "the next window that opens".
     ///
     /// Copies after the first are placed an availability window after the one before, so
     /// this is what keeps them apart once the first has gone.
     due_us: u64,
+    /// When this packet was read out of the tunnel, or zero for "not recorded".
+    ///
+    /// The other end of the wait that [`Stats::tx_wait_sum_us`] measures. Zero rather
+    /// than a separate flag because the clock this link runs on is monotonic from boot
+    /// and never passes zero, so the two cases cannot be confused; the unit tests, which
+    /// do run at zero, therefore leave the statistic alone.
+    queued_us: u64,
 }
 
 /// The bridge.
@@ -427,7 +506,12 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
     /// global one — is dropped, because the AWDL link carries neither.
     ///
     /// Nothing is transmitted here. See [`Link::flush`] for why.
-    pub fn up(&mut self, buf: &mut [u8]) -> io::Result<bool> {
+    ///
+    /// `now_us` is the instant the packet was read, on the schedule's clock. It is the
+    /// other end of the wait the status line reports, and it is taken here rather than
+    /// inside because the caller has already read the clock for the drain — see the
+    /// matching argument on [`Link::down`].
+    pub fn up(&mut self, buf: &mut [u8], now_us: u64) -> io::Result<bool> {
         let Some(len) = self.tunnel.recv(buf)? else {
             return Ok(false);
         };
@@ -450,14 +534,45 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
             return Ok(true);
         }
 
+        let copies = self.copies_now(len);
         self.queue.push_back(Pending {
             packet: packet.to_vec(),
             dst,
             group: dst.is_group(),
-            remaining: copies_for(len, self.burst),
+            copies,
+            remaining: copies,
             due_us: 0,
+            queued_us: now_us,
         });
         Ok(true)
+    }
+
+    /// How many copies this packet is worth, given what is already waiting.
+    ///
+    /// The repetition across a slot is bought with airtime on the one channel the peer is
+    /// also using, and it is worth that air only while there is some to spare. The four
+    /// copies were measured on handshake traffic, which is sparse and small. A TCP stream
+    /// is neither: a 162 MB transfer offers about 280 acknowledgements a second, every one
+    /// of them under [`BURST_MAX`], so four copies each is a thousand frames a second
+    /// aimed at a window that releases [`WINDOW_FRAMES`] of them. Measured on the phone
+    /// 2026-11-15: `tx=13318p/53017f` against `drop=164899` — ninety-two per cent of
+    /// everything the tunnel offered was dropped for want of queue space, and what got
+    /// dropped was chosen by arrival order, so the SYN-ACK and the reply that ends a
+    /// transfer queued behind sixty-four acknowledgements and were discarded with them.
+    /// The peer then waited an RTO it did not have to wait, and the transfer that had
+    /// already finished on this side stayed "正在发送" on the other.
+    ///
+    /// So the copies are spent only when nothing is waiting. A queue already holding a
+    /// window's worth says the airtime is spoken for, and one copy is the honest number
+    /// there: a lost acknowledgement costs a retransmit the peer was going to make
+    /// anyway, while a dropped SYN-ACK costs a round trip on a link whose timer is
+    /// seconds long.
+    fn copies_now(&self, len: usize) -> u8 {
+        if self.queue.len() >= WINDOW_FRAMES {
+            1
+        } else {
+            copies_for(len, self.burst)
+        }
     }
 
     /// How long before a queued frame may go out: zero when one may go now.
@@ -541,18 +656,48 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
     pub fn flush(&mut self, now_us: u64) -> usize {
         let mut frames = 0;
         let mut at = now_us;
+        // How many heads in a row have been stepped over while looking for one that may go.
+        //
+        // A packet small enough to be repeated is released once per availability window, so
+        // most of the time the head is a copy that is not due for another sixteen
+        // milliseconds. Stopping there is what this used to do, and it stopped the whole
+        // queue with it: `send_due_in` reads the head too, so the loop slept for that
+        // window while ready packets sat behind it. The cost is not the airtime, it is the
+        // round trip — the peer measures its own against when the acknowledgement for a
+        // segment comes back, and 48 ms of queueing (four copies, one window apart) is a
+        // round trip it cannot grow a window over. Measured 2026-11-15 on a 45 MB photo
+        // transfer: `tx=23171p/76575f` in 5 s, i.e. 386 frames and 96 packets a second at a
+        // round trip the phone read as one slot, and `rx` that never passed 200 KB/s.
+        //
+        // Bounded by the queue length: a queue in which nothing is due has no head worth
+        // looking for, and walking it forever would be a spinner.
+        let mut passed = 0usize;
         while frames < WINDOW_FRAMES {
-            let (due_us, group, remaining, payload) = match self.queue.front() {
-                Some(head) => (head.due_us, head.group, head.remaining, head.packet.len()),
+            let (due_us, group, copies, remaining, queued_us) = match self.queue.front() {
+                Some(head) => (
+                    head.due_us,
+                    head.group,
+                    head.copies,
+                    head.remaining,
+                    head.queued_us,
+                ),
                 None => break,
             };
-            if due_us > at || !self.window_open(at, group) {
+            if !self.window_open(at, group) {
                 break;
+            }
+            if due_us > at {
+                if passed >= self.queue.len() {
+                    break;
+                }
+                self.queue.rotate_left(1);
+                passed += 1;
+                continue;
             }
             // Read out of the head before taking it mutably: `window_open` and the frame
             // builder both want a borrow of `self`, and the queue entry cannot hold one
             // across them.
-            let copies = copies_for(payload, self.burst);
+            //
             // First of its copies, which is when the packet counts as sent rather than the
             // last, so a counter read between two copies still says the packet left.
             let first = remaining == copies;
@@ -573,9 +718,15 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
             match self.radio.send(&frame) {
                 Ok(()) => {
                     frames += 1;
+                    passed = 0;
                     if first {
                         self.stats.tx_packets += 1;
                         self.stats.tx_bytes += head.packet.len() as u64;
+                        // The wait this node imposed on the peer, closed here because
+                        // this is the first instant any of the packet could be heard.
+                        if queued_us != 0 {
+                            self.stats.record_wait(at.saturating_sub(queued_us));
+                        }
                     }
                     self.stats.tx_frames += 1;
                     let start = at;
@@ -589,6 +740,13 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
                         // from the instant this frame *started*, so the spacing is the AW
                         // and not the AW plus however long this frame held the air.
                         head.due_us = start + u64::from(AW_PERIOD_TU) * TU_US;
+                        // And out of the head, for the reason `passed` gives above: this
+                        // packet now has sixteen milliseconds to wait, and the packets
+                        // behind it have none. Order is not owed to anyone here — a copy of
+                        // a frame already handed over carries the same sequence number as
+                        // its predecessor, and the IPv6 packets underneath are reassembled
+                        // by the peer's own stack.
+                        self.queue.rotate_left(1);
                     }
                 }
                 Err(_) => {
@@ -1078,7 +1236,7 @@ mod tests {
 
         l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 8));
         let mut buf = [0u8; 2048];
-        assert!(l.up(&mut buf).expect("up"));
+        assert!(l.up(&mut buf, 0).expect("up"));
 
         // Slot 4 is inside the gap: nothing may start there however far into it the clock
         // is, and the wait crosses the gap to slot 8 rather than to the next boundary.
@@ -1219,7 +1377,7 @@ mod tests {
         let packet = ipv6_to(&peer().link_local(), 8);
         l.tunnel.inbound.push(packet.clone());
         let mut buf = [0u8; 2048];
-        assert!(l.up(&mut buf).expect("up"));
+        assert!(l.up(&mut buf, 0).expect("up"));
         // Queued, not sent: `flush` is what releases it into a slot window.
         assert!(l.radio.outbound.is_empty());
         assert_eq!(l.flush(open_us()), 1);
@@ -1246,7 +1404,7 @@ mod tests {
         group[15] = 0xfb;
         l.tunnel.inbound.push(ipv6_to(&group, 4));
         let mut buf = [0u8; 2048];
-        assert!(l.up(&mut buf).expect("up"));
+        assert!(l.up(&mut buf, 0).expect("up"));
         assert_eq!(l.flush(open_us()), 1);
         match frame::parse(&l.radio.outbound[0]) {
             Some(Inbound::Ipv6 { dst, .. }) => assert_eq!(dst, Mac::MDNS_V6),
@@ -1259,7 +1417,7 @@ mod tests {
         let mut l = single_link();
         l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 8));
         let mut buf = [0u8; 2048];
-        assert!(l.up(&mut buf).expect("up"));
+        assert!(l.up(&mut buf, 0).expect("up"));
 
         // Inside the guard a frame that starts here is not heard, so it is not sent —
         // and the wait it reports is the one `edgeWaitUs` computes: the distance to the
@@ -1278,11 +1436,48 @@ mod tests {
     }
 
     #[test]
+    fn the_wait_a_packet_spends_in_the_queue_is_measured() {
+        let mut l = link();
+        l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 8));
+        let mut buf = [0u8; 2048];
+        // Read out of the tunnel inside the guard, where nothing may start. The packet is
+        // in this node's hands from this instant, and the peer is waiting on it.
+        assert!(l.up(&mut buf, guarded_us()).expect("up"));
+        assert_eq!(l.stats.tx_wait_n, 0, "queued is not waited");
+
+        assert_eq!(l.flush(guarded_us()), 0, "the guard holds it");
+        assert_eq!(l.stats.tx_wait_n, 0, "and nothing has waited yet");
+
+        // The window opens two time units later. What the peer measures as its own round
+        // trip starts here, and it is the distance the packet sat, not the airtime.
+        let mut at = guard_edge_us();
+        assert_eq!(l.flush(at), 1);
+        assert_eq!(l.stats.tx_wait_n, 1);
+        assert_eq!(l.stats.tx_wait_sum_us, at - guarded_us());
+        assert_eq!(l.stats.tx_wait_max_us, at - guarded_us());
+        assert_eq!(
+            l.stats.tx_wait_buckets,
+            [0, 0, 0, 1, 0, 0, 0],
+            "two time units is the 2-4 ms bucket"
+        );
+
+        // The copies behind it are the same packet waiting again, and counting them would
+        // multiply the wait by the copy count — the one number this is here to divide out.
+        let first_at = at;
+        for _ in 1..AW_BURST {
+            at += u64::from(AW_PERIOD_TU) * TU_US;
+            assert_eq!(l.flush(at), 1);
+        }
+        assert_eq!(l.stats.tx_wait_n, 1, "one packet, one wait");
+        assert_eq!(l.stats.tx_wait_sum_us, first_at - guarded_us());
+    }
+
+    #[test]
     fn a_small_packet_is_repeated_across_the_slot() {
         let mut l = link();
         l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 8));
         let mut buf = [0u8; 2048];
-        assert!(l.up(&mut buf).expect("up"));
+        assert!(l.up(&mut buf, 0).expect("up"));
 
         // One copy per availability window, four to a slot, each a fresh frame: three
         // copies of one sequence number would be discarded as duplicates one layer above
@@ -1310,7 +1505,7 @@ mod tests {
         let mut l = link();
         l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 8));
         let mut buf = [0u8; 2048];
-        assert!(l.up(&mut buf).expect("up"));
+        assert!(l.up(&mut buf, 0).expect("up"));
         assert_eq!(l.flush(guard_edge_us()), 1);
         // The window is still open a moment later, but the next copy is not due for
         // another availability window and the whole point is that it arrives in a
@@ -1321,11 +1516,35 @@ mod tests {
     }
 
     #[test]
+    fn a_waiting_copy_does_not_hold_the_packets_behind_it() {
+        let mut l = link();
+        l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 8));
+        l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 8));
+        let mut buf = [0u8; 2048];
+        assert!(l.up(&mut buf, 0).expect("up"));
+        assert!(l.up(&mut buf, 0).expect("up"));
+
+        // Both first copies leave in the same window. The queue used to be strict
+        // first-in-first-out with `flush` and `send_due_in` both reading the head, so the
+        // first packet's second copy — an availability window away — held the second
+        // packet for sixteen milliseconds and every packet behind it for as long as the
+        // queue was deep. On a transfer the queue is nothing but acknowledgements, and the
+        // peer measures its round trip by when one comes back: forty-eight milliseconds of
+        // that was `tx=23171p/76575f` in five seconds and `rx` that never passed 200 KB/s.
+        assert_eq!(l.flush(guard_edge_us()), 2, "both first copies, in one window");
+        assert_eq!(l.stats.tx_packets, 2);
+
+        // And the two packets waiting on their second copies are still exactly one window
+        // away, so nothing was sent early to get that second frame out.
+        assert_eq!(l.send_due_in(guard_edge_us() + 1000), u64::from(AW_PERIOD_TU) * TU_US - 1000);
+    }
+
+    #[test]
     fn a_burst_late_in_the_window_sends_its_first_copy_at_once() {
         let mut l = link();
         l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 8));
         let mut buf = [0u8; 2048];
-        assert!(l.up(&mut buf).expect("up"));
+        assert!(l.up(&mut buf, 0).expect("up"));
 
         // Forty TU in, where the four copies do not fit: the second is due at 56 TU, the
         // window's far edge. The first copy goes anyway, and that is the measured
@@ -1368,7 +1587,7 @@ mod tests {
         let mut l = link();
         l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 8));
         let mut buf = [0u8; 2048];
-        assert!(l.up(&mut buf).expect("up"));
+        assert!(l.up(&mut buf, 0).expect("up"));
 
         let mut at = guard_edge_us();
         assert_eq!(l.flush(at), 1, "the first copy");
@@ -1404,7 +1623,7 @@ mod tests {
         for _ in 0..4 {
             l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 1400));
             let mut buf = [0u8; 2048];
-            assert!(l.up(&mut buf).expect("up"));
+            assert!(l.up(&mut buf, 0).expect("up"));
         }
         // Above `BURST_MAX` a second copy is air spent on bytes the peer already
         // has, so a large packet gets one — and the window then carries as many as fit,
@@ -1423,7 +1642,7 @@ mod tests {
         group[15] = 0xfb;
         l.tunnel.inbound.push(ipv6_to(&group, 4));
         let mut buf = [0u8; 2048];
-        assert!(l.up(&mut buf).expect("up"));
+        assert!(l.up(&mut buf, 0).expect("up"));
         // Eight time units in: past the unicast guard, still inside the multicast one.
         assert_eq!(l.flush(ANCHOR_US + 8 * TU_US), 0);
         assert!(l.radio.outbound.is_empty());
@@ -1436,12 +1655,60 @@ mod tests {
         let mut buf = [0u8; 2048];
         for _ in 0..QUEUE_LIMIT + 5 {
             l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 8));
-            assert!(l.up(&mut buf).expect("up"));
+            assert!(l.up(&mut buf, 0).expect("up"));
         }
         // Counted rather than silent: a rising `drop` is the one sign that the offered
         // load has outrun the slot, and it is invisible in a packet count alone.
         assert_eq!(l.stats.tx_dropped, 5);
         assert_eq!(l.queue.len(), QUEUE_LIMIT);
+    }
+
+    #[test]
+    fn a_busy_queue_stops_paying_for_four_copies() {
+        let mut l = link();
+        let mut buf = [0u8; 2048];
+        for _ in 0..=WINDOW_FRAMES {
+            l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 8));
+            assert!(l.up(&mut buf, 0).expect("up"));
+        }
+        // The queue was empty for a window's worth, so those packets carry the configured
+        // four. The first one that finds a window's worth already waiting gets one copy:
+        // see [`Link::copies_now`] for the measurement behind it.
+        assert_eq!(l.queue.front().expect("a queue").copies, l.burst());
+        assert_eq!(l.queue.back().expect("a queue").copies, 1);
+    }
+
+    #[test]
+    fn a_thinned_packet_is_still_counted_once_when_its_one_copy_goes() {
+        let mut l = link();
+        let mut buf = [0u8; 2048];
+        let queued = WINDOW_FRAMES + 8;
+        for _ in 0..queued {
+            l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 8));
+            assert!(l.up(&mut buf, 0).expect("up"));
+        }
+        let burst = usize::from(l.burst());
+        // A time unit at a time, the way the daemon's own timer wakes it.
+        let mut now = open_us();
+        for _ in 0..5_000 {
+            if l.queue.is_empty() {
+                break;
+            }
+            l.flush(now);
+            now += TU_US;
+        }
+        assert!(l.queue.is_empty(), "the queue drained");
+        assert_eq!(l.stats.tx_dropped, 0);
+        // Every packet went and was counted once. The copy count is read off the queue
+        // entry rather than recomputed from the link's state: a packet thinned to one copy
+        // is mid-flight when its first copy leaves, and asking `copies_for` there would
+        // answer four and count the packet never.
+        assert_eq!(l.stats.tx_packets as usize, queued);
+        // The first window's worth paid for four copies each; the rest paid for one.
+        assert_eq!(
+            l.stats.tx_frames as usize,
+            WINDOW_FRAMES * burst + (queued - WINDOW_FRAMES)
+        );
     }
 
     #[test]
@@ -1454,7 +1721,7 @@ mod tests {
         privacy[15] = 0x09;
         l.tunnel.inbound.push(ipv6_to(&privacy, 4));
         let mut buf = [0u8; 2048];
-        assert!(!l.up(&mut buf).expect("up"), "nothing to send");
+        assert!(!l.up(&mut buf, 0).expect("up"), "nothing to send");
         assert!(l.radio.outbound.is_empty());
         assert_eq!(l.stats.tx_packets, 0);
     }
@@ -1464,7 +1731,7 @@ mod tests {
         let mut l = link();
         l.tunnel.inbound.push(vec![0x45; 60]);
         let mut buf = [0u8; 2048];
-        assert!(!l.up(&mut buf).expect("up"));
+        assert!(!l.up(&mut buf, 0).expect("up"));
         assert!(l.radio.outbound.is_empty());
     }
 
@@ -1547,7 +1814,7 @@ mod tests {
         let mut l = link();
         let mut buf = [0u8; 2048];
         assert!(!l.down(&mut buf, 2_000_000).expect("down"));
-        assert!(!l.up(&mut buf).expect("up"));
+        assert!(!l.up(&mut buf, 0).expect("up"));
     }
 
     /// A presence frame from a node that is not this one, plus the boundary it announces.
