@@ -150,6 +150,15 @@ public final class ReceiveService extends Service {
         if (!listening(this)) {
             // 走到这里说明对齐和启动之间状态又变了（窗口刚好到期）。直接退，别留一条
             // 「正在接收」的通知去解释一件没发生的事。
+            //
+            // 但「直接退」之前必须先 startForeground：这个服务是被 startForegroundService()
+            // 叫起来的，系统从那以后就在等一次 startForeground，五秒等不到就抛
+            // ForegroundServiceDidNotStartInTimeException，而这条异常是主线程上的未捕获
+            // 异常——整个进程被杀。真机上量到过一次：从外面拉起服务时恰好不满足条件，应用
+            // 直接消失，日志里只剩 TUN_READY 之后的空白。所以先挂上再摘掉，那几十毫秒的
+            // 通知一闪是这个 API 的入场费，不是可以省掉的。
+            startForeground(NOTIFICATION, notification());
+            stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
             return START_NOT_STICKY;
         }

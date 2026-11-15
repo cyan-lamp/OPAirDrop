@@ -128,6 +128,27 @@ final class Listener {
      */
     private static final int TRANSFER_TIMEOUT_MS = 60_000;
 
+    /**
+     * How long a closing connection may take to go quiet.
+     *
+     * <p>Used as a socket timeout while draining after the transfer has already been answered,
+     * so it is not a bound on anything useful happening — it is the pause that ends the drain.
+     * A quarter second is several round trips on this link: the only thing expected after the
+     * reply is the sender's own closing record, one segment, already in flight.
+     */
+    private static final int CLOSING_QUIET_MS = 250;
+
+    /**
+     * The longest a connection may be drained before it is closed anyway.
+     *
+     * <p>{@link #CLOSING_QUIET_MS} ends the drain for a peer that has stopped talking; this
+     * ends it for a peer that has not. Both are needed because the serving thread is single
+     * (see the class comment on why): a sender that keeps writing after its transfer was
+     * answered must not hold every other sender behind it. One second is the same order as
+     * the pause, and still short enough that the next transfer is not waiting on it.
+     */
+    private static final long CLOSING_DRAIN_NANOS = 1_000_000_000L;
+
     /** Told, on the listener's thread, that a line the page shows has changed. */
     interface Watcher {
         void listenerChanged();
@@ -423,16 +444,22 @@ final class Listener {
                     setState("接受连接失败：" + describe(broken), true);
                     break;
                 }
-                // try-with-resources and not a bare close: a serve that throws still has to
-                // release the descriptor, and a leaked one per connection ends in "too many
-                // open files" after a few hundred transfers.
-                try (Socket connection = peer) {
+                // Not try-with-resources any more, and the comment that used to be here said
+                // why it was: a serve that throws still has to release the descriptor. That
+                // still has to be true, so the close moved into `hangUp` and stayed in a
+                // `finally` — but it is no longer a bare `close()`, because a bare close is
+                // what made the sender's screen hang. See {@link #hangUp}.
+                //
+                // The catch that used to sit here is gone with the resource: it caught the
+                // `IOException` the implicit close could throw, and `serve` reports its own
+                // failures without throwing any. Nothing in this block can throw now.
+                try {
                     // The cast is what the socket factory above guarantees; accepting a plain
                     // Socket here is not a case that can arise, and a defensive instanceof
                     // would only hide it if it did.
-                    serve((SSLSocket) connection);
-                } catch (IOException gone) {
-                    setState("连接中断：" + describe(gone), true);
+                    serve((SSLSocket) peer);
+                } finally {
+                    hangUp((SSLSocket) peer);
                 }
             }
         } finally {
@@ -691,6 +718,68 @@ final class Listener {
     }
 
     /**
+     * Ends a connection in a way the sender can see, instead of dropping it.
+     *
+     * <p>A {@code close()} on a socket whose receive buffer still holds bytes does not send a
+     * FIN. The kernel sends RST, and the peer is told its transfer was aborted rather than
+     * completed. That is exactly what a 162.6 MB transfer measured on 2026-11-15 looks like at
+     * the end, on {@code awdltun0}, this device as the receiver:
+     *
+     * <pre>
+     *   1794707288.180051 S: [F.] seq 1641, ack 170189078
+     *   1794707292.129041 C: [P.] seq 170189078:170189102 length 24
+     *   1794707292.129160 S: [R] seq 4143657351, win 0
+     * </pre>
+     *
+     * <p>The sender's last record — 24 bytes, its TLS {@code close_notify} — arrives 2 ms
+     * before this side answers RST. So the file was received in full, said so on this screen,
+     * and the iPhone went on saying 正在发送: from its side the connection never ended, it was
+     * destroyed, and a destroyed connection is not a completed one. Six of those RSTs went out
+     * in that one teardown.
+     *
+     * <p>The order below is the whole fix, and each step is load bearing:
+     *
+     * <ol>
+     *   <li>{@code shutdownOutput()} sends the FIN <em>now</em>. Closing after the drain would
+     *       send one too, but only once the drain had finished — and the FIN is precisely the
+     *       sentence the sender is waiting for.
+     *   <li>Reading to EOF is what keeps the close from being a reset: by the time the
+     *       descriptor goes, there is nothing left unread to discard.
+     *   <li>{@code close()} last, on a socket with an empty receive buffer, sends a FIN and no
+     *       more.
+     * </ol>
+     *
+     * <p>Every step ignores its own failure. Reaching here means the transfer is over one way
+     * or another — answered, refused, or the peer already gone — and a half-closed socket that
+     * has started resetting is not a fault this device can act on. Nothing goes on the page for
+     * the same reason {@link #routine} exists: a share sheet being closed is not news.
+     */
+    private void hangUp(SSLSocket peer) {
+        try {
+            peer.shutdownOutput();
+        } catch (IOException alreadyGone) {
+            // The connection died during the transfer, and the catch in the accept loop has
+            // already said so on the page.
+        }
+        long until = System.nanoTime() + CLOSING_DRAIN_NANOS;
+        try {
+            peer.setSoTimeout(CLOSING_QUIET_MS);
+            java.io.InputStream rest = peer.getInputStream();
+            byte[] sink = new byte[512];
+            while (System.nanoTime() < until) {
+                if (rest.read(sink) < 0) {
+                    break;
+                }
+            }
+        } catch (IOException done) {
+            // A timeout here is the normal exit: the peer has said everything it had. EOF and
+            // a reset land in the same place, which is "stop reading".
+        } finally {
+            closeQuietly(peer);
+        }
+    }
+
+    /**
      * Whether a connection failure is the routine kind: the peer went away.
      *
      * <p>Two of the three ways out of a transfer are not failures by this device, and they
@@ -880,6 +969,26 @@ final class Listener {
         } catch (IOException ignored) {
             // Closing is how the loop is told to stop; a socket that is already closed, or
             // one whose descriptor went away with the interface, has nothing left to say.
+        }
+    }
+
+    /**
+     * The same, for an accepted connection.
+     *
+     * <p>An overload rather than a common {@code AutoCloseable}: the two call sites want
+     * different things said about them — one is the loop being told to stop, the other is the
+     * last step of a transfer — and a shared body would flatten that into one comment about
+     * neither.
+     */
+    private static void closeQuietly(Socket socket) {
+        if (socket == null) {
+            return;
+        }
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+            // The peer may have reset the connection while it was being drained. The
+            // descriptor is gone either way, which is all this method promises.
         }
     }
 }
