@@ -364,6 +364,32 @@ dumpsys notification | awk '/Notification List:/,/^  mArchive=/'
 推论比这条具体命令重要：**能被归档的东西不能当「当前状态」的证据**，而任何靠文案匹配系统 UI 的
 判断，都要先问一句「这段文字是谁写的、什么时候写的」。
 
+**2026-11-15 再追加一条**：**「截到段」不等于「截到条目」。** 上一条把范围收进
+`Notification List:` 之后，段里仍然并排躺着几十条记录，分属不同应用。
+`sed -n '/pkg=com.oshare.airdrop/,/^  *$/p'` 这种写法更糟：段尾那个「空行」只出现在整段末尾，
+于是范围从我们那条记录一直吃到列表结束。同一份 1.1 MB 的 dump 上量：旧写法切出
+**3165 行 / 8 条记录**（混进 3 条 `com.android.systemui`、2 条 `android`、1 条天气），
+新写法 **81 行 / 1 条**。症状不是「抓不到」，是「六条通知的标题挤在同一行」——
+看着有数据，其实分不清是谁的，而其中恰好有我们要找的那一条，于是错误也被判成了通过。
+
+正确切法是按记录头切：以四空格缩进的 `NotificationRecord(` 起、到下一条为止，包名用字面比较：
+
+```bash
+dumpsys notification --noredact | awk -v want=com.oshare.airdrop '
+    /^  Notification List:/ { live = 1; next }
+    live && /^  [A-Za-z]/  { live = 0 }
+    !live { next }
+    /^    NotificationRecord\(/ { if (index(hdr, "pkg=" want " ") > 0) printf "%s", buf
+                                  hdr = $0; buf = $0 "\n"; next }
+    { buf = buf $0 "\n" }
+    END { if (index(hdr, "pkg=" want " ") > 0) printf "%s", buf }'
+```
+
+**同一处还有第二个坑：采样表上的时间列不能写 `i * 0.4`。** 每一拍自己要花约 340 ms 在
+`dumpsys` 上（把 grep 挪到设备内跑也省不下来——实测 350 ms vs 340 ms，说明这是采集成本，
+不是回传成本），于是名义节拍 0.4 s、真实节拍 0.74 s，表上的 `t+` 与真实进度错开近一倍，
+读起来像「通知不跟着字节动」。时间列只能取 `date +%s%3N` 的实测差值。
+
 ---
 
 ## 7. KernelSU → LSPosed：结论
@@ -446,7 +472,8 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 | mDNS 应答器 | 真机抓包 `hlim 255`、3.000 s 节奏、`0*- [0q] 4/0/0` 四条记录、TXT `"h" "fl=137" "flags=137"`；自造 `(QM)` 查询后 0.9 ms 四条应答 |
 | 六项 UI 修改 | 首页开场白卡删除、底栏三只图标重画、刷新按钮删除、设置页跟手动画、回弹以被拉边为轴、震动权限 |
 | 接收进度通路（Rust + JNI） | `crates/ffi/src/serve.rs` 新增 `LandingCallback`/`Watcher` 与第三个导出 `opairdrop_serve_watched`，`jni.rs` 新增 `Java_..._serveWatched` + `report_landing`。`cargo check --lib` 通过；`cargo test --workspace` **380 passed**（1 ignored），含两条新测试：端到端那条断言「只有 `/Upload`、没有前置 `/Ask`」时全程 `total == 0`（诚实的不声明），单元那条断言未声明尺寸的成员贡献 0 而非把总和拉小（7+11+0 = 18） |
-| 接收进度通知栏 | `ReceiveService` 新增固定 id `0x0A40` 的传输通知（`0x0A1D` 是服务、`0x0A20–0x0A3F` 是确认框）；`Listener` 改用 `Native.serveWatched`，`Meter` 按 200 ms 节流投递。`gradle :app:compileDebugJavaWithJavac` **BUILD SUCCESSFUL**。⏳ 未上真机 |
+| 接收进度通知栏 | `ReceiveService` 新增固定 id `0x0A40` 的传输通知（`0x0A1D` 是服务、`0x0A20–0x0A3F` 是确认框）；`Listener` 改用 `Native.serveWatched`，`Meter` 按 200 ms 节流投递。**真机 48 MB 一轮**（`bash notifcheck.sh 48 2.5`）：`正在接收` + `android.progress` 千分数 11 → 88 → 164 → 240 → … → 943，正文 `528.0 KiB / 48.0 MiB` → `45.3 MiB / 48.0 MiB`；19.2 s 后切 `接收完成` + `收到「large (19).bin」，48.0 MiB，存到 Download/`，`flags` 收成 `AUTO_CANCEL` |
+| 流体云卡片跟随真实传输 | 与上一行**同一轮、同一次上传**：互传进程那张卡 `android.title=AirDrop · 正在接收 1%` → `8%` → … → `94%`，收尾切 `AirDrop · 接收完成`。**两条通知逐拍对应**：app 的千分数 11/88/164/240 与云上的 1/8/16/23 一一对齐（云 = 千分数 ÷ 10 向下取整），说明云上的百分比不是另算的，就是我们上报的字节数 |
 | 流体云接收弹窗（互传进程内钩子） | 三段复验连续三轮全绿：`ReceiveDialogActivity` 前台弹出并点拒绝 → `503`（**8.8 s**，不是 30 s 超时）；同一张卡退到后台仍在 `Hist #0`；再次邀请弹出并点接受 → `200 OK`（**8.7 s**）+ `/Upload` `200`（**9.2 s**）。判据日志串成一条：`bridge event out` → `bridge line` → `receive event incoming_transfer … phase=pending installed=true` → `invitation … present=true`，**同一毫秒**。**前置条件是 `cached_apps_freezer=disabled`**，否则钩子进程被 `cgroup.freeze` 冻住、事件永远读不出来（见 §13） |
 
 ### 明确未完成
@@ -458,8 +485,10 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
   （bplist、`Files`+`Items`、`TransferType` 两种）。仍缺的一步是「iPhone 发一张图、文件真的落到
   `receive.directory`」——这一步只能人拿 iPhone 做，且需要本机 root 在手（临时 root，冷重启后要
   手动 `su`）。
-- **流体云卡片**：已定为「承载真实传输」。信道：offer 走广播（我们 → 互传进程），决定走
-  `Settings.System`（互传进程 → 我们，因为普通应用写不了它）。卡片本体未写。
+- **流体云卡片的「我们自己的版式」**：现在这张卡是互传进程原生画的（`AirDrop · 正在接收 N%`），
+  我们只负责把传输与进度递进去（见 §9 那两行）；要换文案/图标/圆环，还得写卡片本体。
+  信道已定：offer 走广播（我们 → 互传进程），决定走 `Settings.System`（互传进程 → 我们，
+  因为普通应用写不了它）。
 - **自有发送面板**：要仿 `IOSShareActivity`（全屏、圆形返回键 + 「与 iPhone 互传」+「本设备：×」、
   中部雷达喻体、底部说明卡），浅/深两套、弹出动画、**点头像才出**蓝色「等待对方接受」、
   接受后进度绕头像圆环走。现有 `SendActivity` 只是临时形态。
@@ -483,7 +512,7 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 | 3 | **接收第一档：iPhone 分享面板里能找到本机** | 人眼在 iPhone 上看见本机名字，点得进去 | ⏳ 待实测（本侧无法自证）。**已有的抓包线索**：02:25:07 一条 `handshake from fe80::84a8:a1ff:fe43:3eb8%awdltun0 failed after 496 ms: Connection reset` —— 对面**已经连上来过**，说明公告被发现了、TXT/SRV 被读走了。下一步只差在它再来的那一刻看 `offer from …` 那一行 |
 | 4 | 接收第二档：接收端 TLS（`Identity` + `h=` + `SSLServerSocket`） | `openssl s_client` 能握手；`/Discover` 有应答 | ✅ 真机：`TLSv1.3`/`AES_256_GCM`、10 ms；`/Discover` → `200` + 138 字节 bplist；TXT `h` 与出示证书指纹逐位相同 |
 | 5 | 接收第三档：文件真的落到 `receive.directory` | iPhone 发一张图，`Download/` 里出现同字节文件 | ✅ **机制已验证**：`/Ask` 三支 + `/Upload` 逐字节（含 `photos/`、`假期/` 两级中文路径）。⏳ 待真实 iPhone 复验 |
-| 6 | 接收三处提示：确认弹窗 + 通知栏 + 流体云 | 三个入口同一份状态，接受/拒绝都回写 | 弹窗 ✅ 真机三支已验；**流体云 ✅** 走互传进程内钩子（`ReceiveDialogActivity`），三段复验三轮全绿，前置是 `cached_apps_freezer=disabled`（见 §13）；通知栏进度 ✅ 通路打通、编译通过（`0x0A40`，200 ms 节流）。⏳ 未上真机 |
+| 6 | 接收三处提示：确认弹窗 + 通知栏 + 流体云 | 三个入口同一份状态，接受/拒绝都回写 | **三处全部真机通过，且是同一轮 48 MB 里同时看到的**：弹窗 ✅（三支已验，前置 `cached_apps_freezer=disabled`）；通知栏 ✅（`0x0A40` 千分数 11→943→`接收完成`）；流体云 ✅（`AirDrop · 正在接收 1%→94%`→`AirDrop · 接收完成`，与千分数逐拍对应）。剩的是**版式**（云上那张卡仍是互传原生画的），不是通路 |
 | 7 | 自有发送面板（仿 `IOSShareActivity`） | 与参照同构；浅/深；弹出动画；环状进度随真实字节走 | `SendActivity` 是临时形态 |
 | 8 | 发送端接入 `SendActivity`（用户点名的第二刀） | 从我们自己的面板发起一次完整发送 | 未开始 |
 | 9 | `phash` 校验 | 指纹不符时不发，且给出可读原因 | 未开始 |
@@ -507,6 +536,8 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 | APK | **13 728 472 字节**（debug，含 `assets/kernel/`） | 内核资产合计约 38 MB 未压缩，压后约 13 MB；不含资产的 clean 包仍是 88 万级 |
 | 接收吞吐 | 80–88 KB/s | 受对端 31.2% 占空比限制，**不是 KPI** |
 | 发送吞吐 | 1.06–1.13 MB/s | 同上 |
+| 自测环路天花板 | **25.6 MB/s** | `adb forward` → 本进程 8770；比真实接收高约 260 倍，只能当「本侧不是瓶颈」的证据，不能推接收端能力（见 §5.6） |
+| 通知栏 / 流体云验收 | 48 MB @ 2.5 MB/s，19.2 s | `bash notifcheck.sh 48 2.5`：一拍一次 `dumpsys`（真实节拍约 0.6 s），全程约 30 拍，两条通知同拍采样 |
 | clippy | **2 warning**（`too_many_arguments`） | `jni::serve_for_java` 8 参、`respond::announce` 8 参，都是上一轮加参数（`landing` / `ttl_override`）留下的；纯签名整理，等一次专门的重构收掉 |
 
 ---
@@ -524,6 +555,36 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 ---
 
 ## 13. 变更日志（新的在上）
+
+- **2026-11-15 19:40**：**接收三处提示在同一轮里同时对上了；顺带修掉验收脚本的两个假判据。**
+
+  `notifcheck.sh` 改了三处，都是「脚本在骗自己」而不是代码有问题：
+
+  1. **切片越界**。`sed -n '/pkg=com.oshare.airdrop/,/^  *$/p'` 的段尾锚点只出现在整段
+     `Notification List` 的末尾，于是范围从我们那条记录一路吃到列表结束。同一份 dump 上量：
+     旧 **3165 行 / 8 条记录**（混进 3 条 systemui、2 条 android、1 条天气），新 **81 行 / 1 条**。
+     症状是「六条通知的标题挤在一行」，其中恰好有要找的那条，所以错误被判成了通过。
+     改为按记录头切（四空格缩进的 `NotificationRecord(` 起、到下一条为止），包名用 `index()` 字面比较。
+  2. **时间列是编的**。原来打 `i * 0.4`，而每拍自己还要花约 340 ms 在 `dumpsys` 上——
+     名义 0.4 s、真实 0.74 s，`t+` 与真实进度错开近一倍。改为 `date +%s%3N` 实测差值。
+  3. **发送端要能被采样**。回环满速 2.5 s 就传完 48 MB，采样快不过它。给 `askfast.py` 加了
+     `THROTTLE_MBPS`（按累计字节对表，`sendall` 阻塞的时间不重复计入），把线压到 2.5 MB/s，
+     「传输中」因此持续 19.2 s，能采到 30 拍。
+
+  改完之后一轮 `bash notifcheck.sh 48 2.5` 全绿，且**三处提示是同一时刻同一份状态**：
+
+  ```
+  t+1.139s  app: 正在接收  528.0 KiB / 48.0 MiB   progress=11    云: AirDrop · 正在接收 1%
+  t+6.491s  app: 正在接收  14.6 MiB / 48.0 MiB    progress=305   云: AirDrop · 正在接收 30%
+  t+19.006s app: 正在接收  45.3 MiB / 48.0 MiB    progress=943   云: AirDrop · 正在接收 94%
+  t+20.486s app: 接收完成   收到「large (19).bin」，48.0 MiB，存到 Download/   云: AirDrop · 接收完成
+  ```
+
+  云上的百分比 = app 千分数 ÷ 10 向下取整，逐拍对得上——**它不是另算的，就是我们上报的字节**。
+  发送端 `sent all 50331821 bytes in 19.20s = 2.5 MB/s (cpu 0.14s = 1%)`，限速精确到 0.01 s。
+
+  于是 §10 第 6 条（三处提示）从「待上真机」改为全绿；剩下的不是通路而是**版式**：
+  云上那张卡仍由互传进程原生绘制，要换文案/图标还得写卡片本体。方法论两条已并入 §6.5。
 
 - **2026-11-15 19:22**：**「自己给自己传只有 1.8 MB/s」结案：慢的是量它的那把尺，不是链路。**
   `ask.py` 的进度行每 512 KiB 调 `drive.describe(drive.ours("transfer"))`，而它内部是
