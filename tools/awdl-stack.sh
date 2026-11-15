@@ -250,6 +250,59 @@ wifi_state() {
     esac
 }
 
+# ---------------------------------------------------------------------------
+# Keeping the receiving hook schedulable.
+#
+# The half of the bridge that turns an incoming offer into a dialog lives inside
+# `com.coloros.oshare`. That process has no visible component of its own: we
+# bring it up with `am startservice`, the service returns within a second, and
+# the process falls straight to `oom_score_adj=905` with `cpuset=/background`.
+# This ROM freezes anything at or above `freezer_cutoff_adj` (900) into
+# `cgroup.freeze`, and a frozen process is not scheduled even when a socket it
+# owns has data waiting -- `recvfrom` never returns, the bytes sit in
+# `rx_queue`, and the app hears nothing until the sender gives up 30s later.
+#
+# Measured on this phone: with the hook frozen, every published event was
+# written, acknowledged by the kernel, and then delivered minutes later or not
+# at all; the three probe runs all ended `503` at 30.0s. `cmd deviceidle
+# whitelist +com.coloros.oshare` did not prevent it (whitelisted, still frozen).
+# With `cached_apps_freezer disabled`, the same event arrived in the same
+# millisecond it was written and the dialog came up, and the probes turned into
+# `503` at 8.9s (refused by the user) and `200 OK` at 8.8s (accepted).
+#
+# So this is not tuning, it is a prerequisite of the same kind as `svc wifi
+# disable`: a system-wide resource the share session takes for as long as it
+# lasts, and hands back when it ends.
+FREEZER_KEY=cached_apps_freezer
+
+freezer_state() {
+    settings get global "$FREEZER_KEY" 2>/dev/null || echo null
+}
+
+freezer_off() {
+    prev=$(freezer_state)
+    # First writer wins. A second `boot` in the same session must not overwrite
+    # the user's original value with the `disabled` we put there ourselves.
+    [ -e "$STATE/freezer-before" ] || echo "$prev" > "$STATE/freezer-before"
+    [ "$prev" = disabled ] && return 0
+    if settings put global "$FREEZER_KEY" disabled 2>/dev/null; then
+        say 'FREEZER_OFF'
+        return 0
+    fi
+    say 'freezer could not be disabled; incoming offers may not reach the hook'
+    return 1
+}
+
+freezer_restore() {
+    prev=$(cat "$STATE/freezer-before" 2>/dev/null)
+    rm -f "$STATE/freezer-before"
+    case "$prev" in
+        enabled|disabled|default) settings put global "$FREEZER_KEY" "$prev" 2>/dev/null ;;
+        null|'') settings delete global "$FREEZER_KEY" 2>/dev/null ;;
+    esac
+    say 'FREEZER_RESTORED'
+}
+
 wifi_wait() {
     want=$1
     n=0
@@ -720,6 +773,7 @@ cmd_start() {
         # The patched stack is already live in this boot. Any failure from here
         # on is recoverable and must not touch the drivers.
         say 'stack already swapped this boot'
+        freezer_off || true
         link_up || true
         cmd_status
         return 0
@@ -737,6 +791,7 @@ cmd_start() {
     echo "$wifi_before" > "$STATE/wifi-before"
     mark stack-boot
     say "WIFI_BEFORE=$wifi_before"
+    freezer_off || true
 
     # Our own receiver probes the link; leaving it running across a HAL restart
     # leaves it holding a socket on an interface that is about to disappear.
@@ -800,6 +855,10 @@ cmd_stop() {
     esac
 
     rm -f "$STATE/stack-boot"
+    # After the radio is back, so the phone is never left both offline and
+    # un-throttled. `freezer_restore` is a no-op when `boot` never had to set
+    # it, which is the case for a `start`/`stop` pair that never shared a link.
+    freezer_restore || true
     # The app's request file is deliberately left alone. It is the user's
     # preference and not state of this run, so `stop` restoring Wi-Fi above is
     # the end of the teardown, not a silent edit of what the switch will be next
@@ -989,6 +1048,11 @@ cmd_boot() {
         # Already swapped in this boot. Same rule as `start`: from here on a
         # failure is above the drivers and must not touch them.
         say 'stack already swapped this boot'
+        # Idempotent and deliberately before the daemon: the flag lives in
+        # `settings`, so it survives a reboot, but a phone that was rebooted
+        # between two `boot` calls can also have had it reset by the OTA-safe
+        # path in `cmd_stop`. Re-asserting it costs one `settings get`.
+        freezer_off || true
         link_up || true
         DAEMON_PID=
         DAEMON_TUN=absent
@@ -1017,12 +1081,21 @@ cmd_boot() {
     mark stack-boot
     say "WIFI_BEFORE=$wifi_before"
 
+    # Before the radio goes away, because this is the only step that depends on
+    # a process outside this script staying schedulable -- see `freezer_off`.
+    # A failure here is reported but not fatal: the drivers can still come up,
+    # and the app should get its receipt rather than a silent no-op.
+    freezer_off || true
+
     # Not `am force-stop com.oshare.airdrop`: that is the caller. `awdld` is what
     # holds the interfaces, and it is exactly what the swap needs gone.
     stop_daemon || true
     svc wifi disable
     wifi_wait 0 || {
         rm -f "$STATE/stack-boot"
+        # No share session is starting, so the phone gets its freezer policy
+        # back the same way it gets its Wi-Fi back.
+        freezer_restore || true
         say 'Wi-Fi did not disable'
         boot_receipt 4 wifi 'Wi-Fi did not disable'
         return 4
@@ -1035,6 +1108,7 @@ cmd_boot() {
         say "DRIVER_SWAP_FAILED rc=$rc"
         restore_drivers || true
         rm -f "$STATE/stack-boot"
+        freezer_restore || true
         boot_receipt "$rc" driver-swap "the driver swap failed at rc=$rc"
         return "$rc"
     fi

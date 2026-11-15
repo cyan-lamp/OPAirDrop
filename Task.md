@@ -489,6 +489,35 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 ## 13. 变更日志（新的在上）
 
+- **2026-11-15 18:45**：**流体云接收弹窗打通。卡了一整天的那一跳不是代码，是 `cgroup.freeze`。**
+  钩子进程 `com.coloros.oshare` 由 `am startservice` 拉起后一秒内就掉到 `oom_score_adj=905`，
+  而这台 ROM 的 `freezer_cutoff_adj` 是 **900** —— 于是它被冻进
+  `/sys/fs/cgroup/apps/uid_10163/pid_<pid>/cgroup.freeze`。被冻结的进程**不会因为自己的 socket
+  上有数据而被调度**：宿主 `write+flush` 成功、`/proc/net/tcp6` 里 `rx_queue` 压着 838 字节、
+  读者线程就停在 `recvfrom`，一次也不返回。对发送端这三种断法长得一模一样（30 s 后 503），
+  所以前几轮排查一直在代码里绕圈。
+
+  **判据链（同一台设备、同一轮）**：
+  ① 冻结位 `cgroup.freeze=1`，41 个线程全在、一个都不跑；
+  ② `echo 0 > …/cgroup.freeze` 那一瞬间，18:21 积压的两条 `incoming_transfer` 立刻被读出 ——
+  但彼时已是 `status=1004 phase=rejected`，邀请早作废，这正是「点了发送什么都没弹」；
+  ③ `settings put global cached_apps_freezer disabled` 之后，同一份代码同一毫秒投递：
+  `18:33:12.849 宿主写 → 18:33:12.849 钩子 bridge line → 18:33:12.855 invitation`；
+  ④ 三段复验从「恒定 30.0 s 超时」变成 A 段 **8.8 s** `503`（人点拒绝）、C 段 **8.7 s** `200 OK`
+  + **9.2 s** `upload → 200`，`dumpsys activity activities` 里能看到后台那张 `ReceiveDialogActivity`。
+
+  **`cmd deviceidle whitelist +com.coloros.oshare` 在这台 ROM 上无效**（白名单里有、照样被冻），
+  所以修法只能落在 `cached_apps_freezer` 这个全局开关上。它不是调优，是和 `svc wifi disable`
+  同一类前置条件：分享会话期间必须借走、结束必须归还。因此写进 `awdl-stack.sh`：
+  `freezer_off` 在冷热两条路径都执行（幂等，首写者把原值存进 `state/freezer-before`），
+  `freezer_restore` 在 `cmd_stop` 与 `boot` 的三条失败分支里还原。
+  已验：`boot` 打 `FREEZER_OFF`、`settings` 从 `null` 变 `disabled`；`stop` 打 `FREEZER_RESTORED`、
+  回到 `null` 且 `freezer-before` 被删；冷路径二次 `boot` 再打 `FREEZER_OFF`，回执
+  `BOOT_RESULT stack up boot=d81a34b5 iface=wonder0 freq=5745 daemon=32710 tun=up`。
+
+  **另记一条环境判据**：`am startservice com.oplus.oshare.OShareServer` 返回后 1 秒内
+  `dumpsys activity services` 就查不到它了 —— 指望它撑住进程优先级这条路不通，别再试。
+
 - **2026-11-15 15:40**：**整批 49.3 MB / 487 s = 98.8 KB/s；24.8 ms 的批周期里我方只占 0.16 ms。**
   带 `wait=` 的 `awdld` 上机跑完整批，`cap-w1.txt` 逐帧分解：我方 ACK 中位 0.16 ms（p90 1.26），
   空口等待中位 <0.5 ms（82% 的包）、均值 4.5 ms、15.9% 的包 ≥8 ms；ACK 进 tun 之后 iPhone 平均
