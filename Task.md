@@ -426,14 +426,15 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 | 指标 | 值 | 说明 |
 | --- | --- | --- |
-| 单元 + 集成测试 | **380 passed**（1 ignored） | 无设备；clippy 零 warning |
+| 单元 + 集成测试 | **384 passed**（1 ignored） | 无设备 |
 | JVM 断言 | **368 条** | `bash crates/ffi/jvm/check.sh`，桌面 JVM + `-Xcheck:jni`，不是真机 |
-| Rust 行数 | 21362 | 八 crate；`src/` 合计 |
+| Rust 行数 | 21561 | 八 crate；`src/` 合计 |
 | Java 行数 | 12133 | 29 个类：三页 + 发送 + 确认 + 服务 + 钩子 + 身份/射频/链路 |
-| 真机库 | `libopairdrop_ffi.so` **681 712 字节** | `aarch64-linux-android`，linker 35（含 mDNS 三个入口） |
-| APK | **14 204 955 字节**（debug，含 `assets/kernel/`） | 内核资产合计约 38 MB 未压缩，压后约 13.5 MB；不含资产的 clean 包仍是 88 万级 |
+| 真机库 | `libopairdrop_ffi.so` **685 344 字节** | `aarch64-linux-android`，linker 35（含 mDNS 三个入口） |
+| APK | **13 728 472 字节**（debug，含 `assets/kernel/`） | 内核资产合计约 38 MB 未压缩，压后约 13 MB；不含资产的 clean 包仍是 88 万级 |
 | 接收吞吐 | 80–88 KB/s | 受对端 31.2% 占空比限制，**不是 KPI** |
 | 发送吞吐 | 1.06–1.13 MB/s | 同上 |
+| clippy | **2 warning**（`too_many_arguments`） | `jni::serve_for_java` 8 参、`respond::announce` 8 参，都是上一轮加参数（`landing` / `ttl_override`）留下的；纯签名整理，等一次专门的重构收掉 |
 
 ---
 
@@ -450,6 +451,63 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 ---
 
 ## 13. 变更日志（新的在上）
+
+- **2026-11-15 09:30**：**「几 MB 就炸」是一个字节校验：`bad field width 3`。同时把「弹窗慢」量成了
+  丢包，不是 RTT，也不是 Nagle。** 真机上一句报错拆成三件事，逐个收口。
+
+  **一、`bad field width 3` 的因果链（已修）**。`/Ask` 的 body 里带 `FileIcon`（几 MB 的 PNG），
+  body 变大之后 iOS 的对象表/引用超过了 0xffff，于是把 trailer 里两个宽度字段写成 **3 字节**。
+  `crates/bplist/src/lib.rs` 的 `Reader::new` 原本只认 `1 | 2 | 4 | 8`，直接 `Err(BadWidth(3))`，
+  `Ask::parse` 上浮成 `Error::Plist`，`server.rs` 回 `400` 并 `Err(Error::Protocol(..))`，
+  `ffi::classify` 把它一律映射成 `status::TRANSPORT`，到页面就只剩一句
+  `接收失败：protocol: plist: bad field width 3`。
+  **三条判据说明缺陷在我们这边，不在对端**：① 写侧 `width_for()` 只会产出 1/2/4/8，我方**不可能**
+  写 3，所以这个 body 一定来自对端；② `legacy/.../Bplist.java` 的 `validWidth()` 是同一个限制——
+  这是从 legacy **平等继承**的历史缺陷，不是新引入的；③ Apple 自己的读侧（`_getSizedInt`）接受
+  **任意 1..8 字节**宽度，宽度是「字节数」不是位宽，我们的检查比格式更严。
+  修法一行：`(1..=8).contains(&width)`，注释写清上面三条；读循环本来就没有限制（`read_unsigned`
+  逐字节移位），不需要动。补两条测试：`accepts_three_byte_field_widths`（手工搭三段式 payload，
+  两个宽度都写 3、引用也 3 字节）与 `still_rejects_impossible_field_widths`（0 / 9 / 255 仍拒）。
+  `cargo test -p opairdrop-bplist` → **18 passed**。新 APK 已装、8770 在听，**判据是重发几 MB 时
+  页面不再出现那句话、`Download/` 里落下同字节文件**。
+
+  **二、「点发送到弹窗慢」不是握手快慢，是三次握手之后的第一批数据被丢了**。抓包
+  `/data/local/tmp/e2e3.txt`（1697 行、`wonder0`、09:08–09:21、修好锚点之后）分两种连接形状，
+  泾渭分明：
+
+  | 形状 | ClientHello 段数 | 握手耗时 | 出现在 |
+  | --- | --- | --- | --- |
+  | A：`P. seg1:518 len517` → 我方 `seg1:1243` → 对端 `seg518:582 len64` | **1 段** | **2–10 ms** | 52166/52167/52169/52171/52174/52175/60847… |
+  | B：`P. seg1429:1497 len68` → 静默 3.5 s → 对端重传 `seg1:1189`、`seg1189:1429` | **3 段** | **3.5–3.7 s** | 56597、49832、59458、53402、49190、58245、60298、63426 |
+
+  形状 B 里，三段的**前两段一个都没到**，到的只有尾巴 68 字节；我方只发得出 1 个 dup ACK
+  （够不到 3 个），iOS 只能等 RTO，于是**每次多花 3.5 s**。这正是 `handshake from … in 4359 ms`
+  那条日志的来源。**RTT 只有 58 ms**（SYN 40.852643 → 对端 ACK 40.910468），所以既不是链路 RTT、
+  也不是 Nagle、也不是 TLS 版本——是**一趟飞行里丢头部**，而头部丢失无法被 dup ACK 发现，只能等 RTO。
+  `ip -s link show wondertap0` 与 `wonder0` 两侧 `dropped 0 / overrun 0`，说明**不是内核环丢的**：
+  要么对端在它自己的 AWDL 队列里丢了这两段，要么我们这颗 radio 的第一批没收到。两种可能已经用
+  **两路抓包**分开测（见四）。
+
+  **三、上一轮的「锚点冻结」修复在真机确认生效。** 换二进制 → `awdl-stack.sh stop/start` →
+  `boot`（pid 20257）。`anchored` 86908（冻结 5.4 h）→ 现在 7721 一路爬到 7809；`released=5`
+  （释放路径真的走过了，不再是 0）；`peer` 会跟着「当前在房间里的那台」换（`ee:17:…` → `6e:fc:…`）；
+  `err` 在 `2tu/3tu` 间抖动而不是钉死；`drop=0`。
+
+  **四、两个抓包脚本进仓库**：`tools/capture.sh`（`wonder0` 上 `port 8770 or port 5353`）、
+  `tools/tap.sh`（`wondertap0` 上 `ip6`，raw 802.11 + radiotap）。写这两个脚本踩到三件事：
+  ① `tcpdump -i any` 在这台机器的 tcpdump 上**一条都收不到**，且不报错；② 抓错接口名
+  （`awdltun0` vs `wonder0`，隧道会随「App 自己持有 / 脚本拉起」换名字）得到的是**空文件**，
+  读起来像「什么都没发生」；③ **成功也会写 stderr**——`listening on wonder0, link-type EN10MB`
+  是它的启动横幅，所以「`.err` 非空 = 失败」这个一开始写进脚本的判据是错的，它会把两个正常
+  起着的抓包报成失败。已改成 `grep -q '^listening on'`：横幅在就是起好了，其余内容
+  （`No such device` / `Permission denied`）才是真失败。
+
+  **五、还没收口的两条**，判据已经架好，等下一次真机测试一次性取：
+  - 「第二台 iPhone 较晚才看到本机」：先看两路抓包里**两台 iPhone 各自的 mDNS 查询时刻**与我们的
+    应答是否成对（形状 B 的丢头同样可能吃掉第一条查询的应答）。
+  - 「弹窗慢」的剩余半段：有确认弹窗时 `answers_ask_early() == false`，必须先读完整个 offer 才
+    回 `/Ask`（`server.rs` 的 `ask()`），几 MB 的 `FileIcon` 要在这个 RTT 上走完。是否需要改成
+    「先答后读」由抓包里的 body 传输时长决定，不先改。
 
 - **2026-11-15 03:30**：**接收进度从写盘循环一路接到通知栏。** Rust 侧新增第三个导出与一个
   `Landing` 回调，Java 侧 `Listener` 换用它、`ReceiveService` 多一条随字节走的通知。按约定
