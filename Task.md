@@ -390,6 +390,28 @@ dumpsys notification --noredact | awk -v want=com.oshare.airdrop '
 不是回传成本），于是名义节拍 0.4 s、真实节拍 0.74 s，表上的 `t+` 与真实进度错开近一倍，
 读起来像「通知不跟着字节动」。时间列只能取 `date +%s%3N` 的实测差值。
 
+**2026-11-15 第三条（一条要撤掉的旧结论）**：**邀请卡在 `uiautomator dump` 里是看得见的，
+而且只能按 dump 里的 `bounds` 点。** 曾经在文档里记成「互传浮窗，`dump` 与 `mCurrentFocus`
+都看不见，只有截图能看」，据此写过点硬编码坐标的脚本——那个结论是错的。当时那张卡**压根没弹**
+（钩子进程陈旧，见 §13 21:40 那段），不是弹了看不见。实测：`topResumedActivity=
+com.coloros.oshare/com.oplus.oshare.ui.ReceiveDialogActivity`，dump 里连正文都有：
+
+```
+topResumedActivity=com.coloros.oshare/com.oplus.oshare.ui.ReceiveDialogActivity
+text="AirDrop · 邀请已过期"        resource-id="android:id/message"
+text="完成"                        bounds="[128,2736][1312,2912]"
+```
+
+跳出邀请那一帧（`text="接受"`）时量到的 `bounds` 是 `[736,2736][1312,2912]`，中心 `(1024,2824)`。
+
+两条推论：
+- **坐标要算不要抄。** 手抄的 `(1022,2722)` 落在按钮上沿外 14 px，连点四次全空，而日志里
+  什么都不报——「点了没反应」与「没点中」在应用侧长得一模一样。正确做法是 dump 里取
+  `bounds` 求中心（`.tmp/tapaccept.sh` 就是这么写的：轮询等到 `text="接受"` 出现，
+  再按它自己的 `bounds` 点一次）。
+- **同一条卡退到后台仍然存在**（`Hist #0`），所以「dump 里没有」要先确认它在不在前台，
+  而不是断言它不进无障碍树。
+
 ---
 
 ## 7. KernelSU → LSPosed：结论
@@ -452,7 +474,7 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 ---
 
-## 9. 当前进度（2026-11-15 21:00）
+## 9. 当前进度（2026-11-15 22:50）
 
 ### 已完成并验证
 
@@ -476,6 +498,10 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 | 流体云卡片跟随真实传输 | 与上一行**同一轮、同一次上传**：互传进程那张卡 `android.title=AirDrop · 正在接收 1%` → `8%` → … → `94%`，收尾切 `AirDrop · 接收完成`。**两条通知逐拍对应**：app 的千分数 11/88/164/240 与云上的 1/8/16/23 一一对齐（云 = 千分数 ÷ 10 向下取整），说明云上的百分比不是另算的，就是我们上报的字节数 |
 | 流体云接收弹窗（互传进程内钩子） | 三段复验连续三轮全绿：`ReceiveDialogActivity` 前台弹出并点拒绝 → `503`（**8.8 s**，不是 30 s 超时）；同一张卡退到后台仍在 `Hist #0`；再次邀请弹出并点接受 → `200 OK`（**8.7 s**）+ `/Upload` `200`（**9.2 s**）。判据日志串成一条：`bridge event out` → `bridge line` → `receive event incoming_transfer … phase=pending installed=true` → `invitation … present=true`，**同一毫秒**。**前置条件是 `cached_apps_freezer=disabled`**，否则钩子进程被 `cgroup.freeze` 冻住、事件永远读不出来（见 §13） |
 | 接收落盘按类型分五桶 | 八份混合文件一次 `/Upload`：五个 `OPAirDrop` 桶逐份对齐，`content query` 八行 `is_pending=0`、`_size` 与源相同、MIME 正确、**无一被改名**；`receive.directory=Documents/All` 时八份全进同一目录（`media_type=1/3/2/6/0`，即走 Files 集合）。完成卡与功能页同步改口（见下节） |
+| 「文件信息未知」结案（诉求 ②） | **那句话是我们自己写的兜底，不是一加互传的文案**：`OShareReceiveBridge.summary()` 在事件 JSON 的 `files` 为空时补一句，而 `repo-src` 的 `Task` 是拿每一条事件的 JSON 现场构造的，传输中那条只带进度、不带 `files`，横幅就退化成那句话。修法有两条：① 摘要行第五个字段写全逐文件清单（`summary_of`，本轮工作区新增，未提交前就是用户看到那句话的时间点）；② 兜底只在正文也没话说时才出现。真机复验：60 MB 传输卡片 19% → 78% 一路显示 `large.bin / 2.9 MB`，**无那句话**；纯链接邀请从「文件信息未知 / 1 个链接」改为只有「1 个链接，30 秒内没人应答就放弃。」 |
+| 超时不再说成「已拒绝」（诉求 ④ 之一） | 超时与手动拒绝在 wire 上是同一件事（`status=1004`，发送端收 `503`），在标题上不该是。`decide()` 里 `!wanted` 时按 `answered` 分岔到 `expired`，复用标题表里本来就有的「AirDrop · 邀请已过期」。真机实测结果卡：`AirDrop · 邀请已过期 / 探针 / 1 个文件 / large.bin / 105 kB / 30 秒内没人应答，已放弃 / 完成` |
+| 接受之后不再二次询问（诉求 ④ 的另一半，也是更深的根因） | 答过之后最后一帧还停在 `pending`，而界面晚到一步会按快照重放（`snapshot`），于是同一个问题被问第二遍、这次没人答、三十秒后屏上冒出「已拒绝」——用户感觉就是「我没点拒绝，它自己拒的」。改成 `progress(0, 0)` 立刻把最后一帧换成 `receiving`。真机复验 3 MB 一轮：`invitation … accepted after 1262 ms via card` 之后 **2 ms** 就是 `phase=receiving`，全程只有一次 `pending` |
+| 应用侧不是速度瓶颈（诉求 ③） | 3 MB 端到端（接受 → `complete`）**334 ms**；200 MB 不限速 **25.1 s = 8.0 MB/s**，且这条路径还过 `adb forward`、没经无线电。iPhone 显示 100% 而我们还在等，是驱动未就绪那段时间的观感 |
 
 ### 接收落盘：按类型分五个桶（2026-11-15 20:40）
 
@@ -525,8 +551,14 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
   接受后进度绕头像圆环走。现有 `SendActivity` 只是临时形态。
 - **通知栏与流体云显示发送进度**。
 - **`phash` 证书校验**（发送端侧；接收端侧的 `h` 已发布且与出示证书一致）。
-- **设置表里还有未接到读值处的行**（各超时、`http.response_limit` 等）。`receive.directory`、
-  `receive.overwrite`、`device.name`、`device.model` 已经接上，并且都在真机上验过读写。
+- **设置表里还剩 7 行没有读值处**。已接上并在真机验过读写的是 `receive.directory`、`receive.overwrite`、
+  `device.name`、`device.model`，加上本轮新接的 `http.response_limit`、`server.handshake_timeout_ms`、
+  `server.read_timeout_ms`（三者的接线点见 §13 本轮记录）。仍无人读的是：
+  `receive.probe_bytes`、`client.ask_timeout_ms`、`client.discover_timeout_ms`（产品代码零引用）；
+  `discover.window_ms`、`discovery.remembered_peers`、`log.level`、`log.preview_bytes`（只在
+  `crates/ffi/jvm/com/oshare/airdrop/SettingsCheck.java` 的自测里被点名）。另外「等多久算没人应答」
+  这件事现在是 `DECISION_TIMEOUT_MS` 与 `Confirmation.TIMEOUT_MS` 两处**硬编码 30 秒**，
+  表里根本没有对应键——要让人能调，得先加行。
 - `git` 已初始化并有提交，但首个提交晚于事故，历史不含更早状态。
 
 ---
@@ -547,7 +579,8 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 | 7 | 自有发送面板（仿 `IOSShareActivity`） | 与参照同构；浅/深；弹出动画；环状进度随真实字节走 | `SendActivity` 是临时形态 |
 | 8 | 发送端接入 `SendActivity`（用户点名的第二刀） | 从我们自己的面板发起一次完整发送 | 未开始 |
 | 9 | `phash` 校验 | 指纹不符时不发，且给出可读原因 | 未开始 |
-| 10 | 15 行设置接线 | 每接一行删一个 `DEFAULT_*` 常量；键名只出现在 `settings.rs` | 部分：`receive.directory`、`receive.overwrite`、`device.name`、`device.model` 已接上并在真机验过读写（`receive.directory` 两条分支都跑过）；各超时与 `http.response_limit` 仍未接到读值处 |
+| 10 | 15 行设置接线 | 每接一行删一个 `DEFAULT_*` 常量；键名只出现在 `settings.rs` | 部分（**8/16**）：`receive.directory`、`receive.overwrite`、`device.name`、`device.model` 已在真机验过读写；本轮新接 `http.response_limit`（`Client::with_limit` 第一次有调用点）、`server.handshake_timeout_ms`、`server.read_timeout_ms`（两个硬编码常量降级为回落）。剩 7 行见 §9 |
+| 11 | 复验本轮三处接线（只差人动手） | ①`http.response_limit=65536` 时超长错误正文被拒；②`server.read_timeout_ms=1000` 时大文件传输约一秒内断；③改回默认后一切复原 | ⏳ 代码已装包，未跑真实传输 |
 
 第 3 档不成立时的排查方向，**不是改参数猜**：先 `tcpdump` 同时抓 `awdltun0` 上我们的公告与 iPhone
 实际发问的时刻分布。如果 iPhone 从不发问，问题在链路（Apple 的 AWDL 只在它自己要发时才醒）；
@@ -559,17 +592,18 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 | 指标 | 值 | 说明 |
 | --- | --- | --- |
-| 单元 + 集成测试 | **388 passed**（1 ignored） | 无设备；2026-11-15 20:44 重跑（`cargo test --workspace`） |
+| 单元 + 集成测试 | **393 passed**（1 ignored） | 无设备；2026-11-15 22:46 重跑（`cargo test --workspace`）。较上一轮 +2：`ffi` 的 `the_response_limit_is_the_row_and_nothing_else` 与 `client` 里那条 |
 | JVM 断言 | **368 条** | `bash crates/ffi/jvm/check.sh`，桌面 JVM + `-Xcheck:jni`，不是真机；本轮未重跑 |
-| Rust 行数 | 21859 | 八 crate；`src/` 合计（`airdrop` 3654 / `awdl` 6064 / `bplist` 924 / `cpio` 1422 / `ffi` 5980 / `http` 1985 / `mdns` 957 / `settings` 873） |
-| Java 行数 | 16282 | **50 个类**：三页 + 发送 + 确认 + 服务 + 钩子 + 身份/射频/链路 + `Publish`（五种落桶） |
-| 真机库 | `libopairdrop_ffi.so` **685 344 字节** | `aarch64-linux-android`，linker 35（含 mDNS 三个入口） |
-| APK | **17 334 740 字节**（debug，含 `assets/kernel/`） | 2026-11-15 20:26 构建实测；`src/main/assets` 是构建期生成，所以不同批次的包体积会随内核资产变 |
+| Rust 行数 | 22095 | 八 crate；`src/` 合计（`airdrop` 3684 / `awdl` 6064 / `bplist` 924 / `cpio` 1422 / `ffi` 6186 / `http` 1985 / `mdns` 957 / `settings` 873） |
+| Java 行数 | 16525 | **50 个类**：三页 + 发送 + 确认 + 服务 + 钩子 + 身份/射频/链路 + `Publish`（五种落桶） |
+| 真机库 | `libopairdrop_ffi.so` **686 816 字节** | `aarch64-linux-android`，linker 35（`transfer()` 由 8 参收敛到 5 参后比上一轮小 128 字节） |
+| APK | **16 677 135 字节**（debug，含 `assets/kernel/`） | **只认 `gradle clean assembleDebug` 的值**；增量打包会残留空对齐条目，同一份代码量出 17 340 260 / 17 101 408 这类虚高数，差 600 KB 以上 |
 | 接收吞吐 | 80–88 KB/s | 受对端 31.2% 占空比限制，**不是 KPI** |
 | 发送吞吐 | 1.06–1.13 MB/s | 同上 |
 | 自测环路天花板 | **25.6 MB/s** | `adb forward` → 本进程 8770；比真实接收高约 260 倍，只能当「本侧不是瓶颈」的证据，不能推接收端能力（见 §5.6） |
+| 单进程端到端（小文件） | **334 ms** | 3 MB 不限速一轮：接受 → 67%（288 ms）→ `complete`。这是「iPhone 1 秒到 100%、我们还在等」的直接反证 |
 | 通知栏 / 流体云验收 | 48 MB @ 2.5 MB/s，19.2 s | `bash notifcheck.sh 48 2.5`：一拍一次 `dumpsys`（真实节拍约 0.6 s），全程约 30 拍，两条通知同拍采样 |
-| clippy | **2 warning**（`too_many_arguments`） | `jni::serve_for_java` 8 参、`respond::announce` 8 参，都是上一轮加参数（`landing` / `ttl_override`）留下的；纯签名整理，等一次专门的重构收掉 |
+| clippy | **1 warning**（旧，非本轮） | `crates/awdl/src/link.rs:187 manual checked division`（`if n > 0 { sum / n }`，建议 `checked_div`）。三条 `too_many_arguments` 已清零：`send::transfer` 靠重构（8 → 5 参，`Client` 挪到调用方），`respond::announce` 与 `jni::serve_for_java` 靠 `#[allow]` + 逐条写明理由（一个是报文形状，一个是 JNI 签名） |
 
 ---
 
@@ -591,7 +625,22 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
   | 功能页「同名时覆盖」开关 | `(1196,1425)` | 第二屏；第一屏依次是「驱动」「接收」「对端看到的…」「射频」「开关」 |
   | 设置页 `receive.directory` 输入框 | `(720,2338)` | `[144,2250][1296,2427]` |
   | 设置页「保存」 | `(1034,2616)` | `[740,2528][1328,2704]` |
-  | 卡片「接受」/「完成」 | `(1024,2824)` | 同一个位置；「拒绝」在 `(416,2824)` |
+  | 卡片「接受」/「完成」 | `(1024,2824)` | 同一个位置；「拒绝」在 `(416,2824)`。**这两个数是从 dump 的 `bounds` 求中心得到的**（接受 `[736,2736][1312,2912]`），手抄会偏到按钮上沿之外 |
+
+  **出包之后必须做四件事，少一件就会出现「代码明明改了却没生效」**：
+
+  ```bash
+  adb shell su -c "kill -9 $(adb shell pidof com.coloros.oshare)"   # 只 start-foreground-service 不换进程
+  adb shell am force-stop com.oshare.airdrop                          # 否则新 .so 不加载
+  adb shell am start-foreground-service -n com.coloros.oshare/com.oplus.oshare.KeepForeService
+  adb shell am start -n com.oshare.airdrop/.MainActivity              # 再点一下「接收端」胶囊
+  ```
+
+  `keepForeService` 对已有进程只是「点了一下」，pid 不变、钩子仍是旧 APK 的类——症状是
+  邀请卡完全不弹、日志里连 `invitation … present=` 那半句都没有。接收端（`com.oshare.airdrop`）
+  被 `force-stop` 后默认是关的，主界面显示「已停止 / 未开始」，点右侧胶囊 `(1162,1078)` 才起来；
+  起来后是「正在监听 8770，等待附近设备」+ 绿色「监听中」，`:2242`（8770 十进制）出现在
+  `/proc/net/tcp6` 里。
 
   功能页会把底栏吞掉：往下滚之后 `uiautomator dump` 里就没有「首页/功能/设置」这三个标签了，
   这时的点击全部落空。先往回划到顶，标签重新出现再点。
@@ -612,6 +661,138 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 ---
 
 ## 13. 变更日志（新的在上）
+
+- **2026-11-15 22:50**：**「文件信息未知」结案；「自动拒绝」找到两层根因并都修掉；应用侧速度上限量出来了。**
+
+  **一、那句话是我们自己写的，不是一加互传的。** 用户报「接入的一加互传通知，传输中会显示
+  『文件信息未知』这一栏」，并猜它在一加互传的 APK 里。全仓搜索的结果是：**它只在
+  `oshare/app/src/main/java/com/oshare/airdrop/OShareReceiveBridge.java` 里出现一次**，
+  判据是 `Task` 构造时拿到的 JSON `files` 数组为空或不存在。而 `repo-src` 的 `Task` 是
+  **拿每一条事件自己的 JSON 现场构造**的（`new Task(json)`），所以传输中那条只带进度的
+  `incoming_transfer` 一旦不带 `files`，横幅上的文件信息就退化成「文件信息未知」。
+  我们这份是照抄过来的，连兜底一起抄了。
+
+  修法两层：
+  1. **摘要行第五个字段写全逐文件清单**（`crates/ffi/src/serve.rs` 的 `summary_of`，本轮工作区新增）：
+     `名字<US>大小<RS>…`。卡片那边按这个字段拆成 `entries()`。这解释了用户为什么看到那句话——
+     他抱怨时包里的摘要还没有这个字段。
+  2. **兜底只在正文也没话说时才出现**。纯链接分享的正文已经是「1 个链接」，中间再写一句
+     「文件信息未知」是自相矛盾。改前 / 改后同一张卡（真机 dump，`--links` 模式）：
+
+     ```
+     改前                                    改后
+     AirDrop · 收到文件邀请                  AirDrop · 收到文件邀请
+     探针                                    探针
+     文件信息未知                            1 个链接，30 秒内没人应答就放弃。
+     1 个链接，30 秒内没人应答就放弃。
+     ```
+
+  顺带把诊断日志那半句也改准：链接分享过去记成 `files=unreported`（读的人会去找一个不存在的
+  解析失败），现在是 `files=none links=1`。
+
+  真机复验文件那一支：**60 MB / 2 MB/s 一轮，卡片从 19% 到 78% 一路显示
+  `large.bin` / `2.9 MB`，没有那句话**；12 帧截图里 `ReceiveDialogActivity` 全程在屏上。
+
+  **二、超时被说成「已拒绝」——用户原话「我没点拒绝，是他自动拒绝的，这应该是个 bug」。**
+  这是两件事，都真的。
+
+  1. **文案层**：超时与手动拒绝在 wire 上是同一件事（`status=1004`，发送端都收 `503`），
+     但标题不该共用。`ReceiveHost.decide()` 里 `!wanted` 时按 `answered` 分岔：超时发
+     `expired`，复用 `Task.title()` 里**早就有、从来没人发过**的那一支「AirDrop · 邀请已过期」。
+     真机结果卡：`AirDrop · 邀请已过期 / 探针 / 1 个文件 / large.bin / 105 kB /
+     30 秒内没人应答，已放弃 / 完成`。协议零影响。
+  2. **行为层（根因）**：答过之后最后一帧**还停在 `pending`**。界面晚到一步会按
+     `snapshot` 重放最后一帧，于是同一个邀请被问第二遍；这次没人答，三十秒后屏上就冒出
+     「已拒绝」。人看到的就是「我没点它，它自己拒的」。修法是在 `decide()` 返回 `true` 前
+     调 `progress(0, 0)`——说实话：人说了收，接下来就是收，字节还没到所以没有百分比。
+     真机复验（3 MB 一轮）：
+
+     ```
+     22:45:30.379  invitation airdrop-2 from 探针 attached=true files=1 links=0
+     22:45:31.641  invitation airdrop-2 accepted after 1262 ms via card
+     22:45:31.643  receive event incoming_transfer airdrop-2 phase=receiving   ← +2 ms
+     ```
+
+     全程只有一次 `pending`，复发路径断了。
+
+  **三、「速度卡在我们这边」不成立。** 用户报「2.7 MB 的图，iPhone 1 秒到 100%，我们还要
+  等很久」。用探针直接量：
+
+  | 实验 | 结果 |
+  | --- | --- |
+  | 3 MB 不限速，接受 → `complete` | **334 ms**（其中 288 ms 到 67%） |
+  | 200 MB 不限速 | 25.1 s = **8.0 MB/s**，且这条路径过 `adb forward`、没经无线电 |
+
+  「8.0 MB/s」是「TLS + cpio + 落盘」这条我们自己路径的上限，比 §11 记的自测环路 25.6 MB/s
+  低，是因为本轮这一轮**边传边落盘**而不是只读不写。用户当时的观感更可能是驱动未就绪那段时间。
+
+  **四、clippy 三条 `too_many_arguments` 清零。** 不是一律 `#[allow]`，而是按「是不是真的
+  该合并」分两种：
+
+  - `send::transfer` 8 参 → **5 参**（重构）。`host`（`Host` 头）与 `limit`
+    （`http.response_limit`）在函数体里只用来 `Client::new(...).with_limit(...)`，把 client
+    挪到调用方构造，剩下的是「对话本身」：client / sender / id / paths / meter。
+  - `respond::announce` 与 `jni::serve_for_java` 保留 8 参并各写一段理由：前者一个报文要写
+    名字、指向、内容、记录位、id、寿命，八项各在不同行上用一次；后者是 JNI 的 Java 签名，
+    JNI 一个 Java 参数对一个 C 参数，包成结构体只是把列表搬到下一行再拆开。
+
+  现在 `cargo clippy --workspace --all-targets` 只剩一条**旧告警**：
+  `crates/awdl/src/link.rs:187 manual checked division`。
+
+  **五、体积只认 clean。** 同一份代码：`gradle assembleDebug` 增量出 17 340 260、
+  `gradle clean assembleDebug` 出 **16 677 135**，差 663 KB——正对上 §11 记的「增量打包残留
+  空对齐条目」。以后报体积一律用 clean 的值，别拿增量数去比。
+
+- **2026-11-15 21:40**：**把设置表最后两项「改了不生效」的接线接上；`retry_publish` 不再被当成陌生指令。**
+
+  **一、`http.response_limit` 从「摆设」变成真实上限。** 这个键一直在表里、范围也校验得好好的，
+  但 `Client::with_limit` 在整个 `crates/` 里**零调用点**，实际生效的永远是
+  `DEFAULT_RESPONSE_LIMIT = 1 << 20`。修法是把设置**整份文本**穿过 JNI 递给发送端，而不是递一个数字：
+
+  ```
+  设置行 → crates/ffi/src/settings.rs::response_limit()
+         → send.rs::drive() 解析出 usize
+         → transfer(..., limit)
+         → Client::new(Wire { .. }, host).with_limit(limit)
+  ```
+
+  为什么传文本不传整数：发送端以后还要认第二行（`client.ask_timeout_ms` 之类），传整数就得再加一个参数，
+  而传文本顺带免掉「Java 侧维护第二份键名」的漂移。`opairdrop_send` 与 `opairdrop_send_with_progress`
+  因此在 `host_len` 之后各多一对 `settings` / `settings_len`，Java 侧只改 `SendActivity.settingsText()`
+  一处（原本 `senderName()` 自己读一遍设置文件，顺手抽成公共的）。
+
+  **解析失败要拒绝，不能静默用默认。** `values_from` 返回 `Err` 时 `drive()` 回 `status::SETTINGS`——
+  注释原话：「the person edited a row, and a send that silently ignored it is the one outcome that
+  leaves them no way to find out」。指针为 null 才是「什么都没设」= 全默认。`response_limit()` 的兜底链是
+  `number(RESPONSE_LIMIT)` → `Some(bytes) if bytes > 0` → 否则回落默认；零不是「快」，是「一个应答都读不了」。
+
+  **二、两个 socket 超时此前是硬编码，且数字与表默认值一模一样。** `Listener` 里的
+  `HANDSHAKE_TIMEOUT_MS = 12000` / `TRANSFER_TIMEOUT_MS = 60000` 与
+  `server.handshake_timeout_ms` / `server.read_timeout_ms` 的默认值**完全相等**——所以「改了不生效」
+  这件事从外观上根本看不出来：改不改，第一次跑都是同一个数。现在两处 `setSoTimeout` 都走新的
+  `timeoutOf(screen, key, fallback)`，常量降级为「设置读不出来」的回落，javadoc 改成这么做并点名键名。
+
+  `timeoutOf()` 里多做一步 `min()/max()` 夹取：设置文件是纯文本，手改的数字不经过 `Values::set` 的
+  范围校验，而超时为 0 不是「很快」，是「对端还没开口就断」。
+
+  **三、`retry_publish` 回「未知指令」是答错了问题。** 这条指令在协议里有位置（发送端存不下去会请求重发），
+  我们这里没有对应动作——收完就落盘。过去落进 `default` 分支回「未知指令：retry_publish」，读起来像
+  我们不认识它。改成专门的 `case`：
+
+  ```
+  case "retry_publish":
+      ok = false;
+      error = "这个接收端不重试发布，收到就已经在目标目录里了";
+  ```
+
+  **四、验数。** `cargo test --workspace` **391 passed / 1 ignored**（本轮新增
+  `the_response_limit_is_the_row_and_nothing_else`）；`cargo build --release --target
+  aarch64-linux-android -p opairdrop-ffi` → `.so` **686 944 字节**（上轮 686 352）；
+  `gradle assembleDebug` BUILD SUCCESSFUL（28 s），APK **17 340 260 字节**；`adb install -r` Success。
+
+  **五、还没验的。** 这三处接线都装在机器上了，但**一次都还没跑过真实传输**。验收方式见 §10：
+  把 `http.response_limit` 改到很小（如 `65536`）再让探针发一个超长错误正文，该被拒；
+  把 `server.read_timeout_ms` 改到 `1000` 再发一个大文件，传输应当在一秒内断而不是等到六十秒。
 
 - **2026-11-15 21:00**：**收尾：把度量表改成实测数、把那条骗人的旧结论标掉、清完临时件、提交。**
 

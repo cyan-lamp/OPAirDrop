@@ -131,6 +131,10 @@ final class ReceiveHost {
     static boolean answer(String session, boolean accepted) {
         Attempt attempt = find(session);
         if (attempt == null) {
+            // 表里没有这一次接收，但通知可能还挂着：这张表在收尾时就退了，而通知要等
+            // {@link Confirmation} 那边超时或回答才撤。人在这段缝里按下去，仍然该被听见——
+            // 所以退到那个闩上再试一次，而不是当作「问题不存在」。
+            Confirmation.answer(session, accepted);
             return false;
         }
         attempt.answer(accepted);
@@ -214,6 +218,16 @@ final class ReceiveHost {
         private final CountDownLatch decided = new CountDownLatch(1);
         private volatile boolean accepted;
 
+        /**
+         * 有人真的回答过。
+         *
+         * <p>和 {@link #accepted} 不是一件事：两者都为假时，「人说了不行」和「一直没人理」
+         * 长得一模一样，而对人来说这是两句话——前者该说「已拒绝」，后者该说「没人应答」。
+         * 过去两种情况共用一句「已拒绝」，于是超时被读成「它自己拒的」，这不是猜错，是
+         * 我们从来没把这件事记下来。
+         */
+        private volatile boolean answered;
+
         /** 这条连接。人说取消时关掉它，读字节的那条线程会从这里出来。 */
         private final Socket peer;
 
@@ -222,6 +236,18 @@ final class ReceiveHost {
 
         /** 对面叫什么。第一条事件之后才可能知道，后面几条要接着用。 */
         private String sender = "Apple 设备";
+
+        /**
+         * 对面报上来的那份清单：叫什么、多大。
+         *
+         * <p>邀请那一刻就知道了，而且必须一路带着。卡片每收到一条事件就整份重建、重新
+         * 算一次摘要，它只看这一条——所以只挂在邀请那一帧上的话，「2 个文件」会在进度
+         * 刚开始时就消失，卡片退回「文件信息未知」，而那正是这个字段要修的东西。
+         *
+         * <p>{@code null} 是「还不知道」，空表是「对面没报」。两者对卡片的说法一样，对
+         * 排查不一样，所以在这里分开。
+         */
+        private JSONArray offered;
 
         /** 有没有对外说过话。没说过就不用收尾。 */
         private boolean announced;
@@ -257,6 +283,9 @@ final class ReceiveHost {
             Confirmation.Offer offer = Confirmation.parse(summary);
             sender = offer.sender;
             announced = true;
+            // 先把「哪几份」记下来再报事件：卡片看到邀请的那一帧就该看得到件数和名字，
+            // 而不是先看一眼「文件信息未知」、等下一次更新才对。
+            offered = filesOf(offer.files);
             try {
                 emit(newEvent("pending", PENDING)
                         .put("name", sender)
@@ -268,12 +297,40 @@ final class ReceiveHost {
             boolean attached = attached();
             // 两条路对发送端是同一个 30 秒，对人却是两种界面（卡片 / 本应用通知）。哪一条被走到
             // 只有这里说得出来，而「屏幕上什么都没出现」这半句排查永远从这里开始。
-            Log.i(TAG, "invitation " + session + " from " + sender + " attached=" + attached);
+            Log.i(TAG, "invitation " + session + " from " + sender + " attached=" + attached
+                    + " files=" + (offer.files.isEmpty() ? "none" : offer.files.size())
+                    // 链接分享没有文件，但它不是「什么都没报」。过去这一行在这种情况下写
+                    // `files=unreported`，读日志的人会去找一个不存在的解析失败。
+                    + " links=" + offer.links);
+            long askedAt = System.currentTimeMillis();
             boolean wanted = attached
                     ? await(DECISION_TIMEOUT_MS)
                     : Confirmation.ask(context, session, summary);
+            // 「人说了不行」和「一直没人理」对发送端是同一个 503，对人却是两句不同的话。
+            // 这一行把两者分开，也把耗时写下来——三十秒这个数只有在拒绝之后才看得见，
+            // 而人看到的是一张很久之前就弹出来的卡片。
+            Log.i(TAG, "invitation " + session
+                    + (wanted ? " accepted" : answered ? " refused" : " unanswered")
+                    + " after " + (System.currentTimeMillis() - askedAt) + " ms via "
+                    + (attached ? "card" : "notification"));
             if (!wanted) {
-                end("rejected", REJECTED, "已拒绝");
+                // 拒绝的话必须说清是谁拒的。过去两种情况共用「已拒绝」，于是超时被读成
+                // 「我没点它，它自己拒的」——那不是人看错，是我们没写明白。
+                // `expired` 是标题表里本来就有的一个相位（「邀请已过期」），只是从来没有
+                // 人发过它：状态码两边都是 1004（对发送端都是同一个 503），区别只在标题。
+                end(answered ? "rejected" : "expired", REJECTED, answered
+                        ? "已拒绝"
+                        : (DECISION_TIMEOUT_MS / 1000) + " 秒内没人应答，已放弃");
+            } else {
+                // 答过之后，最后那一帧不能再留在「邀请」上。
+                //
+                // 界面晚到一步时会按最后那一帧重放（{@link #snapshot}），而这条连接马上就要
+                // 去读 /Upload 了。中间这一段如果不说话，重放出来的就是那张已经答过的邀请——
+                // 于是同一个问题被问第二遍，这一次没人会答，三十秒后屏幕上出现「已拒绝」。
+                // 人在那一刻的感觉就是「我没点拒绝，它自己拒的」。
+                //
+                // 说的是实话：人说了收，接下来就是收。字节还没到，所以没有百分比。
+                progress(0, 0);
             }
             return wanted;
         }
@@ -314,7 +371,11 @@ final class ReceiveHost {
                             .put("mime", mime(entry.name))
                             // 存到哪儿是这块卡片上唯一一句人真正需要的话：这个应用没有浏览
                             // 目录的入口，除了这里没有第二个地方会说出来。
-                            .put("directory", entry.directory));
+                            .put("directory", entry.directory)
+                            // 「打开文件」按下去要有一个能被别的应用读到的地址。收完之后
+                            // 字节归媒体库管，我们手上没有可共享的路径，所以只有媒体库给的
+                            // 这一串能担这件事——留空就等于那个按钮点了没反应。
+                            .put("uri", entry.uri == null ? "" : entry.uri.toString()));
                 }
                 JSONObject event = newEvent("complete", COMPLETE)
                         .put("progress", 100)
@@ -361,6 +422,7 @@ final class ReceiveHost {
         /** 人说收，或者说不收。两个表面最后都落到这里。 */
         void answer(boolean yes) {
             accepted = yes;
+            answered = true;
             decided.countDown();
             // 通知那条路可能正在等：通知按钮和卡片按钮回答的是同一件事，所以两边都叫醒。
             // 没有人在等的时候它什么也不做。
@@ -396,7 +458,7 @@ final class ReceiveHost {
 
         /** 一条新事件，四条都带着的字段写在这里，免得每处都记一遍。 */
         private JSONObject newEvent(String phase, int status) throws JSONException {
-            return new JSONObject()
+            JSONObject event = new JSONObject()
                     .put("ev", "incoming_transfer")
                     .put("session", session)
                     .put("id", id)
@@ -406,6 +468,37 @@ final class ReceiveHost {
                     .put("terminal", false)
                     .put("published", false)
                     .put("progress", -1);
+            // 邀请里那份清单，每一帧都带上。卡片的摘要只看得见手上这一条事件，所以它必须
+            // 每一条都完整——这不是缓存，是因为「同一件事只有一种说法」在这里的具体做法。
+            // 收完之后 {@link #delivered} 会用自己的那份盖掉它：那一份带着落点，才是人真正
+            // 需要的下一句话。
+            if (offered != null && offered.length() > 0) {
+                event.put("files", offered);
+            }
+            return event;
+        }
+
+        /**
+         * 邀请里那份清单，转成卡片认的形状。
+         *
+         * <p>和 {@link #delivered} 里那份只差一个 {@code directory}——还没收，当然还没有
+         * 落点。卡片按名字画前三个、按字节数画总数，两个字段都有就够了。
+         *
+         * <p>大小未知的（文件夹条目）给 -1 而不是 0：卡片那边见到负数会只报件数不报总数，
+         * 而这正是「对面没说」该有的说法。给 0 会画出一个「共 0 B」，那是假话。
+         */
+        private static JSONArray filesOf(List<Confirmation.Item> files) {
+            JSONArray out = new JSONArray();
+            for (Confirmation.Item file : files) {
+                try {
+                    out.put(new JSONObject()
+                            .put("name", file.name)
+                            .put("size", file.size));
+                } catch (JSONException impossible) {
+                    Log.w(TAG, "receive invitation file unavailable", impossible);
+                }
+            }
+            return out;
         }
 
         private void end(String phase, int status, String message) {

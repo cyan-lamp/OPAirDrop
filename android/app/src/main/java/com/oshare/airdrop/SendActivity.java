@@ -797,6 +797,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         try (SSLSocket session = tls) {
             return Native.sendWithProgress(
                     peer.host.isEmpty() ? peer.address : peer.host,
+                    settingsText(),
                     senderName(),
                     modelName(),
                     UUID.randomUUID().toString(),
@@ -1366,9 +1367,9 @@ public final class SendActivity extends Activity implements Peers.Watcher {
 
     /** 我在这台机器上的名字：设置里的 {@code device.name}，没设就用型号。 */
     private String senderName() {
-        try {
-            byte[] text = Native.loadSettings(SettingsFile.of(this).getAbsolutePath());
-            for (String line : new String(text, java.nio.charset.StandardCharsets.UTF_8).split("\n")) {
+        String text = settingsText();
+        if (text != null) {
+            for (String line : text.split("\n")) {
                 int equals = line.indexOf('=');
                 if (equals > 0 && line.substring(0, equals).trim().equals("device.name")) {
                     String value = line.substring(equals + 1).trim();
@@ -1377,10 +1378,24 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     }
                 }
             }
-        } catch (Exception unreadable) {
-            // 读不出来就用型号：这一项不是必填。
         }
         return modelName();
+    }
+
+    /**
+     * 存下来的设置文本，读不出来就给 null——那与「什么都没设」是同一件事。
+     *
+     * <p>发送侧只读 {@code http.response_limit} 一行，却把整份文本传下去：以后发送端再
+     * 认一行，就不必再长一个参数，也不必在 Java 这边再维护一份键名。
+     */
+    private String settingsText() {
+        try {
+            byte[] text = Native.loadSettings(SettingsFile.of(this).getAbsolutePath());
+            return new String(text, java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Exception unreadable) {
+            // 读不出来就用默认：这一项不是必填，而挡住发送是比默认值更坏的答案。
+            return null;
+        }
     }
 
     private static SSLContext trusting() throws Exception {

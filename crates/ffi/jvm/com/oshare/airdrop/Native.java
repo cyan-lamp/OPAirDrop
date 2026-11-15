@@ -125,10 +125,12 @@ public final class Native {
      * the wire would jump. What the person chose is the honest denominator.
      *
      * @param progress a sink that is called while the transfer runs; never null
+     * @param settings the stored settings text, or null for every default; see {@link #send}
      * @return {@code peer<TAB>name\nbytes<TAB>count\n} as UTF-8
      */
     public static native byte[] sendWithProgress(
             String host,
+            String settings,
             String sender,
             String model,
             String transferId,
@@ -329,6 +331,11 @@ public final class Native {
      * multi-gigabyte share costs memory in blocks, not in file sizes.
      *
      * @param host the {@code Host} header value
+     * @param settings the stored settings text, or null for every default. Only
+     *     {@code http.response_limit} is read on this side, and it is the whole text rather
+     *     than the one number so that a second row can be obeyed without a second parameter.
+     *     Text that does not parse is refused instead of ignored: a person who edited a row
+     *     should not have the send quietly send with defaults.
      * @param sender the name the receiving phone shows, or null
      * @param model what this hardware is called, or null
      * @param transferId a UUID in any casing
@@ -339,6 +346,7 @@ public final class Native {
      */
     public static native byte[] send(
             String host,
+            String settings,
             String sender,
             String model,
             String transferId,

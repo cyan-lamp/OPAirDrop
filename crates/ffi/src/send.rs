@@ -133,17 +133,24 @@ impl Failure {
 
 /// Sends `paths` to the peer on the far end of the connection, taking every offer.
 ///
+/// `settings` is the stored settings text, the same bytes [`crate::settings`] hands the
+/// receive side. Only `http.response_limit` is read here, but it is passed as the whole text
+/// rather than as the one number: the sender will want a second row eventually, and a
+/// boundary that carries one integer would have to grow a second parameter to do it.
+///
 /// # Safety
 ///
-/// `host` must point at `host_len` bytes of UTF-8 readable for the duration; `sender_name`,
-/// `model` and `transfer_id` likewise at their stated lengths, or be null where optional;
-/// `paths` must point at `paths_len` bytes of NUL-separated UTF-8; `read` and `write` must be
-/// valid function pointers whose `context` stays valid; `report` must point at a zeroed
+/// `host` must point at `host_len` bytes of UTF-8 readable for the duration; `settings`,
+/// `sender_name`, `model` and `transfer_id` likewise at their stated lengths, or be null where
+/// optional; `paths` must point at `paths_len` bytes of NUL-separated UTF-8; `read` and `write`
+/// must be valid function pointers whose `context` stays valid; `report` must point at a zeroed
 /// [`OpairdropBuffer`] that outlives the call.
 #[no_mangle]
 pub unsafe extern "C" fn opairdrop_send(
     host: *const u8,
     host_len: usize,
+    settings: *const u8,
+    settings_len: usize,
     sender_name: *const u8,
     sender_name_len: usize,
     model: *const u8,
@@ -162,6 +169,8 @@ pub unsafe extern "C" fn opairdrop_send(
         drive(
             host,
             host_len,
+            settings,
+            settings_len,
             sender_name,
             sender_name_len,
             model,
@@ -189,6 +198,8 @@ pub unsafe extern "C" fn opairdrop_send(
 pub unsafe extern "C" fn opairdrop_send_with_progress(
     host: *const u8,
     host_len: usize,
+    settings: *const u8,
+    settings_len: usize,
     sender_name: *const u8,
     sender_name_len: usize,
     model: *const u8,
@@ -216,6 +227,8 @@ pub unsafe extern "C" fn opairdrop_send_with_progress(
         drive(
             host,
             host_len,
+            settings,
+            settings_len,
             sender_name,
             sender_name_len,
             model,
@@ -242,6 +255,8 @@ pub unsafe extern "C" fn opairdrop_send_with_progress(
 unsafe fn drive(
     host: *const u8,
     host_len: usize,
+    settings: *const u8,
+    settings_len: usize,
     sender_name: *const u8,
     sender_name_len: usize,
     model: *const u8,
@@ -263,19 +278,28 @@ unsafe fn drive(
     // SAFETY: every region is promised by the caller, and each null case is taken before the
     // corresponding `from_raw_parts`.
     let parsed = unsafe {
-        (|| -> Result<(&str, &str, Sender, Vec<PathBuf>), Failure> {
+        (|| -> Result<(&str, &str, Sender, Vec<PathBuf>, usize), Failure> {
             let host = text(host, host_len)?;
             let id = text(transfer_id, transfer_id_len)?;
+            // No settings text at all is "nothing configured", which is every default. Text
+            // that is there but does not parse is refused instead: the person edited a row,
+            // and a send that silently ignored it is the one outcome that leaves them no way
+            // to find out.
+            let settings = text_or(settings, settings_len, "");
+            let limit = match crate::settings::values_from(settings.as_bytes()) {
+                Ok(values) => crate::settings::response_limit(&values),
+                Err(message) => return Err(Failure::new(status::SETTINGS, message)),
+            };
             let sender = Sender::new(
                 text_or(sender_name, sender_name_len, ""),
                 text_or(model, model_len, ""),
                 id,
             );
             let paths = path_list(text(paths, paths_len)?)?;
-            Ok((host, id, sender, paths))
+            Ok((host, id, sender, paths, limit))
         })()
     };
-    let (host, id, sender, paths) = match parsed {
+    let (host, id, sender, paths, limit) = match parsed {
         Ok(parsed) => parsed,
         Err(failure) => {
             // SAFETY: `report` is non-null and zeroed, per the contract.
@@ -304,7 +328,12 @@ unsafe fn drive(
     let reader = CallbackReader::new(read, context);
     let writer = CallbackWriter::new(write, context);
 
-    match transfer(host, &sender, &id, &paths, reader, writer, meter.as_ref()) {
+    // The client is built here rather than inside `transfer` so that the two settings that
+    // shape it — the `Host` header and the row `http.response_limit` — are applied in the same
+    // scope that read them. A wire that is handed in already limited cannot be raised by
+    // accident downstream.
+    let mut client = Client::new(Wire { reader, writer }, host).with_limit(limit);
+    match transfer(&mut client, &sender, &id, &paths, meter.as_ref()) {
         Ok(sent) => {
             // SAFETY: `report` is non-null and zeroed, per the contract.
             unsafe { fill(report, frame(&sent)) };
@@ -319,20 +348,19 @@ unsafe fn drive(
 }
 
 /// The conversation itself, once the arguments are strings and paths.
+///
+/// The stream arrives already limited: `http.response_limit` is applied by the caller, on the
+/// same line that reads it, so there is exactly one place where that row becomes a number.
 fn transfer(
-    host: &str,
+    client: &mut Client<Wire>,
     sender: &Sender,
     id: &TransferId,
     paths: &[PathBuf],
-    reader: CallbackReader,
-    writer: CallbackWriter,
     meter: Option<&Meter>,
 ) -> Result<Sent, Failure> {
     let files = describe(paths)?;
     let items: Vec<Item> = files.iter().map(|(item, _)| item.clone()).collect();
     let total = opairdrop_airdrop::offered_bytes(&items);
-
-    let mut client = Client::new(Wire { reader, writer }, host);
 
     // `/Discover` first: a peer that is not accepting answers 503 here, and that answer has
     // to arrive before the other phone shows a prompt.

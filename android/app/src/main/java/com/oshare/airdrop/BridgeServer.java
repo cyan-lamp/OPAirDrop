@@ -245,9 +245,14 @@ final class BridgeServer {
                 break;
             case "ping":
                 break;
+            case "retry_publish":
+                // 收完就落盘，没有「存不下去再试一次」这一步：这条指令在协议里有位置，在这里
+                // 没有对应的动作。回一句说得清的拒绝，而不是「未知」——那不是我们不认识它，
+                // 是它对这个接收端无事可做。
+                ok = false;
+                error = "这个接收端不重试发布，收到就已经在目标目录里了";
+                break;
             default:
-                // 包括 retry_publish：这个应用收完就落盘，没有「存不下去再试一次」这一步，
-                // 所以那条指令在协议里有位置，在这里没有对应的动作。
                 ok = false;
                 error = "未知指令：" + name;
                 break;

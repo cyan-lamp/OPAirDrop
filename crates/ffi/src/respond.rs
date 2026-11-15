@@ -159,6 +159,11 @@ pub struct Reply {
 ///
 /// `ttl_override` is [`TTL_AS_PUBLISHED`] for the normal lifetimes, or a value to force —
 /// zero being the withdrawal.
+// Eight arguments, one packet: the name it announces, where that name points, what it carries,
+// which records to write, under which id, and for how long. Every one of them is used on a
+// different line below, and a struct grouping them would only rename the list at each of the
+// five call sites — so the count is the shape of the thing, not an oversight.
+#[allow(clippy::too_many_arguments)]
 pub fn announce(
     instance: &str,
     host: &str,

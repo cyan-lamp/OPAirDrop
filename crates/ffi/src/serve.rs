@@ -52,7 +52,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use opairdrop_airdrop::inbox::{self, Error as InboxError, Limits};
-use opairdrop_airdrop::payload::Ask;
+use opairdrop_airdrop::payload::{Ask, Item};
 use opairdrop_airdrop::server::{Error as EndpointError, Receiver, Server, Upload};
 use opairdrop_airdrop::{AskAnswer, DiscoverAnswer};
 
@@ -64,8 +64,8 @@ use crate::settings;
 
 /// Asks a person whether a transfer should be taken.
 ///
-/// Called with a one-line summary (`sender<TAB>files<TAB>bytes<TAB>links`, UTF-8) after the
-/// offer has been read and before `/Ask` is answered. A positive return accepts; zero
+/// Called with a one-line summary (`sender<TAB>files<TAB>bytes<TAB>links<TAB>names`, UTF-8)
+/// after the offer has been read and before `/Ask` is answered. A positive return accepts; zero
 /// refuses; a negative value is the caller's own error code and is treated as a refusal,
 /// because the only safe reading of "the prompt broke" is "do not take what nobody saw".
 pub type DecideCallback =
@@ -138,7 +138,8 @@ impl Watcher {
     }
 }
 
-/// The line a person gets to decide on: who, how many, how much.
+/// The line a person gets to decide on: who, how many, how much, and what each one is
+/// called.
 ///
 /// Tab-separated rather than pretty-printed, because the caller renders it and knows the
 /// language: three numbers and a name do not deserve a sentence assembled down here.
@@ -147,15 +148,72 @@ impl Watcher {
 /// links offer — `Files` empty, `Items` full — so a three-field summary describes it as
 /// "0 files", which reads as "there is nothing to take" on the one prompt where the person
 /// is deciding. A real peer asked exactly that way; the count alone could not say so.
+///
+/// The fifth field is the per-file list, and it exists for the same reason the fourth does:
+/// a count and a total are not what a person recognizes. "2 files, 2.7 MB" could be two
+/// photos or one document and one archive; the names decide whether the prompt is worth
+/// reading. Without them the card falls back to saying the file details are unknown, which
+/// is what it said for every invitation until this field existed.
 fn summary_of(offer: &Ask) -> String {
     let bytes: u64 = offer.files.iter().filter_map(|file| file.size).sum();
     format!(
-        "{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}",
         offer.display_name(),
         offer.files.len(),
         bytes,
-        offer.links.len()
+        offer.links.len(),
+        names_of(&offer.files)
     )
+}
+
+/// Separator between one file's name and its size, and between files. See [`names_of`].
+const BETWEEN_NAME_AND_SIZE: char = '\u{1f}';
+
+/// Separator between files. See [`names_of`].
+const BETWEEN_FILES: char = '\u{1e}';
+
+/// The fifth field: `name<US>size<RS>name<US>size…`, sizes empty when undeclared.
+///
+/// Two control characters rather than two more tabs, because a file name is arbitrary text
+/// a person typed and may contain a tab — splitting the fifth field on tabs again would
+/// turn one name into a name and a size. `\x1f` and `\x1e` are not something a share sheet
+/// produces, and the only characters that could break the line are replaced, so the field
+/// survives any name unchanged in meaning:
+///
+/// * `\x1f` and `\x1e` are the field's own structure, and a name carrying one would read as
+///   two entries.
+/// * A tab is the separator *between* fields, so a name carrying one would split the fifth
+///   field in half and truncate every name after it.
+/// * A newline would end the line the caller treats as one line.
+///
+/// Sizes are the sender's own declaration, the same numbers the third field sums. A folder
+/// entry usually has none, and an empty size means "unknown", not zero — the caller must not
+/// draw a total from a list where any entry is blank.
+fn names_of(files: &[Item]) -> String {
+    let mut text = String::new();
+    for file in files {
+        if !text.is_empty() {
+            text.push(BETWEEN_FILES);
+        }
+        for ch in file.name.chars() {
+            let ch = if ch == BETWEEN_NAME_AND_SIZE
+                || ch == BETWEEN_FILES
+                || ch == '\t'
+                || ch == '\n'
+                || ch == '\r'
+            {
+                ' '
+            } else {
+                ch
+            };
+            text.push(ch);
+        }
+        text.push(BETWEEN_NAME_AND_SIZE);
+        if let Some(size) = file.size {
+            text.push_str(&size.to_string());
+        }
+    }
+    text
 }
 
 /// A receiver that answers from the settings and stores what arrives.
@@ -745,7 +803,10 @@ mod tests {
             String::from_utf8_lossy(&answers).starts_with("HTTP/1.1 503"),
             "the peer is told, in the one place it is still listening"
         );
-        assert_eq!(summary, "Ada 的 iPhone\t1\t7\t0");
+        assert_eq!(
+            summary, "Ada 的 iPhone\t1\t7\t0\ta.pdf\u{1f}7",
+            "the fifth field names the file, so the prompt can say what it is"
+        );
     }
 
     #[test]
@@ -769,7 +830,7 @@ mod tests {
 
         assert_eq!(code, status::OK);
         assert!(String::from_utf8_lossy(&answers).starts_with("HTTP/1.1 200"));
-        assert_eq!(summary, "Mac\t1\t7\t0");
+        assert_eq!(summary, "Mac\t1\t7\t0\ta.pdf\u{1f}7");
     }
 
     #[test]
@@ -797,7 +858,42 @@ mod tests {
             false,
         );
 
-        assert_eq!(summary, "链接探针\t0\t0\t2", "the link count is the fourth field");
+        assert_eq!(
+            summary, "链接探针\t0\t0\t2\t",
+            "the link count is the fourth field, and a links offer names no files"
+        );
+    }
+
+    #[test]
+    fn the_fifth_field_names_every_file_and_survives_a_tab_in_one() {
+        // The card draws the first three names above the total, so a name that carries the
+        // field separator must not split into a name and a size — that would put a number
+        // where a file name goes, on the one line a person reads before deciding.
+        let files = [
+            opairdrop_airdrop::Item::new("IMG\t0001.HEIC").with_size(2_000_000),
+            opairdrop_airdrop::Item::new("合同.pdf").with_size(700_000),
+            // A folder entry is declared without a size, and blank means unknown — the
+            // caller drops the total rather than reading it as nothing to download.
+            opairdrop_airdrop::Item::new("资料").as_directory(),
+        ];
+        let text = names_of(&files);
+        assert_eq!(
+            text,
+            "IMG 0001.HEIC\u{1f}2000000\u{1e}合同.pdf\u{1f}700000\u{1e}资料\u{1f}"
+        );
+        assert_eq!(text.split(BETWEEN_FILES).count(), 3, "one entry per file");
+        let names: Vec<&str> = text
+            .split(BETWEEN_FILES)
+            .map(|entry| entry.split(BETWEEN_NAME_AND_SIZE).next().unwrap_or(""))
+            .collect();
+        assert_eq!(names, ["IMG 0001.HEIC", "合同.pdf", "资料"]);
+    }
+
+    #[test]
+    fn an_offer_with_no_files_has_an_empty_fifth_field() {
+        // Not "0" and not "none": absence is what the caller checks, and a placeholder would
+        // make a links offer look like a file called nothing.
+        assert_eq!(names_of(&[]), "");
     }
 
     #[test]

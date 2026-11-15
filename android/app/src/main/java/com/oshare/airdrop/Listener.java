@@ -98,12 +98,16 @@ final class Listener {
     static final int PORT = 8770;
 
     /**
-     * How long a peer has to finish its TLS handshake.
+     * How long a peer has to finish its TLS handshake, when the table cannot be read.
      *
      * <p>Twelve seconds, from the legacy server. A handshake on this link measured about a
      * second; the rest is allowance for the phone that is still arithmeticking when the radio
      * drops out. Without a bound, a peer that walks away mid-handshake holds the serving
      * thread until TCP itself gives up, which is minutes.
+     *
+     * <p>这个数字现在是回落：真正生效的是设置里的 {@code server.handshake_timeout_ms}（默认
+     * 也是 12 秒）。留着常量是因为设置文件可能读不出来，而一个读不出来的文件不该把这条界变成
+     * 「不等」。
      */
     private static final int HANDSHAKE_TIMEOUT_MS = 12_000;
 
@@ -121,13 +125,17 @@ final class Listener {
     private static final int REQUEST_TIMEOUT_MS = 8_000;
 
     /**
-     * How long a transfer may go without delivering a byte before it is dropped.
+     * How long a transfer may go without delivering a byte before it is dropped, when the table
+     * cannot be read.
      *
      * <p>Sixty seconds, as in the legacy server, and it takes over from
      * {@link #REQUEST_TIMEOUT_MS} at the moment the library asks what to do about an upload.
      * That is the one point where a serving thread can tell the two apart without watching the
      * bytes: the request has been parsed and the body has not. Without the raise, a body that
      * paused for eight seconds would be cut off in the middle of a file.
+     *
+     * <p>生效的数字是设置里的 {@code server.read_timeout_ms}，默认同样是 60 秒；常量只在设置
+     * 读不出来时兜底。
      */
     private static final int TRANSFER_TIMEOUT_MS = 60_000;
 
@@ -637,9 +645,32 @@ final class Listener {
         return setting == null ? "" : setting.value().trim();
     }
 
+    /**
+     * 一行时间设置，取不到就用 {@code fallback}。
+     *
+     * <p>表里每一行都带着范围，{@code set} 会拒掉范围外的值；可设置文件是纯文本，手改出来的
+     * 数字不经过那一关，所以这里再夹一次。超时为 0 不是「很快」，是「对端还没开口就断」，
+     * 一个手滑的零会把每一个连接都变成握手失败。
+     */
+    private static int timeoutOf(SettingsScreen screen, String key, int fallback) {
+        SettingsScreen.Setting setting = screen == null ? null : screen.setting(key);
+        if (setting == null) {
+            return fallback;
+        }
+        try {
+            long ms = Long.parseLong(setting.value().trim());
+            return (int) Math.min(Math.max(ms, setting.min()), setting.max());
+        } catch (NumberFormatException notWhole) {
+            return fallback;
+        }
+    }
+
     /** Completes the handshake, hands the connection to the library, and puts what it stored on the page. */
     private void serve(SSLSocket peer) {
         long openedAt = System.nanoTime();
+        // 表读不出来就是 null，下面每个取数都会回落到常量——握手这个界不该因为设置文件坏了而
+        // 从「等 12 秒」变成「不等」。
+        SettingsScreen tuned = settingsNow();
         try {
             // Server mode is the default for a socket from an SSLServerSocket; stated anyway,
             // because the mode is what decides whether this side offers a certificate.
@@ -650,7 +681,9 @@ final class Listener {
             // timer is 1520 ms. Turning it off lets the flight leave back to back. A transfer
             // never felt this, because it fills a segment on every write.
             peer.setTcpNoDelay(true);
-            peer.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
+            // 这一行是表里的「握手超时」，常量只是表读不出来时的回落：一个把大文件传了八分钟
+            // 的人，和他在同一个页面上改的其它数字，应该真的生效。
+            peer.setSoTimeout(timeoutOf(tuned, "server.handshake_timeout_ms", HANDSHAKE_TIMEOUT_MS));
             peer.startHandshake();
             // What was negotiated, once there is a session to ask. It is worth a line because
             // a peer that settled on something unexpected — TLS 1.2 where 1.3 was expected, a
@@ -716,8 +749,11 @@ final class Listener {
                         // The one moment a serving thread can tell a request from a body: the
                         // library has parsed the request and is about to read a file. From here
                         // on, a gap of eight seconds means a slow transfer, not an idle peer.
+                        // 这一段的上限是表里的「读取超时」：传一个几百兆的视频时，两次读到数据
+                        // 之间的空档可以很长，而这条界只该由拿着手机的人来定。
                         try {
-                            peer.setSoTimeout(TRANSFER_TIMEOUT_MS);
+                            peer.setSoTimeout(
+                                    timeoutOf(tuned, "server.read_timeout_ms", TRANSFER_TIMEOUT_MS));
                         } catch (IOException gone) {
                             // The connection died while the offer was being drawn; the read
                             // that follows reports it, and this bound no longer matters.

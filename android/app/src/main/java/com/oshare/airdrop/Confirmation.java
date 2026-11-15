@@ -8,6 +8,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.util.Log;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -86,11 +89,31 @@ final class Confirmation {
         /** 对面叫什么。它是「要不要收这个人的东西」的唯一判断依据。 */
         final String sender;
 
+        /**
+         * 这次要发过来的每一份：叫什么、多大。
+         *
+         * <p>空表有两个来源，而且都对：一次纯链接分享（{@code Items} 有、{@code Files}
+         * 没有），或者对面是一个连文件名都不报的老发送端。两种情况下「哪几份」都是真的
+         * 不知道，所以调用方说「文件信息未知」，而不是编一个。
+         */
+        final List<Item> files;
+
+        /**
+         * 这次要发过来几个链接。{@code Items} 非空的 offer 就是它。
+         *
+         * <p>和 {@link #files} 并列而不是折进去：链接不是文件，收下来也不会是一个文件。
+         * 但「一个链接都没有」和「有链接、没有文件」对人是两件不同的事，所以它得单独留着，
+         * 让摘要和日志都说得准——把链接分享写成「文件信息未知」，是把我们知道的事说成不知道。
+         */
+        final long links;
+
         private final String body;
 
-        private Offer(String sender, String body) {
+        private Offer(String sender, String body, List<Item> files, long links) {
             this.sender = sender;
             this.body = body;
+            this.files = files;
+            this.links = links;
         }
 
         String title() {
@@ -103,18 +126,36 @@ final class Confirmation {
         }
     }
 
+    /**
+     * 一封邀请里的其中一份。
+     *
+     * <p>和传输完成之后那份的区别只有一个：这里没有落点。还没收，当然还没存到哪儿。
+     *
+     * <p>{@code size} 为负是「对面没说」，不是「零字节」。文件夹条目从来不带字节数，而
+     * 一份真的空文件是 0——这两个在话里必须说得不一样，所以用负数表示未知。
+     */
+    static final class Item {
+        final String name;
+        final long size;
+
+        Item(String name, long size) {
+            this.name = name;
+            this.size = size;
+        }
+    }
+
     /** 把库给的那一行摘要解析成两句人话。 */
     static Offer parse(String summary) {
         String[] field = summary == null ? new String[0] : summary.split("\t", -1);
         String sender = field.length > 0 && !field[0].isBlank() ? field[0] : "附近的设备";
-        long files = count(field, 1);
+        long declared = count(field, 1);
         long bytes = Math.max(count(field, 2), 0);
         long links = Math.max(count(field, 3), 0);
         // 纯链接分享是一个 `Files` 为空、`Items` 非空的 offer。只说件数会把它写成「0 个
         // 文件」——一句「没东西可收」的话，而人正是在这一刻决定收不收。
         StringBuilder what = new StringBuilder();
-        if (files != 0 || links == 0) {
-            what.append(files < 0 ? "?" : Long.toString(files)).append(" 个文件");
+        if (declared != 0 || links == 0) {
+            what.append(declared < 0 ? "?" : Long.toString(declared)).append(" 个文件");
         }
         if (links > 0) {
             if (what.length() > 0) {
@@ -122,8 +163,38 @@ final class Confirmation {
             }
             what.append(links).append(" 个链接");
         }
+        // 「当作拒绝」和结果页那句「已放弃」是两句话说了两件事。人没看见这条邀请、或者看见了
+        // 还没来得及伸手，都不等于他拒绝了——发送端拿到的是同一个 503，但屏幕上说什么由这里
+        // 决定。三十秒到点之后那张卡写的是「已放弃」，所以在还没到点的时候就得是同一句话。
         return new Offer(sender, what + (bytes > 0 ? " · " + size(bytes) : "")
-                + "，30 秒内不回答就当作拒绝。");
+                + "，30 秒内没人应答就放弃。", entries(field, 4), links);
+    }
+
+    /**
+     * 第五个字段：{@code 名字<US>大小<RS>名字<US>大小…}。
+     *
+     * <p>没有这个字段、或者它是空的，都是一个空表。老库只给四个字段，而一次链接分享的
+     * 第五个字段本来就该是空的——两种情形对这里的意思一样：哪几份，不知道。
+     *
+     * <p>名字里的分隔符由库那一侧就替换掉了（见 {@code summary_of}），所以这里按分隔符
+     * 切开就是切对了，不需要再猜。
+     */
+    private static List<Item> entries(String[] field, int at) {
+        if (field.length <= at || field[at].isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<Item> items = new ArrayList<>();
+        for (String entry : field[at].split("\u001e", -1)) {
+            if (entry.isEmpty()) {
+                continue;
+            }
+            String[] pair = entry.split("\u001f", -1);
+            // 名字为空说明对面发来一个没有 FileName 的条目。给一个能读的占位，而不是让
+            // 卡片上出现一个空白行——那看起来像渲染坏了，而不是像对面没说。
+            String name = pair[0].isBlank() ? "文件" : pair[0];
+            items.add(new Item(name, pair.length > 1 ? count(pair, 1) : -1));
+        }
+        return items;
     }
 
     /** 问一次，并阻塞到有人回答或超时。没有 session 可用时（老路径）自己起一个。 */

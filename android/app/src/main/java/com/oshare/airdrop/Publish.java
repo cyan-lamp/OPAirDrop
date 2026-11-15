@@ -229,7 +229,7 @@ final class Publish {
                 }
             }
         }
-        return new Entry(finalName, strip(finalDirectory), copied);
+        return new Entry(finalName, strip(finalDirectory), copied, uri);
     }
 
     /**
@@ -393,10 +393,23 @@ final class Publish {
         final String directory;
         final long size;
 
-        Entry(String name, String directory, long size) {
+        /**
+         * 媒体库给这一行的地址，{@code content://media/…}。
+         *
+         * <p>它存在的唯一理由是「打开文件」那个按钮。这个应用收完就把字节交给媒体库，
+         * 自己手上不再有可共享的路径，而 {@code file://} 从 Android 7 起就不许穿过进程
+         * 边界了——所以能指向这份文件、又能被别的应用读到的，只有这一串。
+         *
+         * <p>不留下来的代价过去已经出现过：按钮画得出、点下去什么也不发生，因为事件里
+         * 每一份都没有 {@code uri}，而 {@code openFiles} 只认 {@code content} 开头的。
+         */
+        final Uri uri;
+
+        Entry(String name, String directory, long size, Uri uri) {
             this.name = name;
             this.directory = directory;
             this.size = size;
+            this.uri = uri;
         }
     }
 

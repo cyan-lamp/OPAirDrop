@@ -613,7 +613,13 @@ public final class OShareReceiveBridge {
                 }
                 if (files.length() > 3) text.append("\n…");
                 if (known) text.append("\n").append(android.text.format.Formatter.formatShortFileSize(app, size));
-            } else text.append("\n文件信息未知");
+            } else if (json.optString("message").isEmpty()) {
+                // 没有清单这句话只在真的没别的话可说时才写。一次纯链接分享的清单本来就是空的
+                // （对面发的是链接，不是文件），而正文那句「N 个链接」已经把要来的东西说清楚了
+                // ——再补一句「文件信息未知」就是同一张卡片上两句话互相拆台，人读到的是
+                // 「它不知道要收什么」，而它其实知道。
+                text.append("\n文件信息未知");
+            }
             String message = json.optString("message");
             if (!message.isEmpty()) text.append("\n").append(message);
             java.util.LinkedHashSet<String> directories = new java.util.LinkedHashSet<>();

@@ -523,6 +523,10 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_mdnsReply(
 /// dashes, because the receiver echoes it and a made-up value is a protocol error there
 /// rather than here.
 ///
+/// `settings` is the stored settings text, or null for "nothing configured". Only
+/// `http.response_limit` is read here, and it is the whole text rather than the one number so
+/// that the boundary does not have to grow a parameter per row the sender learns to obey.
+///
 /// The streams are typed `jobject` for the reason `serve` gives: this layer needs `read`
 /// and `write`, and taking the narrower type is what lets a caller hand over a TLS session
 /// it has already established. Closing them stays the caller's business.
@@ -535,6 +539,7 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_send(
     env: *mut JNIEnv,
     _class: jclass,
     host: jstring,
+    settings: jstring,
     sender: jstring,
     model: jstring,
     transfer_id: jstring,
@@ -564,6 +569,14 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_send(
     };
     let Some(transfer_id) = (unsafe { read_string(env, transfer_id) }) else {
         return ptr::null_mut();
+    };
+    let settings = if settings.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, settings) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
     };
     let sender = if sender.is_null() {
         None
@@ -602,6 +615,10 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_send(
         Some(text) => (text.as_ptr(), text.len()),
         None => (ptr::null(), 0),
     };
+    let (settings_pointer, settings_len) = match &settings {
+        Some(text) => (text.as_ptr(), text.len()),
+        None => (ptr::null(), 0),
+    };
 
     let mut report = OpairdropBuffer::EMPTY;
     // SAFETY: every byte slice outlives the call or is null, each callback is paired with
@@ -610,6 +627,8 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_send(
         crate::send::opairdrop_send(
             host.as_ptr(),
             host.len(),
+            settings_pointer,
+            settings_len,
             sender_pointer,
             sender_len,
             model_pointer,
@@ -643,6 +662,7 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_sendWithProgress(
     env: *mut JNIEnv,
     _class: jclass,
     host: jstring,
+    settings: jstring,
     sender: jstring,
     model: jstring,
     transfer_id: jstring,
@@ -674,6 +694,14 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_sendWithProgress(
     };
     let Some(transfer_id) = (unsafe { read_string(env, transfer_id) }) else {
         return ptr::null_mut();
+    };
+    let settings = if settings.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, settings) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
     };
     let sender = if sender.is_null() {
         None
@@ -716,6 +744,10 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_sendWithProgress(
         Some(text) => (text.as_ptr(), text.len()),
         None => (ptr::null(), 0),
     };
+    let (settings_pointer, settings_len) = match &settings {
+        Some(text) => (text.as_ptr(), text.len()),
+        None => (ptr::null(), 0),
+    };
 
     let mut report = OpairdropBuffer::EMPTY;
     // SAFETY: every byte slice outlives the call or is null, each callback is paired with the
@@ -724,6 +756,8 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_sendWithProgress(
         crate::send::opairdrop_send_with_progress(
             host.as_ptr(),
             host.len(),
+            settings_pointer,
+            settings_len,
             sender_pointer,
             sender_len,
             model_pointer,
@@ -826,6 +860,10 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_serveWatched(
 }
 
 /// The body of the two exports above. `landing` may be null, which means nobody is watching.
+// These eight are the Java signature. The exports above cannot pass a struct — JNI marshals
+// one argument per Java parameter — and this body reads each of them exactly once, so grouping
+// them here would add a struct whose only purpose is to be unpacked on the next line.
+#[allow(clippy::too_many_arguments)]
 unsafe fn serve_for_java(
     env: *mut JNIEnv,
     directory: jstring,

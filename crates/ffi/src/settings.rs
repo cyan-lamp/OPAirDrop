@@ -50,6 +50,9 @@ const DEVICE_NAME: &str = "device.name";
 /// Key of the model this device answers a peer with.
 const DEVICE_MODEL: &str = "device.model";
 
+/// Key of the largest answer body a send will read.
+const RESPONSE_LIMIT: &str = "http.response_limit";
+
 /// Suffix of the sibling a save is written to before it is renamed into place.
 const PARTIAL: &str = ".part";
 
@@ -214,6 +217,23 @@ pub(crate) fn limits(values: &Values) -> Limits {
     Limits {
         byte_limit: values.number(BYTE_LIMIT).unwrap_or(0).max(0) as u64,
         overwrite: values.switch(OVERWRITE).unwrap_or(false),
+    }
+}
+
+/// The largest answer body a send may read: `http.response_limit`.
+///
+/// The row is a bound on what a peer can make the sender hold while it waits for a `/Discover`
+/// or `/Ask` answer, and it is set by the person holding the phone rather than by the protocol.
+/// Reading it here rather than in the sender keeps the number's range in one place: a value
+/// outside the row's range cannot be stored ([`Values::set`] refuses it), so the fallback is
+/// only reached if a future edit removes the row without removing this function.
+///
+/// A stored zero would be a sender that can read no answer at all, which is not a setting
+/// anybody means; it falls back like a missing row does.
+pub(crate) fn response_limit(values: &Values) -> usize {
+    match values.number(RESPONSE_LIMIT) {
+        Some(bytes) if bytes > 0 => bytes as usize,
+        _ => opairdrop_airdrop::client::DEFAULT_RESPONSE_LIMIT,
     }
 }
 
@@ -414,6 +434,25 @@ mod tests {
                 overwrite: true,
             }
         );
+    }
+
+    #[test]
+    fn the_response_limit_is_the_row_and_nothing_else() {
+        let mut values = Values::new();
+        // An installation nobody has touched answers with the sender's own constant, so the
+        // row existing changes nothing until somebody changes it.
+        assert_eq!(
+            response_limit(&values),
+            opairdrop_airdrop::client::DEFAULT_RESPONSE_LIMIT
+        );
+
+        values.set(RESPONSE_LIMIT, "65536").expect("in range");
+        assert_eq!(response_limit(&values), 65_536);
+
+        // The row's range ends at sixteen mebibytes and that is the largest answer this can
+        // be asked to hold: nothing here inflates it.
+        values.set(RESPONSE_LIMIT, "16777216").expect("the top of the range");
+        assert_eq!(response_limit(&values), 16 * 1024 * 1024);
     }
 
     #[test]

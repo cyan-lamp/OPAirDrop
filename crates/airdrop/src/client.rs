@@ -765,4 +765,34 @@ mod tests {
         // A folder's size is not declared, so it is not counted either.
         assert_eq!(offered_bytes(&[Item::new("dir").as_directory()]), 0);
     }
+
+    /// The two tests below exist because `with_limit` had no caller for its whole life:
+    /// the number was a constant, and a setter nobody calls is indistinguishable from a
+    /// setting nobody reads. They pin the behaviour at the point the settings row finally
+    /// reaches — an answer larger than the row is refused before it is read into memory.
+    #[test]
+    fn an_answer_beyond_the_limit_is_refused_before_it_is_read() {
+        // The declared length alone is enough to refuse: nothing of the body is consumed,
+        // so a peer cannot make this side allocate by announcing a size it never sends.
+        let oversized = b"HTTP/1.1 200 OK\r\nContent-Length: 9000\r\n\r\n".to_vec();
+        let mut client = Client::new(Wire::answering(oversized), "air").with_limit(4096);
+        let refused = client.discover(&sender()).expect_err("refuses");
+        assert!(
+            matches!(
+                refused,
+                Error::Http(opairdrop_http::Error::BodyTooLarge { limit: 4096 })
+            ),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn the_same_answer_reads_under_a_limit_that_admits_it() {
+        let body = DiscoverAnswer::new("Air").encode();
+        let script = answer(200, body.clone());
+        let mut client = Client::new(Wire::answering(script), "air").with_limit(4096);
+        let found = client.discover(&sender()).expect("reads");
+        assert_eq!(found.computer_name, "Air");
+        assert!(body.len() < 4096, "the fixture must not be the thing under test");
+    }
 }
