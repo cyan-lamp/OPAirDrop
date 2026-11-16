@@ -1,10 +1,15 @@
 package com.oshare.airdrop;
 
 import android.app.Activity;
-import android.app.AlertDialog;
+import android.app.Dialog;
+import android.graphics.Color;
+import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.GradientDrawable;
 import android.text.InputType;
-import android.util.Log;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -59,6 +64,18 @@ final class FeaturePage {
      * {@link RadioShare.State#subtitle()} 说，这里只是不再看了。
      */
     private static final int ANSWER_TICKS = 80;
+
+    /**
+     * 输入浮窗那张卡的圆角，单位 dp。
+     *
+     * <p>22 不是随便挑的：它就是 {@code Chrome.CARD_RADIUS}，页面里每一张卡的圆角。浮窗是从
+     * 「保存位置」那一行里弹出来的，如果它比那一行所属的卡更圆或更方，看起来就像另一个 App 的
+     * 控件飘在上面。同一档半径让它是「那张卡被拎起来了」，而不是「弹了个对话框」。
+     *
+     * <p>这里抄一份常量而不是直接读 {@code Chrome.CARD_RADIUS}，是因为那个字段是 private——
+     * 页面与 Chrome 之间只走方法，不互相翻对方的常量表。要改就两处一起改，注释互相指着。
+     */
+    private static final float SHEET_RADIUS_DP = 22f;
 
     private final Activity host;
     private final Chrome chrome;
@@ -709,6 +726,17 @@ final class FeaturePage {
     /**
      * 弹一个输入框改一行文本设置。所有「点一下弹框改一个字符串」的行共用：目录、名字、机型。
      *
+     * <p># 为什么不再用 {@code AlertDialog}
+     *
+     * <p>因为它给不了这个形状。{@code AlertDialog} 的内容区长在系统主题的那张纸上：直角的
+     * 窗口背景、系统给的标题字号、系统给的按钮排布。圆角只能靠给窗口塞一张圆角 drawable 假装
+     * 出来，而那张纸本身还在——四个角会露出底下那层方角。霜面更没法做：模糊要一个能跟着卡片
+     * 走的 {@link RealtimeBlurView}，也就是一个我们能往里放子视图的容器。
+     *
+     * <p>所以换成自绘的 {@link Dialog}：窗口背景设成全透明，卡片自己长成什么样就是什么样。
+     * 卡片里面是一层霜面 + 一层内容，霜面与导航胶囊同一套参数（同一个类、同一个捕获根、
+     * 同一档半径与色调），所以它读起来就是「胶囊那种玻璃」，而不是另一种玻璃。
+     *
      * @param key      设置表的键
      * @param title    对话框标题
      * @param hint     输入框占位提示
@@ -722,19 +750,30 @@ final class FeaturePage {
         field.setText(stored == null ? "" : stored.value());
         field.setSelection(field.getText().length());
 
-        FrameLayout frame = new FrameLayout(host);
-        frame.setPadding(chrome.dp(24), chrome.dp(8), chrome.dp(24), 0);
-        frame.addView(field, new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT));
+        Dialog dialog = new Dialog(host);
+        // 系统标题栏要关掉：这张卡片的标题由我们自己排，用的是这一页统一的那种小标题，
+        // 留着系统的会得到两行标题。
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        // 高度必须自己说一遍。{@code Dialog.setContentView(View)} 内部走的是
+        // {@code new LayoutParams(MATCH_PARENT, MATCH_PARENT)}——弹窗的内容区默认被撑满，
+        // 传 WRAP_CONTENT 进去，卡片才贴着内容。（还有一半原因在 sheet() 里：那层霜面也得
+        // 定住高度，否则它会替卡片把整个可用高度占掉。）
+        dialog.setContentView(sheet(title, field, key, onSaved, dialog),
+                new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        AlertDialog dialog = new AlertDialog.Builder(host)
-                .setTitle(title)
-                .setView(frame)
-                .setNegativeButton("取消", null)
-                .setPositiveButton("保存",
-                        (d, which) -> saveSetting(key, field.getText().toString(), onSaved))
-                .create();
+        Window window = dialog.getWindow();
+        if (window != null) {
+            // 窗口自己不画任何东西——连默认的那张白纸也不要，否则卡片的圆角外面会多一圈方角。
+            window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            window.setDimAmount(0.45f);
+            // 键盘顶起来的时候让窗口自己缩，卡片跟着往上走，而不是被键盘盖住下半截。
+            window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                    | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
+            window.setLayout(sheetWidth(), ViewGroup.LayoutParams.WRAP_CONTENT);
+        }
+
         dialog.setOnShowListener(shown -> {
             field.requestFocus();
             field.postDelayed(() -> {
@@ -745,6 +784,103 @@ final class FeaturePage {
             }, 100);
         });
         dialog.show();
+    }
+
+    /**
+     * 浮窗那张卡：霜面打底，内容压在上面。
+     *
+     * <p>霜面是**压在底下一层**而不是给卡片设背景：{@link RealtimeBlurView} 要自己 onDraw 才能
+     * 把背后的内容糊出来，设成背景就只剩一张静态图。所以卡片本体是一块圆角实底（拿不到模糊时
+     * 它就是卡片本身，读得清），上面盖一层同圆角的玻璃，再上面才是标题、输入框和按钮。
+     */
+    private View sheet(String title, EditText field, String key, Runnable onSaved, Dialog dialog) {
+        int radius = chrome.dp(SHEET_RADIUS_DP);
+        int width = sheetWidth();
+
+        LinearLayout content = chrome.column();
+        content.setPadding(chrome.dp(22), chrome.dp(20), chrome.dp(22), chrome.dp(18));
+        content.addView(chrome.text(title, 17, true, S.text));
+        content.addView(field, chrome.margins(14, 0));
+
+        LinearLayout actions = chrome.row();
+        TextView cancel = chrome.ghostButton("取消", view -> dialog.dismiss());
+        TextView save = chrome.mainButton("保存", view -> {
+            // 先关窗再写：写成功了要弹一条「已保存」，而那条提示挂在主界面的通知条上，
+            // 浮窗还盖着的时候它会被挡在下面。
+            dialog.dismiss();
+            saveSetting(key, field.getText().toString(), onSaved);
+        });
+        LinearLayout.LayoutParams cancelLp = chrome.mm(0, chrome.dp(46), 1f);
+        cancelLp.rightMargin = chrome.dp(10);
+        actions.addView(cancel, cancelLp);
+        actions.addView(save, chrome.mm(0, chrome.dp(46), 1f));
+        content.addView(actions, chrome.margins(18, 0));
+
+        // 先把内容量一遍，才知道玻璃该多高。理由见下面那段注释——这一步不是优化，是必需的。
+        content.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+        int height = content.getMeasuredHeight();
+
+        FrameLayout card = new FrameLayout(host);
+        GradientDrawable base = new GradientDrawable();
+        base.setCornerRadius(radius);
+        base.setColor(S.card);
+        card.setBackground(base);
+
+        RealtimeBlurView glass = new RealtimeBlurView(host);
+        glass.setCaptureRoot(captureRoot());
+        glass.setCornerRadius(radius);
+        glass.setFill(S.card);
+        glass.setLiquidGlass(true);
+        glass.setBlurRadius(5f);
+        glass.setSheen(lightMode() ? 0x1FFFFFFF : 0x26FFFFFF);
+        glass.setGlassLift(lightMode() ? 8 : 0);
+        glass.setOpacity(240);
+        glass.setTint((S.navTint & 0x00FFFFFF) | 0x4D << 24);
+        glass.setRim(true, chrome.dp(1.2f),
+                lightMode() ? 0x8CFFFFFF : 0x59FFFFFF,
+                lightMode() ? 0x29FFFFFF : 0x14FFFFFF);
+        glass.setRimDual(true);
+
+        // 玻璃的高度是算出来的，不是 MATCH_PARENT——这一条是这张卡片能不能贴合内容的关键。
+        //
+        // RealtimeBlurView 没有自己的 onMeasure，用的是 View 的默认实现：给 AT_MOST 的可用
+        // 高度，它就把那个高度原样返回。它躺在 WRAP_CONTENT 的 FrameLayout 里、又要 MATCH_PARENT
+        // 时，父容器递过去的正是 AT_MOST(整块可用高度)，于是这一层完全透明的玻璃把卡片撑成了
+        // 满屏：圆角只剩最上面和最下面各一段，中间一大片空霜面，看起来像"卡片没画出来"。
+        // 量出内容的真实高度再钉死，父容器量到的就是内容高度。
+        final FrameLayout.LayoutParams glassLp =
+                new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, height);
+        card.addView(glass, glassLp);
+
+        // 横竖屏、字体大小变化之后宽度会变，内容的高度跟着变，玻璃要跟上。高度变回去不会影响
+        // 内容的高度（内容只吃宽度），所以这里不会来回抖。
+        card.addOnLayoutChangeListener((view, left, top, right, bottom, ol, ot, or, ob) -> {
+            int now = bottom - top;
+            if (now > 0 && glassLp.height != now) {
+                glassLp.height = now;
+                glass.setLayoutParams(glassLp);
+            }
+        });
+
+        card.addView(content, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        return card;
+    }
+
+    /** 浮窗的宽度：屏宽的 86%。窗口和内容测量必须用同一个数，差一点量出来的高度就是错的。 */
+    private int sheetWidth() {
+        return (int) (host.getResources().getDisplayMetrics().widthPixels * 0.86f);
+    }
+
+    /** 霜面要糊的那一层。功能页只持有 Activity，读口在 {@link MainActivity#blurRoot}。 */
+    private View captureRoot() {
+        return host instanceof MainActivity ? ((MainActivity) host).blurRoot() : null;
+    }
+
+    /** 与导航胶囊同一判据：深色/浅色决定高光和投影的强弱。 */
+    private boolean lightMode() {
+        return S.light;
     }
 
     /** 写一行文本设置；成功回调刷新，失败把库给的原因说出来。 */

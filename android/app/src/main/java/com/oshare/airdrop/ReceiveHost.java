@@ -2,7 +2,6 @@ package com.oshare.airdrop;
 
 import android.content.Context;
 import android.os.Messenger;
-import android.util.Log;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -174,6 +173,10 @@ final class ReceiveHost {
      * <p>收完之后字节已经交给媒体库，本应用手上没有可共享的路径（{@code file://} 从 Android 7
      * 起不能穿过进程边界），所以能指向这份文件、又能被别的应用读到的只有这一串。多份时打开第一
      * 份——通知上的一个按钮没有"选哪一份"这一说，而人要的通常是刚发过来的那张。
+     *
+     * <p>这里用 {@code getActivity} 而不是 {@code getBroadcast}：通知点下去的 PendingIntent 必须
+     * 落在界面上。落在广播、再由广播去起相册，平台会按「通知蹦床」拦掉这次启动——相册不打开，
+     * 也不会有任何提示。落点那一层做什么，见 {@link OpenDownload}。
      */
     private static android.app.PendingIntent openAction(Context context, Publish.Result published) {
         for (Publish.Entry entry : published.entries()) {
@@ -184,7 +187,7 @@ final class ReceiveHost {
                     .putExtra(OpenDownload.EXTRA_URI, entry.uri.toString())
                     .putExtra(OpenDownload.EXTRA_MIME, context.getContentResolver().getType(entry.uri))
                     .putExtra(OpenDownload.EXTRA_DIR, entry.directory);
-            return android.app.PendingIntent.getBroadcast(context, 0x0B03, open,
+            return android.app.PendingIntent.getActivity(context, 0x0B03, open,
                     android.app.PendingIntent.FLAG_UPDATE_CURRENT
                             | android.app.PendingIntent.FLAG_IMMUTABLE);
         }
@@ -372,6 +375,22 @@ final class ReceiveHost {
                 LiveCard.invite(context, shown.title(), shown.body(),
                         Confirmation.decision(context, session, true),
                         Confirmation.decision(context, session, false));
+            }
+            // 三条出口都不通的时候，别让对面等满三十秒。
+            //
+            // 出口只有三条：胶囊（cloud）、普通通知（Confirmation.ask）、以及正开着的界面。
+            // 前两条都要 POST_NOTIFICATIONS 这条运行时权限，而新装的应用默认是关的——
+            // 1.0.0 就是这么装上去的：授权为 false，系统把每一条通知静默丢弃，于是每次邀请
+            // 都走满三十秒再判拒绝。人看到的是「iPhone 发了，这边没反应」，日志里写的是
+            // `unanswered`；那句话在这里是假的，真相是"没有人被告知"。
+            //
+            // 所以这一条不是优化，是把假话改成真话：没有出口就当场说不，让对面几百毫秒内
+            // 拿到 503，而不是等它自己超时。
+            if (!cloud && !Notices.allowed(context) && !Listener.of(context).watched()) {
+                Log.w(TAG, "invitation " + session
+                        + " dropped: no surface at all (notifications off, nothing on screen)");
+                end("rejected", REJECTED, "通知权限未开，这台设备现在收不到邀请");
+                return false;
             }
             boolean panel = false;
             boolean wanted = false;

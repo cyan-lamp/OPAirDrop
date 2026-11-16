@@ -5,7 +5,6 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.content.Context;
 import android.os.Build;
-import android.util.Log;
 
 /**
  * 我们自己的那张云：一条系统绘制的实时通知（Android 16 起的 Live Updates）。

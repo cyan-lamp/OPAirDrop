@@ -113,13 +113,27 @@ final class HomePage {
             if (wasOn) {
                 ReceiveService.setManual(host, false);
                 ReceiveService.apply(host);
+                chrome.say("接收文件已关闭", S.text);
             } else {
                 ReceiveService.enable(host, 0);
+                // 先起接收端、再要权限：这两件事的顺序决定了人看到什么。反过来问，人可能
+                // 在权限框上犹豫一会儿，而这段时间里开关还是关的——他刚点的那个动作像是没
+                // 生效。接收端先跑起来，权限框只回答「看不看得见」，不决定「收不收」。
+                //
+                // 缺的不是一条权限：没有通知，「有人要发东西给你」这句话一个字也送不出去；
+                // 没有蓝牙广播，对端连这台机器在不在都不知道。两条都在这里问，因为缺任何
+                // 一条，这个开关都是假的。
+                Notices.ensure(host);
+                String gap = Notices.gap(host);
+                chrome.say(gap == null ? "接收文件已开启" : "接收已开启，但" + gap,
+                        gap == null ? S.text : S.orange);
             }
-            chrome.say("接收文件" + (wasOn ? "已关闭" : "已开启"), S.text);
             // 就地刷新胶囊与副标题（这一页此刻不重建），磁贴下次展开会自己按新凭据重画。
-            chrome.setPill(listenPill, wasOn ? "已停止" : "监听中",
-                    wasOn ? S.gray : S.green);
+            // 权限那条要在拨完之后重新算：`ensure` 只是把框弹出去，答案不会立刻回来。
+            String blind = wasOn ? null : Notices.shortGap(host);
+            chrome.setPill(listenPill,
+                    wasOn ? "已停止" : blind != null ? blind : "监听中",
+                    wasOn ? S.gray : blind != null ? S.orange : S.green);
             if (receiveSub != null) {
                 receiveSub.setText(listenState());
             }
@@ -138,9 +152,16 @@ final class HomePage {
     private TextView buildListenPill() {
         boolean running = ReceiveService.listening(host);
         boolean failed = listener.problem();
+        // 在跑、却缺一条权限：这是唯一一个「看起来一切正常、实际全聋」的状态。胶囊这时
+        // 不能说「监听中」——那是在说端口在听，而人关心的是他能不能收到东西。缺的那一块
+        // 必须写在这一行上，否则它只能从「怎么又收不到」这个抱怨里被反推出来。
+        //
+        // 权限排在 `problem()` 之前：库报错是这一版没编好，人自己修不了；权限是他点两下就能
+        // 解决的事，而它恰恰是此刻真正拦住他的那一个。
+        String blind = running ? Notices.shortGap(host) : null;
         listenPill = chrome.statusPill(
-                failed ? "异常" : running ? "监听中" : "已停止",
-                failed ? S.red : running ? S.green : S.gray);
+                blind != null ? blind : failed ? "异常" : running ? "监听中" : "已停止",
+                blind != null ? S.orange : failed ? S.red : running ? S.green : S.gray);
         return listenPill;
     }
 
@@ -248,6 +269,15 @@ final class HomePage {
         }
         if (!listener.last().isEmpty()) {
             return listener.last();
+        }
+        // 没有正在发生的事，而接收端在跑、却缺一条权限：这句话要压在 `state()` 上面。
+        // `state()` 说的是端口在不在听，人问的是「东西为什么没来」——这两句话在权限缺着的
+        // 时候指的是完全不同的事实，而只有第二句是他需要的。
+        if (ReceiveService.listening(host)) {
+            String gap = Notices.gap(host);
+            if (gap != null) {
+                return gap;
+            }
         }
         return listener.state();
     }

@@ -62,20 +62,6 @@ final class Chrome {
         void onScrollChanged();
     }
 
-    /**
-     * 页面根自己声明要多留一条底部空间。
-     *
-     * <p>设置页底部浮着一颗按钮行，它不是滚动内容的一部分，而是压在内容之上。外壳在算滚动区
-     * 的 {@code paddingBottom} 时只知道系统栏的高度，不知道这颗按钮行有多高——不留这一条，
-     * 表单最后一行会被按钮行永久压住，而且滚到底也看不见。
-     *
-     * <p>由页面根实现而不是靠一条常量：三个页面里只有设置页有浮动按钮，外壳不该知道这件事。
-     */
-    interface BottomInset {
-        /** 需要额外留出的底部高度，单位 dp。 */
-        int extraBottomDp();
-    }
-
     private final Activity host;
     private final Scheme scheme;
     private Notice notice;

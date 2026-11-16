@@ -2,7 +2,6 @@ package com.oshare.airdrop;
 
 import android.content.Context;
 import android.os.Build;
-import android.util.Log;
 
 import java.io.File;
 import java.io.IOException;
@@ -251,6 +250,16 @@ final class Listener {
      */
     private volatile String asideProblem = "";
 
+    /**
+     * 蓝牙广播到底发出去了没有。
+     *
+     * <p>这一位存在的理由只有一个：{@link #announceOverBluetooth} 是一次性的敲门，敲不开就
+     * 结束了，不像 socket 那样会重连。而「先拨开关、再在权限框上点允许」是最常见的顺序——
+     * 那次敲门必然发生在权限到手之前。没有这一位，就没有任何依据判断「现在再敲一次」是否
+     * 有意义，只能盲目重试或者永远不试。
+     */
+    private volatile boolean announced;
+
     /** The state line: what the listener is doing, worded for a person. */
     private volatile Line state = new Line("未开始", false);
     /** What the last connection that stored something left behind; empty when none has. */
@@ -293,6 +302,17 @@ final class Listener {
     /** Detaches the page. The receiver keeps running; there is simply nobody to tell. */
     void unwatch() {
         watcher = null;
+    }
+
+    /**
+     * 现在有人在看这一页吗。
+     *
+     * <p>接收端需要知道这件事，只有在一个地方：邀请找不到任何出口的时候。通知发不出去、
+     * 胶囊也提升不了，而屏幕上还有个页面在画——那这个人就还有机会看见。反过来，没有页面
+     * 也没有通知，就等于没有人被告知，那一次的三十秒等待只是在让对面白白等到自己的超时。
+     */
+    boolean watched() {
+        return watcher != null;
     }
 
     /** Whether the loop is currently bound or binding. */
@@ -585,10 +605,35 @@ final class Listener {
         try {
             String line = new String(Native.bleAdvertise(context), java.nio.charset.StandardCharsets.UTF_8);
             Log.i(TAG, "ble: " + line);
+            // Rust 侧把四态压成这一行（idle / starting / advertising / failed: 原因），所以
+            // 判断只有一个依据：开头不是 `failed: ` 就算醒了。`already started` 也算——这条
+            // 路径只在广播没发出去时才被叫到，真撞上它说明别处已经把它拉起来了，结论一样。
+            announced = !line.startsWith("failed: ") || line.contains("already started");
         } catch (Throwable refused) {
             // 一个没有蓝牙权限的接收端仍然能在 8770 上收东西，所以这里不是错误路径。
+            announced = false;
             Log.w(TAG, "ble advertisement did not start: " + refused);
         }
+    }
+
+    /**
+     * 权限刚补齐时补敲一次门。
+     *
+     * <p>{@link #beginAnnouncing} 只在 {@code start()} 里跑一次，而蓝牙广播那一步会当场失败
+     * 返回。于是「先拨开关、再在权限框上点允许」——最常见的那个顺序——会留下一个安静的窟窿：
+     * 接收端在听，人以为在等，而这台机器在对端的扫描里依然不存在，直到开关被拨第二次。人刚
+     * 点完「允许」就发现还是收不到东西，这是最难自证的一件事。
+     *
+     * <p>两道闸：没在跑的接收端不敲（广播没有意义），已经发出去的也不敲（重复注册只会得到
+     * {@code already started}）。所以从 {@code onResume} 每回一次都调是安全的。
+     */
+    void reannounce() {
+        synchronized (lock) {
+            if (announcer == null || announced) {
+                return;
+            }
+        }
+        announceOverBluetooth();
     }
 
     /** Takes the instance back and closes the announcer's socket. Safe to call when there is none. */
@@ -603,6 +648,10 @@ final class Listener {
         }
         // 两盏灯一起灭：只停 mDNS 会让蓝牙继续广播「我在这儿」，而对端听见之后连上来的是一
         // 个已经不在听的端口。
+        //
+        // 这一位跟着一起复位，因为它是「这一次生命周期的广播发出去了没有」；下一次 start 是
+        // 新的一次，得重新问一遍。
+        announced = false;
         try {
             Log.i(TAG, "ble stopped: " + new String(Native.bleStop(), java.nio.charset.StandardCharsets.UTF_8));
         } catch (Throwable refused) {

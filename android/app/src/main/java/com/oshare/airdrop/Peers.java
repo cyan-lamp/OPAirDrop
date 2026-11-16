@@ -4,7 +4,6 @@ import android.content.Context;
 import android.net.wifi.WifiManager;
 import android.os.Handler;
 import android.os.Looper;
-import android.util.Log;
 
 import java.net.DatagramPacket;
 import java.io.IOException;

@@ -268,18 +268,10 @@ pub const CATALOG: &[Setting] = &[
         kind: Kind::Choice(&["off", "error", "info", "debug"]),
         default: "info",
         title: "日志级别",
-        summary: "写进诊断日志的详细程度。debug 会记录报文本身。",
-    },
-    Setting {
-        key: "log.preview_bytes",
-        kind: Kind::Number {
-            min: 0,
-            max: 4 * 1024,
-            unit: Unit::Bytes,
-        },
-        default: "96",
-        title: "日志里的报文长度",
-        summary: "记录报文时截取多少字节，够辨认即可，太长会拖慢传输。",
+        // 原文是「debug 会记录报文本身」，摘掉 log.preview_bytes 时一并改掉：报文收发全在
+        // crates/http 与 crates/airdrop 里，两边都不往这份日志里写一个字，写了日志的只有
+        // Java 侧的 Diagnostics。承诺「记报文」兑现不了，人翻不到只会以为日志坏了。
+        summary: "写进诊断日志的详细程度。debug 连过程中的细节一起记。",
     },
 ];
 

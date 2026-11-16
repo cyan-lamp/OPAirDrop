@@ -1,5 +1,7 @@
 package com.oshare.airdrop;
 
+import android.app.PendingIntent;
+import android.content.Intent;
 import android.graphics.drawable.Icon;
 import android.service.quicksettings.Tile;
 import android.service.quicksettings.TileService;
@@ -24,6 +26,8 @@ import android.service.quicksettings.TileService;
  */
 public final class AirdropTile extends TileService {
 
+    private static final String TAG = "OPAirDrop";
+
     @Override
     public void onStartListening() {
         super.onStartListening();
@@ -41,8 +45,38 @@ public final class AirdropTile extends TileService {
             // 一个开关只该有一个含义（见 2026-11-16 15:10 那条：别人的十分钟窗口正是"又收不到
             // 了"的来源）。
             ReceiveService.enable(this, 0);
+            if (!Notices.ready(this)) {
+                // 磁贴是个 Service，弹不出权限框。缺任何一条，刚打开的这个接收端都是哑的：
+                // 没有通知，「有人要发东西给你」一个字也送不出去；没有蓝牙广播，对端连这台
+                // 机器在不在都不知道——两种缺口在磁贴上长得一模一样（都是「开着但没反应」）。
+                //
+                // 所以把人送到主界面去：那里会把缺的那一条摆出来，并把框弹出去。这一下是他
+                // 自己点的，startActivityAndCollapse 不受后台启动限制。
+                askForPermissions();
+            }
         }
         render();
+    }
+
+    /**
+     * 把主界面拉起来，让它在可见的状态下把缺的几条权限问一次。
+     *
+     * <p>带上 {@link MainActivity#EXTRA_PERMISSIONS}：这是区分「他自己打开应用看看」和「他
+     * 刚点了开、明确要能被发现」的唯一凭据。前者只弹从没问过的框，后者连「系统已经不再弹」的
+     * 那几条也可以直接落到设置页——他已经在等文件了，这时候唯一有用的动作就是把开关勾上。
+     */
+    private void askForPermissions() {
+        Intent open = new Intent(this, MainActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                .putExtra(MainActivity.EXTRA_PERMISSIONS, true);
+        try {
+            startActivityAndCollapse(PendingIntent.getActivity(this, 0, open,
+                    PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));
+        } catch (RuntimeException refused) {
+            // 个别 ROM 在这一步会拒。磁贴自己已经切到「开」，而主界面的胶囊会写明缺什么，
+            // 所以这里只留一行日志，不再弹第二条通知去解释一条发不出去的通知。
+            Log.w(TAG, "磁贴拉不起主界面：" + refused);
+        }
     }
 
     /** 磁贴的样子只反映一件事：现在收不收。 */

@@ -3,17 +3,13 @@ package com.oshare.airdrop;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
-import android.graphics.Outline;
 import android.graphics.drawable.GradientDrawable;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
-import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.ViewOutlineProvider;
-import android.view.WindowInsets;
 import android.view.inputmethod.EditorInfo;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -46,16 +42,17 @@ import java.util.Map;
  * 范围」的 toast：在十几行的一页里，toast 什么也没说。保存是全有或全无——一个字段不合格，就
  * 一个字节都不写，于是保存后看到的这一页，就是下次启动会加载的那一页。
  *
- * <p># 浮层结构
+ * <p># 为什么保存按钮不在页脚
  *
- * <p>表单铺满整个内容区，保存/还原那一行浮在它上面。给根视图加内边距会把滚动区截在胶囊上方，
- * 霜面就永远只盖着一片纯色；所以让列表从按钮行底下滚过去，玻璃底下才有东西可以模糊。
+ * <p>它原来是一条浮在整页底部的玻璃横条。问题不是它不好看，是它**压着内容**：这一页最后剩下
+ * 的两块正好是「诊断」和「关于」，而那条横条浮在底部时，关于那一行和页脚的路径被它盖住一半——
+ * 一个常年看不全的收尾，和没有一个收尾是一样的。
+ *
+ * <p>撤掉之后它当然还要在，只是搬到了它真正管的东西下面：诊断板块的卡下方。这一页现在只剩诊断
+ * 有可编辑的值（发现、发送、接收、设备四块都移到功能页了），所以一颗「保存」写在哪儿都只有一
+ * 个作用对象，而写在它旁边，人不必先想一想这颗按钮管的是谁。
  */
 final class SettingsPage {
-    /** 浮动按钮行的高度。定死它，滚动区的下内边距才能事先算出来。 */
-    private static final int BAR_HEIGHT = 64;
-    /** 按钮行占掉的那条带，交给外壳加到滚动区的下内边距里。 */
-    private static final int BAR_INSET = 66;
 
     /** 控件属于某一行，所以拒绝可以写在引起它的那个字段下面。 */
     private static final class Row {
@@ -71,11 +68,8 @@ final class SettingsPage {
         }
     }
 
-    /**
-     * 页面根。它自己声明要多留一条底部空间：浮动按钮行压在滚动区上，外壳算内边距时不知道
-     * 这件事，所以由它说出来。
-     */
-    private final class Shell extends FrameLayout implements Chrome.BottomInset {
+    /** 页面根。滚动容器直接装进来，不再需要额外让出底部那条按钮行。 */
+    private final class Shell extends FrameLayout {
         Shell() {
             super(host);
         }
@@ -110,11 +104,6 @@ final class SettingsPage {
             }
             return super.dispatchTouchEvent(event);
         }
-
-        @Override
-        public int extraBottomDp() {
-            return BAR_INSET;
-        }
     }
 
     private final Activity host;
@@ -137,6 +126,9 @@ final class SettingsPage {
 
     /** 正在把模型写进控件，这时监听器不该往回写。 */
     private boolean applying;
+
+    /** 诊断板块下方那句「现在记多细」。保存之后要就地改掉，见 {@link #refreshLevelHint}。 */
+    private TextView levelHint;
 
     SettingsPage(Activity host, Chrome chrome) {
         this.host = host;
@@ -166,35 +158,6 @@ final class SettingsPage {
         scroll.setClipToPadding(false);
         root.addView(scroll, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-
-        FrameLayout bar = buttonBar();
-        final FrameLayout.LayoutParams barParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, chrome.dp(BAR_HEIGHT), Gravity.BOTTOM);
-        barParams.leftMargin = chrome.dp(18);
-        barParams.rightMargin = chrome.dp(18);
-        barParams.bottomMargin = chrome.dp(22);
-        root.addView(bar, barParams);
-
-        // 按钮行要落在导航胶囊上方，而导航胶囊的高度只有系统栏内边距知道
-        root.setOnApplyWindowInsetsListener((view, insets) -> {
-            int bottom = insets.getInsets(WindowInsets.Type.systemBars()).bottom;
-            barParams.bottomMargin = bottom + chrome.dp(90);
-            bar.setLayoutParams(barParams);
-            return insets;
-        });
-        // 内边距是「派发」过来的，不是随时能读的属性：这一页第一次翻开时才建，那时窗口早派发
-        // 完了，监听器不会被补叫，按钮行就会一直停在构造时的 22dp——正好压在导航胶囊上，还
-        // 被胶囊的霜面模糊掉一半。接上窗口时主动要一次。
-        root.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
-            @Override
-            public void onViewAttachedToWindow(View attached) {
-                attached.requestApplyInsets();
-            }
-
-            @Override
-            public void onViewDetachedFromWindow(View detached) {
-            }
-        });
         return root;
     }
 
@@ -245,36 +208,29 @@ final class SettingsPage {
     }
 
     /**
-     * 两个不属于任何一行的动作：丢掉全部改动，或者把这一页写下去。
+     * 诊断板块下面那两颗：丢掉日志设置的改动，或者把它写下去。
      *
-     * <p>它是一块浮起来的玻璃状面板：和卡片同色、圆角 22、带投影。白色实底在深色模式下会是
-     * 一条刺眼的白带，而这里没有一条白带是有理由的。
+     * <p>它们只管诊断板块里的东西，而诊断板块里现在**只剩一行** {@code log.level}——发现、
+     * 发送、接收、设备四块都搬到功能页去了，原来的 {@code log.preview_bytes}（报文长度）也摘了
+     * （没有读取方的滑杆）。所以「只管日志级别」在实现上不需要给 {@link SettingsScreen#save}
+     * 加一个键白名单：可见的、可改的本来就只有这一行，其余的写回去时值与加载时一字不差。
+     *
+     * <p>写成白名单反而更危险：白名单里没有的键不会报错，它只是静静地不保存——将来谁把一行挪
+     * 回这一页，就得先猜为什么改了没反应。
+     *
+     * <p>保存成完要把 {@code log.level} 重新读一次（见 {@link #save}）：不重读的话，人把级别
+     * 从 info 改成 debug、回到首页发一个文件，日志里那一档的细节一行都不会多——那个设置看着
+     * 生效了，实际上要等下次启动。这是「保存按钮只管日志」这件事唯一必须自己多走的一步。
      */
-    private FrameLayout buttonBar() {
-        FrameLayout bar = new FrameLayout(host);
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(S.card);
-        bg.setCornerRadius(chrome.dp(22));
-        bar.setBackground(bg);
-        // 投影来自圆角轮廓；被用来裁剪的轮廓不再投影，而子视图自己会裁圆角
-        bar.setClipToOutline(false);
-        bar.setOutlineProvider(new ViewOutlineProvider() {
-            @Override
-            public void getOutline(View view, Outline outline) {
-                outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), chrome.dp(22));
-            }
-        });
-        bar.setElevation(chrome.dp(10));
-
+    private View logActions() {
         LinearLayout line = chrome.row();
-        line.setPadding(chrome.dp(10), chrome.dp(10), chrome.dp(10), chrome.dp(10));
 
         TextView revert = chrome.ghostButton("还原", view -> {
             if (!screen.dirty()) {
                 chrome.say("没有改动", S.textDim);
                 return;
             }
-            ask("放弃全部改动？", "回到上次保存的内容。", "放弃", () -> {
+            ask("放弃诊断的改动？", "回到上次保存的内容。", "放弃", () -> {
                 screen.revert();
                 attempted = false;
                 apply();
@@ -283,14 +239,53 @@ final class SettingsPage {
         });
         TextView save = chrome.mainButton("保存", view -> save());
 
-        LinearLayout.LayoutParams revertLp = chrome.mm(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
+        LinearLayout.LayoutParams revertLp =
+                chrome.mm(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
         revertLp.rightMargin = chrome.dp(10);
         line.addView(revert, revertLp);
         line.addView(save, chrome.mm(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        return line;
+    }
 
-        bar.addView(line, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        return bar;
+    /**
+     * 日志写到哪儿、现在记多细。
+     *
+     * <p>这一块是「日志级别」这个旋钮的落点：人调完级别之后，下一个问题一定是「那日志在哪」。
+     * 上一版的答案是设置文件自己的路径，那是另一个问题的答案。
+     *
+     * <p># 为什么它长在卡里，而不是卡外面
+     *
+     * <p>卡里面每一行都从同一条竖线起头（页面 24dp + 卡内 24dp = 48dp）。放到卡外面就只能自己
+     * 猜一个内边距——上一版猜的是 6dp，结果那一行比「日志级别」往左了 16dp，两行字明明说着同一
+     * 件事，起头却不在一条线上。挪进卡里，对齐是布局给的，不用谁去记一个数。
+     *
+     * <p>路径写成 {@code /sdcard/Documents/AirDrop} 而不是 {@code Documents/AirDrop}：人在文件
+     * 管理器里看到的、在电脑上插线看到的，都是前者。目录名后面接一句按天分文件，是因为文件名
+     * 带日期，不说明的话人打开文件管理器看到一串 {@code airdrop-2026-11-16.log} 会先愣一下。
+     */
+    private View logNote() {
+        LinearLayout box = chrome.column();
+        box.addView(chrome.text("日志文件", 15, true, S.text));
+        TextView where = chrome.caption(Diagnostics.PATH + "，按天一个文件。");
+        where.setPadding(0, chrome.dp(3), 0, 0);
+        box.addView(where);
+
+        levelHint = chrome.caption(Log.describe(host) + "。");
+        levelHint.setPadding(0, chrome.dp(2), 0, 0);
+        box.addView(levelHint);
+        return box;
+    }
+
+    /**
+     * 改完级别之后把那句话换掉。
+     *
+     * <p>不重建整页：重建会把滚动位置和人刚敲的东西一起丢掉，而他刚刚只是按了一下保存。这一句
+     * 是页面上唯一会因为保存而变的事实，让它自己更新最省。
+     */
+    private void refreshLevelHint() {
+        if (levelHint != null) {
+            levelHint.setText(Log.describe(host) + "。");
+        }
     }
 
     /** 画出库报告的每一个分组，按它给的顺序。 */
@@ -326,6 +321,12 @@ final class SettingsPage {
                 body.addView(hint);
             }
             body.addView(groupCard(section), chrome.margins(0, 16));
+            // 动作行紧跟在它管的那张卡后面，中间不再隔任何东西：按钮和它作用的东西之间不该隔着
+            // 一整块别的板块。原来那一行「日志写到哪」挪进了卡里（见 {@link #logNote}），所以
+            // 这里只剩两颗按钮。
+            if (logs(section)) {
+                body.addView(logActions(), chrome.margins(0, 6));
+            }
         }
 
         body.addView(chrome.sectionTitle("关于"), chrome.margins(4, 0));
@@ -337,6 +338,22 @@ final class SettingsPage {
                 rows.size() + " 行 → " + SettingsFile.of(host).getAbsolutePath());
         footer.setPadding(chrome.dp(6), chrome.dp(4), chrome.dp(6), 0);
         body.addView(footer);
+    }
+
+    /**
+     * 这一组是不是日志（诊断）那一组。
+     *
+     * <p>按行的键判断而不是按标题判断：标题是给人看的字，随时可能被改词；{@code log.*} 是表里的
+     * 契约，改它得连 Rust 那张表一起改。用标题的话，某天把「诊断」改成「日志」这颗按钮就会
+     * 悄悄消失——不报错，只是不见了。
+     */
+    private boolean logs(SettingsScreen.Section section) {
+        for (SettingsScreen.Setting setting : section.settings()) {
+            if (setting.key().startsWith("log.")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** 一组一行卡的集合：行与行之间是整幅分隔线，卡的两端圆角由卡片自己给。 */
@@ -353,6 +370,12 @@ final class SettingsPage {
             }
             card.addView(rowView(setting), chrome.margins(first ? 0 : 16, 6));
             first = false;
+        }
+        // 「日志写到哪」作为卡里最后一行挂着：它和上面两行说的是同一件事（这个级别记下来的东西
+        // 存在哪），而且它对不齐的问题只有长在卡里才彻底没有。分隔线照旧用整幅的那种。
+        if (logs(section)) {
+            card.addView(chrome.divider(), chrome.fixedDivider(0, 0));
+            card.addView(logNote(), chrome.margins(16, 0));
         }
         return card;
     }
@@ -594,6 +617,10 @@ final class SettingsPage {
             // 留着人刚敲的那份近似值。
             apply();
             clearProblems();
+            // 级别是进程中唯一被缓存的一份设置（见 Log）。不在这里重读，人把 info 改成 debug
+            // 之后发的那个文件，日志里一行报文都不会多——旋钮看着转动了，线还没接上。
+            Log.reload(host);
+            refreshLevelHint();
             chrome.say("已保存", S.green);
             return;
         }

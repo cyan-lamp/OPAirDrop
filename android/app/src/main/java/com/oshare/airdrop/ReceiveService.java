@@ -8,7 +8,6 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.os.IBinder;
-import android.util.Log;
 
 /**
  * 接收端的前台身份：让「这十分钟里可以被找到」是一句能兑现的话。

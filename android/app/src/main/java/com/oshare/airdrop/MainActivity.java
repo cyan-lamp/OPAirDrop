@@ -2,6 +2,7 @@ package com.oshare.airdrop;
 
 import android.animation.ValueAnimator;
 import android.app.Activity;
+import android.content.Intent;
 import android.content.res.Configuration;
 import android.graphics.Outline;
 import android.graphics.drawable.GradientDrawable;
@@ -69,6 +70,15 @@ public final class MainActivity extends Activity {
     /** 重建（换深浅色、字体大小、旋转）之后停回原来那一页。 */
     private static final String KEY_TAB = "tab";
 
+    /**
+     * 「这次是被人点名下叫来的，权限可以问得强硬一点」。
+     *
+     * <p>只有一个发送方：控制中心的【AirDrop】磁贴。它是 Service，自己弹不出权限框，只能把人
+     * 送到这一页；而它传过来的这个标记，就是「他刚点了开」这件事的唯一凭据——有了它，系统已经
+     * 不再弹的那些权限可以被直接落到设置页，而没有它就只能弹框，不能把人扔进设置。
+     */
+    static final String EXTRA_PERMISSIONS = "ask_permissions";
+
     private Listener listener;
     /** 当前这套配色。深色与浅色各一张表，见 {@link Scheme}。 */
     private Scheme S;
@@ -112,6 +122,15 @@ public final class MainActivity extends Activity {
     private SettingsPage settings;
 
     private boolean lightMode;
+
+    /**
+     * 这一页有没有在启动时递过一次权限请求。
+     *
+     * <p>{@code onWindowFocusChanged} 会因为权限框出现、消失反复回调，没有这个位就会变成
+     * 「弹框 → 失焦 → 关框 → 又弹框」的循环。位只在本页存活期内有效：重建（换主题、转屏）后
+     * 重来一次也无害，{@link Notices#first} 自己会挡住「已经问过」的那几条。
+     */
+    private boolean askedOnOpen;
 
     private final Runnable noticeHide = this::hideNotice;
 
@@ -160,6 +179,75 @@ public final class MainActivity extends Activity {
                 commitTab(tab, false);
             }
         }
+        // 权限不在这里问：这一页此刻还不是一个活着的窗口，弹出去的框可能根本不会出现。
+        // 见 onWindowFocusChanged。
+    }
+
+    /**
+     * 打开应用就把入场券问齐。
+     *
+     * <p>放在窗口拿到焦点之后，而不是 {@code onCreate} 里：{@code requestPermissions} 需要这一页
+     * 已经是一个「活着的窗口」。在 {@code onCreate} 里直接叫，系统有时收下这次请求却一个框都
+     * 不弹——人看到的是应用正常打开、什么都没发生，而三条权限一条都没拿到。
+     *
+     * <p>只问从没问过的那几条（{@link Notices#first}）。这个应用只有一件事可做，打开它就是表示
+     * 了意图，所以第一次进来就把话说清楚；但人拒绝过之后不再重复弹框——系统对被拒两次的权限会
+     * 静默失败，重复问只会把「他不想给」演成「点了没反应」。缺口改由首页那颗胶囊和副标题说。
+     */
+    @Override
+    public void onWindowFocusChanged(boolean focus) {
+        super.onWindowFocusChanged(focus);
+        if (!focus || askedOnOpen) {
+            return;
+        }
+        askedOnOpen = true;
+        openPermissions();
+    }
+
+    /**
+     * 把缺的权限补上：先说话，再问。
+     *
+     * <p>入场券不齐时，接收端有两条互不相干的原因会静默失聪：
+     *
+     * <p>**缺通知**：8770 在听、iPhone 也找得到这台机器，而「有人要发给你文件」这句话一个字
+     * 也送不到人眼前——对面三十秒后拿到 503，本机安安静静。1.0.0 装上之后就是这样：全仓只有
+     * 蓝牙那条权限有申请点，通知这条从来没有，而 Android 13 起新装应用的通知默认是关的，于是
+     * 邀请一次都没出现过。
+     *
+     * <p>**缺蓝牙广播**：反过来的安静。通知这条路是通的，可这台机器在对端的扫描里根本不存在，
+     * 于是从来没有人发起邀请——也就没有通知可发。这条过去只在发送页申请（发送端也要广播），
+     * 于是**只收不发的人**永远拿不到它。
+     *
+     * <p>提示条只在接收端已经在跑时才出：那时开关是绿的、东西进不来，这句话是在解释一个真实
+     * 的矛盾。接收端没跑的时候不出——人还没表示要收东西，先摆一条「收不到邀请」，是在替他回答
+     * 一个他还没问的问题。
+     */
+    private void openPermissions() {
+        if (Notices.ready(this)) {
+            return;
+        }
+        // 这一下是被控制中心那块磁贴叫来的吗？叫来的意思是：他刚点了「开」，明确要能被发现，
+        // 所以缺的那几条值得连设置页一起用上——系统不再弹框的时候，那是唯一的出路。
+        // 单纯打开应用没有这个待遇：一进来就把人扔进系统设置，是最快的卸载理由之一。
+        Intent came = getIntent();
+        boolean insisted = came != null && came.getBooleanExtra(EXTRA_PERMISSIONS, false);
+        if (insisted) {
+            // 只对这一次生效。留着它，转个屏重建出来的这一页会以为自己又被人从磁贴点了一次。
+            came.removeExtra(EXTRA_PERMISSIONS);
+        }
+        // 提示条只在缺口是真的（接收端在跑，或他刚从磁贴点名要开）时才出。其余情况先不说——
+        // 人还没表示要收东西，摆一条「收不到邀请」是在替他回答一个他还没问的问题。
+        String gap = insisted || ReceiveService.listening(this) ? Notices.gap(this) : null;
+        if (gap != null) {
+            // 先说话，再问。权限框会盖住这条气泡，但人关掉框之后读到的还是它——而如果他点了
+            // 拒绝，这句话就是屏幕上唯一还站着的解释。
+            showNotice(gap, S.orange);
+        }
+        if (insisted) {
+            Notices.ensure(this);
+        } else {
+            Notices.first(this);
+        }
     }
 
     @Override
@@ -174,6 +262,39 @@ public final class MainActivity extends Activity {
         // 从系统设置回来时，互传的范围可能已经变了，而设置文件也可能被改过——重新对齐一次
         // 比追着问哪一处变了便宜。重复调用只对齐、不重复注册观察者，见 ReceiveService.follow。
         ReceiveService.follow(this);
+        // 另一件事：人可能是刚去系统设置里把蓝牙权限勾上的。那次「允许」不经过我们的回调，
+        // 而接收端启动时敲的那次广播门已经落空了——回到这一页是唯一能补上的时机。内部有两
+        // 道闸（没在跑、已经发出去），所以每次进来都调是安全的。
+        Listener.of(this).reannounce();
+        refresh();
+    }
+
+    /**
+     * 权限框的答案。
+     *
+     * <p>要回一句话，是因为结果对人是完全不同的事实：齐了，这台机器从此能被叫醒；缺一条，
+     * 接收端会一直绿着、一直收不到邀请。而「接收已开启」那句话说在两种情况下长得一模一样，
+     * 所以差别的这一句只能由这里补。
+     *
+     * <p>一次会回来两条（{@link Notices#ensure} 把缺的一起递了出去），所以这里不去看
+     * {@code granted} 数组，而是问那两条权限此刻的真实状态——数组只说了人点了什么，没说的
+     * 是系统最终给了什么。
+     */
+    @Override
+    public void onRequestPermissionsResult(int code, String[] permissions, int[] granted) {
+        super.onRequestPermissionsResult(code, permissions, granted);
+        if (code != Notices.REQUEST) {
+            return;
+        }
+        String gap = Notices.gap(this);
+        // 现在这个回调也会在「刚打开应用」之后响一次，那时接收端可能还没开——所以齐了的话
+        // 不说「可以收到邀请了」（那要有东西在听才成立），说一句两边都站得住的。
+        showNotice(gap == null ? "权限齐了，可以开始互传了" : gap,
+                gap == null ? S.green : S.orange);
+        // 接收端已经在跑，而蓝牙广播是它启动那一刻敲的一次门——那次敲在权限到手之前，必然
+        // 落空。补这一下，人才不必为了「刚点过允许」再把开关拨一次。
+        Listener.of(this).reannounce();
+        // 首页那颗胶囊说的是同一件事，跟着重画一次，不必等下一次进出页面。
         refresh();
     }
 
@@ -277,6 +398,20 @@ public final class MainActivity extends Activity {
     }
 
     /**
+     * 霜面的捕获根：整个翻页容器。
+     *
+     * <p>导航胶囊、顶部渐隐、通知条，以及功能页那个输入浮窗，糊的都是这一层——
+     * {@link RealtimeBlurView} 取「背后是什么」的办法是把根视图软件重绘一遍，所以它需要
+     * 一个确切的根，而不是「屏幕上碰巧压在下面的那些像素」。
+     *
+     * <p>功能页只能拿到 Activity，看不到这个字段。留一个包级读口，比让每个调用方自己
+     * {@code findViewById} 猜一棵树稳：树一改，猜的地方不会报错，只会糊错。
+     */
+    View blurRoot() {
+        return pager;
+    }
+
+    /**
      * 顶部全宽霜面。
      *
      * <p>它是一张平板：没有圆角、没有描边、没有羽化——唯一的边界是底部那条由竖向渐变遮罩
@@ -347,9 +482,10 @@ public final class MainActivity extends Activity {
      * 往上滚时从玻璃底下穿过去——霜面底下必须始终有东西在动，否则那块玻璃看起来就是一块
      * 纯色方块。
      *
-     * <p>底部的 100dp 是给导航胶囊让位的通用量；页面根如果自己声明了 {@link
-     * Chrome.BottomInset}（设置页那颗浮动按钮行），再叠加上去，否则表单最后一行会被按钮行永
-     * 远压住。
+     * <p>底部的 100dp 是给导航胶囊让位的通用量。这里曾经还要再叠一层：设置页底部浮着一条
+     * 保存按钮行，它压在滚动区上面，外壳算内边距时看不见它，于是由页面自己声明一个
+     * {@code Chrome.BottomInset} 补上那段。那颗按钮已经搬到诊断板块下面、跟着内容一起滚，
+     * 不再有任何东西浮在滚动区之上，所以这一层连同那个接口一起撤了。
      */
     private void applyPageInsets() {
         if (pages == null) {
@@ -360,28 +496,9 @@ public final class MainActivity extends Activity {
             if (scroll == null) {
                 continue;
             }
-            int extraDp = page instanceof Chrome.BottomInset
-                    ? ((Chrome.BottomInset) page).extraBottomDp()
-                    : bottomInsetIn(page);
             scroll.setClipToPadding(false);
-            scroll.setPadding(0, insetTop + dp(55), 0, insetBottom + dp(100) + dp(extraDp));
+            scroll.setPadding(0, insetTop + dp(55), 0, insetBottom + dp(100));
         }
-    }
-
-    /** 页面根不是直接挂在页容器上时（外面还包了一层），往下找一层看有没有声明底部留白。 */
-    private static int bottomInsetIn(View view) {
-        if (!(view instanceof ViewGroup)) {
-            return 0;
-        }
-        ViewGroup group = (ViewGroup) view;
-        for (int i = 0; i < group.getChildCount(); i++) {
-            View child = group.getChildAt(i);
-            if (child instanceof Chrome.BottomInset) {
-                // dp 换算需要 Activity 上下文，这里只回传 dp 数，由调用方乘密度
-                return ((Chrome.BottomInset) child).extraBottomDp();
-            }
-        }
-        return 0;
     }
 
     /** 一页里那个纵向滚动容器；没有就返回 null（例如读不出设置时的纯文本页）。 */
@@ -1059,7 +1176,7 @@ public final class MainActivity extends Activity {
      */
     private void liveProbe(String kind) {
         boolean allowed = LiveCard.allowed(this);
-        android.util.Log.i("OPAirDrop", "live probe (" + kind + "): allowed=" + allowed);
+        Log.i("OPAirDrop", "live probe (" + kind + "): allowed=" + allowed);
         showNotice(allowed ? "系统允许实时通知，看状态栏那颗胶囊" : "系统不允许实时通知，只会是一条普通通知",
                 S.text);
         if ("invite".equals(kind) || "invite_high".equals(kind) || "invite_twice".equals(kind)) {

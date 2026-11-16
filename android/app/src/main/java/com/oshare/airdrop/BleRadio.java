@@ -11,7 +11,6 @@ import android.content.Context;
 import android.content.pm.PackageManager;
 import android.os.Handler;
 import android.os.Looper;
-import android.util.Log;
 
 import java.nio.charset.StandardCharsets;
 

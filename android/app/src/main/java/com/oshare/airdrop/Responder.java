@@ -2,7 +2,6 @@ package com.oshare.airdrop;
 
 import android.content.Context;
 import android.net.wifi.WifiManager;
-import android.util.Log;
 
 import java.io.IOException;
 import java.net.DatagramPacket;

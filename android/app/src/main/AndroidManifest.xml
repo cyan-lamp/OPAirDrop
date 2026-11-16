@@ -106,10 +106,21 @@
             </intent-filter>
         </service>
 
-        <!-- 【打开文件】的落点：先撤卡，再按类型打开相册或文件管理。 -->
-        <receiver
+        <!-- 【打开文件】的落点：先撤卡，再按类型打开相册或文件管理。
+
+             这里必须是 activity 而不是 receiver。通知点下去的 PendingIntent 只允许落到界面上，
+             落到广播再由广播起界面会被平台当成「后台启动」拦掉（Android 12 起禁止通知蹦床，
+             2026-11-16 实测 result code=102 BAL_BLOCK，相册没打开、也没有提示）。
+
+             窗口全透明、不进最近任务、不参与任务栈：它只是那一下点击的落脚处，撤完卡就把人交给
+             相册，自己立刻消失。 -->
+        <activity
             android:name=".OpenDownload"
-            android:exported="false" />
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:noHistory="true" />
 
         <!-- 「完成」按钮的落点：撤掉那张卡。不导出——只有本应用的通知会带这条 PendingIntent。 -->
         <receiver

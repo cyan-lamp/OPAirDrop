@@ -1,7 +1,6 @@
 package com.oshare.airdrop;
 
 import android.content.Context;
-import android.util.Log;
 
 /**
  * 发送侧的那张卡：现在由我们自己发，交给系统的实时通知。

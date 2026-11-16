@@ -22,7 +22,6 @@ import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
-import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.VelocityTracker;
@@ -658,7 +657,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         PanelGlass panel = PanelGlass.attach(sheet);
         if (panel == null) {
             // 这台机器没有那两条隐藏路径。面板留在不透明页底上——能读、能拖，只是不是玻璃。
-            android.util.Log.i("OPAirDrop", "panel glass: unavailable, solid background");
+            Log.i("OPAirDrop", "panel glass: unavailable, solid background");
             return;
         }
         glass = panel;
@@ -669,7 +668,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         // 只设模糊，不染色：叠色自己盖一层 {@link #tint}（理由见 buildShell 里的注释）。
         sheet.setBackground(panel.drawable());
         tintSheet();
-        android.util.Log.i("OPAirDrop", "panel glass: " + panel.source()
+        Log.i("OPAirDrop", "panel glass: " + panel.source()
                 + " radius=" + dp(BLUR_DP) + (blur ? "" : "(rejected)")
                 + " corner=" + dp(CORNER_DP) + (round ? "" : "(rejected)"));
     }
@@ -1705,7 +1704,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             apply();
             if (android.util.Log.isLoggable("OPAirDrop", android.util.Log.DEBUG)
                     && (slide != null || dragging)) {
-                android.util.Log.d("OPAirDrop", "layout during motion: asked=" + top
+                Log.d("OPAirDrop", "layout during motion: asked=" + top
                         + " kept=" + getTop() + " slide=" + (slide != null));
             }
         }
@@ -1824,7 +1823,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     // 有没有反向）。release 里默认不输出，需要时 `adb shell setprop
                     // log.tag.OPAirDrop DEBUG` 打开。
                     if (android.util.Log.isLoggable("OPAirDrop", android.util.Log.DEBUG)) {
-                        android.util.Log.d("OPAirDrop", "drag finger=" + dy
+                        Log.d("OPAirDrop", "drag finger=" + dy
                                 + " panel=" + (shown - startTop) + " top=" + sheet.getTop()
                                 + " frac=" + sheet.getTranslationY());
                     }
