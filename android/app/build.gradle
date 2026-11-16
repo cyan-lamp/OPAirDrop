@@ -28,6 +28,18 @@ def stackScript = new File(repoRoot, 'tools/awdl-stack.sh')
 // reason.
 def jniDir = layout.buildDirectory.dir('rustJniLibs')
 
+// Release signing. The key lives outside the tree (`D:/Downloads/project/keys` on the machine
+// this was set up on) and its password sits in `keystore.properties` beside this project,
+// which is not committed: a key in the repository has to be rotated the moment anyone clones
+// it. Missing either one does not fail the build — `assembleRelease` then produces an
+// unsigned APK, which is something you can inspect, rather than stopping the build for a
+// file that exists on exactly one machine.
+def signingProperties = new Properties()
+def signingPropertiesFile = rootProject.file('keystore.properties')
+if (signingPropertiesFile.isFile()) {
+    signingPropertiesFile.withInputStream { signingProperties.load(it) }
+}
+
 android {
     namespace 'com.oshare.airdrop'
     // 37 to match targetSdk: the SDK refuses a target above the platform it compiles against,
@@ -83,9 +95,29 @@ android {
         buildConfig true
     }
 
+    // Declared only when the properties are readable. An empty signing config is an error AGP
+    // raises at validation time, and there is no version of this file that should carry a
+    // placeholder password just to keep the DSL happy.
+    signingConfigs {
+        if (signingPropertiesFile.isFile()) {
+            release {
+                storeFile file(signingProperties['storeFile'])
+                storePassword signingProperties['storePassword']
+                keyAlias signingProperties['keyAlias']
+                keyPassword signingProperties['keyPassword']
+            }
+        }
+    }
+
     buildTypes {
         release {
+            // minify stays off: there is no reflection here that would need keeping, but
+            // R8 also rewrites the stack traces in a crash report, and the value of this
+            // build is that it behaves exactly like the debug one minus the probe.
             minifyEnabled false
+            if (signingPropertiesFile.isFile()) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 

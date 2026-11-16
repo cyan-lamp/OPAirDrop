@@ -15,3 +15,10 @@ android/app/build/
 # changelog records what shipped; this records what was being thought about.
 # Kept on disk, kept out of the tree.
 Task.md
+
+# Release signing. The key already lives outside the tree; this keeps its password
+# and any stray keystore that gets dropped in here from reaching the archive, where
+# the only fix is rotating the key for every clone.
+android/keystore.properties
+*.jks
+*.keystore
