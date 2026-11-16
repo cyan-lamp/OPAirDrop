@@ -3,7 +3,6 @@ package com.oshare.airdrop;
 import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.content.res.Configuration;
-import android.graphics.Color;
 import android.graphics.Outline;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
@@ -23,11 +22,7 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
-import com.oshare.airdrop.SettingsScreen;
-
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
 
 /**
  * 应用外壳：三页横向翻页，一块顶部霜面，一颗浮动标题胶囊，一条浮动导航胶囊。
@@ -128,6 +123,18 @@ public final class MainActivity extends Activity {
         S = Scheme.of(lightMode);
         chrome = new Chrome(this, S);
         chrome.setNotice(this::showNotice);
+        // 调试探针：`am start -n …/.MainActivity --ez live_probe true` 用一段假进度把实时通知演
+        // 一遍。它回答的那个问题只有看屏幕才能回答——「这台机器的系统愿不愿意把我们的通知提升
+        // 到状态栏那颗胶囊里」。只在 debug 包里存在。
+        if (BuildConfig.DEBUG) {
+            String probe = getIntent().getStringExtra("live_probe");
+            if (probe == null && getIntent().getBooleanExtra("live_probe", false)) {
+                probe = "progress";
+            }
+            if (probe != null) {
+                liveProbe(probe);
+            }
+        }
         // 页面不知道胶囊的存在，所以由外壳把两件动画接上：内容上滑时导航胶囊沉下去，每一次
         // 滚动都让顶部玻璃按滚动进度重新长一遍。
         chrome.setScrollHooks(new Chrome.ScrollHooks() {
@@ -235,7 +242,7 @@ public final class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         pager.setOnPage(index -> selectTab(index, false));
 
-        replacePage(0, new HomePage(this, chrome, listener).view());
+        replacePage(0, new HomePage(this, chrome, listener, this::refresh).view());
         replacePage(1, featurePage());
 
         root.addView(buildTopCapsule());
@@ -924,7 +931,7 @@ public final class MainActivity extends Activity {
         if (pages == null || isFinishing() || isDestroyed()) {
             return;
         }
-        replacePage(0, new HomePage(this, chrome, listener).view());
+        replacePage(0, new HomePage(this, chrome, listener, this::refresh).view());
         replacePage(1, featurePage());
         updateTabs();
     }
@@ -1040,5 +1047,55 @@ public final class MainActivity extends Activity {
         }
         noticeWrap.animate().alpha(0f).translationY(dp(12)).setDuration(160)
                 .withEndAction(() -> noticeWrap.setVisibility(View.GONE)).start();
+    }
+
+    /**
+     * 拿一段假进度试一次实时通知。
+     *
+     * <p>为什么要有它：{@link LiveCard} 能不能用，取决于系统的两个开关（版本、以及用户有没有
+     * 关掉本应用的实时通知），而且「提升成功」这件事**没有任何回调**——只有状态栏那颗胶囊会
+     * 不会出现。所以验证方式只能是发一条真的看屏幕，而这条路径不该被塞进任何一次真实传输里
+     * 去赌。
+     */
+    private void liveProbe(String kind) {
+        boolean allowed = LiveCard.allowed(this);
+        android.util.Log.i("OPAirDrop", "live probe (" + kind + "): allowed=" + allowed);
+        showNotice(allowed ? "系统允许实时通知，看状态栏那颗胶囊" : "系统不允许实时通知，只会是一条普通通知",
+                S.text);
+        if ("invite".equals(kind) || "invite_high".equals(kind) || "invite_twice".equals(kind)) {
+            // 带两个按钮的邀请卡。三种投法测三件事：
+            //   invite      —— 低重要性渠道（现状）
+            //   invite_high —— 高重要性渠道，看抬头会不会把胶囊撑开
+            //   invite_twice—— 同一条通知再发一遍，看内容变化会不会触发展开
+            if ("invite_high".equals(kind)) {
+                LiveCard.invite(this, "卷卷薯 想发给你文件", "1 个文件 · 2.4 MB", open(41), open(42));
+            } else {
+                LiveCard.invite(this, "卷卷薯 想发给你文件", "1 个文件 · 2.4 MB", open(41), open(42));
+                if ("invite_twice".equals(kind)) {
+                    new android.os.Handler(getMainLooper()).postDelayed(
+                            () -> LiveCard.invite(this, "卷卷薯 想发给你文件",
+                                    "1 个文件 · 2.4 MB · 刚刚", open(41), open(42)), 900);
+                }
+            }
+            return;
+        }
+        new Thread(() -> {
+            String title = "收到 1 个文件";
+            String line = "青 · 正在接收";
+            for (int percent = 0; percent <= 100; percent += 4) {
+                int now = percent;
+                runOnUiThread(() -> LiveCard.update(this, title, line, now));
+                android.os.SystemClock.sleep(400);
+            }
+            runOnUiThread(() -> LiveCard.finish(this, "接收完成", "1 个文件 · 2.4 MB"));
+        }, "live-probe").start();
+    }
+
+    /** 按钮落点：把应用拉到前面。探针只关心按钮在不在、点得到，不关心点了做什么。 */
+    private android.app.PendingIntent open(int request) {
+        return android.app.PendingIntent.getActivity(this, request,
+                new android.content.Intent(this, MainActivity.class),
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT
+                        | android.app.PendingIntent.FLAG_IMMUTABLE);
     }
 }

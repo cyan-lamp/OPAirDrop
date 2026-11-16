@@ -33,11 +33,24 @@ public final class Native {
     }
 
     /**
+     * The ABI version this Java source was written against.
+     *
+     * <p>Lives here, beside {@link #abiVersion()}, rather than once per caller: a number
+     * that has to be edited in several places is a number that will be edited in all but
+     * one of them. That happened — the library moved to 3 while two callers still said 2,
+     * and the visible symptom was a receiver refusing to start with a message about a stale
+     * library that was in fact current.
+     *
+     * <p>Every change to a {@code native} signature above bumps this.
+     */
+    public static final int ABI_VERSION = 5;
+
+    /**
      * The ABI version this library was built against.
      *
-     * <p>Call this once before anything else: a library whose answer differs from the
-     * constant the app was compiled with is a stale {@code .so}, and every later call would
-     * be reading a struct the two sides disagree about.
+     * <p>Call this once before anything else: a library whose answer differs from
+     * {@link #ABI_VERSION} is a stale {@code .so}, and every later call would be reading a
+     * struct the two sides disagree about.
      */
     public static native int abiVersion();
 
@@ -115,6 +128,41 @@ public final class Native {
         int DONE = 3;
 
         void report(int phase, long sent, long total);
+
+        /**
+         * The peer's own name, once, as soon as `/Discover` answers.
+         *
+         * <p>Default so that sinks written before this callback existed keep compiling and
+         * working — they simply never learn the name. Called on the sending thread, before the
+         * first {@link #READY} report; marshal to the UI thread before touching a view.
+         */
+        default void name(String peerName) {}
+    }
+
+    /**
+     * Opens the second connection a transfer needs.
+     *
+     * <p>An iPhone reads <em>one request per connection</em>. After answering
+     * {@code /Discover} it stops reading, and it leaves the socket open while it does —
+     * so a sender that writes {@code /Ask} onto that socket sees not a refusal but
+     * silence, indefinitely. The same {@code /Ask} on a connection of its own is answered
+     * {@code 200} with a session id, and the far phone shows its prompt. Renewing is
+     * therefore part of the protocol, not housekeeping.
+     *
+     * <p>{@code send}/{@code sendWithProgress} call this exactly once, between
+     * {@code /Discover} and {@code /Ask}. {@link Progress#READY} has already been reported
+     * when it happens, so a caller that needs to change anything visible can. The
+     * {@code /Upload} that follows stays on the connection this returned, because the
+     * offer's answer is what the archive belongs to.
+     *
+     * <p>{@link #connect} is called on the sending thread. It should close the previous
+     * connection first — the receiver has finished with it — and it must return a socket
+     * whose streams are already wrapped however the caller wraps them (TLS included), as a
+     * plain {@code Socket} is the only way this layer can reach them. Throwing is reported
+     * as an {@code IOException} from the send call.
+     */
+    public interface Link {
+        java.net.Socket connect() throws IOException;
     }
 
     /**
@@ -125,19 +173,54 @@ public final class Native {
      * the wire would jump. What the person chose is the honest denominator.
      *
      * @param progress a sink that is called while the transfer runs; never null
+     * @param link how to obtain the connection {@code /Ask} and {@code /Upload} use; never
+     *     null, because a transfer that cannot open a second connection cannot finish
      * @param settings the stored settings text, or null for every default; see {@link #send}
+     * @param senderId who this device is, as the peer records it; see {@link #send}
      * @return {@code peer<TAB>name\nbytes<TAB>count\n} as UTF-8
+     * @throws RefusedException if the peer answered that it is not taking files, which is
+     *     the one failure here that is not a fault — see the class comment. It arrives before
+     *     {@link Progress#READY}, because the peer's answer to {@code /Discover} is what says
+     *     so, and no offer can be made to a peer that has said it will not take one.
+     * @throws IOException if the connection fails
      */
     public static native byte[] sendWithProgress(
             String host,
             String settings,
             String sender,
             String model,
+            String senderId,
             String transferId,
             String[] paths,
             InputStream input,
             OutputStream output,
+            Link link,
             Progress progress)
+            throws IOException;
+
+    /**
+     * Asks one peer for the name a person gave it, without starting a transfer.
+     *
+     * <p>The device list shows an mDNS hash until this is called: on current iPhones the
+     * instance name is a rotating identifier with no name in it, and the only place the real
+     * name appears is the {@code /Discover} answer. This sends just that one request on a
+     * connection the caller has already made (TLS and certificate pinning included). No
+     * {@code /Ask} follows, so nothing appears on the peer's screen.
+     *
+     * @param host the peer's host or address, as for {@link #sendWithProgress}
+     * @param input  the already-connected stream to read the answer from
+     * @param output the already-connected stream to write the request to
+     * @return the peer's own name as UTF-8 bytes (empty when it did not supply one)
+     * @throws IOException if the connection or the request fails
+     */
+    public static native byte[] discoverName(
+            String host,
+            String settings,
+            String sender,
+            String model,
+            String senderId,
+            InputStream input,
+            OutputStream output)
             throws IOException;
 
     /**
@@ -338,10 +421,19 @@ public final class Native {
      *     should not have the send quietly send with defaults.
      * @param sender the name the receiving phone shows, or null
      * @param model what this hardware is called, or null
+     * @param senderId who this device is, as the peer records it. Not the transfer id: this
+     *     one has to be the **same string on every transfer**, because a receiver groups a
+     *     sender's activity by it — a value drawn per transfer arrives as a stranger each
+     *     time. {@link Identity#senderId()} derives one that survives restarts; null is
+     *     accepted and falls back to the transfer id, which is a body a receiver can still
+     *     read but nothing more
      * @param transferId a UUID in any casing
      * @param paths absolute paths of regular files, in the order they should arrive
+     * @param link how to obtain the connection {@code /Ask} and {@code /Upload} use; never
+     *     null
      * @return {@code peer<TAB>name\nbytes<TAB>count\n} as UTF-8
-     * @throws IOException if the connection fails, or the peer refuses the transfer
+     * @throws RefusedException if the peer answered that it is not taking files
+     * @throws IOException if the connection fails
      * @throws IllegalArgumentException if a path cannot be sent or the id is malformed
      */
     public static native byte[] send(
@@ -349,11 +441,61 @@ public final class Native {
             String settings,
             String sender,
             String model,
+            String senderId,
             String transferId,
             String[] paths,
             InputStream input,
-            OutputStream output)
+            OutputStream output,
+            Link link)
             throws IOException;
+
+    /**
+     * Starts the BLE advertisement that wakes a sleeping receiver, and answers where it got
+     * to.
+     *
+     * <p>This is layer 1 of discovery, and it is the only layer that is a knock rather than a
+     * transport: nothing in it carries data. An iPhone listens for this advertisement and
+     * only then brings AWDL's AirDrop service up, which is why a query can be perfectly
+     * formed, go out on the wireless every two seconds, and be answered by nobody — the
+     * receiver was present at every other layer with nothing listening on 8770.
+     *
+     * <p>The twenty bytes and the four advertising settings are chosen on the Rust side,
+     * because they are Apple's format and not a caller's choice. The radio is
+     * {@code BleRadio}'s, which hands them over and reports the stack's verdict back through
+     * {@link #bleVerdict(int)}.
+     *
+     * <p>Calling this again while something is registered answers the current state and does
+     * not register twice.
+     *
+     * @param context an {@code android.content.Context}, normally the calling activity
+     * @return one state line as UTF-8: {@code idle}, {@code starting}, {@code advertising},
+     *     or {@code failed: } and the reason. A failure to wake is not an error the caller
+     *     should raise: a receiver that is already awake still answers.
+     */
+    public static native byte[] bleAdvertise(android.content.Context context);
+
+    /**
+     * Records the Bluetooth stack's answer about the advertisement.
+     *
+     * <p>Called from {@code BleRadio}, on whichever thread had a looper when the
+     * registration was made. A positive code is the stack's own {@code ADVERTISE_FAILED_*},
+     * zero is success, and a negative one means the radio never got that far — the numbers
+     * are {@code BleRadio}'s {@code NO_PERMISSION} and siblings, and are a contract with
+     * {@code crates/ffi/src/ble.rs}.
+     *
+     * @return the new state line as UTF-8, ready to be logged
+     */
+    public static native byte[] bleVerdict(int code);
+
+    /**
+     * Takes the advertisement down, and answers the state line.
+     *
+     * <p>Stopping something that was never started is not a failure. A page stops on its way
+     * out whether or not the advertisement began.
+     *
+     * @return one state line as UTF-8, {@code idle} unless something went wrong
+     */
+    public static native byte[] bleStop();
 
     /**
      * The settings catalog: one line per setting, tab-separated.
@@ -366,7 +508,6 @@ public final class Native {
      * @return the catalog as UTF-8 text
      */
     public static native byte[] settingsCatalog();
-
     /**
      * Reads the settings stored at {@code path}, or every default when there is no file.
      *

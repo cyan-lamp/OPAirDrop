@@ -341,6 +341,31 @@ mod tests {
     }
 
     #[test]
+    fn a_phone_sized_block_decodes() {
+        // 128 KiB slices, which is what an iPhone sends and what our own encoder never
+        // produces. The reference sender records the failure this guards against: its
+        // reader had `MAX_BLOCK` tied to its own 64 KiB chunk, so a phone's third block
+        // -- deflated to 126136 B, perfectly framed -- was refused, and from the phone's
+        // side the transfer simply failed.
+        const PHONE: usize = 128 * 1024;
+        let plain = noise(9, PHONE * 2 + 500);
+        let mut body = Vec::new();
+        for slice in plain.chunks(PHONE) {
+            let compressed = deflate(slice).unwrap();
+            if compressed.len() < slice.len() {
+                body.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+                body.extend_from_slice(&compressed);
+            } else {
+                body.extend_from_slice(&(0x8000_0000u32 | slice.len() as u32).to_be_bytes());
+                body.extend_from_slice(slice);
+            }
+        }
+        let mut decoded = Vec::new();
+        Decoder::new(&body[..]).read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, plain, "a 128 KiB block is a legal block");
+    }
+
+    #[test]
     fn rejects_implausible_length() {
         let body = (MAX_BLOCK as u32 + 1).to_be_bytes();
         let err = Decoder::new(&body[..]).read_to_end(&mut Vec::new()).unwrap_err();

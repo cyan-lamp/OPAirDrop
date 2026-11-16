@@ -26,11 +26,16 @@
 //! txt    <instance>  <key>   <value>
 //! ```
 //!
-//! Only `model`, `flags` and `phash` are reported from TXT: the rest of an AirDrop TXT record
+//! Only `model`, `flags` and `h` are reported from TXT: the rest of an AirDrop TXT record
 //! describes features the sender does not branch on, and a line per key would be a line per
 //! key.
+//!
+//! `h` is the certificate fingerprint, and its name is one character because Apple named it:
+//! the record is a list of two-character strings and the long keys are the seldom-read ones.
 
-use opairdrop_mdns::{Builder, Message, CLASS_IN, TYPE_A, TYPE_AAAA, TYPE_PTR, TYPE_SRV, TYPE_TXT};
+use opairdrop_mdns::{
+    Builder, Message, CLASS_IN, CLASS_UNICAST, TYPE_A, TYPE_AAAA, TYPE_PTR, TYPE_SRV, TYPE_TXT,
+};
 
 use crate::api::status;
 use crate::buffer::{fill, OpairdropBuffer};
@@ -40,13 +45,29 @@ use crate::buffer::{fill, OpairdropBuffer};
 pub const SERVICE: &str = "_airdrop._tcp.local";
 
 /// The TXT keys worth reporting.
-const TEXT_KEYS: &[&str] = &["model", "flags", "phash"];
+///
+/// `h` is what AirDrop peers actually publish for the certificate fingerprint — see
+/// [`crate::respond`]'s own record and `Responder.java`'s `pairs.put("h", certHash)`. It is
+/// not a name of this crate's choosing; a made-up key here would read as "the peer sent no
+/// fingerprint" for every peer in the world, and every handshake would go unpinned.
+const TEXT_KEYS: &[&str] = &["model", "flags", "h"];
 
 /// Builds the PTR query a sender multicasts to find peers.
 ///
-/// One question, `PTR _airdrop._tcp.local`, class `IN`. The id is zero because mDNS answers
-/// ignore it and a responder that echoes a non-zero id is not a responder anyone should
-/// trust. `report` receives the packet, or a message on failure.
+/// One question, `PTR _airdrop._tcp.local`, class `IN | QU`.
+///
+/// # Why the unicast bit
+///
+/// Without it every responder answers to the multicast group on port 5353, and on AWDL that
+/// answer is exactly the packet that does not survive the trip: the radio hears it, the
+/// tunnel never hands it to the kernel, and the sender sits in silence while the phone is
+/// one metre away and idle-on. With it, the answer is addressed to the sender's own
+/// address and port — an ordinary unicast datagram, which the same tunnel carries without
+/// complaint. The receive side of this crate sets the same bit for the same reason.
+///
+/// The id is zero because mDNS answers ignore it and a responder that echoes a non-zero id
+/// is not a responder anyone should trust. `report` receives the packet, or a message on
+/// failure.
 ///
 /// # Safety
 ///
@@ -56,7 +77,7 @@ pub unsafe extern "C" fn opairdrop_mdns_query(report: *mut OpairdropBuffer) -> i
     if report.is_null() {
         return status::NULL_ARGUMENT;
     }
-    match Builder::new(0, 0).question(SERVICE, TYPE_PTR, CLASS_IN) {
+    match Builder::new(0, 0).question(SERVICE, TYPE_PTR, CLASS_IN | CLASS_UNICAST) {
         Ok(builder) => {
             // SAFETY: `report` is non-null and zeroed, per the contract.
             unsafe { fill(report, builder.build()) };
@@ -104,6 +125,14 @@ pub unsafe extern "C" fn opairdrop_mdns_records(
 
     let mut lines = String::new();
     for record in message.records() {
+        // A TTL of zero is mDNS's "goodbye": the responder is going away and wants listeners
+        // to drop it now rather than after the full record lifetime. iOS sends one when
+        // AirDrop is switched off. The name on a goodbye is the service instance, the same
+        // one the SRV lines carry, so the Java side can remove that peer immediately.
+        if record.ttl == 0 {
+            push(&mut lines, &["gone", &record.name]);
+            continue;
+        }
         match record.record_type {
             TYPE_SRV => {
                 // A record whose rdata does not parse is skipped rather than failing the
@@ -224,6 +253,46 @@ mod tests {
         assert!(text.contains("srv\tAda._airdrop._tcp.local\tadas-iphone.local\t8770\n"), "{text}");
         assert!(text.contains("addr\tadas-iphone.local\t192.168.1.5\n"), "{text}");
         assert!(text.contains("txt\tAda._airdrop._tcp.local\tmodel\tiPhone14,3\n"), "{text}");
+    }
+
+    /// The fingerprint key is `h`, and that is the whole point of this test.
+    ///
+    /// This side once read `phash` — a name it had made up — and the failure was silent in
+    /// the worst way: every peer in the world looked like one that publishes no fingerprint,
+    /// the sender took the "nothing to compare" branch, and every handshake went unpinned
+    /// while the log said the feature was on. A key that is not the peer's key does not
+    /// error; it returns nothing, forever.
+    #[test]
+    fn the_fingerprint_is_reported_under_the_name_peers_actually_send() {
+        const HASH: &str =
+            "3F2A9C1D4B6E8F0A2C4E6F8A0B1D3F5A7C9E1B3D5F7A9C1E3B5D7F9A1C3E5B7D";
+        let txt = Builder::txt_rdata(&[("model", "iPhone14,3"), ("h", HASH), ("flags", "2")])
+            .unwrap();
+        let packet = Builder::response()
+            .answer("Ada._airdrop._tcp.local", TYPE_TXT, 120, &txt)
+            .unwrap()
+            .build();
+
+        let text = records(&packet);
+        assert!(text.contains(&format!("txt\tAda._airdrop._tcp.local\th\t{HASH}\n")), "{text}");
+        // And the made-up name stays unreported: nothing should start reading it again.
+        assert!(!text.contains("phash"), "{text}");
+    }
+
+    /// Keys outside [`TEXT_KEYS`] are dropped rather than passed through, so the Java side
+    /// never has to decide what an unknown key means.
+    #[test]
+    fn a_txt_key_nobody_reads_is_not_reported() {
+        let txt = Builder::txt_rdata(&[("model", "iPhone14,3"), ("pk", "0123456789abcdef")])
+            .unwrap();
+        let packet = Builder::response()
+            .answer("Ada._airdrop._tcp.local", TYPE_TXT, 120, &txt)
+            .unwrap()
+            .build();
+
+        let text = records(&packet);
+        assert!(text.contains("\tmodel\tiPhone14,3\n"), "{text}");
+        assert!(!text.contains("\tpk\t"), "{text}");
     }
 
     #[test]

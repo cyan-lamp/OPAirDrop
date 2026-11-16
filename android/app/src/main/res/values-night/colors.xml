@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  接收确认那张卡的配色（深色）。名字与 values/colors.xml 一一对应——一个样式是整体选中的，
+  所以这里每一项都要重写一遍，不能只写不同的那几行。
+-->
+<resources>
+    <!-- 卡片底：不是纯黑，是比背景亮一档的炭色，压在遮罩上仍有层次。 -->
+    <color name="confirm_card">#FF1C1C1E</color>
+    <color name="confirm_stroke">#1FFFFFFF</color>
+</resources>

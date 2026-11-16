@@ -27,7 +27,7 @@ pub mod inbox;
 pub mod payload;
 pub mod server;
 
-pub use client::{offered_bytes, Client, DEFAULT_RESPONSE_LIMIT};
+pub use client::{offered_bytes, Client, Dial, DEFAULT_RESPONSE_LIMIT};
 pub use inbox::{Inbox, Received, DEFAULT_BYTE_LIMIT};
 pub use payload::{
     ask_request, discover_request, Ask, AskAnswer, DiscoverAnswer, Item, Sender, DEFAULT_FILE_TYPE,

@@ -88,8 +88,10 @@ Rust 重构**，参考 [t4t5/owly](https://github.com/t4t5/owly) 的 Rust 化路
 | `POST /Ask` | plist 九键：三个 Sender 字段 + `BundleID`、`ConvertMediaFormats`、`Files[]`（或 `Items[]`）、可选 `SenderRecordData`/`FileIcon` | plist `{ReceiverComputerName, ReceiverModelName}` |
 | `POST /Upload` | `Content-Type: application/x-cpio`（我们发 `x-dvzip`），`Transfer-Encoding: chunked`，体是 cpio（常被 gzip 或 DVZip 包一层） | `200` + `Content-Length: 0` + `Connection: close` |
 
-`Files[]` 每项：`FileName`、`FileType`（Apple UTI，如 `public.jpeg`）、`FileBomPath`
-（`./名字`）、`FileIsDirectory`、`ConvertMediaFormats`（整数 0）。
+`Files[]` 每项六个键，缺一不可：`FileName`、`FileType`（Apple UTI，如 `public.jpeg`）、
+`FileBomPath`（**`./名字`，`./` 前缀是规范里写明的必填**）、`FileIsDirectory`、`FileSize`
+（当前形式必填）、`ShouldConvertMediaFormats`（`false`）。`ConvertMediaFormats: 0` 是**旧形式**
+的名字，两种拼写同时写进同一项是已知会被「收下然后无视」的写法，不要回退。
 
 ### 4.3 几个反直觉的事实
 
@@ -104,6 +106,11 @@ Rust 重构**，参考 [t4t5/owly](https://github.com/t4t5/owly) 的 Rust 化路
    随机 UUID；真名在 `/Discover` 的 `SenderComputerName` 里。所以面板里**先显示什么**是一个
    协议问题，不是一个 UI 问题：名字要等连上才有。
 5. **UTI 影响对端图标与预览**，猜错只是图标错；`public.content` 是「不认识」的诚实答案。
+6. **一条连接只承载一个请求。** 这不是「省一次握手」的优化，是硬规则：iPhone 在已经答过一个请求的
+   连接上读第二个请求时**什么都不答**——没有状态行、没有 RST、75 秒零字节。所以 `/Discover` 一条
+   连接，`/Ask` 与 `/Upload` 用另一条（后两者共用，`/Upload` 不换连接，它要接着 `/Ask` 的 `200`
+   走同一个 TLS 会话）。把三个请求串在一条连接上的发送端，现象是「`/Discover` 成功，然后永远等待」，
+   看起来像对面拒绝，其实是这一条。代码里的表达是 `Client::renew()` + `Dial`（见 §13 04:20）。
 
 ### 4.4 拒绝与超时
 
@@ -487,6 +494,7 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 | 死对端不再打死进程 | 强 RST 三型（空转 / 写中 / 半截 body）+ 优雅断开后 `pidof` 均存活；桌面 `-Xcheck:jni` 对照：拿掉防线即 2 条 `JNI call made with exception pending` 并让 `check.sh` 退出 1，恢复后零警告 |
 | 前台服务 | `oshare_state=1` → `ReceiveService` 以 `isForeground=true types=0x10` 起来、8770 在听；`=0` → 服务与端口都归零 |
 | 分享面板注入 | 真机确认：一加互传分享面板的设备列表里出现「发送到 iPhone」 |
+| 发送入口注入（`IOSShareActivity`，**已撤下**） | 曾真机跑通：注入的一行 → `SendActivity`，副标题 `1 个文件 · 2.2 MB`，互传进程存活。2026-11-16 00:55 按用户口径撤下——发送端不该借互传的页，实现停在 `legacy/hooks/PanelHook.java`（不进 source set），三条硬约束仍记在下节 |
 | 发送链路 | `Peers`（mDNS 浏览）+ `ShareIntake`（URI→cache）+ `SendActivity`（TLS + 三请求 + **真实进度**） |
 | 接收确认（`/Ask` 三支齐） | 读完 offer 后问一次人（通知两键，30 秒超时按拒绝）。真机新包实测：**接受** → `200` + 106 字节 `AskAnswer`（`ReceiverComputerName=青`、`ReceiverModelName=iPhone 18`）；**拒绝** → `503`，日志 `confirm 3 declined by the person` / `declined after 1448 ms`；**超时** → 同样 `503`，但日志里是等满 30 秒而非早应答。三种结局在 wire 上只用 `200`/`503` 两个码，所以**判据必须是日志，不能只看状态码** |
 | 射频共享开关 | 功能页一张卡，读写 `files/radio-share`/`radio-state`；真机四态（共享/独占/正在开/无回执）逐个拍过；`RadioCheck` **48 项** |
@@ -533,6 +541,186 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 3. 扩展名猜不出 MIME 的（`noext`）落成 `application/octet-stream`，**没有被改名成
    `xxx.bin.jpg`**。只有当 MIME 与扩展名互相矛盾时系统才补扩展名，这一版没有触发。
 
+### 发送入口：直接就是我们的 `SendActivity`，不借互传的页（2026-11-16 01:05）
+
+上一版把入口挂在一加互传的 `IOSShareActivity` 顶部（往 `share_content` 里注入一行「用 AirDrop
+直接发」）。用户当场否掉，原话：
+
+> 我们为什么要开监听呢？不应该是拉起我们的分享界面才开始查询吗？我们作为发送端不需要开自己
+> 监听吧？把你接入的一加互传的分享界面撤掉，先不通过一加互传，直接通过我们 SendActivity 就行。
+
+这句纠正的是一个**产品前提**，不是一处实现。起因是我为了让「身边没有 iPhone」时也有个可发现的
+对端，把设置里 `receive.follow_oshare` 临时改成 `true`，让 `ReceiveService` 起来自收自发——
+那是造对照物的手段，一旦被当成前置条件，发送端就背上了「必须先开接收」这个它根本不需要的依赖。
+
+**发送端现在只有这些前提**：
+
+```
+对方点分享 / 我们拉起 SendActivity
+  → ShareIntake：content:// 读进 cache，得到路径与总字节
+  → Peers：加入 224.0.0.251:5353，绑 wonder0，持 MulticastLock，每 2 s 发一次查询
+  → 收到应答 → Peer(connectable=true)
+  → TLS 连过去 → /Discover → /Ask（对面问人）→ /Upload → 等 report
+```
+
+这条链上没有一处需要本机监听：不需要 `8770`、不需要 `ReceiveService`、不需要
+`receive.follow_oshare=true`，也不需要 `com.coloros.oshare` 在场。
+
+**真机证据**（`receive.follow_oshare=false`，接收端全程没起）：
+
+```
+I OPAirDrop: browse: joined 224.0.0.251:5353 on wonder0, multicast lock held
+I OPAirDrop: browse: nothing connectable yet (0 instance(s) with partial records)
+I OPAirDrop: intake: 1 file(s), 2292220 bytes
+W OPAirDrop: browse: 15 queries sent, nothing came back
+```
+
+同刻 `ss -lntp | grep 8770` 为空、`dumpsys activity services com.oshare.airdrop` 里没有
+`ReceiveService`。页面显示「正在搜索附近设备……」，这与开没开监听无关，只是对面这次确实不在。
+
+**`send()` 没抛异常不等于包出去了，所以再抓一层**（`su -c tcpdump -i any -n port 5353`）：
+
+```
+00:59:23.966  wonder0 Out IP 10.60.227.56.5353 > 224.0.0.251.5353: 0 PTR (QM)? _airdrop._tcp.local. (37)
+00:59:25.969  wonder0 Out ...
+00:59:27.973  wonder0 Out ...
+```
+
+间隔 2.003 s（`ASK_EVERY_MS=2000`）、出口 `wonder0`、源地址 `10.60.227.56`、目标
+`224.0.0.251:5353`、问的是 `_airdrop._tcp.local.`，`(QM)` 表示请求单播应答（对端直接回我们 5353）。
+**只有 Out、没有 In。** 这条把「找不到设备」三种成因里的第一种——**组播没出得去这块网卡**——排除了。
+剩下的两种，等一台 iPhone 在场就能从 `browse:` 那一行分开。
+
+**为了把「找不到设备」拆开，本轮补的日志面**（`Peers`、`SendActivity`）：`browse: joined … /
+nothing connectable yet (N partial) / N connectable — name@addr:port / 15 queries sent, nothing
+came back`、`intake: N file(s), M bytes`、`send to … host=…`、`phase ready / waiting / sending
+N% / done`、`send failed: …`。三种成因——组播出不去、对端不答、答了但记录凑不齐——以前在界面上
+长得一模一样，现在各有一行。
+
+**撤下来的东西**：`PanelHook` 移到 `legacy/hooks/PanelHook.java`（`legacy/` 不进 source set，
+是「停放而不删」的老惯例，`InlinePanelHooks` 是先例）；`Entry.onPackageLoaded` 里那句 `install`
+删掉，类注释改成「只有接收一处钩子」；`build.gradle` 的 `compileOnly androidx.recyclerview`
+一并撤掉。文件开头写了停放理由与接回方法。
+
+**三条硬约束保留**（将来若再借互传的页，会再付一次代价，别再推导一遍）：
+
+1. **包一层 `RecyclerView.Adapter` 不可能成立。** 注入用的是只装本模块 dex 的
+   `InMemoryDexFile` 加载器，`androidx.recyclerview` 又是 `compileOnly`、没进 APK，于是
+   `found instanceof RecyclerView` 必抛 `ClassNotFoundException`，日志上只表现为
+   `share panel row not added`。注入只能用框架类（`View`/`ViewGroup`/`LinearLayout`/`TextView`）。
+2. **`resolveAttribute(android.R.attr.textColorPrimary, …).data` 是资源 id，不是颜色。**
+   框架资源落在 `0x01xxxxxx`，当 ARGB 用时 alpha=`0x01`，结果是**完全透明**（像素扫描：标题带
+   最大偏差 321）。取色只能从对面视图抄（`titleColor(decor)` → `getCurrentTextColor()`）。
+3. **`Intent.setClass(host, SendActivity.class)` 会崩掉互传进程。** 它取传入 Context 的包名，
+   拼出 `com.coloros.oshare/com.oshare.airdrop.SendActivity` → `ActivityNotFoundException`，
+   而这次崩溃会把钉在互传进程里的 `KeepForeService`（流体云锚点 id 111）一起带走。必须
+   `setClassName("com.oshare.airdrop", …)` 并整体 `try/catch`——那行代码跑在互传的 UI 线程上。
+
+**顺带记下的一条**：钩子挂在 `ShareActivity.onCreate` 会同时覆盖 `IOSShareActivity` 与它自己，
+要靠 `getClass().getName().endsWith("IOSShareActivity")` 区分，否则会把互传自己的列表挤掉。
+
+### 发送链路打通：组播组、网卡、跳数三个错，以及 IPv6 的 scope（2026-11-16 01:55）
+
+这一轮第一次把「点一台设备真的把文件发出去」跑完（自收自发，见下面「验证」）。跑通之前，`Peers`
+找人的三处设置全是错的，而且**每一处单独都足以让发现永远静默**：
+
+| | 原来 | 现在 | 为什么 |
+|---|---|---|---|
+| 组播组 | `224.0.0.251` | `ff02::fb`（AWDL 链路）/ `224.0.0.251`（Wi-Fi） | AWDL 上只有 IPv6 组播；`wonder0` 现在根本没有 IPv4 地址，发往 v4 组的包连源地址都填不出来 |
+| 网卡 | `wonder0` | `awdltun0` 优先 | `Responder` 的类注释早就量过：35 秒里无线电收到 9295 帧，`wonder0` 的收包计数只动了 8——回包几乎全被驱动吞掉 |
+| 跳数 | 没设 | `MulticastHop.raise(socket, 255)` | mDNS 规定 255，iPhone 收到低于它的包**直接丢**，不报错。「对方不应答」这个结论就是这么被误判出来的 |
+
+第四条不在表里，但同样致命：**链路本地 IPv6 地址不带 scope，`connect` 不会超时也不会拒绝，而是
+立刻回 `EINVAL`**。
+
+```
+java.net.ConnectException: failed to connect to /fe80::88b0:28ff:fe2d:6ea2 (port 8770)
+  from /:: (port 0) after 8000ms: connect failed: EINVAL (Invalid argument)
+```
+
+看起来像「对端不可达」，其实是请求本身不合法。`Peers` 现在在收到记录时就把当时的网卡索引记在
+`Peer.scope` 上，`Peers.address(peer)` 负责把它塞进 `Inet6Address`；发送侧只写
+`raw.connect(new InetSocketAddress(Peers.address(peer), peer.port), connectMs)`。
+
+**第五处：自己会出现在自己的列表里。** 接收端一开就在组播上宣告，绕回来把自己也发现一遍——「本设备：
+青」和列表里那台一模一样，点下去就是自己发给自己。`Peers` 现在在 `open()` 时收集本机所有网卡地址，
+`absorb` 遇到属于本机的 `addr` 记录直接跳过（地址不填 → 不可连接 → 不进列表）。
+
+#### 验证：自收自发，一次完整的 `ready → waiting → sending → done`
+
+`am start … .SendActivity -a SEND -t image/jpeg --eu …STREAM content://media/external/images/media/5963`
+（2 040 000 B），接收端开着当对端：
+
+```
+browse: joined ff02::fb:5353 on awdltun0, multicast lock held, hop limit 255
+browse: 1 connectable — 75bdacd4227c@fe80::88b0:28ff:fe2d:6ea2:8770
+phase sending 0% → 25% → 51% → 77% → 100% → done
+```
+
+落地 `/sdcard/Pictures/OPAirDrop/IMG_2869 (1).JPG`，2 040 000 B，字节数一致。三条通知同时出现：
+本应用的 `已发送到 75bdacd4227c`（渠道 `opairdrop_send`）、本应用的 `接收完成`、互传进程的
+`AirDrop · 接收完成`。
+
+**取消**：传输中再点同一台 → `send cancelled by the person` → `Socket closed` → 页面写「已取消」、
+通知标题「已取消发送」。开关只有一条：`live.close()`，因为传输线程多半停在 `read` 上。
+
+#### 对真实 iPhone：做不到，原因不在我们这一侧
+
+查询确实按 2 s 一次发出去了（`awdltun0` 上抓包）：
+
+```
+IP6 fe80::88b0:28ff:fe2d:6ea2.5353 > ff02::fb.5353: 0 PTR (QM)? _airdrop._tcp.local. (37)
+IP6 ... 01:48:25 / 01:48:27 / 01:48:29  ← 间隔 2.003 s，只有 Out，没有 In
+```
+
+同时 `awdld` 的状态行里：`peer=5a:ce:35:0b:00:7e`、`confirmed`、`elect=self`、`psf` 在涨——
+**AWDL 链路活着，同步帧也收得到**；但 `rx=32722p` 在这 8 秒里一个字节都没动。也就是说 iPhone
+此刻没有任何 IP 流量过来，不是我们不收。
+
+结论：iPhone 只开着「AirDrop 所有人」并不够，它得处在互传状态里。本页底部那张卡写的两个办法就是
+这件事：**控制中心碰一下 NFC**，或者**打开「OPPO 互联」并停在界面上**。
+
+02:05 在用户明确说「iPhone 就在旁边、已经开着所有人」的情况下又跑了一遍，结论不变，而且把几条退路
+也排除掉了：
+
+- `browse: 15 queries sent, nothing came back`（30 秒），`rx=32722p` 依旧是那个数字、一个字节没动；
+  同一时刻 `psf` 从 640353 涨到 654054——**同步帧一直收得到，数据帧一个没有**。
+- 想退到「同一个路由器上走 IPv4 组播」这条路也不行：`tcpdump -i wlan0` 回 `That device is not up`，
+  这台机器**Wi-Fi 根本没开**（状态栏只有 5G），组播只可能在 AWDL 上，而 AWDL 上 iPhone 不说话。
+
+所以「只开所有人」是不够的这个判断，现在是**排除法**得出的：本侧发包、链路、跳数、scope、自我过滤
+全部实测过，唯一的未知量只剩 iPhone 那侧的 AWDL 数据通路有没有被唤醒。
+
+
+#### 版式：图标缩小、文件信息下方起排、整行居中、名字换行（2026-11-16 02:10 定稿）
+
+- `Nick` 92dp → 62dp，单元格最小 86dp（`CELL_DP` / `NICK_DP` 两个常量）。
+- 中部 `stage` 由 `Gravity.CENTER` 改成 `Gravity.TOP`：列表从「1 个文件 · 1.9 MB」那一行的正下方开始，
+  **从左到右、从上到下**排；空态（一台都没有）自己包一层居中的 `LinearLayout`，雷达与「正在搜索附近
+  设备……」仍然居中——它是一条提示，不该跟着列表跑到左上角。
+- 一行放几台不是写死的：`columns = (屏宽 - 40dp) / 86dp`，本机 360dp 宽上算出 **3 台**（早先注释里写
+  「4 台」是错的，1440px ÷ 4 密度 = 360dp，三台 86dp 才放得下）。
+- **格子宽度取整行平分**（`cellW = span / columns`），不是死板的 86dp：三台 86dp 塞进 320dp，右边会空出
+  小半屏看着像没排完。平分之后每一格一样宽，满行自然撑满。
+- **整行水平居中**（`rows.setGravity(CENTER_HORIZONTAL)`）：顺序仍是从左到右，但一台的时候它落在正中，
+  两台就并排居中，不是永远贴着左边。不满的最后一行同样居中——这是用户看过头一版左对齐之后要的。
+- **名字换行不硬截**：格子只有 106dp 宽，「张三的 iPhone 15 Pro」截成一行只剩「张三的 iP…」，认不出是谁。
+  改成 `maxLines(2)` + 行距 0.95，两行还放不下才省略。
+- 行内改**顶对齐**（`row.setGravity(TOP)`）：名字有的占一行有的占两行，居中会让同一行的头像高低错开。
+- 调试开关：`am start … -e preview 7`（**只在 debug 包**、且只在 `BuildConfig.DEBUG` 下生效）会拿假设备
+  把版式直接演出来，不真的搜索。真机上凑不齐那么多台对端，而「一行几个、在哪折行、长名字会不会顶出格子」
+  只有看着截图才改得动。`preview` 缺省为 0，正式路径一行都不受影响。
+
+#### 首页「发送文件」→ `SendActivity`
+
+那一行原来只弹一句「主动发送还没接入」。现在直接 `startActivity(new Intent(host, SendActivity.class))`，
+**不带任何 data**：空手进去由发送页自己弹 `ACTION_OPEN_DOCUMENT`（`EXTRA_ALLOW_MULTIPLE`，长期可读
+URI，不要存储权限）。选出来的 `ClipData` 再拼成一条 `SEND_MULTIPLE` 意图，让「选出来的文件」和
+「分享进来的文件」只有一条处理路径。取消选择则 `close()`，不留一个空面板。
+
+顺带补了 `onNewIntent`：页面还活着时又来一条 `SEND`，系统不会重建它，`onCreate` 早就跑完了——不接
+这一段，手上还是上一次的文件，人会以为「分享没生效」。
+
 ### 明确未完成
 
 - **iPhone 分享面板里出现本机**：本侧该做的都做了、都抓包看过了（见 §13 本轮记录），这一步只能由
@@ -546,19 +734,25 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
   我们只负责把传输与进度递进去（见 §9 那两行）；要换文案/图标/圆环，还得写卡片本体。
   信道已定：offer 走广播（我们 → 互传进程），决定走 `Settings.System`（互传进程 → 我们，
   因为普通应用写不了它）。
-- **自有发送面板**：要仿 `IOSShareActivity`（全屏、圆形返回键 + 「与 iPhone 互传」+「本设备：×」、
-  中部雷达喻体、底部说明卡），浅/深两套、弹出动画、**点头像才出**蓝色「等待对方接受」、
-  接受后进度绕头像圆环走。现有 `SendActivity` 只是临时形态。
+- **发送页缺一个「从首页进得来」的入口**：`SendActivity` 现在只有 `SEND`/`SEND_MULTIPLE` 两个
+  intent-filter，所以只有别人把文件分享给我们时才进得去。既然不再借互传的页，从桌面/首页直接发起
+  发送这条路径需要一次产品或 UI 决定（放首页按钮？放功能页？还是只在分享面板里出现？）。
+- **自有发送面板的版式**：骨架已有（全屏、圆形返回键 + 「与 iPhone 互传」+「本设备：青(Air)」、
+  文件数与总字节、中部雷达、「正在搜索附近设备……」、底部「如何与 iPhone 互传？」说明卡），
+  还差：浅/深两套、弹出动画、**点头像才出**蓝色「等待对方接受」、接受后进度绕头像圆环走。
 - **通知栏与流体云显示发送进度**。
-- **`phash` 证书校验**（发送端侧；接收端侧的 `h` 已发布且与出示证书一致）。
-- **设置表里还剩 7 行没有读值处**。已接上并在真机验过读写的是 `receive.directory`、`receive.overwrite`、
-  `device.name`、`device.model`，加上本轮新接的 `http.response_limit`、`server.handshake_timeout_ms`、
-  `server.read_timeout_ms`（三者的接线点见 §13 本轮记录）。仍无人读的是：
-  `receive.probe_bytes`、`client.ask_timeout_ms`、`client.discover_timeout_ms`（产品代码零引用）；
-  `discover.window_ms`、`discovery.remembered_peers`、`log.level`、`log.preview_bytes`（只在
-  `crates/ffi/jvm/com/oshare/airdrop/SettingsCheck.java` 的自测里被点名）。另外「等多久算没人应答」
-  这件事现在是 `DECISION_TIMEOUT_MS` 与 `Confirmation.TIMEOUT_MS` 两处**硬编码 30 秒**，
-  表里根本没有对应键——要让人能调，得先加行。
+- **证书钉住只在构造里验过，「相符也照常发」那一刻没验过**（发送端侧，代码 2026-11-16 06:10 接通，
+  见 §13）：TXT 的 `h` 键 → `Peer.fingerprint` → `Identity.clientContext` 钉住 → 不符时
+  `PeerMismatch` 翻成「对方身份不符」。不符那一支靠 `IdentityCheck` 真跑错指纹握手钉住了；相符那一支
+  要一台在场 iPhone。**另记一条教训：键名是 `h` 不是 `phash`**——这里一度按自造的名字读，对任何真实
+  对端都不命中，钉住逻辑空转了整轮而没有任何症状，现在由 `check.sh` 的跨语言字面量比对守着。
+- **设置表里每一行都有读值处了**（2026-11-15 23:30 结案，见 §13）。原先「7 行无人读」的结局分两种：
+  `receive.probe_bytes`、`discover.window_ms`、`client.ask_timeout_ms`、`client.discover_timeout_ms`
+  在产品代码里根本没有对应概念，**删行**；`receive.decision_timeout_ms`（新）、
+  `client.connect_timeout_ms`（新）、`client.read_timeout_ms`（新）、`discovery.remembered_peers`
+  **接上读值处**并真机量过。仍然只是「有行、没人读」的只剩 `log.level` 与 `log.preview_bytes`
+  两行——它们是留给日志接线的，删掉也可以，但要连 `SettingsCheck` 里那两条自测一起改。
+  另注意删行会让老装机那份文件多出旧键，容忍逻辑见 §13 第二条。
 - `git` 已初始化并有提交，但首个提交晚于事故，历史不含更早状态。
 
 ---
@@ -572,15 +766,15 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 | --- | --- | --- | --- |
 | 1 | 驱动打包：`assets/kernel/` + `su -c insmod` + boot_id 标记 | 冷启动后 `wonder0` up | ✅ 已随包，`DriverSetup` 按 §7.3 序列 |
 | 2 | mDNS 应答器（本侧发得出、答得上） | 抓包里 3 s 节奏、`hlim 255`、四条记录、TXT 三键 | ✅ 真机实测，见 §13 |
-| 3 | **接收第一档：iPhone 分享面板里能找到本机** | 人眼在 iPhone 上看见本机名字，点得进去 | ⏳ 待实测（本侧无法自证）。**已有的抓包线索**：02:25:07 一条 `handshake from fe80::84a8:a1ff:fe43:3eb8%awdltun0 failed after 496 ms: Connection reset` —— 对面**已经连上来过**，说明公告被发现了、TXT/SRV 被读走了。下一步只差在它再来的那一刻看 `offer from …` 那一行 |
+| 3 | **接收第一档：iPhone 分享面板里能找到本机** | 人眼在 iPhone 上看见本机名字，点得进去 | ⏳ 待实测（本侧无法自证）。**2026-11-16 13:13 找到了缺的那一层**：BLE 广播（iPhone 先听它才唤起 AWDL）从来没被调用过，`BleRadio` 是死代码——现已接在 mDNS 公告的同一生命周期上，真机日志 `OPAirDrop/Ble: advertising` 与 `announcing … at 青.local:8770` 同秒出现，见 §13。**这条现在可以重测了**。已有的抓包线索：02:25:07 一条 `handshake from fe80::84a8:a1ff:fe43:3eb8%awdltun0 failed after 496 ms: Connection reset` —— 对面**已经连上来过**，说明公告被发现过、TXT/SRV 被读走了。下一步只差在它再来的那一刻看 `offer from …` 那一行 |
 | 4 | 接收第二档：接收端 TLS（`Identity` + `h=` + `SSLServerSocket`） | `openssl s_client` 能握手；`/Discover` 有应答 | ✅ 真机：`TLSv1.3`/`AES_256_GCM`、10 ms；`/Discover` → `200` + 138 字节 bplist；TXT `h` 与出示证书指纹逐位相同 |
 | 5 | 接收第三档：文件真的落到该去的地方 | iPhone 发一张图，相册里出现同字节文件 | ✅ **机制已验证**：`/Ask` 三支 + `/Upload` 逐字节（含 `photos/`、`假期/` 两级中文路径）。落点自 2026-11-15 20:40 起改为**按类型分五个系统可见桶**（`Pictures`/`Movies`/`Music`/`Documents`/`Download` 下的 `OPAirDrop/`），八份混合文件真机逐份对上，见 §9。⏳ 待真实 iPhone 复验 |
 | 6 | 接收三处提示：确认弹窗 + 通知栏 + 流体云 | 三个入口同一份状态，接受/拒绝都回写 | **三处全部真机通过，且是同一轮 48 MB 里同时看到的**：弹窗 ✅（三支已验，前置 `cached_apps_freezer=disabled`）；通知栏 ✅（`0x0A40` 千分数 11→943→`接收完成`）；流体云 ✅（`AirDrop · 正在接收 1%→94%`→`AirDrop · 接收完成`，与千分数逐拍对应）。剩的是**版式**（云上那张卡仍是互传原生画的），不是通路 |
-| 7 | 自有发送面板（仿 `IOSShareActivity`） | 与参照同构；浅/深；弹出动画；环状进度随真实字节走 | `SendActivity` 是临时形态 |
-| 8 | 发送端接入 `SendActivity`（用户点名的第二刀） | 从我们自己的面板发起一次完整发送 | 未开始 |
-| 9 | `phash` 校验 | 指纹不符时不发，且给出可读原因 | 未开始 |
-| 10 | 15 行设置接线 | 每接一行删一个 `DEFAULT_*` 常量；键名只出现在 `settings.rs` | 部分（**8/16**）：`receive.directory`、`receive.overwrite`、`device.name`、`device.model` 已在真机验过读写；本轮新接 `http.response_limit`（`Client::with_limit` 第一次有调用点）、`server.handshake_timeout_ms`、`server.read_timeout_ms`（两个硬编码常量降级为回落）。剩 7 行见 §9 |
-| 11 | 复验本轮三处接线（只差人动手） | ①`http.response_limit=65536` 时超长错误正文被拒；②`server.read_timeout_ms=1000` 时大文件传输约一秒内断；③改回默认后一切复原 | ⏳ 代码已装包，未跑真实传输 |
+| 7 | 自有发送面板（仿 `IOSShareActivity`） | 与参照同构；浅/深；弹出动画；环状进度随真实字节走 | ✅ **2026-11-16 12:53 真实字节把环画满了**：30 302 347 B / 3 个成员，进度是 `0% → 70%(21504139) → 81%(24649867) → 91%(27795595) → 100%`，跨 65.6 s——不是定时器，也不是一次跳满。骨架同构（返回键 / 标题 / 本设备 / 文件数 / 雷达 / 说明卡，真机截图见 §9）；**04:31 真机复核**：`cmd uimode night no/yes` 两档各截一张，浅色白底深字、深色近黑底浅字，两套都成立；弹出是 `ValueAnimator`（不是 `animate()`）；环状进度在 `Radar`/`drawArc`（`-90°` 起、`progressOf` 驱动） |
+| 8 | 发送端接入 `SendActivity`（用户点名的第二刀） | 从我们自己的面板发起一次完整发送 | ✅ **2026-11-16 12:37 真机跑通**：`phase=done status=1006 发送完成`，抓包 `phone acknowledged 122478 B of what we sent`（根因见 §13 12:37：cpio 成员头把普通文件写成 FIFO）。此前「自洽已验」的部分仍然成立：不借互传、直接起 `SendActivity`，`intake` 读到 2.2 MB、`Peers` 在 `wonder0` 上持锁组播每 2 s 查询，全程**没有** `8770`/`ReceiveService`。**「一直等」**曾因「iPhone 一条连接只读一个请求」修过（`Client::renew()` + `Dial`，ABI 3）；**`SenderID`** 已改为从证书派生的稳定值（ABI 4），此前每投送一次就把 `transfer_id` 当 `SenderID` 交出去，接收端会记成一台新设备 |
+| 9 | 证书钉住（原写作 `phash`） | 指纹不符时不发，且给出可读原因 | ✅ 代码与断言都到位（见 §13 06:10）：`h` → `Peer.fingerprint` → `clientContext` 钉住 → `PeerMismatch` 翻成「对方身份不符」。**`phash` 是自造的键名，真实对端发的是 `h`**，已改正并由 `check.sh` 守住。⏳ 真实对端未验：「不符」这一支只能靠构造（`IdentityCheck` 已真跑错指纹握手），「相符也照常发」要等一台在场 iPhone |
+| 10 | 设置表逐行接线（**15 行**，删 4 / 加 3 之后） | 每接一行删一个 `DEFAULT_*` 常量；键名只出现在 `settings.rs` | **13/15**，且都在真机量过：`receive.directory`、`receive.overwrite`、`device.name`、`device.model`、`http.response_limit`、`server.handshake_timeout_ms`、`server.read_timeout_ms`、`receive.decision_timeout_ms`、`client.connect_timeout_ms`、`client.read_timeout_ms`、`discovery.remembered_peers`，加上界面自己读的那几行。剩 `log.level`、`log.preview_bytes` 两行（留给日志接线，删亦可）。见 §13 |
+| 11 | 复验本轮三处接线（只差人动手） | ①`http.response_limit=65536` 时超长错误正文被拒；②`server.read_timeout_ms=1000` 时大文件传输约一秒内断；③改回默认后一切复原 | ✅ 真机跑过：`LimitCheck` 两档 + `stall.py`（正文停顿），数字见 §13 上一轮 |
 
 第 3 档不成立时的排查方向，**不是改参数猜**：先 `tcpdump` 同时抓 `awdltun0` 上我们的公告与 iPhone
 实际发问的时刻分布。如果 iPhone 从不发问，问题在链路（Apple 的 AWDL 只在它自己要发时才醒）；
@@ -592,14 +786,14 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 
 | 指标 | 值 | 说明 |
 | --- | --- | --- |
-| 单元 + 集成测试 | **393 passed**（1 ignored） | 无设备；2026-11-15 22:46 重跑（`cargo test --workspace`）。较上一轮 +2：`ffi` 的 `the_response_limit_is_the_row_and_nothing_else` 与 `client` 里那条 |
-| JVM 断言 | **368 条** | `bash crates/ffi/jvm/check.sh`，桌面 JVM + `-Xcheck:jni`，不是真机；本轮未重跑 |
-| Rust 行数 | 22095 | 八 crate；`src/` 合计（`airdrop` 3684 / `awdl` 6064 / `bplist` 924 / `cpio` 1422 / `ffi` 6186 / `http` 1985 / `mdns` 957 / `settings` 873） |
-| Java 行数 | 16525 | **50 个类**：三页 + 发送 + 确认 + 服务 + 钩子 + 身份/射频/链路 + `Publish`（五种落桶） |
-| 真机库 | `libopairdrop_ffi.so` **686 816 字节** | `aarch64-linux-android`，linker 35（`transfer()` 由 8 参收敛到 5 参后比上一轮小 128 字节） |
-| APK | **16 677 135 字节**（debug，含 `assets/kernel/`） | **只认 `gradle clean assembleDebug` 的值**；增量打包会残留空对齐条目，同一份代码量出 17 340 260 / 17 101 408 这类虚高数，差 600 KB 以上 |
+| 单元 + 集成测试 | **419 passed**（1 ignored） | 无设备；2026-11-16 13:16 重跑（`cargo test --workspace`），`failed=0`。较上一条 +2：`cpio` 的 `odc_wire_fields_are_the_ones_a_receiver_reads`（线上那六个字符，见 §13 12:37）与 `a_phone_sized_block_decodes`（128 KiB 块，真 iPhone 的形状，我们自己的编码器永远不产出它）；`ffi` 另加 `several_files_archive_in_the_order_they_were_offered`（多成员顺序 / inode 0,1,2,3,0 / 块框架覆盖 body）。1 ignored 是 `opairdrop_bplist` 里既有的那条 |
+| JVM 断言 | **381 条** | `bash crates/ffi/jvm/check.sh`，桌面 JVM + `-Xcheck:jni`，不是真机；2026-11-16 06:10 重跑全绿（round-trip 38 / settings 172 / identity **54** / radio 48 / stack 69），较上一值 +7 全是 `theRefusalArrivesAsOneType`。该脚本第一道检查现在是**跨语言的字面量比对**：TXT 指纹键在 `Responder.java`（发布）/ `browse.rs`（上报）/ `Peers.java`（读取）三处必须一致，不一致在编译前退出 |
+| Rust 行数 | 23690 | 八 crate；`crates/*/src/*.rs` 合计（`airdrop` 4042 / `awdl` 6064 / `bplist` 924 / `cpio` 1499 / `ffi` 7286 / `http` 1985 / `mdns` 957 / `settings` 933） |
+| Java 行数 | 18550 | **50 个类**：三页 + 发送 + 确认 + 服务 + 钩子 + 身份/射频/链路 + `Publish`（五种落桶）；`android/` 下全部 `*.java`，不含 `build/` |
+| 真机库 | `libopairdrop_ffi.so` **699 736 字节** | `aarch64-linux-android`，linker 35；比上一值 −80（<0.1 KB，属编译噪声量级：本轮 Rust 侧只改了 `cpio` 的常量值与 inode 编号，代码路径未变） |
+| APK | **16 722 975 字节**（debug，含 `assets/kernel/`） | **只认 `gradle clean assembleDebug` 的值**（2026-11-16 12:43：先 `build.sh clean` 再 `assembleDebug`）；增量打包会残留空对齐条目，同一份代码量出 17 340 260 / 17 101 408 / 17 385 820 这类虚高数，差 20–660 KB |
 | 接收吞吐 | 80–88 KB/s | 受对端 31.2% 占空比限制，**不是 KPI** |
-| 发送吞吐 | 1.06–1.13 MB/s | 同上 |
+| 发送吞吐 | **432 KB/s**（30.3 MB / 65.6 s，2026-11-16 12:53 真机） | **瓶颈是对端的接收窗口，不是我们**：`cap7.pcap` 里 iPhone 通告的窗口共 6970 次更新，中位数 **6380 B**、均值 6314 B、峰值 65535 B，且 `ws=0`（无窗口缩放）。发送方上限就是 `窗口 / RTT`，所以在途字节均值只有 20.7 KB、峰值 120.6 KB——远低于 `sndbuf`，`SO_SNDBUF` 没有成为瓶颈。参考实现在同一条链路上量到过 0.50 / 0.54 / 2.33 MB/s 三种值（`trace-bbr.txt`，差异来自对端窗口与人工应答），同一量级 |
 | 自测环路天花板 | **25.6 MB/s** | `adb forward` → 本进程 8770；比真实接收高约 260 倍，只能当「本侧不是瓶颈」的证据，不能推接收端能力（见 §5.6） |
 | 单进程端到端（小文件） | **334 ms** | 3 MB 不限速一轮：接受 → 67%（288 ms）→ `complete`。这是「iPhone 1 秒到 100%、我们还在等」的直接反证 |
 | 通知栏 / 流体云验收 | 48 MB @ 2.5 MB/s，19.2 s | `bash notifcheck.sh 48 2.5`：一拍一次 `dumpsys`（真实节拍约 0.6 s），全程约 30 拍，两条通知同拍采样 |
@@ -661,6 +855,1023 @@ insmod wonder.ko physical_name=wondertap0 virtual_name=wonder0
 ---
 
 ## 13. 变更日志（新的在上）
+
+- **2026-11-16 19:55**：**发布 1.0.0（versionCode 10000）——清理、去死代码、干净重编。**
+
+  - **版本**：`versionName 1.0.0` / `versionCode 10000`；`Cargo.toml` workspace `version = "1.0.0"`，
+    `repository` 由陈旧的 `opairdrop/opairdrop` 改为 `cyan-lamp/OPAirDrop`。八个 crate 全部
+    `version.workspace = true`，一处改动即全部生效，`Cargo.lock` 随之刷新。
+  - **旧代码移出仓库**：`legacy/`（7.5MB / 449 文件，上一代 LSPosed 注入实现）整体移到
+    `D:/Downloads/project/backup/legacy-2024-lsposed/`。它没有任何构建引用，只有几处注释把
+    「当年为什么这么定」指向它；那几句说明保留，文件不再进仓库。
+  - **删掉 7 个零引用类**（合计 248 行）：`AirDropPresentation`、`CallbackFactory`、`HostContext`、
+    `ReceiveUiPolicy`、`ShareMode`、`ShareModeRuntime`、`StartupTrace`。判定方式是把
+    `android/app/src`（含 debug 源集与全部 XML）、`crates/**` 的 Java/Rust、清单与 gradle 拼成
+    一份语料，对每个类名做 `\bSymbol\b` 命中——前 5 个零命中，后 2 个只互相引用。
+  - **删掉三个从未被引用的 Gradle 依赖**：`io.github.libxposed:api`、`org.luckypray:dexkit`、
+    `org.jetbrains.kotlin:kotlin-stdlib`。它们是注入式方案的遗产，`dependencies {}` 现在是空的
+    （这一点在注释里写明，免得下次有人以为是漏写）。配套删掉 `gradle.properties` 里的
+    `android.useAndroidX`——它的注释还在讲 androidx.recyclerview，而全项目已无任何 androidx。
+  - **删掉两条从未使用的权限**：`SYSTEM_ALERT_WINDOW`、`INTERNAL_SYSTEM_WINDOW`。全仓没有一处
+    `WindowManager` / `TYPE_SYSTEM_ALERT` / `canDrawOverlays`，`ConfirmOverlay` 也早已不存在
+    ——这两个名字解释的那套「后台弹窗」已经不在了。同一处那段讲「回环 TCP 找互传进程」的注释
+    一并删除（`BridgeMessenger` 等已在上一次清理中消失）。
+  - **死资源**：10 个 `confirm_*` / `tile_*` 颜色、2 个样式（`ConfirmTheme`、`TilePanelTheme`）、
+    6 条磁贴面板字符串，全部无引用，删。`confirm_card` / `confirm_stroke` 保留（悬浮确认卡在用）。
+  - **死方法与死字段**：`HomePage.shareLabel/shareColor`（接收范围那一行早已移除）、
+    `SendNotice.yield/clear/id` 与 `yielded` 字段（让位给互传原生卡片的机制，互传那条路已经不在了；
+    删掉后 `post()` 里那个恒假的 `if (yielded)` 分支一并消失，行为不变）、
+    `Publish.SOUNDS/DOCUMENTS`（`Bucket.of` 只认照片和视频，其余一律 Download）。
+  - **6 处未使用 import** + **4 处同包冗余 import** 清掉；`build.gradle` 里指向已删类
+    `OShareReceiveResolver` 的注释、清单里指向 `BridgeMessenger` 的注释改成描述现状。
+  - **Task.md** 自身：七处重复的 `## 13. 变更日志` 标题合并为一个（此前每次追加都多写一个）。
+  - **构建**：`target/`、`android/build`、`android/app/build`、`.gradle` 全部清空后跑
+    `android/build.sh assembleDebug`——Rust 零告警（`cargo check --workspace --all-targets`），
+    Java 零 error，APK 13.0MB，`aapt2 dump badging` 确认 `versionCode='10000' versionName='1.0.0'`。
+    本次未装机（设备未连接），也未发 Release。
+
+- **2026-11-16 19:35**：**线上仓库清空重建。** 删除 `cyan-lamp/OPAirDrop`（原为 `Weverses/OPAirDrop`
+  的 fork，11 个发行版 / 44 个资产 / 约 227MB / 累计约 1572 次下载、63 个提交、5 star），
+  重新创建同名空仓库（public、issues 关闭、无描述无话题）。删除前已在本机留完整镜像备份：
+  `D://Downloads//project//backup//OPAirDrop-mirror.git`（1.82MiB，含全部历史）。
+  本地工作区未变（无 remote），仅新增 origin 指向新仓库，尚未推送。
+  **影响**：原发行版里的 `update.json` 是 app 内置更新源，已失效，已安装用户的自动更新会失败；
+  新仓库不再是 fork，star / fork 关系不可恢复。
+
+
+- **2026-11-16 19:28**：**四项 UI 微调（图标、对齐、板块迁移、去图标）。**
+
+  1. **接收图标只转箭头**：上一版把整个 send 图标 rotate 180°，托盘也翻过来了。这次把 send
+     拆成 `tray()`（开口朝上的托盘）+ `arrow()`（向上的箭头），`receive()` 复用 tray、只对 arrow
+     做 rotate(180)。截图确认：两行托盘形状相同、只有箭头方向相反。
+  2. **功能页文字对齐**：NO_ICON 行原本在 mid 上又加了 18dp 缩进，叠在 addRow 的 18dp 上，
+     比卡片标题右移一截。改成 NO_ICON 时 mid padding=0。uiautomator 实测三行文字左缘同为
+     x=144（内核驱动 / WiFi 共享射频 / 接收文件保存位置），严格对齐。
+  3. **设备板块移到功能页**：设置页 fill() 里跳过「设备」section；功能页新增【设备显示】板块，
+     两行「对端看到的名字/机型」，复用泛化后的 `askSetting`/`saveSetting` 弹框逻辑（原来只有
+     保存位置一套，现在 key/title/hint/onSaved 参数化，目录/名字/机型共用）。副标题显示此刻
+     生效值（Air / iPhone 18），空值时注明跟随机型/系统型号。
+  4. **关于行去图标**：aboutCard 传 IconView.NO_ICON，盾牌图标去掉。
+
+  全编译通过、装包、逐页截图验证完成，无崩溃。设置页 footer 显示「2 行」——只剩诊断的两项。
+
+
+- **2026-11-16 18:45**：**三个页面的 UI 调整（首页 / 功能页 / 设置页）。**
+
+  **一、首页。** 接收端从「环境」挪到「传输」板块、紧跟【发送文件】下面一行、用分隔线区分，
+  改名【接收文件】；新增 `IconView.RECEIVE`（向下箭头落进托盘，与 SEND 的上传托盘成一对）。
+  环境板块改为【root 权限】一行：新增 `RootInfo`（移植 legacy 的 root 管理器白名单，
+  `su -c id -u` 判授权、`getPackageInfo().versionName` 取管理器版本，进程内缓存、异步探测回调
+  重画），右侧胶囊「已获取/未获取」，已获取副标题「管理器 + 版本」、未获取「请在管理器授予
+  root 权限」，整行可点重测。MainActivity 两处 HomePage 构造补 `this::refresh` 回调。
+
+  **二、功能页。** 删「接收」「开关」「传输状态」三个 section 及其方法链（receiveCard/identityCard/
+  switchCard/addSwitch/statusCard/switches 及 ask/written 等），字段一并清理。驱动卡加【卸载】按钮，
+  用 `DriverSetup.run("stop")`（awdl-stack.sh stop 恢复原厂驱动与网络），与【安装】同一行、卸载在左、
+  安装在右，装/卸互斥置灰。新增 `IconView.NO_ICON=-1`，`Chrome.featureRow` 据此跳过图标砖、文字
+  从卡片左缘起笔；【WiFi 共享射频】改传 NO_ICON 去掉图标。
+
+  **三、设置页。** `Shell.dispatchTouchEvent` 在按下点落在已聚焦输入框外时 `clearFocus()` +
+  `hideSoftInput()`，点击空白收光标/键盘；【关于】行图标（IconView.SHIELD）保留不变。
+
+  全编译通过。真机验证待设备 adb 恢复后补（本次会话末 adb 掉线）。
+
+
+- **2026-11-16 17:40**：**设备一出现就显示真名：抓包证伪 hash 反推，改走「后台预查询 + 稳定地址缓存」。**
+
+  **一、取证：hash 解不出来，不是没试。** 真机 tcpdump（SLL2 + AWDL IPv6）解出 iPhone 的 mDNS
+  报文：TXT **只有 `flags=13311`**（无 model / 无指纹 / 无名字）；实例名是 12 位 hash，同一台
+  iPhone 三次广播分别是 `a651a674f3f5` / `159f0bbd31cc` / `b61e70c52e8d`，SRV 的 UUID 也每次变
+  ——是 Apple 的 rotating identifier，与名字无关（拿「卷卷薯」算 SHA-256/MD5/SHA-1 前后 12 位均
+  不匹配）。唯一稳定的是链路本地 IPv6 `fe80::5c55:2bff:feec:646`（由 MAC 派生）。
+
+  **二、新链路：只问名字、不开始传输。**
+  - `send.rs` 新增 `opairdrop_discover_name`：复用 `Client` + stream callbacks，只发一次
+    `/Discover` 就返回 `computer_name`，无 `/Ask`、无第二条连接、对面不弹窗。
+  - `jni.rs` 新增 `Java_com_oshare_airdrop_Native_discoverName`；`Native.java` 新增声明；
+    ABI_VERSION 4→5（两侧同步）。
+  - `open()` 拆成 `rawSocket`（TCP）+ `connectTls`（握手/钉住）两个静态方法，预查询复用它们，
+    但绝不碰 `live`——否则后台查询会把正在传的连接顶掉。
+  - `PeerNames`：按稳定 IPv6 地址把真名持久化到 SharedPreferences；`onPeers` 对缓存未命中的
+    设备后台开 TLS 问一次，用 `probed` 集合按地址去重（hash 每次变，按 hash 去重会无限重查）。
+
+  **三、实测。** 清缓存后打开发送页、全程未点设备：
+  ```
+  17:38:27.595  browse: 1 connectable — 1afb7dcc0892@fe80::5c55:2bff:feec:646
+  17:38:27.714  probed name ... -> 卷卷薯        （119 ms）
+  UI: 卷卷薯                                     （点击之前就已显示）
+  ```
+  重开页面（不清缓存）：设备 hash 又变，但缓存文件
+  `fe80::5c55:2bff:feec:646 → 卷卷薯` 命中，`probed` 日志为空（未重跑），UI 立即显示真名。
+
+
+- **2026-11-16 17:18**：**发送页四处改动：真名、两处 75% 透明、箭头居中、发送接入流体云。**
+
+  **一、设备图标下方显示对方真名（打通 FFI 全链路）。** 发现阶段只有 mDNS 实例名（hash），
+  真名在 `/Discover` 应答的 `ReceiverComputerName` 里。为此给进度回调加了一条并行的名字通道：
+  `send.rs` 的 `Meter` 加 `NameCallback`，`transfer()` 拿到 `computer_name` 后回调（`/Ask` 的空
+  回退也报一次）；`jni.rs` 的 `Gauge` 缓存 `Progress.name(String)V`（可选方法，老 sink 兼容），
+  新增 `report_peer_name` 回调构造 jstring；`Native.java` 的 `Progress` 加 default `name()`；
+  `SendActivity` 把 lambda 改成匿名类实现它，`realNames` 跨视图重建保存真名，`nameViews` 快速
+  改那一行 label。进度卡标题也改用真名。实测日志：
+  `peer name from /Discover: b61e70c52e8d -> 卷卷薯`。
+
+  **二、说明卡 + 返回圆底 75% 透明。** `alpha(color, 0.75f)` 换 alpha 保 rgb；返回键从 `‹` 字形
+  换成 `ic_back.xml` 矢量箭头 + `FrameLayout` 里 `Gravity.CENTER` 的 `ImageView`——字形重心不
+  在几何中心，看起来永远偏，矢量箭头才真的居中。颜色取 `S.text`，深浅色都跟得上。
+
+  **三、发送接入流体云 + 完成按钮。** 根因：`SendHost.attach(this)` 从来没被调用，`context()`
+  恒为 null，`begin/progress/finished` 一帧都没画出来。补上 attach；成功终态从 `LiveCard.finish`
+  改为 `finishWithActions`（接收侧已验证的现成组合）：进度拉满、挂【完成】按钮、不自己消失，
+  点按钮经 `CardDismiss` 广播撤通知。实测通知栏出现「发送完成 / 1 个文件 · 5 B / 【完成】」。
+
+  **四、验证。** Rust + APK 全编译通过；截图确认箭头居中、卡片透出壁纸；真机完成一次 5 B
+  发送，`live card 0%→100%`、`live done`、真名替换 hash，无崩溃。
+
+
+- **2026-11-16 16:50**：**互传桥接整批删除，应用不再是 LSPosed 模块。**
+
+  **一、删掉 18 个桥接类**：`OShare*`（12 个）、`Bridge*`（3 个）、`Entry`、`FluidCloud`、
+  `Oshare`——连同 `META-INF/xposed/`（`module.prop` / `scope.list` / `java_init.list`）一起移除，
+  打出来的 APK 里已无任何 `xposed` 条目，不再依赖 LSPosed / 互传进程。
+
+  **二、发送侧卡换到 `LiveCard`**：保留 `SendHost` 这个名字（发送页调用点一行没动），内部改成
+  通知栏流体云风格的进度卡；`LiveCard` 补了 `dropLater` 收尾。自动展开那步跳过——实测接收邀请
+  本身就会让流体云胶囊自动展开。
+
+  **三、11 个引用点逐个改掉**：`App` 不再开桥、`StartupTrace`/`ShareModeRuntime` 日志 TAG 自给、
+  `FeaturePage`/`HomePage` 去掉互传状态行与「跟随」态、`ReceiveHost` 只剩流体云一条表面、
+  `SendActivity` 不再叫醒互传。注释里指向已删类的 `{@link}` 与旧架构描述一并改写成当前事实。
+
+  **四、实测**：装包 → 点磁贴 → `LISTEN *:8770` + `ble: starting` + `announcing ...:8770`；
+  清理前那次 iPhone 传来的 3 MB 文件 `sending 0%→100%→done` 全程正常。无崩溃。
+  `cmd statusbar click-tile` 偶发不生效是 TileService 绑定延迟（循环点击即恢复），非应用 bug。
+
+  **五、装包重启的自愈**：`install -r` 杀进程后端口一度掉下，但 `App.onCreate →
+  ReceiveService.follow → apply` 会读 SP 里的「开」把前台服务与 8770 自动拉起，无需点磁贴。
+  最终态：`ServiceRecord ...ReceiveService` 在、`LISTEN *:8770` 在、无崩溃。
+
+
+- **2026-11-16 16:35**：**磁贴回归「一个开关」；图标复用应用图标并收紧视口；SystemUI 钩子撤掉。**
+
+  **一、放弃展开面板。** `TilePrefs`（长按打开的那一页）删除，清单里的 `QS_TILE_PREFERENCES`
+  也删了。磁贴只做一件事：点一下开，再点一下关。**没有十分钟窗口**——上一版给"开"配了十分钟
+  期限，那是从互传那个会自己到期的窗口带过来的习惯；一个开关只该有一个含义。
+
+  **二、图标小是因为视口，不是画小了。** 应用图标画在 108×108 网格，那一点两环只占中间约
+  48×48（四周是自适应安全边）；控制中心按 24dp 画，于是只有六成是实心，看着比旁边小一圈。
+  修法是**同一组路径 + `translate(-30,-30)` + 视口 108→48**（`res/drawable/tile_airdrop.xml`），
+  一条曲线都没有重画。颜色交给系统着色——磁贴本身就是单色语义的地方。
+
+  **三、撤掉 SystemUI 的观测钩子。** 面板路线放弃后，`OplusQsDetailTileFactory.createTile` 那个
+  只记日志的钩子没有意义，而它在 SystemUI 进程里每次启动都要加载一次模块。钩子方法与
+  `scope.list` 里的 `com.android.systemui` 一并移除，作用域只剩下真正有钩子的 `com.coloros.oshare`。
+
+  **四、实测。** 装包 → 重启 SystemUI → `cmd statusbar click-tile` → `LISTEN *:8770`；
+  紧接着日志里出现一次来自 iPhone 的 `handshake ... TLSv1.3`，说明磁贴打开后链路是通的。
+
+- **2026-11-16 16:20**：**磁贴详情面板的接入点摸清了：系统 API 能调，但"面板"不在其中。**
+
+  **一、反编译求证（不是猜）。** `oplus-framework.jar` 与 `SystemUI.apk` 单独 baksmali 之后：
+
+  ```
+  com.oplus.quicksettings.OplusTileManager      （whitelist）
+     getInstance / getOplusTile(ComponentName) / updateOplusTile(Tile, ComponentName)
+     updateRequest(Bundle, ComponentName) / registerOplusTileService(OplusBaseTileService)
+  com.oplus.quicksettings.OplusBaseTileService extends IOplusTileService$Stub   ← 是 Binder，不是 TileService
+  com.oplus.systemui.qs.slider.detail.tile.QsDetailTile / QsDetailTileImpl      ← SystemUI 内部接口
+  com.oplus.systemui.qs.slider.detail.data.OplusQsDetailTileFactory.createTile(String spec)
+       只认：darkmode / noisereduction / autoscreentemperature / autobrightness / spatialaudio / mediumute
+  ```
+
+  **二、真机探针：API 对我们开放，没有权限拦截。**
+
+  ```
+  oplus tile: getInstance ok -> OplusTileManager@1ee32dd
+  oplus tile: getOplusTile ok -> android.service.quicksettings.Tile@9d92e52
+  oplus tile: updateRequest ok
+  oplus tile: oshare tile refused          ← 取互传那一格被拒（那一条走的是系统侧）
+  ```
+
+  **三、结论：A 路（公开 API）不足以拿到面板。** `getOplusTile` 只返回一个 `Tile`（label/subtitle/
+  icon/state），装不下"三行单选"。而真正的面板由 SystemUI 的 `QsDetailTile` 承载，工厂里只有固定
+  几个系统 spec——第三方磁贴不在其中。所以"面板由系统画、内容我们给"这条，只能落在 **hook
+  SystemUI**（B 路）：拦 `OplusQsDetailTileFactory.createTile(spec)`，对我们这一格返回一个
+  `QsDetailTile` 实现，再由它决定 `getDetailType()`。
+
+  **四、现在的状态。** 磁贴与面板仍用我们自己的实现（`AirdropTile` + `TilePrefs` 浮窗卡）作为
+  兜底；`LiveProbe` 里留了 `oplus_tile` 探针，后面验证 hook 的时候还要用。
+
+- **2026-11-16 15:55**：**落点改成 DCIM/Download；【打开文件】按类型分流并撤卡；磁贴换成应用图标 + 长按面板；掐断发往互传的事件。**
+
+  **一、保存位置（`Publish`）。** 原来的五类桶（Pictures/Movies/Music/Documents/Download）收成三类：
+  照片、视频都进 `DCIM/AirDrop`（**相册扫的是 DCIM，不是 Pictures**），其余一切进
+  `Download/AirDrop`。文件夹名从 `OPAirDrop` 改成 `AirDrop`。声音不再进 Music——把 mp3 放进
+  DCIM 只会让相册里多一条打不开的条目。
+
+  **二、【打开文件】= 先撤卡，再按类型打开。** 一个 `PendingIntent` 只能指向一个组件做一件事，
+  所以这里是一条广播 `OpenDownload`：① `LiveCard.drop()`；② 照片/视频 `ACTION_VIEW` 给
+  `com.coloros.gallery3d`（解析不到就退回系统选择器）；③ 其余用
+  `content://com.android.externalstorage.documents/document/primary:Download/AirDrop` 配
+  `vnd.android.document/directory` 打开**它所在的那一层**，优先 `com.coloros.filemanager`。
+
+  **三、磁贴。** 图标换成应用自己的图标（控制中心那一格必须和桌面图标是同一个东西）。点击 =
+  开「iPhone（10 分钟）」或关；长按走系统的 `QS_TILE_PREFERENCES`，打开 `TilePrefs` 那一页：
+  标题 `AirDrop`，两个选项「iPhone（10 分钟）／可被附近 AirDrop 设备发现」与「接收关闭／不可被
+  任何 AirDrop 设备发现」，选中项有圆点。**十分钟是限时的**：`receive.until` 记到点时刻，服务
+  自己挂一个 `postDelayed` 到点收摊，不依赖任何观察者。
+
+  **四、掐断发往互传的事件（`ReceiveHost.emit` 置空）。** 症状是传输过程中通知栏和流体云里
+  **同时**出现一条一加互传自己的普通通知——它不属于我们，也点不动。原因就是每收一次我们还在
+  给互传发事件，它照着画一张。现在出口空了；整个桥接连同 LSPosed 作用域的删除是下一步。
+
+  **五、还没做。** ①把 26 个互传桥接文件与 LSPosed 作用域整批删掉（发送侧卡片要同时换
+  `LiveCard`）；②hook SystemUI，让胶囊在通知到达时自动展开。
+
+- **2026-11-16 15:15**：**撤掉应用级浮窗；监听改由控制中心【AirDrop】磁贴控制；不再跟随互传。**
+
+  **一、为什么撤掉浮窗。** `TYPE_APPLICATION_OVERLAY` 是"应用覆盖层"，它要么把胶囊挡在下面、
+  要么（做成 Activity 时）让系统抑制我们自己的胶囊——两条都要付代价。而 `TYPE_SYSTEM_ALERT`
+  拿不到：`pm grant android.permission.INTERNAL_SYSTEM_WINDOW` 直接回
+  `SecurityException: not a changeable permission type`（signature|privileged，实测见下）。
+  所以确认只留流体云这一条表面，`ConfirmOverlay.java` 已删除。
+
+  ```
+  Exception occurred while executing 'grant':
+  java.lang.SecurityException: Permission android.permission.INTERNAL_SYSTEM_WINDOW requested by
+  package com.oshare.airdrop is not a changeable permission type
+  ```
+
+  **二、接收开关变成我们自己的一个布尔。** `ReceiveService.listening()` 以前是
+  `Oshare.following && Oshare.everyone`——那个"所有人（10 分钟）"是别人的计时器，到点自己关，
+  我们的接收端跟着安静地停。现在只有一个凭据 `receive.manual`：开着就收，关掉就停，没有第三种
+  状态；`follow()` 不再注册观察者，`onStartCommand` 里 `OShareWake.ensure` 也已去掉。
+
+  **三、控制中心【AirDrop】磁贴。** `AirdropTile`（`BIND_QUICK_SETTINGS_TILE` + QS intent-filter
+  + 自绘 24dp 图标）。点击 = 取反 `receive.manual` → `apply()` → 起停前台服务；磁贴配色直接反映
+  状态，不需要第二处解释。冷启动可用：系统展开通知栏时会绑定它，进程被杀也点得动。
+
+  **四、实测（这正是要验的场景）。**
+
+  ```
+  am force-stop com.oshare.airdrop        → 进程没了端口也没了（磁贴绑定会把进程拉回来，但不开监听）
+  cmd statusbar click-tile .AirdropTile   → LISTEN *:8770
+                                          → ble: starting
+                                          → announcing 75bdacd4227c at 青.local:8770 on awdltun0
+  ```
+
+  **全程没有打开应用**。前台服务通知的文案也改成 `正在监听 8770 · 附近设备可发现`，不再提互传。
+
+  **五、还没做。** ①整批删除互传桥接（26 个文件 / 156 处引用，含发送侧卡片与 LSPosed 钩子）；
+  ②发送侧进度也换成 `LiveCard`；③流体云自动展开——留给 hook SystemUI 或 root 侧研究。
+
+- **2026-11-16 15:00**：**确认卡从「贴底的 Activity」改成「悬浮窗里的独立卡片」，两条表面同时可用。**
+
+  **一、三个问题的实因。**
+  1. **形态不对**：14:45 那版把面板贴在屏幕底部，而互传弹的是一块**四周留边的独立卡片**。
+  2. **点空白等于拒绝**：这是设计错误，不是实现问题。点空白只说明这一刻没在看它，不说明
+     「不接」；手滑一下就把对面拒了，对端收到的还是「对方不收文件」。
+  3. **流体云没出现**：因为那版卡片是一个 **Activity**——系统在**本应用处于前台时会抑制自己的
+     胶囊**（14:30 那条已经量到过）。于是"中间一张卡"和"上面一颗胶囊"只能二选一。
+
+  **二、改成悬浮窗之后三条一起解决。** `ConfirmOverlay` 直接往 `WindowManager` 上挂一块全屏
+  遮罩 + 居中卡片（`TYPE_APPLICATION_OVERLAY`，`FLAG_NOT_FOCUSABLE`：不抢输入法、不吞返回键，
+  按钮照常可点）。应用仍在后台，**胶囊照常画出来**，两块表面同时可用（`d5.png`：状态栏
+  `(◎) 1个文件 · 2.4` 与中间那张卡同帧）。顺带绕开了 Android 10 起对后台启动 Activity 的限制。
+
+  **三、点击语义。** 遮罩吃掉点击但**什么也不做**——既不拒绝，也不让触摸穿到下面那个应用去
+  （悬浮窗之下是别人的界面，误点一下可能就是替人开了个开关）。邀请继续等，直到三十秒超时；
+  期间从胶囊里回答同样有效。
+
+  **四、深浅两套。** 配色搬进 `values/colors.xml` 与 `values-night/colors.xml`（`confirm_card`
+  / `confirm_title` / `confirm_body` / `confirm_accept_*` / `confirm_refuse_*` / `confirm_scrim`
+  / `confirm_stroke`），页面里只按名字取，不做判断。浅色是白卡黑字，深色是炭卡白字（`d2.png`
+  / `d3.png`）。
+
+  **五、前提。** 悬浮窗要 `SYSTEM_ALERT_WINDOW`（appops 必须为 `allow`）。没有它 `show()` 返回
+  `false`，邀请退回流体云那张卡——**不是"能不能收"的前提，只是"有没有中间那张卡"**。
+
+- **2026-11-16 14:45**（其中「底部面板 / 点外面即拒绝」两条已被 15:00 那条推翻）：**接收确认改成互传那种面板；进度只留在流体云；收完的卡挂【打开文件】【完成】且不自动关。**
+
+  **一、为什么撤掉「通知里按接受」。** 这是一次要人在几十秒内做的决定。通知要先让人注意到、
+  再拉下来、再找到按钮——三步里断任何一步，对端看到的就是「邀请已过期」。互传自己用的是底部
+  面板（它的 `IOSShareActivity` 里是一个 bottom sheet），一加用户在传文件时认得的就是这个形态。
+
+  **二、`ConfirmActivity`：遮罩 + 底部圆角面板 + 两个按钮。** 从 `ReceiveHost` 那条等答案的线程
+  上叫起来，所以必须 `FLAG_ACTIVITY_NEW_TASK`；而 Android 10 起后台起 Activity 默认被拒，这就是
+  清单里补 `SYSTEM_ALERT_WINDOW` 的原因——**这条权限不是为了画悬浮窗，是为了让面板能从后台起来**。
+  实测（`d1.png`）：从后台广播叫起，面板确实压在「设置」之上；`拒绝` 在左、`接收` 在右，
+  倒计时每半秒刷一次，点遮罩等于拒绝。
+
+  起不来时 `ConfirmActivity.show()` 返回 `false`，调用方退回流体云那张卡——不会静悄悄地没人应。
+
+  **三、回答仍然只有一个闩。** 面板、云卡、通知三条来路都走 `ReceiveHost.answer(session,
+  accepted, from)`，`from` 记的是 `"dialog"` / `"card"` / `"notification"`。日志因此能说清
+  「问在哪、答在哪」，而不是像上一版那样一律写 `via card`。
+
+  **四、普通通知不再承担任何传输语义。** `Listener` 的进度回调不再调 `ReceiveService.progress`
+  （那条带进度条的普通通知），收完也不再发 `ReceiveService.finished`。**一次传输只在流体云里
+  走一遍**，否则通知栏里那个数和胶囊里那个数会各说各话，而其中一条还点不动。
+
+  **五、收完的卡不自己消失。** `LiveCard.finishWithActions()`：进度拉满，挂
+  【打开文件】【完成】。「打开文件」用的是 `Publish.Entry.uri`（`content://media/…`）——收完之后
+  字节归媒体库，`file://` 从 Android 7 起穿不过进程边界，能指向这份文件、又能被别人读到的只有
+  这一串。「完成」发给 `CardDismiss`，把这个 id 撤掉。**传输结束不是这件事的结束**，人还要去打开
+  那份东西；一张自己消失的完成提示，等于把「东西在哪」留给人翻相册。
+
+  **六、流体云不再追自动展开。** 结论见上一条：那颗胶囊只在点击时展开，应用设置里的「横幅」只管
+  普通通知（页面小字："实时活动…不受通知设置影响"）。所以现在的分工是——**决定用面板，进度用云，
+  结果用云**，谁都不指望胶囊自己张开。
+
+- **2026-11-16 14:30**：**云端卡「自动展开」的真正开关是每个应用的「横幅」，不是代码。**
+
+  **一、症状与三次排除。** 邀请进来时屏幕上只有一颗 chip，要点一下才展开。依次试过：
+
+  | 试法 | 结果 |
+  | --- | --- |
+  | 低重要性渠道（当时的生产配置） | 只有 chip |
+  | `IMPORTANCE_HIGH` 渠道 | chip 变宽成 `(◎) 1个文件 · 2.4`，仍不展开 |
+  | 同一 id 二次投递（内容刷新） | 不展开 |
+  | 普通的、有声、非常驻高重要性通知 | **连抬头都没有** |
+
+  最后一行是分水岭：连普通通知都不抬头，说明问题不在「提升」，而在更下面——应用的通知被系统按住了。
+
+  **二、真凶：每个应用一个「横幅」开关，而我们这个没勾。** 打开
+  `ACTION_APP_NOTIFICATION_SETTINGS`（本应用）看到：
+
+  ```
+  允许通知              ✅
+  流体云显示实时活动    ✅   实时活动会以流体云展示，不受通知设置的影响
+  [锁屏 ☐]  [横幅 ☐]        ← 就是这个
+  ```
+
+  控件是 `com.oplus.notificationmanager:id/ll_banner`（CheckBox，可点区域是整个卡
+  `[740,1654][1336,2022]`）。勾上之后，**同一个 `invite` 立刻自动展开浮在别的应用之上**：
+
+  ```
+  卷卷薯 想发给你文件
+  1 个文件 · 2.4 MB
+  [ 拒绝 ]   [ 接收 ]
+  ```
+
+  所以「自动展开」不需要 hook SystemUI，也不需要常驻悬浮窗：**系统本来就肯，只是这个应用的
+  横幅被关了**。这也解释了 13:52 那次 `inv4.png` 为什么是展开的——那一次是从别的路径进来的。
+
+  **三、这个开关没法用代码拨。** 它不在 `Settings.Global/Secure/System` 里，也不在 `AppOps`
+  （只有一个 `POST_PROMOTED_NOTIFICATIONS`，管的是「能不能提升」，不是「会不会抬头」）。
+  `com.oplus.notificationmanager` 的 `/data/data` 下也没有数据——它属于框架的 per-app 通知策略
+  （`/data/system/notification_policy.xml`，二进制）。**能做的只有把人送到那一页**：
+  `ACTION_APP_NOTIFICATION_SETTINGS` + `APP_PACKAGE`，一步到位。要「自动帮用户打开」就得改框架
+  策略文件，代价与风险都不值。
+
+  **四、邀请阶段不再画进度条。** `invite` 去掉了 `ProgressStyle`，只留标题、副行、两个按钮；
+  进度轨道从 `update()`（点了接收之后）才出现。理由很直接：邀请时一个字节都还没走，一条轨道
+  只会让人以为传输已经开始。
+
+  **五、渠道换成高重要性（生产路径的 bug）。** 之前 `ReceiveHost` 走的是 `LiveCard.invite` →
+  `CHANNEL`（`IMPORTANCE_LOW`），而**低重要性永远不会抬头**——也就是说就算横幅开关打开，真实
+  接收也不会自动展开。现在 `invite` 默认用 `CHANNEL_LOUD`，进度更新仍走低重要性渠道（同 id 换
+  渠道是允许的，于是进度不会再弹一次）。
+
+  **六、按钮高度：做不到，试过并有证据。** 卡里的两个按钮是系统画的。试了
+  `setCustomHeadsUpContentView(RemoteViews)`（自绘 64dp 按钮，约 1.5 倍）：**视图确实被采纳了**
+  ——但渲染是坏的，文字与相邻通知重叠、按钮变成没有标签的灰块（截图 `s8.png`）。所以这条路
+  回退，试验代码与 `res/layout/live_invite.xml` 已删除。要在这一层控制高度，只剩「完全自己画一张
+  悬浮窗」或「hook SystemUI」，两者都不划算。
+
+- **2026-11-16 13:58**：**不再依赖互传画卡片：系统自己的实时通知就是流体云，接收侧已切过去。**
+
+  **一、结论先说：不需要「移植互传的画法」。** 这台机器是 API 37 / ColorOS 17，Android 16 起
+  系统提供了 Live Updates：`Notification.ProgressStyle` + `setRequestPromotedOngoing(true)` +
+  `setShortCriticalText(...)`。ColorOS 把这东西渲染成流体云那一套，**画的人是系统**。所以我们
+  只要发通知，不需要知道谁在画、也不需要谁活着。
+
+  **二、踩到的第一道门：权限链。** 直接发只会得到一条普通通知，`canPostPromotedNotifications()`
+  为 `false`，而 `dumpsys` 里能看到：
+
+  ```
+  cmd appops get com.oshare.airdrop
+    POST_PROMOTED_NOTIFICATIONS: ignore; rejectTime=+26s782ms ago
+  ```
+
+  这个 AppOp 挂在 `android.permission.POST_PROMOTED_NOTIFICATIONS` 上，**清单里不声明就永远是
+  ignore**，而且**应用还在跑的时候 `appops set allow` 改不动**（它每发一次就被拒一次，状态被写
+  回，`rejectTime` 一直在刷新）。正确顺序是三条：清单声明 → `am force-stop` → `appops set allow`。
+  做完之后：
+
+  ```
+  live probe: allowed=true
+  dumpsys notification: flags=ONGOING_EVENT|ONLY_ALERT_ONCE|PROMOTED_ONGOING
+  ```
+
+  **三、两个真机形态（截图在 `live2/live3/inv4.png`）。**
+  - **桌面**：状态栏出现一颗胶囊 `(◎) 青 · 正在接收`，就是流体云那个位置；
+  - **锁屏**：一张带进度轨道的大卡（`收到 1 个文件 / 青 · 正在接收` + 进度条 + 拖动圆点）；
+  - **应用在前台时系统会抑制胶囊**——和流体云行为一致，不是没生效。
+
+  **四、关键交互验证：胶囊能不能直接「接收 / 拒绝」。** 能。带两个 action 的通知被提升后，
+  它**就地展开**成一张浮在其它应用之上的卡（探针是在「设置」页面上截的，没有拉通知栏）：
+
+  ```
+  卷卷薯 想发给你文件
+  1 个文件 · 2.4 MB
+  —————— 轨道 ——————
+  [ 接收 ]   [ 拒绝 ]
+  ```
+
+  所以用户提的「直接用顶部流体云接收/拒绝」成立，不需要退回到「点胶囊 → 下拉通知栏 → 再点」。
+
+  **五、接收侧已切换（`ReceiveHost`）。** 问的那一段从「`attached` ? 等卡片 : 抬头通知」改成
+  「`LiveCard.allowed()` ? 云端卡 : 抬头通知」：
+
+  ```java
+  cloud = LiveCard.allowed(context);
+  if (cloud) LiveCard.invite(context, shown.title(), shown.body(),
+          Confirmation.decision(context, session, true),
+          Confirmation.decision(context, session, false));
+  boolean wanted = cloud ? await(decisionMs) : Confirmation.ask(context, session, summary);
+  ```
+
+  同一个 notification id 贯穿三态：邀请（不确定态 + 两个按钮）→ 进度（`正在接收 xx%`）→ 完成
+  （`接收完成`，六秒后自己让位）。按钮复用的是同一个 `DecisionReceiver` 与同一串 session，答案
+  仍然落进 `ReceiveHost` 那个闩——**两个表面一个答案，不存在第二次问**。
+
+  同时删掉了上一轮临时加的「三秒兜底通知」：它存在的前提是「卡片可能没画」，而云端卡没有这个
+  状态（发出去就是发出去了）。留着它就是留第二个真相。
+
+  **六、还没做（下一步）：** ①发送侧同样换这张卡；②接收开关自己拿回来——今天的门槛仍是互传的
+  「所有人（10 分钟）」，而且**十分钟后它自己过期**（今天撞了两次：`oshare_state` 从 1 回到 0，
+  接收端静默关闭，屏幕上没有任何说法）；③卡片相关的 LSPosed 钩子在确认稳定后停用。
+
+- **2026-11-16 13:13**：**BLE 广播是死代码——`BleRadio` 从没被任何人调用，所以 iPhone 根本看不见我们。**
+
+  **一、怎么发现的。** 接收端在 `8770` 上听着、mDNS 应答器也绑上了 `*:5353`，但日志里一句广播
+  都没有。于是去查这个仓库里所有和"敲门"有关的东西：
+
+  ```
+  Native.bleAdvertise(Context) / bleVerdict(int) / bleStop()   ← 三个 JNI 入口都在
+  BleRadio.start(context, companyId, data, mode, tx, connectable, timeoutMs)  ← 实现也在
+  grep -rn "BleRadio" android/ --include=*.java | grep -v BleRadio.java   ← 零命中
+  ```
+
+  `BleRadio` 的类注释把这件事说得很清楚：这条广播**不运数据**，它只是敲门——iPhone 的隔空
+  投送先听到它，才把 AWDL 上的服务拉起来。所以少这一层时，表现恰好是 §10 第 3 行记的那一句
+  「查询发得完全正确、每两秒一次，却谁都不答」：对端在每一层都在，只是没人听 8770。
+
+  **二、接线方式。** 二十字节与四个广播参数都由 Rust 决定（`ble::manufacturer_data` 是 Apple
+  的格式，不是调用方的选择），Java 只负责把广播交给协议栈。所以挂载点是
+  `Listener` 里 mDNS 公告的同一处生命周期：
+
+  ```
+  Listener.beginAnnouncing()  → announcing.start() 之后 → announceOverBluetooth()
+  Listener.endAnnouncing()    → announcing.stop()  之后 → Native.bleStop()
+  ```
+
+  两盏灯必须一起亮灭：只停 mDNS 会让蓝牙继续广播「我在这儿」，而对端听见后连上来的是一个
+  已经不在听的端口。失败只记日志、不改变接收端结论——已经醒着的对端照样会答（类注释里的
+  约定，这里照做）。
+
+  **三、真机（2026-11-16 13:13）。**
+
+  ```
+  13:13:30.285 D BluetoothLeAdvertiser: TxPower == ADVERTISE_TX_POWER_HIGH
+  13:13:30.287 I bt_shim_advertiser: StartAdvertisingSet: create advertising set, client_id:255
+  13:13:30.297 I OPAirDrop/Ble: start: 051240cc76230000000003000000000000000000 mode=2 tx=3
+  13:13:30.297 I OPAirDrop/Ble: advertising
+  13:13:30.273 I OPAirDrop: announcing 75bdacd4227c at 青.local:8770 on awdltun0
+  ```
+
+  载荷逐字节对得上格式：`05`（类型）`12`（长度 18）`40`（版本 3 的保留头）`cc 76 23`（本次
+  会话的 tag）`00×4`（保留）`03`（版本）`00×9`（四个联系人哈希，本实现没有 Apple ID 可哈希，
+  按「所有人」这一档就该是零）。
+
+  **四、一个观察方法上的教训。** BLE 的日志 tag 是 `OPAirDrop/Ble`，而我一直用
+  `logcat -s OPAirDrop` 过滤——它按 tag 精确匹配，看不到子 tag。上一轮「看起来没在广播」
+  有一半是这个原因；真正没广播是因为没人调用。**先 grep 代码确认有人调用，再看日志**，
+  顺序反过来就会被过滤规则骗。
+
+- **2026-11-16 12:53**：**多文件 + 大文件真机通过；「发送只有 432 KB/s」归因于对端接收窗口，不是我们。**
+
+  **一、一次投送三个成员（含中文名）。** 走的是应用自己的选择器（`ACTION_OPEN_DOCUMENT` +
+  `EXTRA_ALLOW_MULTIPLE`），而不是 `am` 拼 Intent——`am` 没有设 ClipData 的口子，多个 URI
+  根本传不进来，这也是这条路径只能用真人手点的原因：
+
+  ```
+  12:52:43.841 intake: 3 file(s), 30302347 bytes
+  12:52:51.737 connected to 4d7c88d205bb, sndbuf 131072, nodelay true
+  12:52:53.332 phase sending 0% (0/30302347 bytes)
+  12:53:37.413 phase sending 70% (21504139/30302347 bytes)
+  12:53:44.749 phase sending 81% (24649867/30302347 bytes)
+  12:53:51.591 phase sending 91% (27795595/30302347 bytes)
+  12:53:58.905 phase sending 100% (30302347/30302347 bytes)
+  12:53:59.949 send event f1469f9e-… status=1006 发送完成
+  ```
+
+  30 302 347 = 70（`报告.txt`）+ 9 330 757（`照片.jpg`）+ 20 971 520（`big.bin`），与 `/Ask`
+  报出之和逐字节相等。抓包 `cap7.pcap`：`us -> phone 30370148 B`，`phone acknowledged
+  30370149 B`（含 FIN），三个成员全部落地。**进度环由此证明不是定时器**：0→70→81→91→100
+  跨 65.6 s，与真实字节同步（§10 第 7 行那条余项就此关闭）。
+
+  **二、432 KB/s 不是我们的问题，别去调 `SEND_BUFFER`。** 先看自己：`sndbuf 131072`（Linux
+  把 64 KiB 的请求翻倍），而在途字节**峰值 120 582 B、均值 20 734 B**——缓冲远没有被填满，
+  所以它不可能是瓶颈。再看对端：
+
+  ```
+  peer window scale 0 -> x1
+  6970 window updates from the peer
+    min 0 B, median 6380 B, max 65535 B, mean 6314 B
+  ```
+
+  iPhone 通告的接收窗口中位数只有 6.4 KB（且 `ws=0`，无缩放）。发送方上限就是
+  `窗口 / RTT`，所以这条链路的速率是**对方的消费速度**。参考实现在同一类链路上量到
+  0.50 / 0.54 / 2.33 MB/s 三种值（`trace-bbr.txt`，差异同样来自对端窗口与人工应答），
+  同一量级——**§11 里那条「1.06–1.13 MB/s」不是发送吞吐**，已按今天的实测改写。
+
+  结论：`SEND_BUFFER` 保持 64 KiB。内核给到 128 KiB，已经覆盖对端最大窗口 65535，
+  再大只是多攒一个我们无法交付的队列；而它换来的「进度是线上字节，不是写进队列的字节」
+  在 30 MB 这一档上刚刚被证明有价值。
+
+  **三、顺手发现接收端为什么一直不自动起。** `settings.conf` 第 8 行是
+  `receive.follow_oshare=false`（早前测试留下的），而 `ReceiveService.listening()` 要求
+  `following && everyone`，于是「互传开着所有人」也不会收；功能页那个手动开关又只在
+  `following=false` 时可拨（跟随开着时置灰）。两边都没错，合起来却是**沉默的不收**。
+  已改回 `true`，重启后 `ss -ltn` 见到 `LISTEN *:8770`。这条要记进排障：**「对方找不到我」
+  的第一件事不是看链路，是先看一眼这行设置和第 8770 端口有没有人听。**
+
+- **2026-11-16 12:37**：**「iPhone 点了接收却发不出去」的根因：cpio 成员头少了一位八进制，普通文件被写成了 FIFO。**
+
+  **一、症状先摆清楚。** `tiny2.bin`（120000 B）三次都停在同一个位置：
+
+  ```
+  12:09:37.791 phase sending 0% (0/120000 bytes)
+  12:09:37.799 phase sending 100% (120000/120000 bytes)
+  12:09:37.871 java.net.SocketException: Connection reset  at socketWrite0
+  ```
+
+  抓包给出的判据是「对端先走」：我方在该连接上共送出 **122454 B**，而 iPhone 只
+  `ack 80598` 就回了 `Flags [R.]`。所以不是超时、不是写短、不是 `TotalBytes` 算错——
+  对端收下约 80 KB 后主动弃流。
+
+  **二、把「猜」换成逐字节对齐。** 参考实现的 `Cpio.java` / `DvZip.java` 只依赖 `java.*`，
+  所以桌面 `javac` 就能编起来。搭了一个小工具（`D:\Downloads\project\refcheck`：`RefArchive`
+  照抄 `AirDropClient.writeArchive()` 的三步，`compare.py` 解开两边 DVZip 后比 cpio 字节），
+  同一个输入文件、同一个 `./tiny2.bin`，一次就撞出唯一一处实质差异：
+
+  ```
+  field mode of './tiny2.bin': ours=010644  ref=100644
+  OK: archives identical apart from odc mtime    ← 修好之后
+  ```
+
+  对应 `crates/cpio/src/lib.rs` 的常量：`MODE_REGULAR` 写的是 `0o010644`，而参考实现的
+  `0100644`（Java 八进制字面量）在 Rust 里是 `0o100644`。少的那一位是**文件类型半字**
+  （`S_IFREG`）：`0o010644` 的类型位是 `0o010000`，**命名管道**。于是每个文件成员都在
+  说「我是一根 FIFO」——接收端读到这个成员头就判定落不了盘，而它的内核已经把后续
+  80 KB 缓冲住了，关流时形成 RST。
+
+  这条错误的可怕之处是**它不可能被自家测试发现**：读写两侧共用同一个常量，`read()` 把
+  `0o010644` 读回来再和 `MODE_REGULAR` 比，永远相等。所以新加的守门测试直接断言**线上那六个
+  字符**：
+
+  ```rust
+  assert_eq!(&plain[head_at + 18..head_at + 24], b"100644", "a regular file is 0100644 in octal");
+  ```
+
+  `crates/cpio` 另有一条只读字节不看结构的 `odc_wire_fields_are_the_ones_a_receiver_reads`：
+  `.` 的 `040755` / nlink 2 / inode 0、文件的 `100644` / nlink 1 / inode 1 / namesize，全部按
+  参考实现的取值钉住。inode 编号也一并对齐（`.` = 0、文件从 1 起、trailer = 0），
+  理由只有一个：**与参考抓包做 diff 时，不该出现「合法但不同」的值。**
+
+  **三、顺带补上三处 socket 选项。** 对照 `HttpCall.ensureOpen()` 发现我们从没设过
+  `SO_SNDBUF`/`TCP_NODELAY`/`SO_LINGER`。现在 `SendActivity.open()` 在 `connect` 之前设
+  `setTcpNoDelay(true)` 与 `setSendBufferSize(64 * 1024)`，连上之后 `setSoLinger(false, 0)`，
+  并把实际生效值写进日志：
+
+  ```
+  12:37:04.697 connected to 4d7c88d205bb, sndbuf 131072, nodelay true
+  ```
+
+  （Linux 把 64 KiB 的请求翻倍成 131072，属正常。）这一项不修 RST，修的是**进度诚实性**：
+  不设时整份档案落进内核队列就返回，界面上「0% → 100%」只用 16 ms，而线路上一块还没走完。
+  参考实现在 24 MB 视频上量到过同样的一幕（50 ms 报「已写 1.06 MB」，然后 7.24 s 静默）。
+
+  **四、真机复验（同一台一加 13 / iPhone，`cap6.pcap`）。**
+
+  ```
+  12:37:06.280 phase sending 0% (0/120000 bytes)
+  12:37:06.296 phase sending 100% (120000/120000 bytes)
+  12:37:07.282 phase done (all bytes written, waiting for the report)
+  12:37:07.291 send event b5c4dfa9-… phase=done status=1006 terminal=true
+  ```
+
+  抓包按 TCP 序号空间统计（`-s 128` 截断了载荷，序号不会）：
+
+  ```
+  === port (8770, 35688) ===
+    us -> phone: 105 pkts, seq space 122477 B
+    phone acknowledged 122478 B of what we sent     ← 整份归档收下（失败那次是 80598）
+    12:37:07.284 us    ACK+FIN      seq=1875249026 ack=487128218
+    12:37:07.293 phone ACK+RST      seq=487128218  ack=1875249027
+  ```
+
+  收尾那记 `ACK+RST` 是对端答完 200 后已经关了自己那一半，不是拒收——**同样的 RST 在上一轮
+  失败时被误读成「对端拒绝」**，区别在于 ack 覆盖了多少：122478/122477 是全部，80598/122454 不是。
+
+  **五、教训归入 §6.5 那一类。** 这是同一族错误的第三次：`SenderID` 自造、TXT 键名自造、
+  现在轮到 mode 的位数自造。三者都不是逻辑写错，是**「协议里有一个确定的值，而我按自己的
+  理解写了一个」**。唯一可靠的判据仍是参考实现与抓包，而且必须落在**字节层**——结构层
+  （字段顺序、字段长度、块边界）全对，只有那一位数值不同，任何 round-trip 都看不见它。
+
+- **2026-11-16 06:10**：**发送端的证书钉住接上了，而它读的那个 TXT 键是自造的——对任何真实对端都不命中。**
+
+  **一、真正的缺陷不在校验，在键名。** 校验逻辑写完后我去找「这个值从哪个键读」的证据，结果推翻
+  了自己写的东西：
+
+  ```
+  repo-v2/AirDropLink.java:200:   txt.put("h", current.certHash());
+  repo-v2/AirDropBrowser.java:595: peer.port, values.get("h"), ...
+  本仓 Responder.java:158:        pairs.put("h", certHash);        ← 我们发出去的也是 h
+  本仓 browse.rs:45:              &["model", "flags", "phash"]   ← 我们读的是 phash
+  ```
+
+  `h` 是 Apple 定的键名（TXT 是一串两字符起步的短串，常读的键都短），不是我们取的名字。读错的后果
+  **没有报错**：每条连接都落在「没收到指纹」这条分支上，钉住逻辑永远是空转，日志里那句「没有可比
+  的值」对每一台设备都成立。功能关了，代码却在跑，测试全绿。
+
+  这与上一条 `SenderID` 是同一类错误的第二次：**凡是「协议里有名字的东西」，名字只有参考实现和抓包
+  能定，我的自造名不行。**
+
+  **二、三处字面量改为由脚本守着。** 发布（`Responder.java` 的 `pairs.put`）、上报
+  （`browse.rs` 的 `TEXT_KEYS`）、读取（`Peers.absorb` 的 `equals(field[2])`）分在两种语言三个文件
+  里，这里没有编译器同时看到三者。`check.sh` 的第一道检查就是这个：三个字面量抽出来比对，不一致就
+  在编译前退出并点名哪两个文件。已反向验证——把读取侧改回 `phash`，脚本在 `building the library`
+  之前退出，输出 `Responder publishes the fingerprint as 'h' but Peers reads 'phash'`。
+  `browse.rs` 另加两条测试：`the_fingerprint_is_reported_under_the_name_peers_actually_send`
+  （`h` 出现、`phash` 不出现）与 `a_txt_key_nobody_reads_is_not_reported`（`TEXT_KEYS` 之外的键
+  不落地）。
+
+  **三、钉住的链路。** TXT `h` → `Peers.absorb` 存进 `Peer.fingerprint` →
+  `SendActivity.open()` 用 `Identity.clientContext(fingerprint)` 建 TLS → 握手时
+  `PinnedTrustManager.verify()` 重算链上第一张证书的 SHA-256 与它比对。它证明的是「答 mDNS 查询
+  的那台机器同时握着这张证书的私钥」，挡的是最便宜的那种攻击：拿真手机的哈希答查询，再拿自己的
+  证书完成握手。
+
+  **四、不符是一种类型，不是一句话。** 新增 `crates/ffi/jvm/com/oshare/airdrop/PeerMismatch.java`：
+  `Pin extends CertificateException` 在 `verify()` 里抛，JSSE 会再套两三层
+  （`ValidatorException` → `SSLHandshakeException`），层数随 JDK 与 Android 版本变，所以
+  `PeerMismatch.of(Throwable)` 沿 cause 链找（上限 16 层，防自环），调用点拿到的永远是同一个类型。
+  `PeerMismatch extends IOException`，与 `RefusedException` 同因：发送路径声明 `throws IOException`，
+  既有每一条 catch 都得继续接住它。界面因此能说「对方身份不符 · 已中止，没有发出任何内容。对方的
+  证书若是刚换过，重新搜索一次设备再试」，而不是「发送失败」，也不是把
+  `SSLHandshakeException: java.security.cert.CertificateException: fingerprint mismatch: ...`
+  端给用户。
+
+  **五、空指纹照连。** TXT 分几条记录到达，型号到了指纹可能没到。此时拒绝发送等于把「记录还没收
+  全」判成「对端有问题」，所以 `fingerprint` 为空时仍用 `clientContext(null)` 连（接受任意自签链），
+  只记一行 `no fingerprint for <name>: the certificate cannot be pinned`。代价写进代码，不藏在注释
+  里。
+
+  **六、删掉了「全都接受」那条路。** `SendActivity` 原先自己实现了一个三个方法都空着的
+  `X509TrustManager`（`trusting()`），`peer.phash` 接上后它成了第二条没人走但仍在的路——两条路一条
+  校验一条不校验，日后谁把 `open()` 里的上下文换回去就静默退回不校验，且没人体会到。连同随之无用的
+  五个 import（`SecureRandom`、`X509Certificate`、`SSLContext`、`TrustManager`、`X509TrustManager`）
+  一起删除。
+
+  **七、断言是跑出来的，不是读出来的。** `IdentityCheck` 新增 `theRefusalArrivesAsOneType`：真跑
+  一次错指纹握手，断言拒绝不为空、`PeerMismatch.of(拒绝) != null`、句子里含广播与实际两边的 12 位
+  前缀、整句不超过 96 字、`instanceof IOException` 成立、以及 `PeerMismatch.of(new
+  IOException("socket closed")) == null`（不认识的失败不许被误认成身份不符）。identity 段 47 → 54。
+
+  **八、基线。** `cargo test --workspace` **416 passed**（1 ignored）/ `failed=0`（较上一条 +2，
+  即 `browse.rs` 那两条）；`check.sh` 全绿（round-trip 38 / settings 172 / **identity 54** /
+  radio 48 / stack 69 = **381 条**，较上一条 +7）；`bash android/build.sh assembleDebug`
+  `BUILD SUCCESSFUL in 21s`，`libopairdrop_ffi.so` **699 816 字节**（+48）。
+
+- **2026-11-16 05:05**：**`SenderID` 之前是每次投送都换的新名字，接收端因此把同一台手机看成陌生设备。**
+
+  **一、缺陷的形状。** `send.rs` 的 `drive()` 直接把 `transfer_id` 那个字符串当 `SenderID`
+  （`Sender::new(..., id)`），而 `SendActivity` 每次调用都新 `UUID.randomUUID()`。于是每投送一次，
+  接收端就多一台设备：iPhone 侧的表现是历史记录里一串同名条目，而不是一台设备的多次投送。
+  `SenderID` 是接收端**归并同一个发送方**用的键，不是这一次投送的编号。
+
+  **二、算法照 `repo-v2`。** `AirDropClient.derivedSenderId`：
+
+  ```
+  UUID.nameUUIDFromBytes(("oshare-airdrop:" + certHash()).getBytes(UTF_8))
+      .toString().toUpperCase(Locale.ROOT)
+  ```
+
+  type-3（MD5 名字型）UUID，输入是证书指纹（即 TXT 记录里的 `h=`，大写十六进制 SHA-256）。
+  从证书派生所以**跨重启稳定**，不需要另存一份；改名不影响它。
+
+  **三、`id` 与 `TransferID` 在 FFI 里分开传。** `opairdrop_send`/`opairdrop_send_with_progress`
+  在 `model` 之后插了 `sender_id`/`sender_id_len` 两个参数，JNI 侧与 `Native.java` 同步，
+  `SendActivity` 改成 `Native.sendWithProgress(..., senderId(), UUID.randomUUID().toString(), ...)`，
+  `senderId()` 进程内缓存一次（`volatile` 静态字段），派生输入是证书所以下次还是这个值。
+
+  **四、ABI 3 → 4。** 参数插在中间，其后每个参数都错位两个 word：按 3 编译的调用方会把
+  transfer id 当字符串指针交出去、把 paths 当 transfer id——得到一个「恰好能解析」的 `SenderID`
+  和一份不能用的路径表。理由已写进 `api.rs` 的版本注释。`ABI_VERSION` 在 `api.rs` 与
+  `Native.java` 两处同步为 4；`AboutActivity`/`HomePage` 的 `EXPECTED_ABI` 引用常量，自动跟随。
+
+  **五、空值退化，不报错。** 调用方没给 `sender_id` 时用 `transfer_id` 顶替。这不是「兼容老调用方」
+  的敷衍：`SenderID` 在 plist 里是自由文本，等于 transfer id 的值仍是良构的报文体，只是跨投送
+  不再归并——这是降级，不是畸形 offer。规则收在一个四行的纯函数 `sender_identity()` 里，两条测试
+  盯着它（`the_sender_id_is_kept_apart_from_the_transfer_id`、`a_caller_without_a_sender_id_still_offers_a_readable_body`）。
+
+  **六、顺带修好了一直跑不起来的桌面 JVM 断言。** `crates/ffi/jvm/check.sh` 的 `javac` 一直卡在
+  `Native.java:441` 的 `android.content.Context`（`bleAdvertise` 的参数），于是 `RoundTrip` 里那条
+  「`Native.abiVersion()` 等于 `Native.ABI_VERSION`」的断言**从来没被跑到过**——也就是说 ABI 对齐
+  这件事一直没有验证。做法是在脚本自己的临时目录里生成一个最小 `android.content.Context` stub，
+  `-sourcepath` 指过去；stub 不进仓库（设备上由真的 `android.jar` 提供，进源码集会重名）。
+  现在 `ok the ABI version is the one the app was built against` 是真跑过的。
+
+  **七、`IdentityCheck` 新增 6 条。** 形状（type 3 / variant 8-B 的大写 UUID）、与
+  `"oshare-airdrop:" + certHash()` 的**重复展开式**对齐（这一行是与参考实现的契约，复用生产表达式
+  的检查会跟着任何前缀一起对）、不等于指纹本身、同证书重载不变、改名不变、换设备就变。
+  写这条正则时第一次把 variant 段写成 5 位十六进制，检查先自己失败了一次——它确实在看。
+
+  **八、基线。** `cargo test --workspace` 414 passed（1 ignored）/ `failed=0`（较上一条 +2）；
+  `crates/ffi/jvm/check.sh` 全绿：round-trip 38 项、settings 172 项、identity 47 项（另有 1 条在
+  Windows 上按预期跳过：0600 权限位）、radio 48 项、stack 69 项。
+
+- **2026-11-16 04:20**：**根因是「一条连接只承载一个请求」；头被排除，体也被排除，延时早就排除过。**
+
+  **一、头先被排除。** `/Ask` 的头与 `/Discover` **同形**：`Host` + `User-Agent: AirDrop/1.0` +
+  `Content-Type: application/octet-stream` + `Content-Length` + `Connection: keep-alive`。
+  **不是** SPEC 里那五行、**不是** chunked。而 `/Discover` 用同一套头在同一条连接上拿到过 `200`，
+  所以头形状不可能是「不答」的原因。
+
+  **二、体也被排除。** `/Ask` 的 plist 与抓到的 iPhone 报文逐键对齐：`Items` 每一项的九个键、键名、
+  键序、类型都一致。上一轮修的 `FileBomPath` 空串（见 03:25 那条）确实是个真缺陷，但它解释不了
+  「同一个体在 `/Discover` 之后就不再被读走」。
+
+  **三、真正的原因：一条连接一个请求。** 真机时间线是 `/Discover` `200` 加名字回来只用 80 ms，
+  `/Ask` 写到**同一个** socket 上，然后手机静默 45 秒，最后自己把连接重置
+  （`java.net.SocketException: Connection reset`）。iPhone 在已经承载过一个请求的连接上读第二个请求时
+  **什么都不答**：无状态行、无 reset、75 秒零字节。发送端的「一直等」和那条 `reset` 都是这一条的
+  后果；`client.read_timeout_ms` 只是把等待截短，不解决它。
+
+  正确的连线是两条：`/Discover` 一条；`/Ask` 与 `/Upload` 共用另一条（`/Upload` 不换连接，它要接着
+  `/Ask` 的 `200` 走同一个 TLS 会话）。
+
+  **四、代码怎么表达。** 新增 `Dial` trait（`fn dial(&mut self) -> io::Result<()>`：开一条新连接并从
+  此读写它；旧连接由实现关闭，失败按普通传输错误上报——没有可回退的东西，旧连接载不动下一个请求）。
+  `Client::renew()` 通过它换连接，并清掉 `closed` 标记（「上一条连接的应答不代表这一条」）。FFI 侧同步
+  加 `DialCallback`，ABI 升到 **3**，理由与 ABI 2 那次相同：老调用方会把它的 context 当函数指针读，
+  版本号是唯一能在调用前就发现的办法，已写进 `api.rs` 的版本注释。
+
+  一个刻意的取舍：`Wire`（FFI 的流）**不**实现 `Dial`。这样单连接测试不可能「顺手」写成有续连，
+  需要续连的地方必须显式拿一个实现 `Dial` 的流——规则由类型表达，不靠注释提醒。
+
+  **五、把规则钉在真实 socket 上。** `tests/loopback.rs` 新增
+  `the_offer_and_the_archive_arrive_on_a_connection_of_their_own`：`listen_to_two()` 顺序 `accept`
+  两次、每条连接各建一个 `Server` + 独立 `Sink`，于是「第一条连接只有 `/Discover`、第二条连接有
+  `/Ask` 与 `/Upload`」变成分别可断言的值，而不是靠脚本流的写缓冲推断。反向验证过：把
+  `client.renew()` 注释掉，测试 5 秒内失败并给出
+  `connection 2 of 2 never arrived within 5s: the far end opened 1 and stopped`——这也正是把 `accept()`
+  换成带 5 秒预算的 `accept_within()` 的原因，否则回归会表现为**挂住**而不是失败；`handle.join()`
+  也改成把监听线程的 panic 原样 `resume_unwind`，免得那句诊断被压成一句无关的断言。
+
+  **六、还没验的那一步。** 真机复验卡在 AWDL 对端不在场：`awdld.log` 的 `rx` 冻结在 `36662p`
+  （`tx` 仍在涨、`elect=self`、`iw dev wonder0 station dump` 为空、`peer=5e:55:2b:ec:06:46` 是个
+  已经离开的旧对端），说明 iPhone 已不在同一场 AWDL 里，要等手机侧重新进入。链路本身没问题——历史
+  日志里先后出现过 7 个 Apple 随机 MAC，说明它确实接通过；`awdl-stack.sh status` 也仍是
+  `wonder0 UP` / `IBSS` / `channel 149` / `radio=exclusive confirmed`。
+
+- **2026-11-16 03:25**：**「一直等」不是延时，是 300 秒读超时；而 `/Ask` 里 `FileBomPath` 一直是空串。**
+
+  **一、先证伪「发送路径上有人为延时」。** 对 `crates/ffi/src/send.rs`、`crates/airdrop/src/{client,payload}.rs`
+  和全部发送相关 Java 文件 grep `sleep` / `Duration::from_` / `postDelayed`，命中的只有 UI 动画与
+  `BridgeReconnect` 退避，与发送无关。真机日志也自证：`03:09:11.828 send to bca8abae3cd5` →
+  `03:09:12.842 phase ready` → `03:09:12.848 phase waiting`，**TLS 握手 + `/Discover` + `/Ask` 写出
+  共用 1.0 s，`READY` 到 `WAITING` 间隔 6 ms**。所以「久」发生在 `/Ask` 写出**之后**。
+
+  **二、那 131.8 秒是等一个永远不会来的字节。** `03:11:24.679 send failed: bca8abae3cd5 /
+  java.net.SocketException: Connection reset`，栈顶 `SocketInputStream.read` ← `ConspiracyEngineSocket`
+  ← `Native.sendWithProgress` ← `SendActivity.transfer:1199`；距 `phase waiting` **131.8 s**，且这期间
+  **没有第二条 `send to` 行**——不是新的一次投送，是 iPhone 把自己挂着的那条 `/Ask` 连接重置了。
+  而我们 `client.read_timeout_ms` 默认 **300 000 ms**，等于对端先断之后的 168 s 全在干等，界面一直停在
+  「等待对方接受…」。按 ASK-2a（"senders wait about 45 s, then reset the connection and report the
+  transfer as declined"）改成 **45 000**，`settings` 里那一行的默认值同步改，回落常量同步改
+  （`SendActivity.READ_TIMEOUT_MS`）。
+
+  **三、`/Ask` 的真缺陷：每个文件的 `FileBomPath` 是空串。** `Item::new()` 里写的是
+  `bom_path: String::new()`，`send.rs::describe()` 又只设了 `name`/`size`/`file_type`，于是九键都齐、
+  唯独每一项的路径是 `""`。§6.4 把它标成必填并明确「`./` 前缀是必须的」，而且它就是接收端在
+  `/Upload` 归档里找文件的依据——一个空路径描述的是「一个没地方落的文件」。已改：
+  `Item::new()` 默认 `./<name>`，`Item::to_value()` 对空路径再兜一次底，`send.rs::archive()`
+  的成员名改走 `Item::member_name()`（`./x` 归一成 `x`），并补两条测试钉住。
+
+  **四、为什么不照 repo-v2 的 `askRequest` 抄。** 对照过：repo-v2 发的是**旧形式**（无
+  `TransferID`/`TransferType`/`FileSize`，每项用 `ConvertMediaFormats: 0L`，空数组省掉），我们发的是
+  当前形式。**这一条没有跟 repo-v2 走**，理由是 repo-v2 自己的类注释写着发送路径「is the only way to
+  test sending without an Apple peer in the room」——它的接收路径在真机上调试过，**发送路径只在 JVM 上
+  排练过**；而 SPEC §6.4 写的是 "Senders MUST send the current form (ASK-7)"，并给了反例：收到旧形式的
+  接收端「may answer `200` without ever prompting its user」。按仓库既定规矩（规范 > 参考实现），
+  保留当前形式，只补它缺的那一项。
+
+- **2026-11-16 02:10**：**发送页设备网格定稿：3 列、整行水平居中、格子平分宽度、名字换行；加 `preview` 调试开关。**
+
+  头一版是「左上角起排、格子死板 86dp」，用户看过头一版之后要的是**水平居中 + 名字自动换行**。
+  `columns = (屏宽 - 40dp) / 86dp` 在本机 360dp 上算出 3 台（原注释写 4 台是算错的）；
+  `cellW = span / columns` 让三格平分整行，右边不再空出小半屏；`rows.setGravity(CENTER_HORIZONTAL)`
+  让不满的那一行也居中（一台设备时它就在正中）；名字从「截一行」改成「两行 + 行距 0.95」，
+  行内顶对齐，免得同一行的头像因名字行数不同而高低错开。
+
+  真机上凑不齐多台对端，所以加了只有 debug 包认的 `-e preview N`：拿 `青 / 张三的 iPhone 15 Pro /
+  MacBook Pro / 林子` 这几个假设备把版式直接演出来。7 台 = 3+3+1，1 台 = 正中，都截图确认过。
+
+  顺带把 iPhone 那侧的结论又验了一遍（用户说 iPhone 就在旁边、开着所有人）：30 秒 15 次查询全部
+  无回，`rx=32722p` 一字未动而 `psf` 正常增长；想退到 Wi-Fi 上的 IPv4 组播也不行——`wlan0` 没起
+  （`That device is not up`），这台机器 Wi-Fi 根本没开。
+
+- **2026-11-16 01:55**：**发送链路第一次端到端跑通；发现链路上三个错 + IPv6 scope；首页入口接通；发送版式改左上角网格。**
+
+  `Peers` 的三处设置全错，且每一处单独都足以让发现永久静默：组播组 `224.0.0.251`→`ff02::fb`
+  （AWDL 只有 IPv6 组，而 `wonder0` 现在连 IPv4 地址都没有）、网卡 `wonder0`→`awdltun0`（回包被驱动
+  吞掉，`Responder` 注释里有 9295 帧对 8 个计数的实测）、跳数补上 `MulticastHop.raise(…, 255)`
+  （iPhone 对低于 255 的包直接丢，不报错）。第四处：链路本地 IPv6 不带 scope 时 `connect` 立刻回
+  `EINVAL`，`Peer.scope` 记下发现时的网卡索引，`Peers.address(peer)` 塞进 `Inet6Address`。第五处：
+  本机接收端一开，自己会出现在自己的列表里，`absorb` 现在跳过属于本机的 `addr`。
+
+  验证：自收自发一次完整传输（2 040 000 B，`0 → 25 → 51 → 77 → 100% → done`，落地字节一致），
+  三条通知同时在栏里（`opairdrop_send` / 本应用 `接收完成` / 互传 `AirDrop · 接收完成`），传输中
+  再点头像 → 「已取消」，关 socket 一条路。
+
+  对真实 iPhone 仍未跑通，且原因不在我们这侧：`tcpdump -i awdltun0` 显示查询每 2.003 s 一次稳定发出
+  （`ff02::fb`，`0 PTR (QM)? _airdrop._tcp.local`），`awdld` 状态里 `peer=5a:ce:35:0b:00:7e` `confirmed`
+  且 `psf` 在涨，但 `rx=32722p` 八秒不动——iPhone 没有 IP 流量过来。它得处在互传状态（NFC 碰一下，或
+  打开「OPPO 互联」），只开「AirDrop 所有人」不够。
+
+  界面：`Nick` 92→62dp，中部从整块居中改成左上角起排、满行折行、可滚，空态雷达单独居中；首页
+  「发送文件」直接起 `SendActivity`（空手 → 系统选择器）；补 `onNewIntent`。
+
+- **2026-11-16 01:05**：**撤回互传页接入，发送入口回到我们自己的 `SendActivity`；并确认「发送端不需要本机监听」。**
+
+  用户否掉了上一轮的做法，并且纠正的是一个产品前提：
+
+  > 我们为什么要开监听呢？不应该是拉起我们的分享界面才开始查询吗？我们作为发送端不需要开自己
+  > 监听吧？把你接入的一加互传的分享界面撤掉，先不通过一加互传，直接通过我们 SendActivity 就行。
+
+  我之所以去开监听，是为了在「身边没有 iPhone」时造一个可发现的对端：把 `receive.follow_oshare`
+  临时改成 `true` 让 `ReceiveService` 自收自发。手段被写成了前提，就会得出「发送端必须先开接收」
+  这种错结论——**发送端的发现走 `Peers` 的组播查询，和 `8770` 那条接收监听没有关系。**
+
+  **落地的四处改动**：① `PanelHook.java` 用 `git mv` 移入 `legacy/hooks/`（不进 source set），
+  文件头写清停放理由、三条硬约束与接回方法；② `Entry.onPackageLoaded` 删掉 `PanelHook.install`
+  那一段，类注释改为「模块入口：只有接收一处钩子」；③ `receive.follow_oshare` 回滚 `false`；
+  ④ `Peers.loop()` 补两行观测：进循环先 `publish(null)` 记一笔「此刻为空」，以及每 15 次查询
+  （30 s）仍一包未收时打 `browse: 15 queries sent, nothing came back`——原来 `publish` 只在收到
+  包时调用，没有对端时一次都不会执行，于是「一直在问、没人答」这件事在日志里根本不存在。
+
+  **真机证据**（`receive.follow_oshare=false`，`am start` 直接进 `SendActivity`）：
+
+  ```
+  I OPAirDrop: browse: joined 224.0.0.251:5353 on wonder0, multicast lock held
+  I OPAirDrop: browse: nothing connectable yet (0 instance(s) with partial records)
+  I OPAirDrop: intake: 1 file(s), 2292220 bytes
+  W OPAirDrop: browse: 15 queries sent, nothing came back
+  ```
+
+  同刻 `ss -lntp | grep 8770` 为空、`dumpsys activity services com.oshare.airdrop` 无
+  `ReceiveService` 记录；页面「正在搜索附近设备……」、`与 iPhone 互传`、`本设备：青(Air)`、
+  `1 个文件 · 2.2 MB`、底部说明卡俱在。**即：不借互传、不开监听，发送页自洽。**
+
+  **另加一层抓包**（`su -c tcpdump -i any -n port 5353`）证明查询真的上线了：`wonder0 Out IP
+  10.60.227.56.5353 > 224.0.0.251.5353: 0 PTR (QM)? _airdrop._tcp.local. (37)`，三条间隔
+  2.003 s（=`ASK_EVERY_MS`），**只有 Out 没有 In**。于是「组播没出得去这块网卡」被排除，剩下的
+  两种成因（对端不答 / 答了但记录不齐）等 iPhone 在场就能从 `browse:` 那行分开。
+
+  仍缺的一步只有真实对端：`Peers` 的 `N connectable — name@fe80::…:port` 与
+  `Native.sendWithProgress` 的四相（`ready → waiting → sending N% → done`）需要一台 iPhone 在场才看得见。
+
+- **2026-11-16 00:40**：**发送入口接上了——一加互传「与 iPhone 互传」页里，我们自己的一行。**
+  > **已于 01:05 撤下**：发送端不该借互传的页，入口回到我们自己的 `SendActivity`。
+  > 下面这一轮的实测与三条坑是真实发生过的，留作记录；代码停在 `legacy/hooks/PanelHook.java`。
+  用户点名的第二刀是「接入 `ui.iOSShareActivity`，用我们的服务，参考 mosey 版怎么接的」。
+  落地的分工跟 mosey 不同：mosey 是**伪造设备塞进互传的列表**（改 `manager.list`/`manager.get`、
+  钩 `service.send`），要复刻 `DeviceAdapter` 的绑定数据；我们是**在 `share_content` 里加一个
+  普通 View**，点下去把人和文件交回我们自己的进程。少动互传的三处内部结构，代价是那一行长得像
+  它、但不是它的设备行。
+
+  **真机链路（本轮实测）：** `am start` 进 `IOSShareActivity` → UI dump 里 `share_content` 下出现
+  `用 AirDrop 直接发`（`[96,488][1303,579]`）/`不经过互传，点一下开始找附近的 iPhone`
+  （`[96,579][1303,665]`）/`›`（`[1303,512][1344,641]`），下面 `view_empty` 雷达与底部说明卡
+  未受影响 → 日志 `share panel hook installed` → `sender row added` → `input tap 700 520` →
+  `topResumedActivity=com.oshare.airdrop/.SendActivity`，`ps | grep -c com.coloros.oshare` = **1**。
+
+  **三条坑（细节见 §9 上一节）：** ① `instanceof RecyclerView` 在注入用的 `InMemoryDexFile`
+  加载器下必抛 `ClassNotFoundException`——「包一层 adapter」这条路不是难，是不可能；
+  ② `resolveAttribute(textColorPrimary).data` 是 **资源 id `0x01xxxxxx`**，当 ARGB 用 alpha=1，
+  标题整个透明（像素扫描：标题带偏差 321 / 副标题 324），取色只能从对面 `TextView` 抄；
+  ③ `setClass(host, …)` 拼出的组件名带互传包名 → `ActivityNotFoundException` → **互传进程崩，
+  连带带走递流体云的 `KeepForeService`**，必须 `setClassName("com.oshare.airdrop", …)` 并整体
+  `try/catch`。同时删掉 `build.gradle` 里的 `compileOnly androidx.recyclerview`（已无用处）。
+
+- **2026-11-15 23:40**：**真 iPhone 端到端跑通（三份文件落盘、字节数对齐）；同一批实测顺带把「为什么不弹流体云」问出了答案——流体云不是通知升级出来的表面，是**一加互传进程里画的窗口**，互传不在就没有。**
+
+  **一、三笔真机接收全部落盘。** 对面 AirDrop 名 `卷卷薯` / `卷心菜`，三张 `IMG_*.JPG`：
+
+  | 时刻 | 文件名 | 字节数 | 落点 |
+  |---|---|---|---|
+  | 23:32 | `IMG_2870.JPG` | 2 121 916 | `Pictures/OPAirDrop/` |
+  | 23:36 | `IMG_1583.JPG` | 1 402 934 | 同上 |
+  | 23:36 | `IMG_2869.JPG` | 2 040 000 | 同上 |
+
+  三份都与 offer 里声明的 `Files[0].FileSize` 逐字节相等。§10 第 5 行「真 iPhone 复验」这一步完成
+  （此前只有探针形状的 `/Ask` + `/Upload`）。
+
+  **二、`._` 伴生文件被算成第二个文件。** 每份旁边多一个 AppleDouble 资源叉
+  （`._IMG_2870.JPG` 1672 B、`._IMG_1583.JPG` 1967 B、`._IMG_2869.JPG` 1672 B），卡片与通知因此
+  写「**2 个文件**」并把它列成第二行。人看见的是「我明明只发了一张」。这是 `summary_of` 与
+  `files` 两边都照抄上传条目的直接后果，不是卡片的排版问题。
+
+  **三、「为什么不弹流体云」= 互传进程不在，`attached()` 拿到 false。** 确认界面有两条路
+  （{@code ReceiveHost.decide}）：`attached()` 为真时问卡片——那张卡片跑在 `com.coloros.oshare`
+  进程里，也就是系统流体云；为假时退到本应用自己的通知。`attached()` 的真身是
+  `ui != null && ui.getBinder().isBinderAlive()`，而 `ui` 只在互传进程通过回环 TCP 报过
+  `hello` 之后才有值。互传是**按需启动**的（没有 launcher Activity，
+  `monkey -c LAUNCHER` 直接 `No activities found`；`KeepForeService` 要 OEM 权限，
+  `am start-foreground-service` 被 `Requires permission not exported from uid 10163` 挡掉），
+  而**我们的接收路径从不拉起它**。于是「手机放桌上、互传早被回收」这个最常见的情形，正好是
+  流体云不出现的情形。
+
+  **四、五次邀请的路径与耗时（同一份二进制、同一台 iPhone）：**
+
+  | 时刻 | 会话 | 互传进程 | `attached` | 走哪条 | 从邀请到接受 |
+  |---|---|---|---|---|---|
+  | 23:31:16 | airdrop-4 | 不在 | false | 通知 | 30 007 ms，无人应答 → `503` |
+  | 23:32:06 | airdrop-5 | 不在 | false | 通知 | 29 135 ms，在本应用通知上按了接受 |
+  | 23:34:18 | airdrop-8 | 不在 | false | 通知 | 30 006 ms，无人应答 → `503` |
+  | 23:36:13 | airdrop-10 | 不在 | false | 通知 | 21 720 ms 接受 |
+  | 23:36:25 | airdrop-11 | **在**（`am start -n com.coloros.oshare/com.oplus.oshare.ui.ShareActivity`） | **true** | **卡片** | **977 ms 接受** |
+
+  最后一行是这次唯一一次 `attached=true`：日志 `invitation airdrop-11 from 卷卷薯 attached=true`
+  → `invitation airdrop-11 accepted after 977 ms via card`，截屏里状态栏是一颗「接收完成 ✓」
+  胶囊、底下是互传自己那张「AirDrop · 接收完成」卡片。**拉起互传这一下，把「通知」换成「流体云」，
+  接受耗时从 21.7 s 掉到 0.98 s。**
+
+  **五、待办（还没做）。** ① 接收端启动时顺手把互传进程拉起来（跨应用启动，Android 10 之后
+  受后台启动限制，要先实测能不能成）；拉不起来就至少在「接收端已开」那一刻说清「没有流体云，
+  只能收通知」。② `._` 条目在摘要与列表里都不该算作一份文件。
+
+- **2026-11-15 23:30**：**「空转的 7 行」结案：删 4 行、加 3 行、四行接上读值处；「等多久算没人应答」从两处硬编码变成一个可调的数。**
+
+  **一、空转的键不能硬接，只能删。** 上一轮数出 7 行没有任何读取处。逐行查过之后，其中四行在
+  产品代码里根本没有对应概念：`receive.probe_bytes`（Rust 侧 `Limits` 只有 `byte_limit` 与
+  `overwrite`，从来没有什么「预览上限」，那行摘要是编的）、`discover.window_ms`
+  （`Peers.ASK_EVERY_MS`/`EXPIRE_MS` 是 mDNS 重问与过期，不是「搜索时长」）、
+  `client.ask_timeout_ms`、`client.discover_timeout_ms`（Rust 客户端 `client.rs` 里连 timeout 都没有）。
+  给它们接一个读值处只会造出四个说谎的旋钮，所以删行。表从 16 行变 15 行，表头注释改成
+  「每行都必须有读取处，读到不存在的行要删」。
+
+  **二、删一行的代价不是少一行，是让老装机的发送全挂。** `Values::from_text` 原本对表里没有的
+  键返回 `Error::UnknownKey`，而同一份文本同时喂给发送路径（`crates/ffi/src/send.rs` 的
+  `values_from`，出错即 `Failure::new(status::SETTINGS, …)`）。也就是说：升级后第一次发送会因为
+  用户机器上那份**旧文件多出的四行**而整次失败。改成**跳过并记名**——`Values.retired`，
+  写出时自然丢掉，`retired()` 让被丢掉的键可见。`PartialEq` 改为手写、只比 `entries`，
+  否则 crate 里每一处相等判断的语义都会跟着变。这是本轮唯一一处改变语义的改动，有对应单测
+  （`a_key_that_left_the_table_is_skipped_and_named_rather_than_refusing_the_file`）。
+
+  **三、一个数，三个用处。** 新增 `receive.decision_timeout_ms`（默认 30 s）。此前
+  `ReceiveHost.DECISION_TIMEOUT_MS` 与 `Confirmation.TIMEOUT_MS` 是两处硬编码 30 s，
+  靠注释维持一致。现在两边都调 `Confirmation.decisionTimeout(context)`，同一个数还进两句文案：
+  卡片上的「N 秒内没人应答就放弃」与结果里的「N 秒内没人应答，已放弃」。另外两行新键
+  `client.connect_timeout_ms`（8 s）/ `client.read_timeout_ms`（300 s）接进
+  `SendActivity.transfer()`，每次投送重读，两个常量降级为回落值；`discovery.remembered_peers`
+  接进 `ServiceId`，同时把描述改对——它管的是「换过名字之后保留几个发布过的旧实例名」，
+  不是「记住的设备」。
+
+  **四、读设置这件事收成一份实现**：新增 `android/…/Tuning.java`（`read(Context)`/`read(File)`/
+  `ms(...)`）。四个调用方（Listener、SendActivity、Confirmation、ServiceId）必须共用的是
+  「读不出来怎么办」，此前每处各写一遍。
+
+  **五、真机数字。** `receive.decision_timeout_ms=5000` 时：
+  - 卡片路 `invitation airdrop-1 unanswered after 5001 ms via card`；
+  - 停掉互传进程走通知路 `invitation airdrop-2 unanswered after 5008 ms via notification`，
+    通知正文 `1 个文件 · 4.0 MB，5 秒内没人应答就放弃。`——两条路读的是同一个数，文案也跟着变；
+  - 发送端 5.01 s 收到 `503`。
+
+  测法：给 `tools-probe/stall.py` 加了 `--invite`（发邀请、谁也不点，等到 `503` 的秒数就是判定
+  超时），`--shot` 顺手抓屏。三行没有钟可读的键（`client.*`、`remembered_peers`）用新探针
+  `tools-probe/jvm/TuneCheck.java` 量：反射调**装好的** `Tuning`（`CLASSPATH` 带 `base.apk`，
+  不编译副本），文件里写 7000/3000/120000/3 就读出 7000/3000/120000/3。
+
+  **六、顺带量到两件原先只是推测的事，注释已按事实改写。**
+  1. **越界或非数字会让 `from_text` 整份拒绝**，不是只废掉那一行。`discovery.remembered_peers=999`、
+     `client.read_timeout_ms=abc` 各试一次，两次都是全部回落默认值（`Tuning.read` 返回 null）。
+     所以 `Tuning.ms` 里那道夹取今天走不到——留着是因为它防的后果（超时 0 = 每次连接都断）
+     比两行代码贵，理由写在方法注释里。
+  2. **`/data/data/<pkg>` 对 `app_process` 读不到**（即使 `su`），探针把设置文件放在
+     `/data/local/tmp` 才读得出来。第一版探针因此打印了一整屏「回落值」，看着像四行都没接线。
+
+  **七、旧键容忍的设备侧证据。** 这台机器上原有的 `settings.conf` 正好还留着那四行被删的键。
+  新包照常发送（`LimitCheck` 走到 plist 解析才失败，不是设置校验）；同一份文件配上一版 `.so`
+  也读得出来（那时它们还是合法行），但上一版对 `bogus.key` 会
+  `IllegalArgumentException: the settings could not be read: unknown setting bogus.key`，
+  新版跳过——这一对才是「删行不再打断老装机」的证据。验完已把设备上的文件恢复原状。
+
+  测试：`cargo test -p opairdrop-settings` 19 passed、`-p opairdrop-ffi` 66 passed。
 
 - **2026-11-15 22:50**：**「文件信息未知」结案；「自动拒绝」找到两层根因并都修掉；应用侧速度上限量出来了。**
 

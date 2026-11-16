@@ -30,6 +30,6 @@ public final class DecisionReceiver extends BroadcastReceiver {
         // 按下去的是同一个问题，所以答案必须落到同一个闩上；而那个闩在 ReceiveHost 手里，
         // Confirmation 只是它下面的一层。过去这里直连 Confirmation，等于让通知的答案绕过
         // 了卡片的闩——两边各答一次才发现漏了。
-        ReceiveHost.answer(id, accepted);
+        ReceiveHost.answer(id, accepted, "notification");
     }
 }

@@ -83,11 +83,11 @@ mod device {
     /// The sender's segment size is not ours to choose directly. It is whatever our SYN-ACK
     /// advertises, and the kernel derives that from this number: MTU less 60 for IPv6 and
     /// TCP. So the value is also the clamp — 1458 advertises 1398, and 1398 bytes leave as
-    /// exactly the 1512-byte frame the driver takes. `legacy/` arrived at the same 1398 from
-    /// the same arithmetic (`MSS_CEILING` in `AwdlData.java`, `MAX_TUN_PACKET - 60 - 3`),
-    /// and its notes are worth reading before changing this one: 512 was too small because
+    /// exactly the 1512-byte frame the driver takes. The earlier injection-based build
+    /// arrived at the same 1398 from the same arithmetic (`MSS_CEILING` in `AwdlData.java`,
+    /// `MAX_TUN_PACKET - 60 - 3`), and its notes — 512 was too small because
     /// the peer sizes its receive window from the MSS it is given, and 200 stalled the link
-    /// outright.
+    /// outright — are worth recollecting before changing this one.
     const TUN_MTU: usize = 1458;
     /// How many to move per wakeup before returning to the poll. A cap rather than a loop
     /// to exhaustion, so a busy direction cannot starve the presence timer.

@@ -26,7 +26,12 @@ pub struct Sender {
     pub computer_name: String,
     /// `SenderModelName` — e.g. `OPPO PJZ110`, or `iPhone` for a phone that reports one.
     pub model_name: String,
-    /// `SenderID` — the sender's own identity string, stable across a session.
+    /// `SenderID` — the sender's own identity string, the same one on every transfer.
+    ///
+    /// Not to be confused with the transfer id: a receiver groups a sender's activity by
+    /// this string, so a value that changes per transfer makes the same device arrive as a
+    /// stranger each time. It is derived from something durable (see `Identity::senderId`),
+    /// which is why it outlives the transfer that carried it.
     pub id: String,
 }
 
@@ -97,8 +102,20 @@ pub struct DiscoverAnswer {
     pub computer_name: String,
     /// `ReceiverMediaCapabilities`, the raw JSON blob — `Some` when the peer sent one.
     pub media_capabilities: Option<Vec<u8>>,
-    /// `IsAirDropable`: the one bit that says this peer accepts files at all.
-    pub airdropable: bool,
+    /// `IsAirDropable`: what the peer said about taking a transfer, or `None` when it said
+    /// nothing at all.
+    ///
+    /// Three-valued rather than a `bool`, because the three cases are not two:
+    ///
+    /// * `Some(true)` — the peer will take one.
+    /// * `None` — the peer answered without saying. A current iPhone does this, and the
+    ///   reference sender reads it as yes (`flag(caps, "IsAirDropable", true)`) and posts
+    ///   `/Ask` regardless. Reading it as no is the difference between a prompt on the
+    ///   other phone and no request at all.
+    /// * `Some(false)` — the peer said no. That is a statement about this moment, not a
+    ///   verdict: the sender goes on to `/Ask`, which is the request that makes the other
+    ///   phone show a prompt, and the answer to *that* is the one a person gives.
+    pub airdropable: Option<bool>,
 }
 
 impl DiscoverAnswer {
@@ -107,7 +124,7 @@ impl DiscoverAnswer {
         DiscoverAnswer {
             computer_name: computer_name.into(),
             media_capabilities: Some(MEDIA_CAPABILITIES.as_bytes().to_vec()),
-            airdropable: true,
+            airdropable: Some(true),
         }
     }
 
@@ -120,7 +137,7 @@ impl DiscoverAnswer {
         DiscoverAnswer {
             computer_name: computer_name.into(),
             media_capabilities: Some(media_capabilities.into()),
-            airdropable: true,
+            airdropable: Some(true),
         }
     }
 
@@ -139,7 +156,13 @@ impl DiscoverAnswer {
                 Value::Data(capabilities.clone()),
             ));
         }
-        pairs.push(("IsAirDropable", Value::Bool(self.airdropable)));
+        // Our own answer always says yes — this device is answering because it is
+        // accepting — so the silence is not a case this side produces. `unwrap_or(true)`
+        // rather than `true` keeps the encoder honest about the type.
+        pairs.push((
+            "IsAirDropable",
+            Value::Bool(self.airdropable.unwrap_or(true)),
+        ));
         Value::dict(pairs)
     }
 
@@ -156,13 +179,15 @@ impl DiscoverAnswer {
     /// > was a device that appeared in the share sheet, opened a TLS connection, asked
     /// > `/Discover`, received a `200`, and then vanished without ever posting `/Ask`.
     ///
-    /// so the absent boolean now reads as `false` here, on purpose.
+    /// The absent boolean is now reported as absent and nothing else: whether the peer
+    /// takes a transfer is decided by `/Ask`, and a sender that reads a missing key as "no"
+    /// reproduces exactly the symptom quoted above one layer down.
     pub fn parse(body: &[u8]) -> Result<DiscoverAnswer, Error> {
         let root = opairdrop_bplist::parse_dict(body)?;
         Ok(DiscoverAnswer {
             computer_name: field(&root, "ReceiverComputerName"),
             media_capabilities: root.get_data("ReceiverMediaCapabilities").map(<[u8]>::to_vec),
-            airdropable: root.get_bool("IsAirDropable", false),
+            airdropable: root.get("IsAirDropable").and_then(Value::as_bool),
         })
     }
 }
@@ -220,12 +245,20 @@ pub struct Item {
 pub const DEFAULT_FILE_TYPE: &str = "public.content";
 
 impl Item {
-    /// A regular file of unknown size.
+    /// A regular file of unknown size, landing at `./<name>` inside the archive.
+    ///
+    /// `FileBomPath` defaults to `./` plus the name rather than to the empty string. §6.4
+    /// marks it required, says the `./` prefix is required, and is specific about what it
+    /// is for: it is the path the receiver announces *and* the name it will look for in
+    /// the archive. An offer whose path is empty describes a file with nowhere to land —
+    /// the sender here used to emit exactly that, because nothing ever set the field, and
+    /// the phone on the other end answered the offer by simply holding the request open.
     pub fn new(name: impl Into<String>) -> Item {
+        let name = name.into();
         Item {
-            name: name.into(),
+            bom_path: format!("./{name}"),
+            name,
             file_type: DEFAULT_FILE_TYPE.to_string(),
-            bom_path: String::new(),
             directory: false,
             size: None,
         }
@@ -251,6 +284,24 @@ impl Item {
         self
     }
 
+    /// The exact `FileBomPath` this item announces in `/Ask`, `./` included.
+    ///
+    /// One expression feeds both [`Item::to_value`] and the archive writer, and that is the
+    /// point of it being a method: UP-7 lets a receiver drop a member whose name is not a
+    /// path the offer announced, so the offered string and the member name are not allowed
+    /// to differ — not even by the `./` the archive could do without. Written in one place,
+    /// that agreement cannot be lost; written in two, it was lost here, and the archive
+    /// carried `photo.jpg` while the offer had said `./photo.jpg`.
+    pub fn bom_path(&self) -> String {
+        // The path is required and must start at `./`; an entry built by parsing an offer
+        // that left it out would otherwise be echoed back with the same hole in it.
+        if self.bom_path.is_empty() {
+            format!("./{}", self.name)
+        } else {
+            self.bom_path.clone()
+        }
+    }
+
     /// The archive member name this item should be written as, or `None` when neither
     /// its declared path nor its name survives sanitising.
     ///
@@ -258,6 +309,10 @@ impl Item {
     /// folder prefix the receiver should keep. Each candidate is run through
     /// [`opairdrop_cpio::safe_name`], so a path that would escape the destination
     /// directory cannot become a member name here.
+    ///
+    /// This is the *receiving* side's question — "where may these bytes land?" — and the
+    /// leading `./` goes away with the rest of the sanitising. A sender must not ask it:
+    /// see [`Item::bom_path`].
     pub fn member_name(&self) -> Option<String> {
         let candidate = if self.bom_path.is_empty() {
             &self.name
@@ -268,10 +323,11 @@ impl Item {
     }
 
     fn to_value(&self) -> Value {
+        let bom_path = self.bom_path();
         let mut pairs = vec![
             ("FileName", Value::String(self.name.clone())),
             ("FileType", Value::String(self.file_type.clone())),
-            ("FileBomPath", Value::String(self.bom_path.clone())),
+            ("FileBomPath", Value::String(bom_path)),
             ("FileIsDirectory", Value::Bool(self.directory)),
             ("ShouldConvertMediaFormats", Value::Bool(false)),
         ];
@@ -532,7 +588,7 @@ mod tests {
         );
 
         let parsed = DiscoverAnswer::parse(&body).unwrap();
-        assert!(parsed.airdropable);
+        assert_eq!(parsed.airdropable, Some(true));
         assert_eq!(parsed.computer_name, "Air");
         assert_eq!(
             parsed.media_capabilities.as_deref(),
@@ -540,17 +596,17 @@ mod tests {
         );
     }
 
-    /// The failure this reads: a peer's answer without the boolean must not be taken as
-    /// "yes". Treating absent as true makes us offer a transfer to something that will
-    /// never accept it.
+    /// What a current iPhone sends: the name, the capabilities, and no boolean. Read as
+    /// absent, not as a refusal — the reference sender reads the same plist with
+    /// `flag(caps, "IsAirDropable", true)` and goes on to `/Ask`.
     #[test]
-    fn an_answer_without_the_boolean_is_not_airdropable() {
+    fn an_answer_without_the_boolean_says_nothing_rather_than_no() {
         let body = opairdrop_bplist::encode(&Value::dict([
             ("ReceiverComputerName", Value::String("Mac".into())),
             ("ReceiverModelName", Value::String("MacBookPro18,3".into())),
         ]));
         let parsed = DiscoverAnswer::parse(&body).unwrap();
-        assert!(!parsed.airdropable);
+        assert_eq!(parsed.airdropable, None);
         assert_eq!(parsed.computer_name, "Mac");
         assert_eq!(parsed.media_capabilities, None);
     }
@@ -560,7 +616,7 @@ mod tests {
         let answer = DiscoverAnswer {
             computer_name: "Air".into(),
             media_capabilities: None,
-            airdropable: true,
+            airdropable: Some(true),
         };
         let root = decode(&answer.encode());
         assert_eq!(keys(&root), ["ReceiverComputerName", "IsAirDropable"]);
@@ -655,6 +711,26 @@ mod tests {
         let root = decode(&body);
         let entry = &root.get_array("Files")[0];
         assert!(entry.get("FileSize").is_none());
+    }
+
+    #[test]
+    fn every_file_entry_names_a_path_inside_the_archive() {
+        let files = [Item::new("IMG_0049.HEIC").with_size(141_853)];
+        let body = ask_request(&sender(), &transfer_id(), &files, &[]);
+        let root = decode(&body);
+        let entry = &root.get_array("Files")[0];
+        // §6.4: "Path inside the `/Upload` archive: `./<FileName>` … The `./` prefix is
+        // required." This was `""` for every file until the offer stopped being ignored.
+        assert_eq!(entry.get_str("FileBomPath"), Some("./IMG_0049.HEIC"));
+    }
+
+    #[test]
+    fn an_entry_without_a_path_of_its_own_gets_one_rather_than_a_hole() {
+        let mut item = Item::new("a.txt");
+        item.bom_path.clear();
+        let body = ask_request(&sender(), &transfer_id(), &[item], &[]);
+        let entry = &decode(&body).get_array("Files")[0].clone();
+        assert_eq!(entry.get_str("FileBomPath"), Some("./a.txt"));
     }
 
     #[test]

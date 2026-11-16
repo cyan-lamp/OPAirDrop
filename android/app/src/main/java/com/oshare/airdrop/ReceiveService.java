@@ -67,31 +67,60 @@ public final class ReceiveService extends Service {
 
     private static final String MANUAL = "receive.manual";
 
+    /** 这次「开」到什么时刻为止（毫秒时间戳）。0 表示一直开。 */
+    private static final String UNTIL = "receive.until";
+
+    /** 限时接收的收摊计时器。 */
+    private static final android.os.Handler CLOSER =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+
     /** 人手动开了接收端没有。 */
     static boolean manual(Context context) {
         return context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
                 .getBoolean(MANUAL, false);
     }
 
-    /** 记下（或撤掉）手动开的凭据。功能页那个开关是唯一的写者。 */
+    /** 记下（或撤掉）手动开的凭据。磁贴与功能页那个开关是写者。 */
     static void setManual(Context context, boolean on) {
         context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
-                .edit().putBoolean(MANUAL, on).apply();
+                .edit().putBoolean(MANUAL, on).putLong(UNTIL, 0).apply();
     }
 
     /**
-     * 该不该收：窗口开着，或者平时跟着互传且互传是「所有人」，或者有人已经在收。
+     * 开接收。{@code minutes <= 0} 表示一直开（磁贴走这条）；正数留给需要限时的调用方。
      *
-     * <p>第二条是给功能页那个手动开关用的：手动打开接收端时既没有窗口也没有互传的许可，
-     * 但只要那个开关是自己拨开的，服务的职责就是把它钉住。少了它，手动开的接收端在离开应用
-     * 九十秒后就会安静地停掉；而把「线程在跑」直接当成理由又会让窗口永远关不掉——两件事都要
-     * 成立，所以凭据写在 {@link #manual} 里，而不是看线程。
+     * <p>期限那段原来服务于磁贴面板里的「iPhone（10 分钟）」。面板已经撤掉，磁贴现在是一个纯粹
+     * 的开关——给 {@code 0}，开了就一直收、关了就停，不再有会自己到期的中间态。
+     */
+    static void enable(Context context, long minutes) {
+        long until = minutes <= 0 ? 0 : System.currentTimeMillis() + minutes * 60_000L;
+        context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+                .edit().putBoolean(MANUAL, true).putLong(UNTIL, until).apply();
+        apply(context);
+    }
+
+    /** 剩下的毫秒数；0 表示一直开；负数表示已经过期。 */
+    static long remaining(Context context) {
+        long until = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+                .getLong(UNTIL, 0);
+        return until == 0 ? 0 : until - System.currentTimeMillis();
+    }
+
+    /**
+     * 该不该收：只看那一个开关。
+     *
+     * <p>2026-11-16 起这条判据不再读互传的「所有人（10 分钟）」：那个窗口是别人的计时器，十分钟
+     * 一到就自己关掉，而我们的接收端会跟着安静地停——屏幕上没有任何说法，人只会觉得"又不好使
+     * 了"。现在只有一个凭据：{@link #manual}，由控制中心那块【AirDrop】磁贴（和功能页那个开关）
+     * 写。开关开着就收，关掉就停，没有第三种状态。
      */
     static boolean listening(Context context) {
-        if (manual(context) && Listener.of(context).running()) {
-            return true;
+        if (!manual(context)) {
+            return false;
         }
-        return Oshare.following(context) && Oshare.everyone(context);
+        long until = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+                .getLong(UNTIL, 0);
+        return until == 0 || System.currentTimeMillis() < until;
     }
 
     /** 把进程状态对齐到 {@link #listening}。幂等，可以在任何线程调用。 */
@@ -103,28 +132,10 @@ public final class ReceiveService extends Service {
         }
     }
 
-    /** 观察互传的接收范围，并立刻对齐一次。跟着进程走，只注册一次。 */
+    /** 把进程状态对齐到那块磁贴的开关。幂等，可以在任何线程调用。 */
     static void follow(Context context) {
-        Context app = context.getApplicationContext();
-        synchronized (ReceiveService.class) {
-            if (!watching) {
-                android.database.ContentObserver observer =
-                        new android.database.ContentObserver(new android.os.Handler(
-                                android.os.Looper.getMainLooper())) {
-                            @Override
-                            public void onChange(boolean selfChange) {
-                                apply(app);
-                            }
-                        };
-                app.getContentResolver().registerContentObserver(
-                        android.provider.Settings.System.getUriFor(Oshare.KEY), false, observer);
-                watching = true;
-            }
-        }
-        apply(app);
+        apply(context.getApplicationContext());
     }
-
-    private static boolean watching;
 
     private static void start(Context context) {
         Intent intent = new Intent(context, ReceiveService.class);
@@ -132,7 +143,8 @@ public final class ReceiveService extends Service {
             context.startForegroundService(intent);
         } catch (RuntimeException refused) {
             // Android 12 起，应用在后台时启动前台服务会被拒（ForegroundServiceStartNotAllowed）。
-            // 这不是错误而是系统的取舍：这时候人来按一下应用，{@code App.onCreate} 会再对齐一次。
+            // 这不是错误而是系统的取舍：磁贴那一下会带一个几秒的允许窗口，而被拒时人还在
+            // 通知栏里，界面上的开关会如实显示「没开」——所以这里只记一行。
             Log.w(TAG, "前台服务没能启动：" + refused);
         }
     }
@@ -164,6 +176,18 @@ public final class ReceiveService extends Service {
         }
         startForeground(NOTIFICATION, notification());
         Listener.of(this).start();
+        // 限时开着的，到点自己收摊：那个期限是我们自己的承诺，不该等某个观察者来兑现。
+        long left = remaining(this);
+        if (left != 0) {
+            CLOSER.removeCallbacksAndMessages(null);
+            CLOSER.postDelayed(() -> {
+                if (!listening(this)) {
+                    stop(this);
+                }
+            }, Math.max(1000, left));
+        }
+        // 不再叫互传的门：流体云是我们自己发的一条实时通知（LiveCard），系统负责画它，
+        // 谁的进程在不在都与它无关。
         // 不 sticky：进程被杀之后由 App/面板重新对齐，而不是让系统在一个没人知道的时刻
         // 把它拉起来——那种重启没有窗口、没有理由，只有一条通知。
         return START_NOT_STICKY;
@@ -301,6 +325,8 @@ public final class ReceiveService extends Service {
 
     /** 通知上那句话：窗口开着就说还剩多久，否则说跟着互传。 */
     private String line() {
-        return Oshare.label(this) + " · AirDrop 接收中";
+        // 这句话只说我们自己的事：磁贴开着，接收端就在跑。以前它要跟着互传的措辞走
+        // （「所有人（10 分钟）」），那是别人的窗口，已经不再决定我们收不收。
+        return "正在监听 " + Listener.PORT + " · 附近设备可发现";
     }
 }

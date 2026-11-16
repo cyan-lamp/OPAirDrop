@@ -24,21 +24,21 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>接收这件事本身完全在协议层里：{@link Listener} 收字节，库决定答什么，文件落在磁盘
  * 上。这些都不需要界面。需要界面的只有三件事——有人要发东西、走到百分之几、收完了——而
- * 这三件事现在有两个可能的所在：本应用自己的通知（{@link Confirmation} 与
- * {@link ReceiveService}），或者互传进程里那张原生卡片与弹窗（{@link OShareReceiveBridge}）。
- * 这个类是唯一知道「两个所在说的是同一件事」的地方：它产生事件，谁在听谁就画。
+ * 这三件事现在都落在流体云胶囊（{@link LiveCard}）与本应用自己的通知（{@link Confirmation}
+ * 与 {@link ReceiveService}）上。这个类是唯一知道「两条路说的是同一件事」的地方：它产生
+ * 事件，谁在听谁就画。
  *
  * <p># 为什么状态按 session 存在这里
  *
- * <p>卡片上的「接受」，最后必须落回停在 {@link Confirmation} 里等答案的那条线程，而卡片在
- * 另一个进程、另一个线程上。中间要穿过的是一条 Messenger 通道，它只能传字符串，所以两个
- * 进程得用同一个名字指同一件事——那就是 {@code session}。这个名字由这里产生，同时交给
- * {@link Confirmation#ask}，于是通知上的按钮和卡片上的按钮回答的是同一个闩。
+ * <p>「接受」最后必须落回停在 {@link Confirmation} 里等答案的那条线程，而按下去的地方在
+ * 系统流体云里。中间隔着一条只能传字符串的路，两头得用同一个名字指同一件事——那就是
+ * {@code session}。这个名字由这里产生，同时交给 {@link Confirmation#ask}，于是流体云上的
+ * 按钮和通知上的按钮回答的是同一个闩。
  *
  * <p># 为什么状态码是这些数
  *
- * <p>1002 与 1006/1007 是互传那一侧的词汇（{@code OShareReceiveBridge} 用它区分「邀请」与
- * 「已经失败的」，这里沿用），中间两个是这个项目自己起的号。真正的判据是 {@code phase}：
+ * <p>1002 与 1006/1007 是从互传那一侧沿用的号（分别指「邀请」与「已经失败的」），中间两个
+ * 是这个项目自己起的。真正的判据是 {@code phase}：
  * 对面按 {@code phase} 决定标题和按钮，{@code status} 只在读不到 {@code phase} 时兜底。
  *
  * <p># 它不做什么
@@ -63,13 +63,6 @@ final class ReceiveHost {
     /** 人中途取消，或者被对面撤掉。 */
     private static final int CANCELLED = 1008;
 
-    /**
-     * 等人回答多久。
-     *
-     * <p>和 {@link Confirmation} 同一个数，而且是同一个理由：发送端自己有超时，比它早一点
-     * 放手更礼貌。两条路用两个数字的话，同一次邀请在通知上和卡片上会有两个寿命。
-     */
-    private static final long DECISION_TIMEOUT_MS = 30_000;
 
     /** 保护下面两个字段。{@link Attempt} 自己的字段不归它管。 */
     private static final Object LOCK = new Object();
@@ -99,8 +92,8 @@ final class ReceiveHost {
     /**
      * 对面没了。只清掉还是它的那一个，免得把一个刚连上来的新客户端一起抹掉。
      *
-     * <p>参数是「谁没了」而不是没有参数：这条通道现在走回环 TCP（见 {@link BridgeServer}），
-     * 一条连接断开和另一条连接建立可以发生在同一个瞬间，无条件清空会把新的那条一起抹掉。
+     * <p>参数是「谁没了」而不是没有参数：每个连接一个界面，一条连接断开和另一条连接建立
+     * 可以发生在同一个瞬间，无条件清空会把新的那条一起抹掉。
      */
     static void detach(Messenger expected) {
         synchronized (LOCK) {
@@ -110,7 +103,7 @@ final class ReceiveHost {
         }
     }
 
-    /** 现在有人能画吗。决定这一次是问卡片还是问通知。 */
+    /** 现在有人能画吗。决定这一次是走流体云还是走通知。 */
     static boolean attached() {
         synchronized (LOCK) {
             return ui != null && ui.getBinder().isBinderAlive();
@@ -127,8 +120,15 @@ final class ReceiveHost {
         return attempt;
     }
 
-    /** 人按了接受或拒绝。送进等答案的那个闩里。 */
-    static boolean answer(String session, boolean accepted) {
+    /**
+     * 人按了接受或拒绝。送进等答案的那个闩里。
+     *
+     * <p>{@code from} 是「人在哪个表面上按的」：{@code "card"}（系统流体云胶囊）或
+     * {@code "notification"}（本应用通知，经 {@link DecisionReceiver}）。以前这里只记
+     * {@code attached}，于是无论人从哪里按，日志都写 {@code via card}——排查「卡片没
+     * 画出来、人是靠兜底通知进来的」那次，这条日志正好把唯一的线索写反了。
+     */
+    static boolean answer(String session, boolean accepted, String from) {
         Attempt attempt = find(session);
         if (attempt == null) {
             // 表里没有这一次接收，但通知可能还挂着：这张表在收尾时就退了，而通知要等
@@ -137,7 +137,7 @@ final class ReceiveHost {
             Confirmation.answer(session, accepted);
             return false;
         }
-        attempt.answer(accepted);
+        attempt.answer(accepted, from);
         return true;
     }
 
@@ -168,6 +168,29 @@ final class ReceiveHost {
         }
     }
 
+    /**
+     * 「打开文件」按下去去哪儿：那一份文件的 {@code content://media/…}。
+     *
+     * <p>收完之后字节已经交给媒体库，本应用手上没有可共享的路径（{@code file://} 从 Android 7
+     * 起不能穿过进程边界），所以能指向这份文件、又能被别的应用读到的只有这一串。多份时打开第一
+     * 份——通知上的一个按钮没有"选哪一份"这一说，而人要的通常是刚发过来的那张。
+     */
+    private static android.app.PendingIntent openAction(Context context, Publish.Result published) {
+        for (Publish.Entry entry : published.entries()) {
+            if (entry.uri == null) {
+                continue;
+            }
+            android.content.Intent open = new android.content.Intent(context, OpenDownload.class)
+                    .putExtra(OpenDownload.EXTRA_URI, entry.uri.toString())
+                    .putExtra(OpenDownload.EXTRA_MIME, context.getContentResolver().getType(entry.uri))
+                    .putExtra(OpenDownload.EXTRA_DIR, entry.directory);
+            return android.app.PendingIntent.getBroadcast(context, 0x0B03, open,
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT
+                            | android.app.PendingIntent.FLAG_IMMUTABLE);
+        }
+        return null;
+    }
+
     private static Attempt find(String session) {
         if (session == null || session.isEmpty()) {
             return null;
@@ -177,15 +200,27 @@ final class ReceiveHost {
         }
     }
 
+    /**
+     * 这次邀请还在等人回答没有。
+     *
+     * <p>兜底通知用它决定还要不要挂：有人按了、或者这次已经过期，那次邀请就从表里退掉了，
+     * 而定时器可能还排着队。没有这个判据，一条已经作废的邀请会在几秒后冒出一条点不动的通知。
+     */
+    static boolean pending(String session) {
+        return find(session) != null;
+    }
+
+    /**
+     * 往互传进程发事件的那条路，已经停用。
+     *
+     * <p>2026-11-16 15:45：接收侧不再依赖互传画卡（改由 {@link LiveCard}），但这条桥还留着，
+     * 于是真机上出现了一件怪事——传输过程中通知栏和流体云里**同时**有一加互传自己的一条普通
+     * 通知，它不属于我们，也点不动。原因是每收一次我们还在给互传发事件，它就照着画一张。
+     *
+     * <p>这里先掐断出口；整个桥接（含 LSPosed 作用域）的删除是下一步。
+     */
     private static void emit(JSONObject event) {
-        Messenger target;
-        synchronized (LOCK) {
-            target = ui;
-        }
-        if (target == null) {
-            return;
-        }
-        BridgeMessenger.sendEvent(target, event);
+        // 有意留空：本应用的所有对外可见状态都走 LiveCard。
     }
 
     private static void forget(String session) {
@@ -227,6 +262,24 @@ final class ReceiveHost {
          * 我们从来没把这件事记下来。
          */
         private volatile boolean answered;
+
+        /**
+         * 人在哪个表面上回答的：{@code "card"} 或 {@code "notification"}，没人回答时是
+         * {@code null}。
+         *
+         * <p>记它的理由只有一条：卡片会不会出现是这台机器上最不可观测的一件事，
+         * {@link #attached()} 只说明 binder 活着，所以「这次到底是怎么被回答的」必须是事实，
+         * 不能由 {@code attached} 推出来。
+         */
+        private volatile String answeredFrom;
+
+        /**
+         * 这次邀请是在云端卡上问的（{@link LiveCard}），不是本应用的通知。
+         *
+         * <p>一条连接一个值，在决定那一刻定下来：系统不肯提升我们时它就是假的，之后的进度与
+         * 结果都走原来那条通知，不该去碰一张不存在的卡。
+         */
+        private volatile boolean cloud;
 
         /** 这条连接。人说取消时关掉它，读字节的那条线程会从这里出来。 */
         private final Socket peer;
@@ -280,7 +333,10 @@ final class ReceiveHost {
          * 情形在这里不可能发生——不是靠判断，是靠只有一条路被走到。
          */
         boolean decide(String summary) {
-            Confirmation.Offer offer = Confirmation.parse(summary);
+            // 一次邀请一个数，卡片和通知都从这里拿：让两条路共用一个常量是上一版的做法，
+            // 那是「同一个数」靠人记得；现在它们读同一行设置，是结构上的同一个数。
+            long decisionMs = Confirmation.decisionTimeout(context);
+            Confirmation.Offer offer = Confirmation.parse(summary, decisionMs);
             sender = offer.sender;
             announced = true;
             // 先把「哪几份」记下来再报事件：卡片看到邀请的那一帧就该看得到件数和名字，
@@ -294,25 +350,52 @@ final class ReceiveHost {
             } catch (JSONException impossible) {
                 Log.w(TAG, "receive invitation unavailable", impossible);
             }
-            boolean attached = attached();
-            // 两条路对发送端是同一个 30 秒，对人却是两种界面（卡片 / 本应用通知）。哪一条被走到
-            // 只有这里说得出来，而「屏幕上什么都没出现」这半句排查永远从这里开始。
-            Log.i(TAG, "invitation " + session + " from " + sender + " attached=" + attached
+            // 只有一条表面：流体云。互传那张卡与它的叫醒逻辑已经撤掉（2026-11-16 16:40），
+            // 于是这里不再有「卡片在不在」这个中间状态——发出去就是发出去了。
+            Log.i(TAG, "invitation " + session + " from " + sender
                     + " files=" + (offer.files.isEmpty() ? "none" : offer.files.size())
                     // 链接分享没有文件，但它不是「什么都没报」。过去这一行在这种情况下写
                     // `files=unreported`，读日志的人会去找一个不存在的解析失败。
                     + " links=" + offer.links);
             long askedAt = System.currentTimeMillis();
-            boolean wanted = attached
-                    ? await(DECISION_TIMEOUT_MS)
-                    : Confirmation.ask(context, session, summary);
+            // 问在哪：系统画的实时通知（状态栏那颗胶囊，展开就是带两个按钮的大卡），或者——
+            // 系统不肯提升我们时——本应用的抬头通知。前者比互传那张卡可靠一个量级：它发出去
+            // 就是发出去了，没有「binder 活着但没画」这种状态（2026-11-16 13:14 撞过一次，
+            // 屏幕上什么都没有，三十秒后按时过期）。
+            // 问在哪：先是底部那块面板（互传同一种形态，人在传文件时认得的就是它），起不来才
+            // 退回流体云那张卡。两条路的答案都落进同一个闩，所以这里的先后只影响"人看到什么"。
+            // 问在哪：只有流体云这一条。应用级的浮窗已经撤掉（2026-11-16 15:10）——它要么
+            // 抢走前台、要么把胶囊挡住，为了"更醒目"付出的代价比收益大。
+            Confirmation.Offer shown = Confirmation.parse(summary, decisionMs);
+            cloud = LiveCard.allowed(context);
+            if (cloud) {
+                LiveCard.invite(context, shown.title(), shown.body(),
+                        Confirmation.decision(context, session, true),
+                        Confirmation.decision(context, session, false));
+            }
+            boolean panel = false;
+            boolean wanted = false;
+            try {
+                wanted = (panel || cloud) ? await(decisionMs) : Confirmation.ask(context, session, summary);
+            } finally {
+                // 云卡只在没接受时撤。接受的那条路马上会被 {@link #progress} 改写成进度，
+                // 收完再由 {@link #delivered} 收尾。
+                if (cloud && !wanted) {
+                    LiveCard.drop(context);
+                    cloud = false;
+                }
+            }
             // 「人说了不行」和「一直没人理」对发送端是同一个 503，对人却是两句不同的话。
-            // 这一行把两者分开，也把耗时写下来——三十秒这个数只有在拒绝之后才看得见，
+            // 这一行把两者分开，也把耗时写下来——超时这个数只有在拒绝之后才看得见，
             // 而人看到的是一张很久之前就弹出来的卡片。
             Log.i(TAG, "invitation " + session
                     + (wanted ? " accepted" : answered ? " refused" : " unanswered")
-                    + " after " + (System.currentTimeMillis() - askedAt) + " ms via "
-                    + (attached ? "card" : "notification"));
+                    + " after " + (System.currentTimeMillis() - askedAt) + " ms"
+                    // 前半句是「问在哪」，后半句是「答在哪」。它们可以不同：卡片先问、三秒后
+                    // 兜底通知接手，人是从通知进来的——这正是那段兜底存在的理由，日志必须能
+                    // 把它和「卡片画出来了」区分开。
+                    + " asked=" + (cloud ? "cloud" : "nobody")
+                    + " answered=" + (answered && answeredFrom != null ? answeredFrom : "nobody"));
             if (!wanted) {
                 // 拒绝的话必须说清是谁拒的。过去两种情况共用「已拒绝」，于是超时被读成
                 // 「我没点它，它自己拒的」——那不是人看错，是我们没写明白。
@@ -320,7 +403,7 @@ final class ReceiveHost {
                 // 人发过它：状态码两边都是 1004（对发送端都是同一个 503），区别只在标题。
                 end(answered ? "rejected" : "expired", REJECTED, answered
                         ? "已拒绝"
-                        : (DECISION_TIMEOUT_MS / 1000) + " 秒内没人应答，已放弃");
+                        : (decisionMs / 1000) + " 秒内没人应答，已放弃");
             } else {
                 // 答过之后，最后那一帧不能再留在「邀请」上。
                 //
@@ -342,6 +425,10 @@ final class ReceiveHost {
             }
             try {
                 int percent = total > 0 ? (int) Math.min(100L, done * 100L / total) : -1;
+                if (cloud) {
+                    // 同一个 id，同一朵云：邀请那张卡在这里变成进度，不需要先撤再发。
+                    LiveCard.update(context, "正在接收", percent >= 0 ? percent + "%" : "准备中", percent);
+                }
                 emit(newEvent("receiving", RECEIVING).put("progress", percent));
             } catch (JSONException impossible) {
                 Log.w(TAG, "receive progress unavailable", impossible);
@@ -362,6 +449,13 @@ final class ReceiveHost {
                 return;
             }
             settled = true;
+            if (cloud) {
+                // 收完不是结束：人还要去打开那份东西。所以这张卡不自己消失，留到人按「完成」。
+                LiveCard.finishWithActions(context, "接收完成",
+                        published.entries().size() + " 份 · " + Listener.bytes(published.bytes()),
+                        openAction(context, published));
+                cloud = false;
+            }
             try {
                 JSONArray files = new JSONArray();
                 for (Publish.Entry entry : published.entries()) {
@@ -420,9 +514,10 @@ final class ReceiveHost {
         }
 
         /** 人说收，或者说不收。两个表面最后都落到这里。 */
-        void answer(boolean yes) {
+        void answer(boolean yes, String from) {
             accepted = yes;
             answered = true;
+            answeredFrom = from;
             decided.countDown();
             // 通知那条路可能正在等：通知按钮和卡片按钮回答的是同一件事，所以两边都叫醒。
             // 没有人在等的时候它什么也不做。
@@ -438,7 +533,8 @@ final class ReceiveHost {
         void cancel() {
             cancelled = true;
             if (decided.getCount() > 0) {
-                answer(false);
+                // 人是从卡片上的取消进来的，所以来源记 card；日志里那一句要知道是谁按的。
+                answer(false, "card");
                 return;
             }
             try {
@@ -502,6 +598,11 @@ final class ReceiveHost {
         }
 
         private void end(String phase, int status, String message) {
+            if (cloud) {
+                // 没有收成就没有可留的东西：一张停在中间态、也没人能再点的常驻卡，比没有更糟。
+                LiveCard.drop(context);
+                cloud = false;
+            }
             if (announced && !settled) {
                 settled = true;
                 try {

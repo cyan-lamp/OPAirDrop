@@ -40,7 +40,7 @@
          不用 `windowNoDisplay`：那样确实一个像素都不画，但平台在 resume 时会要求 Activity 有一个
          窗口，拿不到就抛 `Unable to resume activity`——真机上撞到过。 -->
     <style name="SendPanelTheme" parent="@android:style/Theme.Translucent.NoTitleBar">
-         <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:backgroundDimEnabled">false</item>
         <item name="android:windowAnimationStyle">@style/PanelAnimation</item>
         <!-- 这条窗口自己一个像素都不画，但它的**系统栏区域**会画。
 

@@ -41,7 +41,8 @@ public final class RoundTrip {
             }
         }
 
-        check("the ABI version is the one the app was built against", Native.abiVersion() == 2,
+        check("the ABI version is the one the app was built against",
+                Native.abiVersion() == Native.ABI_VERSION,
                 "abiVersion() returned " + Native.abiVersion());
 
         receiveLandsEveryMember(archive, inbox, expected);

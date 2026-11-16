@@ -42,6 +42,7 @@
 #![deny(missing_docs)]
 
 pub mod api;
+pub mod ble;
 pub mod browse;
 pub mod buffer;
 pub mod jni;

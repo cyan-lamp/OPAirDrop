@@ -44,7 +44,7 @@ import java.nio.charset.StandardCharsets;
  */
 public final class AboutActivity extends Activity {
     /** 外壳期望的 ABI。对不上时这一页要说出来，而不是显示一个「关于」就完事。 */
-    private static final int EXPECTED_ABI = 2;
+    private static final int EXPECTED_ABI = Native.ABI_VERSION;
 
     private Chrome chrome;
     private Scheme S;

@@ -47,6 +47,10 @@ final class IconView extends View {
     static final int KERNEL = 10;
     /** 三条带旋钮的滑杆：一般设置。 */
     static final int SLIDERS = 11;
+    /** 首页「接收文件」：就是 SEND 那只托盘转 180°（见 onDraw 的 case）。 */
+    static final int RECEIVE = 15;
+    /** 哨兵：这一行不要图标砖，文字从卡片左缘起笔（见 Chrome.featureRow）。 */
+    static final int NO_ICON = -1;
 
     /**
      * 底栏三格专用的三个图标。
@@ -98,6 +102,9 @@ final class IconView extends View {
                 break;
             case SEND:
                 send(c, cx, cy, w, h);
+                break;
+            case RECEIVE:
+                receive(c, cx, cy, w, h);
                 break;
             case SHIELD:
                 shield(c, cx, cy, w, h, false);
@@ -158,13 +165,38 @@ final class IconView extends View {
         c.drawCircle(cx, cy, w * 0.07f, paint);
     }
 
+    /** 上传：托盘开口朝上，箭头从托盘里向上指出去。 */
     private void send(Canvas c, float cx, float cy, float w, float h) {
+        tray(c, cx, cy, w, h);
+        arrow(c, cx, cy, w, h);
+    }
+
+    /**
+     * 下载：托盘照旧开口朝上，只把那支箭头绕中心转 180°——尖端翻到下面、落进托盘里。
+     *
+     * <p>不转整个图标：托盘要是跟着翻过来，开口就朝下了，看着像一个倒扣的碗而不是接东西的托盘。
+     * 只有箭头该反向，所以 save/rotate 只裹住画箭头的那几笔。
+     */
+    private void receive(Canvas c, float cx, float cy, float w, float h) {
+        tray(c, cx, cy, w, h);
+        c.save();
+        c.rotate(180, cx, cy);
+        arrow(c, cx, cy, w, h);
+        c.restore();
+    }
+
+    /** 收发共用：开口朝上的托盘。 */
+    private void tray(Canvas c, float cx, float cy, float w, float h) {
         Path tray = new Path();
         tray.moveTo(cx - w * 0.28f, cy + h * 0.02f);
         tray.lineTo(cx - w * 0.28f, cy + h * 0.36f);
         tray.lineTo(cx + w * 0.28f, cy + h * 0.36f);
         tray.lineTo(cx + w * 0.28f, cy + h * 0.02f);
         c.drawPath(tray, paint);
+    }
+
+    /** 收发共用：一支向上的箭头。接收时只把这一段旋转 180°（见 {@link #receive}）。 */
+    private void arrow(Canvas c, float cx, float cy, float w, float h) {
         c.drawLine(cx, cy + h * 0.18f, cx, cy - h * 0.38f, paint);
         c.drawLine(cx, cy - h * 0.38f, cx - w * 0.19f, cy - h * 0.19f, paint);
         c.drawLine(cx, cy - h * 0.38f, cx + w * 0.19f, cy - h * 0.19f, paint);

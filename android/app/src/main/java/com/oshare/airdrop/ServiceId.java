@@ -40,7 +40,8 @@ import java.util.List;
  *
  * <p>A few entries rather than one, because a start that dies between "read" and "withdrew"
  * leaves the oldest ID behind otherwise, and the cost of remembering eight twelve-byte strings
- * is nothing.
+ * is nothing. The eight is {@code discovery.remembered_peers} — it counts the name in use, so
+ * the history is one shorter than the row says.
  *
  * <p>Writes go through a temporary file and a rename: a crash mid-write must not turn into an
  * unparseable ID, because a service ID that fails to parse is a new service ID, which is the
@@ -50,8 +51,23 @@ final class ServiceId {
     /** In the app's private directory, beside {@code settings.conf}. */
     private static final String FILE_NAME = "service.id";
 
-    /** How many published IDs to remember. See the class comment for why more than one. */
+    /**
+     * How many published IDs to remember, when the table cannot say.
+     *
+     * <p>The row is {@code discovery.remembered_peers}; this is what it was before it was a row.
+     * See the class comment for why more than one ID is kept at all.
+     */
     private static final int MAX_REMEMBERED = 8;
+
+    /**
+     * How many IDs to keep now: the row, clamped by it, or the constant above.
+     *
+     * <p>Read from the settings file that sits beside {@code service.id} rather than from a
+     * {@link android.content.Context}, because this class is handed a directory and nothing else.
+     */
+    private static int remembered(File directory) {
+        return (int) Tuning.ms(directory, "discovery.remembered_peers", MAX_REMEMBERED);
+    }
 
     /** The current ID first, then the ones that should be withdrawn, oldest first. */
     final String current;
@@ -199,7 +215,7 @@ final class ServiceId {
             unique.add(id);
         }
         List<String> ordered = new ArrayList<>(unique);
-        int from = Math.max(0, ordered.size() - MAX_REMEMBERED);
+        int from = Math.max(0, ordered.size() - remembered(directory));
         return ordered.subList(from, ordered.size());
     }
 
@@ -210,8 +226,9 @@ final class ServiceId {
         StringBuilder body = new StringBuilder();
         // Trim the history rather than the current ID: the ID in use is the one record that must
         // never be lost, and the oldest ghosts are the ones least likely to still be in
-        // anybody's cache.
-        int from = Math.max(0, stale.size() - (MAX_REMEMBERED - 1));
+        // anybody's cache. The row counts the name in use too, so the history gets one fewer.
+        int keep = Math.max(1, remembered(directory));
+        int from = Math.max(0, stale.size() - (keep - 1));
         for (String id : stale.subList(from, stale.size())) {
             body.append(id).append('\n');
         }

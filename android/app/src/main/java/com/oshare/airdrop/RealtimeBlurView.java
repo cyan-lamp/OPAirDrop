@@ -16,7 +16,6 @@ import android.graphics.RenderEffect;
 import android.graphics.RenderNode;
 import android.graphics.Shader;
 import android.view.View;
-import android.view.ViewGroup;
 
 /**
  * Realtime background blur. Floating surfaces sample a

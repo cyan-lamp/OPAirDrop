@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "opairdrop-airdrop"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "opairdrop-bplist",
  "opairdrop-cpio",
@@ -88,25 +88,25 @@ dependencies = [
 
 [[package]]
 name = "opairdrop-awdl"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "opairdrop-bplist"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "opairdrop-cpio"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "flate2",
 ]
 
 [[package]]
 name = "opairdrop-ffi"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "jni-sys 0.3.1",
  "opairdrop-airdrop",
@@ -117,15 +117,15 @@ dependencies = [
 
 [[package]]
 name = "opairdrop-http"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "opairdrop-mdns"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "opairdrop-settings"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "proc-macro2"

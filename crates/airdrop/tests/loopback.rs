@@ -5,17 +5,22 @@
 //! that a `200` reaches a peer whose body has not arrived, and that an archive of the sizes
 //! a photo and a video actually are arrives byte for byte.
 //!
-//! The client is written by hand rather than reusing anything, because a test client that
-//! shares code with the server can only prove the server agrees with itself.
+//! One test goes the other way round and uses our own [`Client`] against this server, because
+//! `/Ask` has to arrive on a **second** connection — see `Client::renew`. A scripted stream
+//! proves which request was written to which buffer; only a real listener proves that the
+//! second connection is a second `accept`.
+//!
+//! Most of the client is written by hand rather than reusing anything, because a test client
+//! that shares code with the server can only prove the server agrees with itself.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::thread;
 
 use opairdrop_airdrop::payload::{discover_request, Item, Sender};
 use opairdrop_airdrop::server::{Receiver, Upload};
 use opairdrop_airdrop::{
-    ask_request, offered_bytes, Ask, AskAnswer, Client, DiscoverAnswer, Server, TransferId,
+    ask_request, offered_bytes, Ask, AskAnswer, Client, Dial, DiscoverAnswer, Server, TransferId,
 };
 
 /// What the far end of the socket saw.
@@ -94,14 +99,129 @@ fn listen() -> (TcpListener, thread::JoinHandle<Server<Sink>>) {
     (listener, handle)
 }
 
+/// A listener that serves two connections in turn, keeping each one's receiver apart.
+///
+/// Separate [`Server`]s rather than one shared receiver is the whole point: "the offer went
+/// out on the connection `/Discover` was answered on" is only a question that can fail if
+/// each connection's `Sink` remembers its own requests.
+///
+/// The accepts are bounded, because the regression this test is for is a *missing* second
+/// connection. A plain `accept` would turn that into a test run that never ends, and a hang
+/// says less than `no second connection arrived`.
+fn listen_to_two() -> (TcpListener, thread::JoinHandle<Vec<Server<Sink>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+    let handle = {
+        let listener = listener.try_clone().expect("clones the listener");
+        thread::spawn(move || {
+            let mut served = Vec::new();
+            for arrival in 1..=2 {
+                let stream = accept_within(&listener, arrival);
+                let mut reader = stream.try_clone().expect("clones the socket");
+                let mut writer = stream;
+                let mut server = Server::new(Sink {
+                    received: Received::default(),
+                });
+                server
+                    .serve(&mut reader, &mut writer)
+                    .expect("serves the connection");
+                served.push(server);
+            }
+            served
+        })
+    };
+    (listener, handle)
+}
+
+/// Waits up to [`ACCEPT_BUDGET`] for the next connection, then fails by name.
+fn accept_within(listener: &TcpListener, arrival: usize) -> TcpStream {
+    const ACCEPT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    listener
+        .set_nonblocking(true)
+        .expect("makes the listener polling");
+    let deadline = std::time::Instant::now() + ACCEPT_BUDGET;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("makes the connection blocking again");
+                return stream;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "connection {arrival} of 2 never arrived within {:?}: the far end opened \
+                     {} and stopped. A sender that renews before /Ask is the whole point of \
+                     this test.",
+                    ACCEPT_BUDGET,
+                    arrival - 1
+                );
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => panic!("accept failed: {error}"),
+        }
+    }
+}
+
 fn connect(listener: &TcpListener) -> TcpStream {
-    let stream = TcpStream::connect(listener.local_addr().expect("an address")).expect("connects");
+    open_at(listener.local_addr().expect("an address"))
+}
+
+/// One freshly opened socket, with the timeouts that keep a broken test from hanging.
+fn open_at(at: SocketAddr) -> TcpStream {
+    let stream = TcpStream::connect(at).expect("connects");
     // A hung test is worse than a failing one.
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(10)))
         .expect("sets a timeout");
     stream.set_nodelay(true).expect("disables Nagle");
     stream
+}
+
+/// A socket that can reopen itself, which is what a renewal is on a real transport.
+///
+/// The FFI's wire does this by asking the platform layer for another `Socket`; here it is a
+/// second `connect` to the same listener. Either way the old connection is closed rather
+/// than reused, because a receiver that has answered one request is done with it.
+struct Link {
+    at: SocketAddr,
+    socket: TcpStream,
+}
+
+impl Link {
+    fn open(at: SocketAddr) -> Link {
+        Link {
+            at,
+            socket: open_at(at),
+        }
+    }
+}
+
+impl Read for Link {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.socket.read(buf)
+    }
+}
+
+impl Write for Link {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.socket.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.socket.flush()
+    }
+}
+
+impl Dial for Link {
+    fn dial(&mut self) -> std::io::Result<()> {
+        // Shut down first so the serving thread sees a clean end of stream and can go back
+        // to `accept`; a socket merely dropped would work here too, but this is the shape
+        // the real transport has and it does not depend on drop order.
+        let _ = self.socket.shutdown(Shutdown::Both);
+        self.socket = open_at(self.at);
+        Ok(())
+    }
 }
 
 /// One response: its status, and its body when it declared a length.
@@ -180,7 +300,7 @@ fn the_three_endpoints_walk_over_one_connection() {
     let reply = read_reply(&mut stream);
     assert_eq!(reply.status, 200);
     let answer = DiscoverAnswer::parse(&reply.body).expect("a plist");
-    assert!(answer.airdropable);
+    assert_eq!(answer.airdropable, Some(true));
     assert_eq!(answer.computer_name, "Air");
 
     let files = [Item::new("a.jpg").with_size(3_000_019), Item::new("empty.txt").with_size(0)];
@@ -288,7 +408,8 @@ fn a_head_with_no_body_is_answered_while_the_socket_stays_open() {
 
 /// A peer that frames an offer and then hangs up gets no answer it can use, and no panic.
 #[test]
-fn an_offer_whose_body_is_cut_off_ends_the_connection_quietly() {    let (listener, handle) = listen();
+fn an_offer_whose_body_is_cut_off_ends_the_connection_quietly() {
+    let (listener, handle) = listen();
     let mut stream = connect(&listener);
 
     let ask = ask_request(&Sender::new("Mac", "MacBook", "id"), &id(), &[Item::new("a")], &[]);
@@ -410,5 +531,74 @@ fn a_sender_and_a_receiver_move_one_archive_the_whole_way() {
         unpacked[1].data == payload,
         "the video arrived with a difference somewhere"
     );
+}
+
+/// The rule the whole send path is shaped around: an iPhone reads one request per connection.
+///
+/// `/Discover` and `/Ask` therefore cannot share a socket, and this is the test that says so
+/// in terms a listener can fail: two `accept`s, the first carrying the question about the
+/// peer and nothing else, the second carrying the offer **and** the archive.
+///
+/// The failure this replaces is worth restating because it did not look like a failure. On
+/// one socket, `/Discover` came back `200` with a name in 80 ms and `/Ask` was then met with
+/// complete silence — no status, no reset, no close — for as long as this side waited. A
+/// listener that accepted twice would have shown it immediately: the second connection
+/// never arrived, because there was never a second request to read.
+///
+/// The archive stays on the connection the offer was answered on, which is the other half of
+/// the rule and the reason there are two connections here rather than three.
+#[test]
+fn the_offer_and_the_archive_arrive_on_a_connection_of_their_own() {
+    let (listener, handle) = listen_to_two();
+    let at = listener.local_addr().expect("an address");
+    let mut client = Client::new(Link::open(at), "air.local");
+
+    let sender = Sender::new("OPPO Find X", "OPPO PJZ110", "1A2B:3C4D");
+    let transfer_id = id();
+    let files = [Item::new("a.jpg").with_size(11)];
+
+    let found = client.discover(&sender).expect("the receiver answers");
+    assert_eq!(found.computer_name, "Air");
+
+    // The step that used to be missing. Without it the offer is written onto the socket the
+    // receiver has already finished with, and the transfer dies of silence.
+    client.renew().expect("a second connection");
+
+    let names = client
+        .ask(&sender, &transfer_id, &files, &[])
+        .expect("the offer is answered");
+    assert_eq!(names.model_name, "OPPO PJZ110");
+    client
+        .upload(&transfer_id, offered_bytes(&files), |out| {
+            out.write_all(b"07070100000000TRAILER")
+        })
+        .expect("the archive is accepted");
+
+    drop(client.into_inner());
+
+    // A panic inside the listener thread is the failure being reported, so it is resumed
+    // rather than flattened into "the server thread finishes".
+    let served = match handle.join() {
+        Ok(served) => served,
+        Err(hung) => std::panic::resume_unwind(hung),
+    };
+    assert_eq!(served.len(), 2, "the listener accepted exactly twice");
+
+    // The first connection asked one question and was then spent.
+    let first = &served[0].receiver().received;
+    assert_eq!(first.senders, ["OPPO Find X"]);
+    assert!(first.offers.is_empty(), "the spent connection carried no offer");
+    assert!(first.archives.is_empty(), "and no archive");
+
+    // The second opened with the offer, because that is the first thing it was written.
+    let second = &served[1].receiver().received;
+    assert!(
+        second.senders.is_empty(),
+        "the second connection was never asked whether the peer accepts files"
+    );
+    assert_eq!(second.offers.len(), 1);
+    assert_eq!(second.offers[0].transfer_id.as_deref(), Some(transfer_id.as_str()));
+    assert_eq!(second.archives.len(), 1);
+    assert_eq!(second.archives[0], b"07070100000000TRAILER");
 }
 

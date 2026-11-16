@@ -10,16 +10,16 @@ import android.widget.TextView;
  *
  * <p># 三块，从上到下
  *
- * <p>发送入口一行、环境两行、设备信息六行。最上面那张开场白卡片已经拿掉：它说的是「这个
- * 应用是什么」，而打开应用的人已经知道了——它占掉的正好是第一屏最贵的那块位置，把真正要
- * 点的那一行和两个前提条件一起挤到折线以下。现在页首直接就是「传输」分组标题。
+ * <p>传输两张卡（发送文件 / 接收文件）、环境一张卡（root 权限）、设备信息六行。最上面那张开
+ * 场白卡片已经拿掉：它说的是「这个应用是什么」，而打开应用的人已经知道了——它占掉的正好是
+ * 第一屏最贵的那块位置。现在页首直接就是「传输」分组标题。
  *
- * <p># 为什么环境那两行从 LSP / root 换成了接收端 / 一加互传
+ * <p># 为什么收发挨在一起、root 单列在环境
  *
- * <p>legacy 要靠 LSPosed 注入互传进程、要靠 root 读框架状态，所以那两行问的是「桥搭起来
- * 没有」。这一版接收端在自己的进程里监听 8770，不再需要框架也不再需要 root，于是同一张卡
- * 要回答的问题变成了「接收端在不在跑」「互传把本机设成谁能找到」——还是两行、还是一颗状态
- * 胶囊、还是同一条分隔线，只是答案换成了这一版真正依赖的两样东西。
+ * <p>接收文件原先在「环境」里，和发送文件分在两处——可收发本是一件事的两面，人打开这一页
+ * 要先同时看到「我要发」和「我在收」。于是接收挪到传输板块、紧跟发送下面，用分隔线分开；
+ * 环境板块让位给 root 权限，它回答的是「这台机器给没给 root、是谁给的」，是这一个 app 能否
+ * 装驱动的前提，和收发不是一个层面。
  *
  * <p># 这一页只回答问题，不放开关
  *
@@ -32,19 +32,25 @@ final class HomePage {
      *
      * <p>与库自报的数字比一次：APK 里的 {@code .so} 比调用它的 Java 旧时，这两个数就会不
      * 相等。这一步要在第一次结构化调用之前完成——两个数字是一句诊断，段错误不是。
+     *
+     * <p>数字本身在 {@link Native#ABI_VERSION}。这里原本也写着一个 2，于是库升到 3 的时候
+     * 它没跟着动，接收端拒绝启动并报「库的 ABI 是 3，本版需要 2」——明明是新的库，却说它旧。
      */
-    private static final int EXPECTED_ABI = 2;
+    private static final int EXPECTED_ABI = Native.ABI_VERSION;
 
     private final Activity host;
     private final Chrome chrome;
     private final Scheme S;
     private final Listener listener;
+    /** root 探测结束后用来重画那一行；由 MainActivity 传进来（就是 refresh）。 */
+    private final Runnable onRootChecked;
 
-    HomePage(Activity host, Chrome chrome, Listener listener) {
+    HomePage(Activity host, Chrome chrome, Listener listener, Runnable onRootChecked) {
         this.host = host;
         this.chrome = chrome;
         this.S = chrome.scheme();
         this.listener = listener;
+        this.onRootChecked = onRootChecked;
     }
 
     View view() {
@@ -64,57 +70,125 @@ final class HomePage {
         return chrome.scroller(body);
     }
 
-    /** 发送入口：整个应用被打开的理由，所以排在最前。 */
+    /**
+     * 发送入口：整个应用被打开的理由，所以排在最前。
+     *
+     * <p># 这一行和系统分享面板进的是同一页
+     *
+     * <p>两条路的区别只在「手上有没有文件」：从别的应用分享过来时，文件已经在 intent 里；
+     * 从这里点进去时，人只有「我要发点东西」这个念头。所以这里不塞任何 data，就让
+     * {@link SendActivity} 自己先弹出选择器——判断只有一处，不会出现「分享进来的和点进来
+     * 的不是同一页」这种两套逻辑。空手进去时那一页也知道该怎么开场。
+     */
     private View sendCard() {
         LinearLayout card = chrome.rowCard();
         LinearLayout row = chrome.featureRow(
                 IconView.SEND, "发送文件", "选文件，发给附近的 Apple 设备",
                 chrome.text("›", 20, true, S.textDim));
         chrome.addRow(card, row, chrome.rowHeight());
-        chrome.setRowAction(row, true, Scheme.CORNERS_ALL,
-                () -> chrome.say("主动发送还没接入：现在靠接收端应答对端", S.orange));
+        chrome.setRowAction(row, true, Scheme.CORNERS_TOP, () -> {
+            android.content.Intent send = new android.content.Intent(host, SendActivity.class);
+            try {
+                host.startActivity(send);
+            } catch (Throwable unavailable) {
+                // 起不来只可能是这一版的清单里没有它。说清楚，而不是什么都不发生。
+                chrome.say("发送页打不开：" + unavailable, S.orange);
+            }
+        });
+
+        // 接收文件原先在「环境」那张卡里。挪到传输板块、紧跟发送文件下面：收发本就是一件事的
+        // 两面，人打开这一页要先看到「我要发」和「我在收」这两个动作，而不是把它们分到两处。
+        card.addView(chrome.divider(), chrome.insetDivider());
+        TextView[] receiveSubOut = new TextView[1];
+        LinearLayout receiveRow = chrome.featureRow(
+                IconView.RECEIVE, "接收文件", listenState(), buildListenPill(), receiveSubOut);
+        receiveSub = receiveSubOut[0];
+        chrome.addRow(card, receiveRow, chrome.rowHeight());
+        chrome.setRowAction(receiveRow, true, Scheme.CORNERS_BOTTOM, () -> {
+            // 和控制中心那块【AirDrop】磁贴走同一条路：都读写 ReceiveService 的 manual 凭据。
+            // 之前这里直接 listener.start/stop，只动了底层监听、没写凭据，结果磁贴那边（或下次
+            // follow 对齐）一看凭据没变就把接收端改回去——两个开关各说各话。现在拨这一行，就是
+            // 拨那个磁贴：开用 enable(0)（一直开），关用 setManual(false)+apply。
+            boolean wasOn = ReceiveService.listening(host);
+            if (wasOn) {
+                ReceiveService.setManual(host, false);
+                ReceiveService.apply(host);
+            } else {
+                ReceiveService.enable(host, 0);
+            }
+            chrome.say("接收文件" + (wasOn ? "已关闭" : "已开启"), S.text);
+            // 就地刷新胶囊与副标题（这一页此刻不重建），磁贴下次展开会自己按新凭据重画。
+            chrome.setPill(listenPill, wasOn ? "已停止" : "监听中",
+                    wasOn ? S.gray : S.green);
+            if (receiveSub != null) {
+                receiveSub.setText(listenState());
+            }
+        });
         return card;
     }
 
     /**
-     * 环境两行：接收端、一加互传。
+     * 「接收文件」那行的状态胶囊与副标题引用：拨完就地刷新，不必重建整页。
+     * 每次画卡都会重新赋值（{@link #sendCard()} 每次 new）。
+     */
+    private TextView listenPill;
+    private TextView receiveSub;
+
+    /** 接收文件那行的状态胶囊，每次画卡现取——状态在运行中会变。 */
+    private TextView buildListenPill() {
+        boolean running = ReceiveService.listening(host);
+        boolean failed = listener.problem();
+        listenPill = chrome.statusPill(
+                failed ? "异常" : running ? "监听中" : "已停止",
+                failed ? S.red : running ? S.green : S.gray);
+        return listenPill;
+    }
+
+    /**
+     * 环境一行：root 权限。
      *
-     * <p>分隔线从文字左缘起笔（18 内边距 + 44 图标砖 + 12 间隙），和下面设备信息卡一致——
-     * 一条从卡片左缘起笔的线会把两行的图标砖串成一条，读起来像表格的竖线。
+     * <p>接收端已经挪到传输板块、和发送文件挨在一起了；互传那一行早在脱离一加互传时删掉。
+     * 这一张卡现在只剩一个问题：机器给没给 root、是谁给的。
+     *
+     * <p>第一次进来时探测还没跑完，先显示「检测中」占位；{@link RootInfo#probe} 在后台线程查完
+     * 会回调 {@link #onRootChecked} 重画这一行。之后用进程内缓存，不再反复起 su 弹授权。
      */
     private View envCard() {
         LinearLayout card = chrome.rowCard();
 
-        boolean running = listener.running();
-        boolean failed = listener.problem();
-        TextView listenPill = chrome.statusPill(
-                failed ? "异常" : running ? "监听中" : "已停止",
-                failed ? S.red : running ? S.green : S.gray);
-        LinearLayout listenRow = chrome.featureRow(
-                IconView.RADAR, "接收端", listenState(), listenPill);
-        chrome.addRow(card, listenRow, chrome.rowHeight());
-        // 整行点一下就把接收端拉起来 / 停下：这是首页唯一一个「看状态顺手动一下」的地方，
-        // 但它不写任何设置，所以不算开关。
-        chrome.setRowAction(listenRow, !Oshare.following(host), Scheme.CORNERS_TOP, () -> {
-            // 先记住拨之前的样子：start/stop 是往工作线程派活，回来问 running() 时答案已经
-            // 变了，于是提示词会和刚发生的事正好相反。
-            boolean wasRunning = listener.running();
-            if (wasRunning) {
-                listener.stop();
-            } else {
-                listener.start();
-            }
-            chrome.say("接收端正在" + (wasRunning ? "停止" : "启动"), S.text);
+        RootInfo.Snapshot root = RootInfo.get();
+        String pill;
+        int pillColor;
+        String subtitle;
+        if (!root.checked) {
+            pill = "检测中";
+            pillColor = S.gray;
+            subtitle = "正在读取 root 授权状态";
+        } else if (root.granted) {
+            pill = "已获取";
+            pillColor = S.green;
+            subtitle = root.manager.isEmpty()
+                    ? "已获得 root 授权"
+                    : root.manager + (root.version.isEmpty() ? "" : " " + root.version);
+        } else {
+            pill = "未获取";
+            pillColor = S.red;
+            subtitle = "请在管理器授予 root 权限";
+        }
+        TextView rootPill = chrome.statusPill(pill, pillColor);
+        LinearLayout rootRow = chrome.featureRow(
+                IconView.TERMINAL, "root 权限", subtitle, rootPill);
+        chrome.addRow(card, rootRow, chrome.rowHeight());
+        // 可按压：点一下重新测一次授权（人刚在 KernelSU / Magisk 里点了授权，不必重启应用）。
+        chrome.setRowAction(rootRow, true, Scheme.CORNERS_ALL, () -> {
+            chrome.say("正在重新检测 root 权限", S.text);
+            RootInfo.probe(host, onRootChecked);
         });
 
-        card.addView(chrome.divider(), chrome.insetDivider());
-
-        int share = Oshare.stateOf(host);
-        TextView sharePill = chrome.statusPill(shareLabel(share), shareColor(share));
-        LinearLayout shareRow = chrome.featureRow(
-                IconView.PHONE, "一加互传", Oshare.label(host), sharePill);
-        chrome.addRow(card, shareRow, chrome.rowHeight());
-        chrome.setRowAction(shareRow, false, null, null);
+        // 没测过就起一次；测过了但显示「未获取」也允许点行重测，这里不自动重跑。
+        if (!root.checked) {
+            RootInfo.probe(host, onRootChecked);
+        }
         return card;
     }
 
@@ -176,26 +250,6 @@ final class HomePage {
             return listener.last();
         }
         return listener.state();
-    }
-
-    private String shareLabel(int share) {
-        switch (share) {
-            case 1:
-                return "所有人";
-            case 2:
-                return "仅联系人";
-            case 0:
-                return "已关闭";
-            default:
-                return "读不到";
-        }
-    }
-
-    private int shareColor(int share) {
-        if (share == 1) {
-            return S.green;
-        }
-        return share < 0 ? S.red : S.gray;
     }
 
     /**

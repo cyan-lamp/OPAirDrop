@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  接收确认那张卡的配色（浅色）。
+
+  深浅两套是同一组名字，靠 values-night 覆盖——系统按当前 uiMode 直接取，页面里不需要判断
+  白天黑夜，也就不会出现「深色模式下漏改一处」这种半黑半白。
+-->
+<resources>
+    <!-- 卡片底：纯白，和系统对话框同一层纸。 -->
+    <color name="confirm_card">#FFFFFFFF</color>
+    <!-- 描边：一层极淡的墨，让卡片压在浅色桌面上时不至于糊成一片。 -->
+    <color name="confirm_stroke">#14000000</color>
+</resources>

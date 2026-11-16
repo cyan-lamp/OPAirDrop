@@ -9,6 +9,7 @@ import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewOutlineProvider;
@@ -77,6 +78,37 @@ final class SettingsPage {
     private final class Shell extends FrameLayout implements Chrome.BottomInset {
         Shell() {
             super(host);
+        }
+
+        /**
+         * 点到输入框外面就把光标收起来、键盘落下去。
+         *
+         * <p>只在按下那一刻判断，而且只认「当前正聚焦的那个输入框」：别的输入框没聚焦，点在它
+         * 上面本来就会把焦点移过去，不该在这里插手。落点用屏幕坐标比，因为滚动容器会滚、行的
+         * 位置一直在变。返回 false 把事件照常往下传，否则这一下点击就被这里吃掉了，按钮也不响应。
+         */
+        @Override
+        public boolean dispatchTouchEvent(MotionEvent event) {
+            if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                View focused = findFocus();
+                if (focused instanceof EditText) {
+                    int[] location = new int[2];
+                    focused.getLocationOnScreen(location);
+                    float x = event.getRawX();
+                    float y = event.getRawY();
+                    boolean inside = x >= location[0] && x <= location[0] + focused.getWidth()
+                            && y >= location[1] && y <= location[1] + focused.getHeight();
+                    if (!inside) {
+                        focused.clearFocus();
+                        android.view.inputmethod.InputMethodManager keyboard =
+                                host.getSystemService(android.view.inputmethod.InputMethodManager.class);
+                        if (keyboard != null) {
+                            keyboard.hideSoftInputFromWindow(focused.getWindowToken(), 0);
+                        }
+                    }
+                }
+            }
+            return super.dispatchTouchEvent(event);
         }
 
         @Override
@@ -267,6 +299,15 @@ final class SettingsPage {
         rows.clear();
 
         for (SettingsScreen.Section section : screen.sections()) {
+            // 发现、发送、接收三块都撤了：发现没有可拨的，发送没有可设的，接收里唯一还用的
+            // 「接收文件保存位置」已移到功能页的【保存位置】板块。设备那两行（名字/机型）也
+            // 移到功能页，改名【设备显示】——都是「拨一下就换对端看到什么」的行为，归到一处。
+            // 这一页只剩诊断和关于。
+            String heading = section.title();
+            if ("发现".equals(heading) || "发送".equals(heading)
+                    || "接收".equals(heading) || "设备".equals(heading)) {
+                continue;
+            }
             boolean any = false;
             for (SettingsScreen.Setting setting : section.settings()) {
                 if (setting.control() != SettingsScreen.Control.SWITCH) {
@@ -613,7 +654,7 @@ final class SettingsPage {
     private View aboutCard() {
         LinearLayout card = chrome.rowCard();
         LinearLayout row = chrome.featureRow(
-                IconView.SHIELD, "关于 OPAirDrop", "版本、源代码与开源许可",
+                IconView.NO_ICON, "关于 OPAirDrop", "版本、源代码与开源许可",
                 chrome.text("›", 20, true, S.textDim));
         chrome.addRow(card, row, chrome.rowHeight());
         chrome.setRowAction(row, true, Scheme.CORNERS_ALL,

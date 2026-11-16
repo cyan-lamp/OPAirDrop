@@ -2,6 +2,7 @@ package com.oshare.airdrop;
 
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
@@ -53,11 +54,13 @@ public final class IdentityCheck {
         certificateShape(identity);
         signatureVerifies(identity);
         fingerprintMatchesSha256(identity);
+        senderIdIsDerivedFromTheCertificate(identity);
         reloadKeepsTheCertificate(identity);
         coherentRejectsAForeignKey(identity);
         serverHandshakeSucceeds(identity);
         pinnedClientAcceptsMatchingFingerprint(identity);
         pinnedClientRejectsOtherFingerprint(identity);
+        theRefusalArrivesAsOneType(identity);
 
         storeGeneratesAndKeepsItsIdentity(dir);
         storeReplacesATruncatedCertificate(dir);
@@ -171,6 +174,52 @@ public final class IdentityCheck {
             identity.certHash());
     }
 
+    // ---------------------------------------------------------------- the sender id
+
+    /**
+     * The one string a receiver files this device under.
+     *
+     * <p>It is neither random nor per-transfer, and both halves of that matter: two offers from
+     * the same phone must arrive as one device, and a phone that restarted must arrive as the
+     * device it was before. So the assertions are about the value staying put while everything
+     * around it moves — a second {@link Identity} over the same certificate, another device
+     * name, a fresh process — and about its exact form, because which string the peer groups by
+     * is not something a later refactor may quietly change.
+     */
+    private static void senderIdIsDerivedFromTheCertificate(Identity identity) throws Exception {
+        String senderId = identity.senderId();
+        check("the sender id is a type 3 uuid",
+            senderId.matches(
+                "[0-9A-F]{8}-[0-9A-F]{4}-3[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}"),
+            senderId);
+
+        // The derivation spelled out again instead of called: this line is the agreement with
+        // the reference implementation, and a check that reused the production expression would
+        // agree with whatever prefix it was handed.
+        String expected = java.util.UUID.nameUUIDFromBytes(
+            ("oshare-airdrop:" + identity.certHash())
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8))
+            .toString().toUpperCase(Locale.ROOT);
+        check("the sender id is the name-based uuid of the prefix and the fingerprint",
+            expected.equals(senderId), expected);
+        check("the sender id is not the fingerprint", !senderId.equals(identity.certHash()),
+            senderId);
+
+        Identity reloaded = Identity.load(identity.privateKey(), identity.certificate(), "Pixel 9");
+        check("the same certificate gives the same sender id",
+            senderId.equals(reloaded.senderId()), reloaded.senderId());
+
+        // A rename must not read as a new device: the peer keys its grouping on this string, and
+        // what the person typed is a label, not an identity.
+        Identity renamed = Identity.load(identity.privateKey(), identity.certificate(), "另一个名字");
+        check("a renamed device keeps its sender id",
+            senderId.equals(renamed.senderId()), renamed.senderId());
+
+        Identity other = Identity.generate("Pixel 9");
+        check("a different device is a different sender id",
+            !senderId.equals(other.senderId()), other.senderId());
+    }
+
     private static void reloadKeepsTheCertificate(Identity identity) throws Exception {
         Identity reloaded = Identity.load(identity.privateKey(), identity.certificate(), "Pixel 9");
         check("reload keeps the fingerprint",
@@ -243,6 +292,54 @@ public final class IdentityCheck {
                     String.valueOf(expected.getMessage()));
             }
             check("a mismatched fingerprint is rejected", rejected, "the handshake was accepted");
+        }
+    }
+
+    /**
+     * The sending path decides what to say by type, and the type has to survive the JSSE.
+     *
+     * <p>This is the half of pinning that {@link #pinnedClientRejectsOtherFingerprint} does not
+     * cover: it is not enough for the handshake to fail, the caller has to be able to tell a
+     * swapped certificate from a closed socket. The {@code TrustManager} raises a
+     * {@link PeerMismatch.Pin}, and by the time the send page sees it the JSSE has wrapped it —
+     * how many times differs between this JDK and Android's Conscrypt, which is why
+     * {@link PeerMismatch#of} walks the chain instead of checking the top. Running the real
+     * handshake here is what makes that claim a fact rather than a reading of the source.
+     */
+    private static void theRefusalArrivesAsOneType(Identity identity) throws Exception {
+        try (SSLServerSocket server = listen(identity)) {
+            startEcho(server);
+            String wrong = new String(new char[64]).replace('\0', 'A');
+            Exception refusal = null;
+            try (SSLSocket client = connect(Identity.clientContext(wrong), server.getLocalPort())) {
+                // Unreachable when the pin holds, which is the point: the handshake in `connect`
+                // is where the refusal has to arrive.
+                client.getOutputStream().write('x');
+            } catch (Exception expected) {
+                refusal = expected;
+            }
+            check("a pinned mismatch does refuse the handshake", refusal != null,
+                "the handshake completed with the wrong fingerprint pinned");
+            PeerMismatch mismatch = PeerMismatch.of(refusal);
+            check("the refusal is recognised as a pin mismatch", mismatch != null,
+                "nothing in the chain said so: " + refusal);
+            if (mismatch == null) {
+                return;
+            }
+            String sentence = mismatch.getMessage();
+            check("the sentence says what the peer advertised",
+                sentence.contains(wrong.substring(0, 12)), sentence);
+            check("the sentence says what the peer presented",
+                sentence.contains(identity.certHash().substring(0, 12)), sentence);
+            check("the sentence fits a tile and a notification line", sentence.length() <= 96,
+                sentence.length() + " characters: " + sentence);
+            check("a pin mismatch is an IOException like every other send failure",
+                mismatch instanceof IOException, mismatch.getClass().getName());
+            // The walk has to answer "no" for an ordinary failure, or every broken socket would
+            // be reported as a swapped certificate.
+            check("an unrelated failure is not read as a pin mismatch",
+                PeerMismatch.of(new IOException("socket closed")) == null,
+                "an IOException was taken for a mismatch");
         }
     }
 

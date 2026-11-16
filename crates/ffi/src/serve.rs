@@ -278,6 +278,26 @@ impl Receiver for Store {
 
     fn saw_ask(&mut self, _offer: &Ask) {}
 
+    /// Keeps the last `/Ask` body next to what it offered, so an invitation that parsed as
+    /// nothing can be explained afterwards.
+    ///
+    /// <p>The failure this exists for is the one with no other evidence: the connection is
+    /// TLS, the body lives inside it, and both "we could not read the offer" and "the sender
+    /// offered nothing" end in the same empty prompt. One file, overwritten every time and
+    /// capped, because what it holds is a peer's file names — and because a diagnostic that
+    /// grows is a disk-full bug waiting for a busy day.
+    fn saw_ask_body(&mut self, body: &[u8]) {
+        const KEEP: usize = 64 * 1024;
+        const NAME: &str = ".ask-last.bin";
+        if body.is_empty() {
+            return;
+        }
+        if let Err(error) = std::fs::write(self.directory.join(NAME), &body[..body.len().min(KEEP)]) {
+            // A diagnostic that cannot be written is not a reason to fail a transfer.
+            let _ = error;
+        }
+    }
+
     fn upload(&mut self, body: &mut dyn std::io::Read, _upload: &Upload<'_>) -> io::Result<()> {
         // The body is de-chunked but still wrapped — gzip or DVZip blocks — and the inbox
         // sniffs and unwraps it. Doing that here would mean two places that know what an
@@ -978,7 +998,11 @@ mod tests {
         // so a byte-window search would fail on exactly the case worth testing.
         let answer = DiscoverAnswer::parse(body_of(&answers)).expect("the answer is a plist");
         assert_eq!(answer.computer_name, "书房里的手机");
-        assert!(answer.airdropable, "a peer must be told this device accepts files");
+        assert_eq!(
+            answer.airdropable,
+            Some(true),
+            "a peer must be told this device accepts files"
+        );
     }
 
     #[test]

@@ -4,17 +4,12 @@ import android.content.Context;
 import android.os.Build;
 import android.util.Log;
 
-import com.oshare.airdrop.Native;
-import com.oshare.airdrop.Report;
-import com.oshare.airdrop.SettingsScreen;
-
 import java.io.File;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
-import java.net.SocketTimeoutException;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
 import java.util.ArrayList;
@@ -280,8 +275,8 @@ final class Listener {
     /**
      * The process's listener, with nobody attached to it.
      *
-     * <p>For callers that start and stop the receiver rather than draw it — the switch in
-     * {@link Oshare} is one. They must not go through {@link #open}, because that method
+     * <p>For callers that start and stop the receiver rather than draw it — the tile switch
+     * is one. They must not go through {@link #open}, because that method
      * assigns the watcher: a background caller passing {@code null} would silently detach the
      * page that is currently on screen, and the page would then stop being redrawn while
      * everything still worked.
@@ -571,6 +566,29 @@ final class Listener {
             announcer = announcing;
         }
         announcing.start();
+        // 第二层公告：蓝牙。iPhone 的隔空投送先听这二十字节，听见了才把 AWDL 上的服务叫起来，
+        // 之后才轮得到上面那条 mDNS 记录被读到。少这一层时，「查询发得完全正确、每两秒一次、
+        // 却谁都不答」正是它会表现成的样子——对端在每一层都在，只是没人听 8770。
+        //
+        // 与 mDNS 同一个生命周期：两者都是「这台机器现在可以被发现」这句话的实现，分开启停会
+        // 让中间那段变成「mDNS 说在、蓝牙说不在」，而对端只信后者。
+        announceOverBluetooth();
+    }
+
+    /**
+     * 敲一次门。失败不改变接收端的结论——已经醒着的对端照样会答。
+     *
+     * <p>二十字节和四个广播参数都在 Rust 侧（{@code ble::manufacturer_data}），这里只把状态行
+     * 记下来：它是「为什么对面看不见我」唯一能留下的一句话，而这个问题在别的层看起来都正常。
+     */
+    private void announceOverBluetooth() {
+        try {
+            String line = new String(Native.bleAdvertise(context), java.nio.charset.StandardCharsets.UTF_8);
+            Log.i(TAG, "ble: " + line);
+        } catch (Throwable refused) {
+            // 一个没有蓝牙权限的接收端仍然能在 8770 上收东西，所以这里不是错误路径。
+            Log.w(TAG, "ble advertisement did not start: " + refused);
+        }
     }
 
     /** Takes the instance back and closes the announcer's socket. Safe to call when there is none. */
@@ -582,6 +600,13 @@ final class Listener {
         }
         if (announcing != null) {
             announcing.stop();
+        }
+        // 两盏灯一起灭：只停 mDNS 会让蓝牙继续广播「我在这儿」，而对端听见之后连上来的是一
+        // 个已经不在听的端口。
+        try {
+            Log.i(TAG, "ble stopped: " + new String(Native.bleStop(), java.nio.charset.StandardCharsets.UTF_8));
+        } catch (Throwable refused) {
+            Log.w(TAG, "ble advertisement did not stop: " + refused);
         }
     }
 
@@ -632,11 +657,7 @@ final class Listener {
 
     /** The table as it stands now, or null when it cannot be read — every caller treats that as blank rows. */
     private SettingsScreen settingsNow() {
-        try {
-            return SettingsScreen.open(SettingsFile.of(context).toPath());
-        } catch (IOException | RuntimeException unreadable) {
-            return null;
-        }
+        return Tuning.read(context);
     }
 
     /** One text row, trimmed; empty when the row is missing, blank, or there is no table at all. */
@@ -648,21 +669,11 @@ final class Listener {
     /**
      * 一行时间设置，取不到就用 {@code fallback}。
      *
-     * <p>表里每一行都带着范围，{@code set} 会拒掉范围外的值；可设置文件是纯文本，手改出来的
-     * 数字不经过那一关，所以这里再夹一次。超时为 0 不是「很快」，是「对端还没开口就断」，
-     * 一个手滑的零会把每一个连接都变成握手失败。
+     * <p>夹范围和回落都在 {@link Tuning#ms} 里：发送端、收件箱、邀请卡片读的是同一张表，
+     * 而「手改出来的零算不算数」这个问题只能有一个答案。
      */
     private static int timeoutOf(SettingsScreen screen, String key, int fallback) {
-        SettingsScreen.Setting setting = screen == null ? null : screen.setting(key);
-        if (setting == null) {
-            return fallback;
-        }
-        try {
-            long ms = Long.parseLong(setting.value().trim());
-            return (int) Math.min(Math.max(ms, setting.min()), setting.max());
-        } catch (NumberFormatException notWhole) {
-            return fallback;
-        }
+        return (int) Tuning.ms(screen, key, fallback);
     }
 
     /** Completes the handshake, hands the connection to the library, and puts what it stored on the page. */
@@ -1049,16 +1060,16 @@ final class Listener {
             }
             postedAt = now;
             showing = true;
-            ReceiveService.progress(context, done, total);
-            // 卡片没有那条节流后的进度条那么贵——它只是一段 JSON——但也跟着同一个节拍走，
-            // 免得一次传输在一秒里给另一个进程发五十次消息。
+            // 进度只画在流体云那张卡上（{@code attempt.progress}）。普通通知不再画进度条：
+            // 同一条传输在两处同时走进度，一处是胶囊、一处是通知栏，人只会看见两个不一样的数。
             attempt.progress(done, total);
         }
 
         /** 有结果了：把进度条换成那句话。 */
         void finished(String text) {
             settled = true;
-            ReceiveService.finished(context, text);
+            // 收完那句话由流体云的卡说（带【打开文件】【完成】）。这里不再另发一条普通通知，
+            // 否则一次接收会在通知栏和胶囊里各留一条同样的话，而其中一条点不动。
         }
 
         /**

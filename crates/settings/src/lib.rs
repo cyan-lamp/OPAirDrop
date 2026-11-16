@@ -123,8 +123,11 @@ pub struct Setting {
 
 /// The table.
 ///
-/// Every entry is a number or a choice that was hardcoded somewhere in the Java stack, with
-/// the same default it had there unless the value was load-bearing for a peer's behaviour.
+/// Every entry is a number or a choice that is read somewhere in the Java or Rust stack, and
+/// its default is what that reader used before the row existed. A row that no reader consults
+/// is a knob the screen promises and nothing honours, so rows are added when the reading code
+/// lands and removed when it does not exist — see [`Values::retired`] for what removal does to
+/// a file that already has the old row in it.
 pub const CATALOG: &[Setting] = &[
     Setting {
         key: "device.name",
@@ -159,17 +162,6 @@ pub const CATALOG: &[Setting] = &[
         summary: "一次投送最多写入多少字节，超出后拒绝该成员并继续读完这一次投送。",
     },
     Setting {
-        key: "receive.probe_bytes",
-        kind: Kind::Number {
-            min: 0,
-            max: 512 * 1024 * 1024,
-            unit: Unit::Bytes,
-        },
-        default: "50331648",
-        title: "上传预览上限",
-        summary: "边收边判断内容类型时最多缓冲多少字节。调大更准，但占内存。",
-    },
-    Setting {
         key: "receive.overwrite",
         kind: Kind::Switch,
         default: "false",
@@ -184,15 +176,15 @@ pub const CATALOG: &[Setting] = &[
         summary: "互传开着「所有人」时跟着接收；关掉此项改由本页按钮控制。",
     },
     Setting {
-        key: "discover.window_ms",
+        key: "receive.decision_timeout_ms",
         kind: Kind::Number {
-            min: 300,
-            max: 30_000,
+            min: 5_000,
+            max: 300_000,
             unit: Unit::Milliseconds,
         },
-        default: "2500",
-        title: "搜索时长",
-        summary: "打开分享面板后等对端出现的时间。太短会漏掉慢的设备。",
+        default: "30000",
+        title: "等人应答时长",
+        summary: "邀请弹出后多久没人应答就当作拒绝。卡片和通知用同一个数。",
     },
     Setting {
         key: "server.read_timeout_ms",
@@ -217,26 +209,37 @@ pub const CATALOG: &[Setting] = &[
         summary: "从连接建立起，等对端发出第一行请求的最长时间。",
     },
     Setting {
-        key: "client.ask_timeout_ms",
+        key: "client.connect_timeout_ms",
         kind: Kind::Number {
             min: 1_000,
-            max: 120_000,
+            max: 60_000,
             unit: Unit::Milliseconds,
         },
         default: "15000",
-        title: "等待对方同意",
-        summary: "发送前等对端回答 /Ask 的时间。对方在锁屏时可能较慢。",
+        title: "连接超时",
+        summary: "点了一个设备之后，最多等多久让它接受连接。",
     },
     Setting {
-        key: "client.discover_timeout_ms",
+        key: "client.read_timeout_ms",
         kind: Kind::Number {
-            min: 1_000,
-            max: 120_000,
+            min: 5_000,
+            max: 600_000,
             unit: Unit::Milliseconds,
         },
         default: "15000",
-        title: "等待搜索应答",
-        summary: "发送前等 /Discover 应答的时间。",
+        title: "请求超时",
+        summary: "发出一条请求之后，多久收不到任何回应就放弃。问一句 HTTP 本就是毫秒级的，等对方的人做决定是下面那一行。",
+    },
+    Setting {
+        key: "client.upload_read_timeout_ms",
+        kind: Kind::Number {
+            min: 5_000,
+            max: 600_000,
+            unit: Unit::Milliseconds,
+        },
+        default: "90000",
+        title: "等待接受超时",
+        summary: "档案已经在发，等的是对面手机上那个人点「接受」。他犹豫多久都合法，所以它比上面那行长得多。",
     },
     Setting {
         key: "http.response_limit",
@@ -257,8 +260,8 @@ pub const CATALOG: &[Setting] = &[
             unit: Unit::Plain,
         },
         default: "8",
-        title: "记住的设备数",
-        summary: "为了重连而保留的最近对端数量。",
+        title: "记住的旧实例名",
+        summary: "换过名字之后还保留几个发布过的旧实例名，让仍记着它们的设备能找到本机。",
     },
     Setting {
         key: "log.level",
@@ -390,10 +393,22 @@ impl std::error::Error for Error {}
 /// Held as strings rather than as typed fields because that is what the config file, the
 /// UI and the clipboard all speak; [`Values::number`] and [`Values::switch`] are the way
 /// back to a number, and they cannot fail for a value that came through [`Values::set`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Values {
     entries: Vec<(&'static Setting, String)>,
+    /// Keys met in a file that the table no longer has. Not part of the values: a set that
+    /// compares unequal to itself for having read a retired row would make every equality in
+    /// this crate mean something other than "same settings".
+    retired: Vec<String>,
 }
+
+impl PartialEq for Values {
+    fn eq(&self, other: &Values) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Eq for Values {}
 
 impl Default for Values {
     fn default() -> Self {
@@ -402,6 +417,7 @@ impl Default for Values {
                 .iter()
                 .map(|setting| (setting, setting.default.to_string()))
                 .collect(),
+            retired: Vec::new(),
         }
     }
 }
@@ -410,6 +426,15 @@ impl Values {
     /// Every setting at its default.
     pub fn new() -> Values {
         Values::default()
+    }
+
+    /// Keys this value set was read past because the table no longer lists them.
+    ///
+    /// Empty for anything built by [`Values::new`], and empty again after a save, because
+    /// [`Values::to_text`] writes the table and nothing else. Non-empty means the file on disk
+    /// is older than the table — not an error, and not something to keep.
+    pub fn retired(&self) -> &[String] {
+        &self.retired
     }
 
     /// The stored form of `key`, if it is in the table.
@@ -489,9 +514,16 @@ impl Values {
     /// Reads the stored form back.
     ///
     /// Blank lines and lines starting with `#` are skipped, so the head and a person's own
-    /// notes survive a round trip. Every other line must be `key=value` with a key from the
-    /// table; a key that is not there is refused rather than ignored, because a file that
-    /// still loads after a rename is a file that silently keeps a value nobody reads.
+    /// notes survive a round trip. Every other line must be `key=value`; a line whose key is
+    /// not in the table is **skipped and named** in [`Values::retired`] rather than refused.
+    ///
+    /// Refusing it was the first rule here and it was wrong, for a reason that only shows up
+    /// when a row is deleted: the same bytes that feed this function also feed the send path,
+    /// where an unreadable table is a send that fails with a settings error. Deleting a row —
+    /// the right end for a knob no reader consults — would then break every install that had
+    /// the old file until somebody happened to open the settings screen and save. Skipping
+    /// keeps the file readable and still leaves the stale key visible: it is dropped on the
+    /// next [`Values::to_text`], so it lives one round trip, not forever.
     pub fn from_text(text: &str) -> Result<Values, Error> {
         let mut values = Values::new();
         for (index, line) in text.lines().enumerate() {
@@ -502,7 +534,10 @@ impl Values {
             let Some((key, value)) = line.split_once('=') else {
                 return Err(Error::Malformed { line: index + 1 });
             };
-            values.set(key, value)?;
+            match find(key) {
+                Some(_) => values.set(key, value)?,
+                None => values.retired.push(key.to_string()),
+            }
         }
         Ok(values)
     }
@@ -647,11 +682,11 @@ mod tests {
     #[test]
     fn a_number_that_is_not_a_number_says_so() {
         let mut values = Values::new();
-        let error = values.set("discover.window_ms", "2.5s").unwrap_err();
+        let error = values.set("client.read_timeout_ms", "2.5s").unwrap_err();
         assert_eq!(
             error,
             Error::NotANumber {
-                key: "discover.window_ms",
+                key: "client.read_timeout_ms",
                 value: "2.5s".to_string(),
             }
         );
@@ -738,6 +773,9 @@ mod tests {
 
     #[test]
     fn an_unknown_key_is_refused_rather_than_kept_for_later() {
+        // About `set`, which is what the screen calls when a row is edited: a key nobody has a
+        // row for has no default to fall back to and no range to check, so writing one is a bug
+        // at the call site. Reading a file is the other direction and is tolerant — see below.
         let mut values = Values::new();
         let error = values.set("server.timeout_ms", "5000").unwrap_err();
         assert_eq!(
@@ -746,6 +784,28 @@ mod tests {
                 key: "server.timeout_ms".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn a_key_that_left_the_table_is_skipped_and_named_rather_than_refusing_the_file() {
+        // The file on a device that has been installed since before a row was deleted still
+        // carries that row. Refusing the whole file would be a send that fails with a settings
+        // error until somebody opened the screen and saved; dropping the line keeps the install
+        // working and still reports what it dropped.
+        let text = format!("{HEAD}\ndiscover.window_ms=2500\ndevice.name=青\n");
+        let values = Values::from_text(&text).expect("one retired row is not a broken file");
+        assert_eq!(values.get("device.name"), Some("青"));
+        assert_eq!(values.retired(), ["discover.window_ms".to_string()]);
+
+        // And the next write drops it: the file catches up with the table on its own.
+        assert!(!values.to_text().contains("discover.window_ms"));
+
+        // A key that is still in the table is still checked, retired neighbours or not.
+        let bad = format!("{HEAD}\ndiscover.window_ms=2500\nreceive.byte_limit=1\n");
+        assert!(matches!(
+            Values::from_text(&bad).unwrap_err(),
+            Error::OutOfRange { .. }
+        ));
     }
 
     #[test]
@@ -769,7 +829,7 @@ mod tests {
         let text = format!("{HEAD}\n\n# 手写的说明\nlog.level=debug\n\n");
         let values = Values::from_text(&text).expect("comments are not content");
         assert_eq!(values.get("log.level"), Some("debug"));
-        assert_eq!(values.number("discover.window_ms"), Some(2500));
+        assert_eq!(values.number("discovery.remembered_peers"), Some(8));
     }
 
     #[test]

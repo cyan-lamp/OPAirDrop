@@ -48,6 +48,7 @@ use jni_sys::{
 };
 
 use crate::api::{self, status};
+use crate::ble;
 use crate::buffer::{opairdrop_buffer_free, OpairdropBuffer};
 use crate::serve::{serve, Decide, Watcher};
 use crate::settings;
@@ -248,7 +249,13 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_serve(
     }) else {
         return ptr::null_mut();
     };
-    let mut connection = Connection { reader, sink };
+    // Nothing on the receiving side renews: a receiver answers a connection, it does not
+    // ask on one, so its connection has no `Link` to follow.
+    let mut connection = Connection {
+        reader,
+        sink,
+        link: None,
+    };
 
     let (settings_pointer, settings_len) = match &settings_text {
         Some(text) => (text.as_ptr(), text.len()),
@@ -542,10 +549,12 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_send(
     settings: jstring,
     sender: jstring,
     model: jstring,
+    sender_id: jstring,
     transfer_id: jstring,
     paths: jobjectArray,
     input: jobject,
     output: jobject,
+    link: jobject,
 ) -> jbyteArray {
     if env.is_null() {
         return ptr::null_mut();
@@ -594,6 +603,14 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_send(
             None => return ptr::null_mut(),
         }
     };
+    let sender_id = if sender_id.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, sender_id) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
+    };
     // SAFETY: `paths` is a live `java.lang.String[]`.
     let Some(paths) = (unsafe { read_paths(env, paths) }) else {
         return ptr::null_mut();
@@ -605,13 +622,29 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_send(
     }) else {
         return ptr::null_mut();
     };
-    let mut connection = Connection { reader, sink };
+    // A null `Link` means the caller asked for a single-connection transfer, which is a
+    // request the receiver will not answer — so the library reports it rather than waiting
+    // out a read timeout. See `dial_connection`.
+    let link = if link.is_null() {
+        None
+    } else {
+        // SAFETY: `link` is a live object and `env` outlives this call.
+        match unsafe { Link::new(env, link) } {
+            Ok(link) => Some(link),
+            Err(()) => return ptr::null_mut(),
+        }
+    };
+    let mut connection = Connection { reader, sink, link };
 
     let (sender_pointer, sender_len) = match &sender {
         Some(text) => (text.as_ptr(), text.len()),
         None => (ptr::null(), 0),
     };
     let (model_pointer, model_len) = match &model {
+        Some(text) => (text.as_ptr(), text.len()),
+        None => (ptr::null(), 0),
+    };
+    let (sender_id_pointer, sender_id_len) = match &sender_id {
         Some(text) => (text.as_ptr(), text.len()),
         None => (ptr::null(), 0),
     };
@@ -633,12 +666,15 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_send(
             sender_len,
             model_pointer,
             model_len,
+            sender_id_pointer,
+            sender_id_len,
             transfer_id.as_ptr(),
             transfer_id.len(),
             paths.as_ptr(),
             paths.len(),
             read_connection,
             write_connection,
+            dial_connection,
             &mut connection as *mut Connection as *mut c_void,
             &mut report,
         )
@@ -665,10 +701,12 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_sendWithProgress(
     settings: jstring,
     sender: jstring,
     model: jstring,
+    sender_id: jstring,
     transfer_id: jstring,
     paths: jobjectArray,
     input: jobject,
     output: jobject,
+    link: jobject,
     progress: jobject,
 ) -> jbyteArray {
     if env.is_null() {
@@ -719,6 +757,14 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_sendWithProgress(
             None => return ptr::null_mut(),
         }
     };
+    let sender_id = if sender_id.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, sender_id) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
+    };
     // SAFETY: `paths` is a live `java.lang.String[]`.
     let Some(paths) = (unsafe { read_paths(env, paths) }) else {
         return ptr::null_mut();
@@ -730,7 +776,19 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_sendWithProgress(
     }) else {
         return ptr::null_mut();
     };
-    let mut connection = Connection { reader, sink };
+    // A null `Link` means the caller asked for a single-connection transfer, which is a
+    // request the receiver will not answer — so the library reports it rather than waiting
+    // out a read timeout. See `dial_connection`.
+    let link = if link.is_null() {
+        None
+    } else {
+        // SAFETY: `link` is a live object and `env` outlives this call.
+        match unsafe { Link::new(env, link) } {
+            Ok(link) => Some(link),
+            Err(()) => return ptr::null_mut(),
+        }
+    };
+    let mut connection = Connection { reader, sink, link };
     // SAFETY: `progress` is a live object; the method id is looked up on its own class.
     let Ok(mut gauge) = (unsafe { Gauge::new(env, progress) }) else {
         return ptr::null_mut();
@@ -741,6 +799,10 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_sendWithProgress(
         None => (ptr::null(), 0),
     };
     let (model_pointer, model_len) = match &model {
+        Some(text) => (text.as_ptr(), text.len()),
+        None => (ptr::null(), 0),
+    };
+    let (sender_id_pointer, sender_id_len) = match &sender_id {
         Some(text) => (text.as_ptr(), text.len()),
         None => (ptr::null(), 0),
     };
@@ -762,20 +824,117 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_sendWithProgress(
             sender_len,
             model_pointer,
             model_len,
+            sender_id_pointer,
+            sender_id_len,
             transfer_id.as_ptr(),
             transfer_id.len(),
             paths.as_ptr(),
             paths.len(),
             read_connection,
             write_connection,
+            dial_connection,
             &mut connection as *mut Connection as *mut c_void,
             report_progress,
             &mut gauge as *mut Gauge as *mut c_void,
+            // Only advertise the name callback when the Java sink actually implements it.
+            if gauge.peer_name.is_some() {
+                Some(report_peer_name as crate::send::NameCallback)
+            } else {
+                None
+            },
             &mut report,
         )
     };
 
     // SAFETY: `report` is a zeroed buffer the call above filled, one way or the other.
+    unsafe { finish(env, outcome, &mut report) }
+}
+
+/// Asks one peer for its name, without starting a transfer.
+///
+/// Java owns the TLS socket (and its certificate pinning); this call only sends `/Discover`
+/// on the streams it hands over. No `/Ask`, no prompt on the peer, no second connection.
+/// Returns the name as bytes on success; a failure is thrown by [`finish`].
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv` and objects of the declared types.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_discoverName(
+    env: *mut JNIEnv,
+    _class: jclass,
+    host: jstring,
+    settings: jstring,
+    sender: jstring,
+    model: jstring,
+    sender_id: jstring,
+    input: jobject,
+    output: jobject,
+) -> jbyteArray {
+    if env.is_null() {
+        return ptr::null_mut();
+    }
+    if host.is_null() || input.is_null() || output.is_null() {
+        unsafe {
+            throw(env, "java/lang/NullPointerException",
+                "host and both streams are required");
+        }
+        return ptr::null_mut();
+    }
+
+    // SAFETY: all are live strings and null is taken before read_string.
+    let Some(host) = (unsafe { read_string(env, host) }) else {
+        return ptr::null_mut();
+    };
+    // SAFETY: null means "not supplied"; a non-null value must be a live string. A failed
+    // read leaves an exception pending, which is the caller's answer, so return at once.
+    let optional = |value: jstring| -> Option<String> {
+        if value.is_null() { None } else { unsafe { read_string(env, value) } }
+    };
+    let (settings, sender, model, sender_id) =
+        (optional(settings), optional(sender), optional(model), optional(sender_id));
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
+
+    // SAFETY: both are live streams and `env` outlives this call.
+    let (Ok(reader), Ok(sink)) =
+        (unsafe { Stream::new(env, input) }, unsafe { Sink::new(env, output) })
+    else {
+        return ptr::null_mut();
+    };
+    // No Link: `/Discover` is one request on one connection.
+    let mut connection = Connection { reader, sink, link: None };
+
+    let slice = |text: &Option<String>| match text {
+        Some(value) => (value.as_ptr(), value.len()),
+        None => (ptr::null(), 0),
+    };
+    let (settings_p, settings_n) = slice(&settings);
+    let (sender_p, sender_n) = slice(&sender);
+    let (model_p, model_n) = slice(&model);
+    let (id_p, id_n) = slice(&sender_id);
+
+    let mut report = OpairdropBuffer::EMPTY;
+    // SAFETY: slices outlive the call; callbacks are paired with `connection` for its life.
+    let outcome = unsafe {
+        crate::send::opairdrop_discover_name(
+            host.as_ptr(),
+            host.len(),
+            settings_p,
+            settings_n,
+            sender_p,
+            sender_n,
+            model_p,
+            model_n,
+            id_p,
+            id_n,
+            read_connection,
+            write_connection,
+            &mut connection as *mut Connection as *mut c_void,
+            &mut report,
+        )
+    };
     unsafe { finish(env, outcome, &mut report) }
 }
 
@@ -917,7 +1076,13 @@ unsafe fn serve_for_java(
     }) else {
         return ptr::null_mut();
     };
-    let mut connection = Connection { reader, sink };
+    // Nothing on the receiving side renews: a receiver answers a connection, it does not
+    // ask on one, so its connection has no `Link` to follow.
+    let mut connection = Connection {
+        reader,
+        sink,
+        link: None,
+    };
     // SAFETY: `decide` is a live object; the method id is looked up on its own class.
     let Ok(mut decider) = (unsafe { Decider::new(env, decide) }) else {
         return ptr::null_mut();
@@ -1065,6 +1230,223 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_saveSettings(
     unsafe { finish(env, outcome, &mut out) }
 }
 
+/// Starts the advertisement that wakes a receiver, and answers where it got to.
+///
+/// The twenty bytes and the four settings are [`ble`]'s; the radio is Java's, in `BleRadio`.
+/// This export is the join: it builds what goes out, hands it over, and reports the stack's
+/// answer as a state line — never as an exception, because a phone that cannot be woken is
+/// not an error the page should turn into an error screen. The search behind it works
+/// without the advertisement, just not against a receiver that is asleep.
+///
+/// Called again while something is registered, it answers the current line and does not
+/// register twice: the stack refuses the second registration with `ALREADY_STARTED`, so a
+/// page returning to the foreground would turn a working advertisement into a failure.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv` and a live `android.content.Context`.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_bleAdvertise(
+    env: *mut JNIEnv,
+    _class: jclass,
+    context: jobject,
+) -> jbyteArray {
+    if env.is_null() {
+        return ptr::null_mut();
+    }
+    if context.is_null() {
+        // SAFETY: `env` was checked non-null.
+        unsafe { throw(env, "java/lang/NullPointerException", "a Context is required") };
+        return ptr::null_mut();
+    }
+    if ble::current().is_awake() {
+        let line = ble::line();
+        // SAFETY: `env` is valid.
+        return unsafe { new_bytes(env, line.as_bytes()) };
+    }
+
+    let payload = ble::manufacturer_data(ble::random_tag());
+    // The state moves to `starting` before the call, and the lock is released by then: the
+    // inline path answers through `bleVerdict` from inside `start` below, on this thread,
+    // and a standard mutex taken twice by one thread deadlocks against itself.
+    ble::starting();
+
+    let radio = match unsafe { Radio::new(env) } {
+        Ok(radio) => radio,
+        // SAFETY: `env` is valid.
+        Err(reason) => return unsafe { new_bytes(env, ble::given_up(&reason).as_bytes()) },
+    };
+
+    // SAFETY: `env` is valid and `payload` outlives the copy.
+    let data = unsafe { new_bytes(env, &payload) };
+    if data.is_null() {
+        // `new_bytes` has already thrown, and an array that could not be made is not the
+        // radio's failure to report.
+        // SAFETY: `radio.class` is a local reference this frame owns.
+        unsafe { delete_local(env, radio.class) };
+        return ptr::null_mut();
+    }
+    let table = unsafe { table(env) };
+    // SAFETY: `radio.class` is the class object made above, `radio.start` is a static
+    // method on it, and every argument matches the descriptor it was looked up with.
+    unsafe {
+        (entry!(table, CallStaticVoidMethod))(
+            env,
+            radio.class,
+            radio.start,
+            context,
+            ble::COMPANY_ID as jint,
+            data,
+            ble::MODE_LOW_LATENCY,
+            ble::POWER_HIGH,
+            // A `jboolean` in a varargs slot travels as an `int` — C's default argument
+            // promotion — which is what the JVM's own dispatch reads back out of it.
+            ble::CONNECTABLE as jint,
+            ble::TIMEOUT_MS,
+        )
+    };
+    // SAFETY: both are local references this frame owns.
+    unsafe {
+        delete_local(env, data);
+        delete_local(env, radio.class);
+    };
+
+    // A pending exception is the honest report and belongs to the caller: copying the state
+    // out would answer with null and leave the exception unexplained.
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
+    let line = ble::line();
+    // SAFETY: `env` is valid.
+    unsafe { new_bytes(env, line.as_bytes()) }
+}
+
+/// Records the stack's answer about the advertisement, and answers the new state line.
+///
+/// Called from `BleRadio`'s callback, which runs on whichever thread had a looper when the
+/// registration was made. A positive code is the stack's own `ADVERTISE_FAILED_*`; zero is
+/// success; a negative one is [`ble::refusal`], meaning the radio never got that far.
+///
+/// The line comes back rather than being swallowed because the only thing to do with it is
+/// write it to the log, and that is one call instead of two.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv`.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_bleVerdict(
+    env: *mut JNIEnv,
+    _class: jclass,
+    code: jint,
+) -> jbyteArray {
+    if env.is_null() {
+        return ptr::null_mut();
+    }
+    let line = ble::verdict(code);
+    // SAFETY: `env` is valid.
+    unsafe { new_bytes(env, line.as_bytes()) }
+}
+
+/// Takes the advertisement down, and answers the state line.
+///
+/// Stopping what was never started is not a failure: a page stops on its way out whether or
+/// not the advertisement ever began, and a phone that refused to be woken must not leave
+/// this call throwing.
+///
+/// # Safety
+///
+/// Called by the JVM with a valid `JNIEnv`.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_bleStop(
+    env: *mut JNIEnv,
+    _class: jclass,
+) -> jbyteArray {
+    if env.is_null() {
+        return ptr::null_mut();
+    }
+    if let Ok(radio) = unsafe { Radio::new(env) } {
+        // SAFETY: `env` is valid.
+        if !unsafe { pending(env) } {
+            let table = unsafe { table(env) };
+            // SAFETY: `radio.class` is the class object made above and `radio.stop` is a
+            // static method on it that takes nothing.
+            unsafe { (entry!(table, CallStaticVoidMethod))(env, radio.class, radio.stop) };
+        }
+        // SAFETY: `radio.class` is a local reference this frame owns.
+        unsafe { delete_local(env, radio.class) };
+    }
+    let line = ble::stopped();
+    // SAFETY: `env` is valid.
+    unsafe { new_bytes(env, line.as_bytes()) }
+}
+
+/// The Java side of the radio: one class, and the two static methods called on it.
+///
+/// The class is looked up by name on each call rather than cached. A cached `jclass` is a
+/// local reference and dies with the frame that made it; keeping one across calls means a
+/// global reference and its lifetime, which is a real cost to pay for a lookup that happens
+/// twice per page. `FindClass` inside a native method the JVM called uses that caller's
+/// class loader — the application's — so `BleRadio` is found where a static initializer
+/// would find it. It would not be found from a thread attached by anything but Java, and
+/// that is the one condition this design rests on.
+struct Radio {
+    class: jclass,
+    /// `BleRadio.start(Context, int, byte[], int, int, boolean, int)`.
+    start: jni_sys::jmethodID,
+    /// `BleRadio.stop()`.
+    stop: jni_sys::jmethodID,
+}
+
+impl Radio {
+    /// # Safety
+    ///
+    /// `env` must be valid.
+    unsafe fn new(env: *mut JNIEnv) -> Result<Radio, String> {
+        // SAFETY: `env` is valid for the whole call, and the table outlives it.
+        let table = unsafe { table(env) };
+        let class_name = c_str("com/oshare/airdrop/BleRadio");
+        // SAFETY: `env` is valid and the name outlives the call.
+        let class = unsafe { (entry!(table, FindClass))(env, class_name.as_ptr()) };
+        if class.is_null() {
+            // `FindClass` has answered by throwing `NoClassDefFoundError`. It is cleared so
+            // the failure can be reported the way the rest of this module reports one — as
+            // a state line — instead of as an exception out of a call whose job is to not
+            // throw.
+            // SAFETY: `env` is valid.
+            unsafe { (entry!(table, ExceptionClear))(env) };
+            return Err("com.oshare.airdrop.BleRadio is not on the class path".to_string());
+        }
+        let start_name = c_str("start");
+        let start_signature = c_str("(Landroid/content/Context;I[BIIZI)V");
+        let stop_name = c_str("stop");
+        let stop_signature = c_str("()V");
+        // SAFETY: `class` is the live class object made above and every string outlives the
+        // call.
+        let start = unsafe {
+            (entry!(table, GetStaticMethodID))(
+                env,
+                class,
+                start_name.as_ptr(),
+                start_signature.as_ptr(),
+            )
+        };
+        // SAFETY: as above.
+        let stop = unsafe {
+            (entry!(table, GetStaticMethodID))(env, class, stop_name.as_ptr(), stop_signature.as_ptr())
+        };
+        // SAFETY: `env` is valid.
+        if start.is_null() || stop.is_null() || unsafe { pending(env) } {
+            // SAFETY: `class` is a local reference made here.
+            unsafe { delete_local(env, class) };
+            return Err(
+                "BleRadio has no start(Context,int,byte[],int,int,boolean,int) or stop()"
+                    .to_string(),
+            );
+        }
+        Ok(Radio { class, start, stop })
+    }
+}
+
 /// Turns a status and the buffer it filled into the `byte[]` a Java method returns.
 ///
 /// Every export above ends here, so the rule "success copies the buffer out and releases
@@ -1108,10 +1490,20 @@ unsafe fn finish(env: *mut JNIEnv, outcome: i32, report: &mut OpairdropBuffer) -
 /// A refused setting and a bad path are both "you asked for something that is not allowed"
 /// and cannot be retried into working, so they are unchecked; everything else is an I/O
 /// failure the caller is expected to handle.
+///
+/// [`status::REFUSED`] gets its own class rather than plain `IOException` because the
+/// caller has to *say something else* about it. Every other failure on this path means
+/// something went wrong, and "the transfer failed" is the right sentence for it. A refusal
+/// is a peer that answered: the handshake held, the request was well formed, the name came
+/// back. The only missing thing is a setting on a phone the caller cannot reach, so the
+/// sentence has to name that setting instead of inviting another try. A caller that has to
+/// tell the two apart by reading the message text would be parsing English, which is the
+/// kind of coupling that survives exactly until someone rewords a string.
 fn class_for(outcome: i32) -> &'static str {
     match outcome {
         status::NULL_ARGUMENT => "java/lang/NullPointerException",
         status::SETTINGS | status::BAD_PATH => "java/lang/IllegalArgumentException",
+        status::REFUSED => "com/oshare/airdrop/RefusedException",
         _ => "java/io/IOException",
     }
 }
@@ -1378,8 +1770,10 @@ unsafe extern "C" fn write_sink(context: *mut c_void, buf: *const u8, len: usize
 struct Gauge {
     env: *mut JNIEnv,
     object: jobject,
-    /// Cached `Progress.report(long, long)V`.
+    /// Cached `Progress.report(int, long, long)V`.
     report: jni_sys::jmethodID,
+    /// Cached `Progress.name(String)V`, when the sink implements it. Absent on older sinks.
+    peer_name: Option<jni_sys::jmethodID>,
     /// Set once the sink threw. The transfer is not aborted for it, but the sink is not
     /// called again either: one broken listener must not become thousands of exceptions.
     failed: bool,
@@ -1401,15 +1795,33 @@ impl Gauge {
         let signature = c_str("(IJJ)V");
         // SAFETY: `class` is the live class object made above, both strings outlive the call.
         let report = unsafe { (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr()) };
+
+        // `name(String)` is optional: a sink written before the peer-name callback existed
+        // still works for byte counts. A missing method leaves NoSuchMethodError pending, so
+        // clear it and remember there is no method to call. Looked up on the same live `class`
+        // before it is deleted below.
+        let method_name = c_str("name");
+        let method_sig = c_str("(Ljava/lang/String;)V");
+        let peer_method = unsafe {
+            (entry!(table, GetMethodID))(env, class, method_name.as_ptr(), method_sig.as_ptr())
+        };
+        let peer_absent = peer_method.is_null() || unsafe { pending(env) };
+        if peer_absent {
+            // SAFETY: `env` is valid; clear the expected NoSuchMethodError.
+            unsafe { (entry!(table, ExceptionClear))(env) };
+        }
+
         // SAFETY: `class` is the local reference made above.
         unsafe { (entry!(table, DeleteLocalRef))(env, class) };
         if report.is_null() || unsafe { pending(env) } {
             return Err(());
         }
+
         Ok(Gauge {
             env,
             object,
             report,
+            peer_name: if peer_absent { None } else { Some(peer_method) },
             failed: false,
         })
     }
@@ -1454,6 +1866,50 @@ unsafe extern "C" fn report_progress(context: *mut c_void, phase: i32, sent: u64
     // SAFETY: `gauge.env` is valid.
     if unsafe { pending(gauge.env) } {
         // The exception stays pending: it is the caller's, and it is the honest report.
+        gauge.failed = true;
+    }
+}
+
+/// The C ABI's peer-name callback, backed by `Progress.name(String)`.
+///
+/// # Safety
+///
+/// `context` must point at a live [`Gauge`] and `name` must be readable for `name_len` bytes.
+unsafe extern "C" fn report_peer_name(
+    context: *mut c_void,
+    name: *const u8,
+    name_len: usize,
+) {
+    if context.is_null() || name.is_null() {
+        return;
+    }
+    let gauge = unsafe { &mut *(context as *mut Gauge) };
+    let Some(method) = gauge.peer_name else {
+        return;
+    };
+    if gauge.failed || unsafe { pending(gauge.env) } {
+        return;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(name, name_len) };
+    let text = String::from_utf8_lossy(bytes);
+    // A name with an embedded NUL cannot cross through NewStringUTF. Skip it rather than
+    // truncate: a half name is worse than the mDNS hash the UI already has.
+    let Ok(c_text) = CString::new(text.as_bytes()) else {
+        return;
+    };
+    let table = unsafe { table(gauge.env) };
+    let argument = unsafe { (entry!(table, NewStringUTF))(gauge.env, c_text.as_ptr()) };
+    if argument.is_null() {
+        gauge.failed = true;
+        return;
+    }
+    // SAFETY: `method` is `Progress.name(String)V` on the object the caller handed over.
+    unsafe {
+        (entry!(table, CallVoidMethod))(gauge.env, gauge.object, method, argument)
+    };
+    // SAFETY: `argument` is a local reference made above.
+    unsafe { (entry!(table, DeleteLocalRef))(gauge.env, argument) };
+    if unsafe { pending(gauge.env) } {
         gauge.failed = true;
     }
 }
@@ -1662,9 +2118,176 @@ unsafe extern "C" fn report_landing(context: *mut c_void, done: u64, total: u64)
 /// two trampolines below exist because a callback receives a context, not a field: each
 /// hands the field's address to the adapter that expects it, which is the same shape
 /// `receiveArchive` uses when it passes a lone [`Stream`].
+///
+/// The streams are replaced in place by [`dial_connection`]: a receiver reads one request
+/// per connection, so `/Ask` arrives on a socket of its own and this struct follows it
+/// there. That is why they are fields rather than borrows.
 struct Connection {
     reader: Stream,
     sink: Sink,
+    /// How a second connection is obtained, or `None` when the caller asked for a
+    /// single-connection transfer.
+    link: Option<Link>,
+}
+
+/// A Java `com.oshare.airdrop.Native$Link`: the caller's way of opening another connection.
+///
+/// Everything that makes a connection — the socket, the TLS handshake, the certificate
+/// policy, the timeouts — stays on the Java side, because none of it crosses this boundary
+/// as anything but bytes. This struct holds the object and the three method ids needed to
+/// turn one call into two fresh streams.
+struct Link {
+    env: *mut JNIEnv,
+    object: jobject,
+    /// Cached `Link.connect()Ljava/net/Socket;`, valid as long as `object` is.
+    connect: jni_sys::jmethodID,
+    /// Cached `Socket.getInputStream()` and `Socket.getOutputStream()`.
+    ///
+    /// Resolved on `java.net.Socket` rather than on what `connect` returns, because a
+    /// caller may hand back an `SSLSocket` — JNI resolves a superclass method id against
+    /// any instance of the subclass, which is what makes one lookup enough for both.
+    input: jni_sys::jmethodID,
+    output: jni_sys::jmethodID,
+}
+
+impl Link {
+    /// # Safety
+    ///
+    /// `env` must be valid and `object` a live `com.oshare.airdrop.Native$Link`.
+    unsafe fn new(env: *mut JNIEnv, object: jobject) -> Result<Link, ()> {
+        // SAFETY: `env` is valid for the whole call, and the table outlives it.
+        let table = unsafe { table(env) };
+
+        // SAFETY: `object` is a live object.
+        let class = unsafe { (entry!(table, GetObjectClass))(env, object) };
+        if class.is_null() {
+            return Err(());
+        }
+        let name = c_str("connect");
+        let signature = c_str("()Ljava/net/Socket;");
+        // SAFETY: `class` is the live class object made above and both strings outlive the
+        // call.
+        let connect =
+            unsafe { (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr()) };
+        // SAFETY: `class` is the local reference made above.
+        unsafe { (entry!(table, DeleteLocalRef))(env, class) };
+        if connect.is_null() || unsafe { pending(env) } {
+            return Err(());
+        }
+
+        // `java.net.Socket` is a boot class, so `FindClass` resolves it from this thread
+        // whatever loader the caller's own class came from.
+        let socket_name = c_str("java/net/Socket");
+        // SAFETY: the name is a valid class name and the string outlives the call.
+        let socket = unsafe { (entry!(table, FindClass))(env, socket_name.as_ptr()) };
+        if socket.is_null() || unsafe { pending(env) } {
+            return Err(());
+        }
+        let get_input = c_str("getInputStream");
+        let input_signature = c_str("()Ljava/io/InputStream;");
+        // SAFETY: `socket` is the live class object made above.
+        let input = unsafe {
+            (entry!(table, GetMethodID))(
+                env,
+                socket,
+                get_input.as_ptr(),
+                input_signature.as_ptr(),
+            )
+        };
+        let get_output = c_str("getOutputStream");
+        let output_signature = c_str("()Ljava/io/OutputStream;");
+        // SAFETY: as above.
+        let output = unsafe {
+            (entry!(table, GetMethodID))(
+                env,
+                socket,
+                get_output.as_ptr(),
+                output_signature.as_ptr(),
+            )
+        };
+        // SAFETY: `socket` is the local reference made above.
+        unsafe { (entry!(table, DeleteLocalRef))(env, socket) };
+        if input.is_null() || output.is_null() || unsafe { pending(env) } {
+            return Err(());
+        }
+
+        Ok(Link {
+            env,
+            object,
+            connect,
+            input,
+            output,
+        })
+    }
+
+    /// Asks the caller for another connection and wraps the streams it comes with.
+    ///
+    /// A Java exception from `connect` is left pending on purpose: it carries the caller's
+    /// own diagnosis — a refused TCP connection, a failed handshake — and the shim above is
+    /// told not to throw over it, exactly as a failing `InputStream.read` is.
+    ///
+    /// # Safety
+    ///
+    /// The environment and the object this was built with must still be live.
+    unsafe fn dial(&self) -> Result<(Stream, Sink), ()> {
+        // SAFETY: `env` is valid for the whole call, and the table outlives it.
+        let table = unsafe { table(self.env) };
+
+        // SAFETY: `object` is live and `connect` is a method of its class.
+        let socket =
+            unsafe { (entry!(table, CallObjectMethod))(self.env, self.object, self.connect) };
+        if socket.is_null() || unsafe { pending(self.env) } {
+            return Err(());
+        }
+        // SAFETY: `socket` is a live `java.net.Socket`, and both ids were resolved on that
+        // class.
+        let (input, output) = unsafe {
+            (
+                (entry!(table, CallObjectMethod))(self.env, socket, self.input),
+                (entry!(table, CallObjectMethod))(self.env, socket, self.output),
+            )
+        };
+        // The socket object is not held past this point: the two streams keep the
+        // connection alive, and closing it belongs to the caller that opened it.
+        if input.is_null() || output.is_null() || unsafe { pending(self.env) } {
+            return Err(());
+        }
+
+        // SAFETY: both are live streams made by the call above, and `env` outlives them.
+        let reader = unsafe { Stream::new(self.env, input) };
+        let sink = unsafe { Sink::new(self.env, output) };
+        match (reader, sink) {
+            (Ok(reader), Ok(sink)) => Ok((reader, sink)),
+            _ => Err(()),
+        }
+    }
+}
+
+/// The C ABI's dial callback: the caller closes the served connection and opens another.
+///
+/// # Safety
+///
+/// `context` must point at a live [`Connection`].
+unsafe extern "C" fn dial_connection(context: *mut c_void) -> isize {
+    if context.is_null() {
+        return -1;
+    }
+    // SAFETY: the caller passes the `Connection` created above, and the C ABI drives the
+    // callbacks on one thread, so this cannot overlap a read or a write.
+    let connection = unsafe { &mut *(context as *mut Connection) };
+    let Some(link) = connection.link.as_ref() else {
+        return -1;
+    };
+    // SAFETY: the link was built against the same environment, which outlives this call.
+    let Ok((reader, sink)) = (unsafe { link.dial() }) else {
+        return -1;
+    };
+    // The old pair is dropped here: its local references go, and the caller has closed the
+    // socket they read from. Replaced rather than mutated because a [`Stream`] caches the
+    // method id of one object.
+    connection.reader = reader;
+    connection.sink = sink;
+    0
 }
 
 /// The C ABI's read callback, pointed at the connection's reader.

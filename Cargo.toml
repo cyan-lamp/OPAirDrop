@@ -12,11 +12,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.75"
 license = "GPL-2.0-only"
-repository = "https://github.com/opairdrop/opairdrop"
+repository = "https://github.com/cyan-lamp/OPAirDrop"
 
 [profile.release]
 opt-level = 3

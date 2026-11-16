@@ -128,6 +128,33 @@ public final class Identity {
         return fingerprint(certificate);
     }
 
+    /**
+     * The {@code SenderID} this device presents when it sends, derived from the identity.
+     *
+     * <p># Why it is derived and not stored
+     *
+     * <p>A receiver groups a sender's activity by this string, so it has to be the same one
+     * on every transfer: a fresh value each time reads as a brand new device, and a phone
+     * that remembers the last sender will not recognise the next one. Deriving it from the
+     * certificate gives that stability without a second file to keep in step with the first —
+     * an identity that is replaced takes its sender id with it, which is the right coupling.
+     *
+     * <p>Type 3 (name-based, MD5) rather than a random UUID for the same reason: two launches
+     * must produce the same string from the same certificate. Upper case with the hyphens
+     * left in, which is the shape the reference implementation puts on the wire; nothing here
+     * parses it, it is only ever compared for equality.
+     *
+     * <p>Note that this is <em>not</em> the {@code TransferID}; one names the device, the other
+     * names a single transfer, and sending one for the other is the bug this exists to avoid.
+     */
+    public String senderId() {
+        String seed = "oshare-airdrop:" + certHash();
+        return java.util.UUID
+                .nameUUIDFromBytes(seed.getBytes(StandardCharsets.UTF_8))
+                .toString()
+                .toUpperCase(Locale.ROOT);
+    }
+
     /** Hex digest used both for our own TXT record and for pinning a peer. */
     public static String fingerprint(byte[] der) {
         try {
@@ -320,8 +347,12 @@ public final class Identity {
             }
             String actual = fingerprint(chain[0].getEncoded());
             if (!expected.equals(actual)) {
-                throw new CertificateException(
-                    "certificate fingerprint " + actual + " != " + expected);
+                // A type rather than a message: what the sending path has to decide is "was
+                // this a pin mismatch", and a caller that answered that by looking for a
+                // substring would go quiet the first time the wording changed. The two hashes
+                // travel as fields so {@link PeerMismatch} can put them in a sentence of its
+                // own; the message here is the log's copy.
+                throw new PeerMismatch.Pin(expected, actual);
             }
         }
 

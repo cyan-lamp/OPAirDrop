@@ -433,12 +433,17 @@ final class Chrome {
     LinearLayout featureRow(int iconType, String title, String subtitle, View right,
                             TextView[] subOut) {
         LinearLayout line = row();
-        View tile = iconTile(iconType);
-        tile.setLayoutParams(new LinearLayout.LayoutParams(dp(TILE), dp(TILE)));
-        line.addView(tile);
+        if (iconType != IconView.NO_ICON) {
+            View tile = iconTile(iconType);
+            tile.setLayoutParams(new LinearLayout.LayoutParams(dp(TILE), dp(TILE)));
+            line.addView(tile);
+        }
 
         LinearLayout mid = column();
-        mid.setPadding(dp(GAP), 0, dp(8), 0);
+        // 有图标砖时文字从图标右边 12dp 起笔。没有图标时不能再额外加缩进：调用方把这一行放进
+        // rowCard + addRow，行本身已经左右各缩进 18dp，mid 再加一次就会比卡片标题（card 的 18dp
+        // padding）右移一截——功能页那两行和内核驱动标题对不齐就是这么来的。
+        mid.setPadding(dp(iconType == IconView.NO_ICON ? 0 : GAP), 0, dp(8), 0);
         mid.addView(text(title, 15, true, scheme.text));
         TextView sub = caption(subtitle);
         sub.setPadding(0, dp(2), 0, 0);

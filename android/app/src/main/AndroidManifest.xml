@@ -17,6 +17,20 @@
          one that does not need the packets. It is normal-level and needs no prompt. -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
+    <!-- 叫醒 iPhone 用的那条 AirDrop 广播。发现**不是**从 mDNS 开始的：iPhone 要先在蓝牙
+         上听到一条 AirDrop 广播，才会把 AWDL 上的 AirDrop 服务拉起来。少了这一层，空口上
+         会出现「对端在场、8770 端口没人听」的样子——查询每两秒发一次、每帧都合法、都上了
+         无线，回包一个也没有。
+         ADVERTISE 在 API 31+ 是运行时权限，发送页自己会申请；CONNECT 是读适配器状态
+         （这枚芯片够不够格做多路广播、蓝牙开没开）时要用的，缺了它那几个 getter 是抛
+         SecurityException 而不是返回 false。 -->
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- 没有 BLE 的机器装得上、只是叫不醒对端；用 required="false" 而不是让安装被拦下。 -->
+    <uses-feature
+        android:name="android.hardware.bluetooth_le"
+        android:required="false" />
+
     <!-- Receiving has to outlive the window: without a foreground service ColorOS stops a
          background process about ninety seconds after the last activity closes, and a phone
          lying on a desk is exactly when a transfer is expected to arrive. Type
@@ -28,13 +42,12 @@
          service has to show. Without the permission the service still runs; the notice is
          simply not drawn. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-
-    <!-- 接收界面（跑在互传进程里）通过回环 TCP 找过来，用的是上面那条 INTERNET。
-         没有 <service>，也没有 QUERY_ALL_PACKAGES：前者在这台 ROM 上根本到不了——互传的
-         targetSdk 是 37，它的 <queries> 里没有本包，bindService 过来时 resolveService 按
-         调用方 uid 过滤成空，AMS 只记一句 "not found"；后者解决的是「我们看得见别人」，
-         对被别人看见无效，实测 granted=true 之后那句 not found 一字未变。两处细节都在
-         BridgeMessenger 的类注释里。 -->
+    <!-- 实时通知（状态栏那颗胶囊，ColorOS 把它画在流体云的位置）。
+         这条权限不是「多发一条通知」：它决定我们的进度通知能不能被系统提升到那个位置。
+         Android 16 起这是一条独立权限，没声明时对应的 AppOp 永远是 ignore——
+         2026-11-16 实测：`cmd appops get` 显示 `POST_PROMOTED_NOTIFICATIONS: ignore`，
+         而且无论怎么 `appops set allow` 都改不动，因为那条 AppOp 是跟着这条权限走的。 -->
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
 
     <application
         android:name=".App"
@@ -78,6 +91,30 @@
                 <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
+
+        <!-- 控制中心的【AirDrop】磁贴。
+             BIND_QUICK_SETTINGS_TILE 是系统绑定它的门槛：只有 SystemUI 拿得到，别的应用绑不上。
+             导出是必须的——系统要从自己那个进程里找到它。 -->
+        <service
+            android:name=".AirdropTile"
+            android:exported="true"
+            android:icon="@drawable/tile_airdrop"
+            android:label="@string/tile_airdrop"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <!-- 【打开文件】的落点：先撤卡，再按类型打开相册或文件管理。 -->
+        <receiver
+            android:name=".OpenDownload"
+            android:exported="false" />
+
+        <!-- 「完成」按钮的落点：撤掉那张卡。不导出——只有本应用的通知会带这条 PendingIntent。 -->
+        <receiver
+            android:name=".CardDismiss"
+            android:exported="false" />
 
         <!-- Reachable only from the settings page, so not exported: there is nothing a
              settings page does that another app should be able to trigger. -->

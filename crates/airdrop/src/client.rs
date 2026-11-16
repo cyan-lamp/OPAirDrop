@@ -37,6 +37,21 @@
 //! `200` carrying a body is an error report. Treating the status alone as success is how a
 //! transfer that the receiver rejected — a full disk, a name collision, a policy — gets
 //! reported to the user as delivered. [`Client::upload`] checks both halves.
+//!
+//! # One request per connection, and that is a rule rather than a habit
+//!
+//! `/Discover` and `/Ask` go out on **different** connections. This module used to put all
+//! three requests on one socket, on the reasonable-sounding theory that a receiver which
+//! answered `Connection: keep-alive` wanted them there. An iPhone does not: it reads one
+//! request per connection and then stops reading, while leaving the socket open. What a
+//! sender sees is not a refusal — there is no `401`, no `reset`, no `close` — it is
+//! **silence**, for as long as the sender is willing to wait. Here that was forty-five
+//! seconds of nothing between a `/Discover` answered in 80 ms and an `/Ask` that was never
+//! read, and it read exactly like a receiver that had gone to sleep.
+//!
+//! [`Client::renew`] is the fix, and it is a protocol step: the connection that answered
+//! `/Discover` is spent, and `/Ask` gets one of its own. `/Upload` then stays on the
+//! `/Ask` connection, because the answer to the offer is what the archive follows.
 
 use std::io::{self, Read, Write};
 
@@ -74,9 +89,10 @@ pub fn offered_bytes(files: &[Item]) -> u64 {
 
 /// A sender over an already-connected stream.
 ///
-/// One instance serves one connection, which is what makes reuse work: `/Ask` and
-/// `/Upload` share a TLS session when the peer keeps it alive, and a second session costs
-/// another key exchange on a link whose handshake has been measured at 28 s.
+/// One instance serves one connection, and a connection serves one request — except for
+/// `/Ask` and `/Upload`, which are one conversation: the offer's answer is what the upload
+/// follows, and it arrives as a session the upload belongs to. `/Discover` is not part of
+/// that conversation; see [`Client::renew`].
 pub struct Client<S> {
     stream: S,
     host: String,
@@ -108,12 +124,22 @@ impl<S: Read + Write> Client<S> {
 
     /// Asks whether the peer accepts transfers at all, and learns its name.
     ///
-    /// Returns [`Error::Unavailable`] when the answer says it does not. That case is worth
-    /// its own error rather than a `Ok(answer)` the caller has to remember to check: a
-    /// receiver that appears in a device list, completes a TLS handshake, answers
-    /// `/Discover` with `200` and then never posts `/Ask` is exactly what a missing
-    /// `IsAirDropable` looks like from the outside, and the difference between "this peer
-    /// is not accepting" and "this peer is broken" is the whole diagnosis.
+    /// The answer is **recorded, not obeyed**. `IsAirDropable` is a statement about the
+    /// moment the question was asked, and the reference sender logs it and posts `/Ask`
+    /// anyway:
+    ///
+    /// > A false here is answered by the next `/Ask` with a full acknowledgement of every
+    /// > byte and then silence until the connection is reset, which from this side is
+    /// > indistinguishable from a prompt that was shown and ignored.
+    ///
+    /// This used to return `Error::Unavailable` instead, and that was the whole of the
+    /// end-to-end failure: an iPhone answered `200` in 80 ms with its name and no boolean,
+    /// the absent key read as "no", and the run stopped one request short of the only
+    /// request that makes a phone show a prompt. The device list said *"<name> is not
+    /// accepting files"* while the phone was set to everyone, unlocked, and never asked.
+    ///
+    /// So a caller gets the name and the flag, and a refusal arrives where a person gives
+    /// one: as a status on `/Ask`, in [`Error::Refused`].
     pub fn discover(&mut self, sender: &Sender) -> Result<DiscoverAnswer, Error> {
         self.open(PATH_DISCOVER)?;
         let body = discover_request(sender);
@@ -129,13 +155,7 @@ impl<S: Read + Write> Client<S> {
                 body: answer.body().to_vec(),
             });
         }
-        let parsed = DiscoverAnswer::parse(answer.body()).map_err(Error::Protocol)?;
-        if !parsed.airdropable {
-            return Err(Error::Unavailable {
-                computer_name: parsed.computer_name,
-            });
-        }
-        Ok(parsed)
+        DiscoverAnswer::parse(answer.body()).map_err(Error::Protocol)
     }
 
     /// Offers `files` and `links`, returning the names to show while the archive is sent.
@@ -143,6 +163,10 @@ impl<S: Read + Write> Client<S> {
     /// The offer is the only place a receiver learns what is coming, so the same `files`
     /// list the archive is built from belongs here: an offer that describes one set of
     /// names and an archive that carries another is a prompt the user cannot recognise.
+    ///
+    /// The connection must be one that has carried nothing yet — see [`Client::renew`]. This
+    /// is the request a phone answers with a prompt, and a phone that has already answered
+    /// on this socket will answer this one with nothing.
     pub fn ask(
         &mut self,
         sender: &Sender,
@@ -248,6 +272,14 @@ impl<S: Read + Write> Client<S> {
     /// drift the first time one of the two gained a header. The framing header sits
     /// immediately before `Connection` for the same reason: that is where Java put it, and
     /// a capture diff should only ever show values that differ, never headers that moved.
+    ///
+    /// This is the head for all three requests, `/Ask` included: SPEC's HTTP-2 block prints a
+    /// five-line `/Ask` with no `Host` and `Transfer-Encoding: chunked`, and this side sent
+    /// exactly that for a while on the theory that the document describes Apple's own bytes.
+    /// The sender that was measured producing a prompt on a real iPhone does not — it writes
+    /// `Host`, `Content-Length` and `Connection: keep-alive`, the same shape as its
+    /// `/Discover`. Where the two disagree the measured one wins: the five-line form is what
+    /// a reader of the spec would write, and it is not what made a phone prompt.
     fn head(
         &self,
         path: &str,
@@ -308,6 +340,48 @@ impl<S: Read + Write> Client<S> {
     }
 }
 
+/// A stream that can continue on a connection of its own.
+///
+/// Implemented by the FFI's wire, which asks the caller for another socket. A test's
+/// scripted stream implements nothing, and that is useful: a single-connection test cannot
+/// accidentally be written as if renewal happened, so what it proves is what it says.
+pub trait Dial {
+    /// Opens a fresh connection to the same peer and starts using it.
+    ///
+    /// The old connection is spent and the implementation closes it; every read and write
+    /// after this returns goes to the new one. Failing to open one is an ordinary transport
+    /// failure and is reported as such — there is nothing to fall back to, because the old
+    /// connection cannot carry the next request.
+    fn dial(&mut self) -> io::Result<()>;
+}
+
+impl<S: Read + Write + Dial> Client<S> {
+    /// Continues the conversation on a connection of its own.
+    ///
+    /// # Why `/Ask` cannot follow `/Discover`
+    ///
+    /// An iPhone reads **one request per connection**, and then stops reading while leaving
+    /// the socket open. It does not answer the second request with a status, a reset, or a
+    /// close: it answers with nothing at all, indefinitely. From this side that silence is
+    /// indistinguishable from a receiver that never saw the offer — which is exactly what it
+    /// was taken for here, for hours. `/Discover` came back `200` with a name in 80 ms,
+    /// `/Ask` went out on the same socket, and the phone went quiet for forty-five seconds
+    /// until this side's own read timed out and closed the connection.
+    ///
+    /// The same `/Ask`, on a connection of its own, is answered `200` with a session id —
+    /// and the phone shows its prompt. So dropping the discovery connection is a protocol
+    /// step rather than a closing courtesy, and this method is how a caller takes it.
+    ///
+    /// `/Upload` deliberately stays where `/Ask` was: those two are one conversation, and
+    /// the answer to the offer is what the archive follows.
+    pub fn renew(&mut self) -> Result<(), Error> {
+        self.stream.dial().map_err(Error::Io)?;
+        // The answer that closed the old connection said nothing about this one.
+        self.closed = false;
+        Ok(())
+    }
+}
+
 /// How the body after a head announces its own end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Framing {
@@ -339,8 +413,6 @@ pub enum Error {
     /// that had already accepted the archive, and reporting it as delivered would be a lie
     /// the user acts on.
     Reported { status: u16, body: Vec<u8> },
-    /// The receiver answered `/Discover` and stated it cannot take a transfer.
-    Unavailable { computer_name: String },
     /// The peer asked for the connection to be closed, and a request followed anyway.
     Closed { requested: &'static str },
 }
@@ -362,11 +434,6 @@ impl std::fmt::Display for Error {
                 body.len(),
                 describe(body)
             ),
-            Error::Unavailable { computer_name } => write!(
-                f,
-                "{computer_name:?} answered that it cannot accept a transfer, \
-                 so no offer was made"
-            ),
             Error::Closed { requested } => write!(
                 f,
                 "the receiver closed the connection, so {requested} cannot follow on it"
@@ -381,7 +448,7 @@ impl std::error::Error for Error {
             Error::Io(error) => Some(error),
             Error::Http(error) => Some(error),
             Error::Protocol(error) => Some(error),
-            Error::Refused { .. } | Error::Reported { .. } | Error::Unavailable { .. } => None,
+            Error::Refused { .. } | Error::Reported { .. } => None,
             Error::Closed { .. } => None,
         }
     }
@@ -415,6 +482,7 @@ fn describe(body: &[u8]) -> String {
 mod tests {
     use super::*;
     use opairdrop_bplist::Value;
+    use std::collections::VecDeque;
 
     /// A stream that answers from a canned script and keeps every byte written to it.
     ///
@@ -493,6 +561,68 @@ mod tests {
         }
     }
 
+    /// Several connections in a row, each keeping its own bytes.
+    ///
+    /// [`Dial`] is what a real transport implements by opening a socket, so a test that
+    /// wants to see the second request on a second connection has to model exactly that.
+    /// The point of separate [`Wire`]s rather than one growing buffer is that "which
+    /// connection carried which request" becomes a question about a value, and the failure
+    /// this module exists to prevent — the offer written onto a socket that has already
+    /// answered — fails a test instead of a transfer.
+    struct Reel {
+        links: Vec<Wire>,
+        live: usize,
+        /// The answers later connections will give, oldest first.
+        queued: VecDeque<Vec<u8>>,
+    }
+
+    impl Reel {
+        fn first(script: Vec<u8>) -> Reel {
+            Reel {
+                links: vec![Wire::answering(script)],
+                live: 0,
+                queued: VecDeque::new(),
+            }
+        }
+
+        /// What the connection opened by the next [`Dial`] will be answered with.
+        fn then(mut self, script: Vec<u8>) -> Reel {
+            self.queued.push_back(script);
+            self
+        }
+    }
+
+    impl Read for Reel {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.links[self.live].read(buf)
+        }
+    }
+
+    impl Write for Reel {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.links[self.live].write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Dial for Reel {
+        fn dial(&mut self) -> io::Result<()> {
+            let Some(script) = self.queued.pop_front() else {
+                // A real dial gets one of: a connection, a refusal, or a timeout. A test
+                // that queued nothing has no third option to offer, and failing here is
+                // louder than handing back an empty stream that answers `0` to every read.
+                return Err(io::Error::other("no connection queued for the dial"));
+            };
+            self.links.push(Wire::answering(script));
+            self.live = self.links.len() - 1;
+            Ok(())
+        }
+    }
+
+
     fn id() -> TransferId {
         TransferId::from_bytes16(&[0x37; 16])
     }
@@ -518,7 +648,7 @@ mod tests {
         let mut client = Client::new(Wire::answering(script), "air.local");
         let found = client.discover(&sender()).expect("answers");
         assert_eq!(found.computer_name, "Air");
-        assert!(found.airdropable);
+        assert_eq!(found.airdropable, Some(true));
 
         let wire = client.into_inner();
         let lines = wire.head_lines();
@@ -549,21 +679,32 @@ mod tests {
     }
 
     #[test]
-    fn a_receiver_that_states_it_cannot_take_a_transfer_is_reported_with_its_name() {
-        // The exact shape of the incident: a plist with no `IsAirDropable` at all. The
-        // sender used to read the absent boolean as "fine", offer, and then watch the peer
-        // vanish; it now stops with a name in the message.
+    fn an_answer_that_does_not_say_whether_it_accepts_is_not_a_refusal() {
+        // The exact shape of the incident: a plist with the name and no `IsAirDropable`.
+        // Reading the absent key as "no" is what stopped the sender one request short of
+        // `/Ask`, so the answer now comes back with the name and a `None`, and the caller
+        // goes on to ask.
         let body = opairdrop_bplist::encode(&Value::dict([(
             "ReceiverComputerName",
             Value::String("Air".to_string()),
         )]));
         let mut client = Client::new(Wire::answering(answer(200, body)), "air");
-        let error = client.discover(&sender()).expect_err("refuses");
-        match &error {
-            Error::Unavailable { computer_name } => assert_eq!(computer_name, "Air"),
-            other => panic!("expected an unavailable receiver, got {other:?}"),
-        }
-        assert!(error.to_string().contains("Air"));
+        let found = client.discover(&sender()).expect("an answer is an answer");
+        assert_eq!(found.computer_name, "Air");
+        assert_eq!(found.airdropable, None);
+    }
+
+    #[test]
+    fn a_receiver_that_states_it_cannot_take_one_is_still_asked() {
+        // `IsAirDropable = false` is a statement about the moment, not a verdict, and the
+        // reference sender posts `/Ask` anyway. Nothing here may turn it into an error:
+        // the error would arrive instead of the prompt.
+        let mut said = DiscoverAnswer::new("Air");
+        said.airdropable = Some(false);
+        let mut client = Client::new(Wire::answering(answer(200, said.encode())), "air");
+        let found = client.discover(&sender()).expect("answered");
+        assert_eq!(found.airdropable, Some(false));
+        assert_eq!(found.computer_name, "Air");
     }
 
     #[test]
@@ -577,7 +718,148 @@ mod tests {
 
         let wire = client.into_inner();
         assert_eq!(wire.head_lines()[0], "POST /Ask HTTP/1.1");
+        // The body on the wire is the offer byte for byte. There are no chunk frames to
+        // strip, because the head declared the length — an offer that arrived framed was
+        // the shape a reader of SPEC's HTTP-2 block would send, and it is not the shape
+        // this request has on the wire from the sender that works.
         assert_eq!(wire.body(), ask_request(&sender(), &id(), &files, &[]));
+    }
+
+    #[test]
+    fn the_offer_head_is_the_same_shape_as_the_discovery_head() {
+        // One head builder, and this is the assertion that keeps it one. The sender that
+        // was measured making a real iPhone prompt writes `/Ask` as an ordinary HTTP/1.1
+        // request: `Host`, a declared length, `Connection: keep-alive` — the same five
+        // headers as its `/Discover`. SPEC's HTTP-2 block prints a different, five-line
+        // form with no `Host` and chunked framing, this side sent exactly that for a
+        // while, and the phone stayed silent on it. A second head builder would break
+        // this test before it broke a transfer.
+        let script = answer(200, AskAnswer::new("Air", "MacBook Pro").encode());
+        let mut client = Client::new(Wire::answering(script), "air.local");
+        let files = [Item::new("a.jpg")];
+        client
+            .ask(&sender(), &id(), &files, &[])
+            .expect("offers");
+
+        let wire = client.into_inner();
+        let lines = wire.head_lines();
+        assert_eq!(lines[0], "POST /Ask HTTP/1.1");
+        assert_eq!(lines[1], "Host: air.local");
+        assert_eq!(lines[2], "User-Agent: AirDrop/1.0");
+        assert_eq!(lines[3], "Content-Type: application/octet-stream");
+        assert_eq!(
+            lines[4],
+            format!(
+                "Content-Length: {}",
+                ask_request(&sender(), &id(), &files, &[]).len()
+            ),
+            "the offer declares its own end"
+        );
+        assert_eq!(lines[5], "Connection: keep-alive");
+        assert_eq!(lines.len(), 6, "no blank-line artefacts, no seventh header");
+
+        let head = wire.head();
+        assert!(!head.contains("chunked"), "the offer is not chunked\n{head}");
+        assert!(
+            !head.to_lowercase().contains("accept"),
+            "HTTP-2: no `Accept*`\n{head}"
+        );
+        assert!(!head.contains("Expect"), "HTTP-3: no `100-continue`\n{head}");
+    }
+
+    #[test]
+    fn the_offer_goes_out_on_a_connection_of_its_own() {
+        // The failure this module is shaped around, as an assertion: a receiver answers one
+        // request per connection and then goes silent. What matters is not that the offer
+        // was answered quickly here — a scripted peer always answers — but that the offer's
+        // bytes are not on the socket that carried `/Discover` at all.
+        let reel = Reel::first(answer(200, DiscoverAnswer::new("Air").encode()))
+            .then(answer(200, AskAnswer::new("Air", "MacBook Pro").encode()));
+        let mut client = Client::new(reel, "air.local");
+
+        let found = client.discover(&sender()).expect("answers");
+        assert_eq!(found.computer_name, "Air");
+        client.renew().expect("a second connection");
+
+        let files = [Item::new("a.jpg").with_size(10)];
+        let names = client
+            .ask(&sender(), &id(), &files, &[])
+            .expect("offers");
+        assert_eq!(names.model_name, "MacBook Pro");
+
+        let reel = client.into_inner();
+        assert_eq!(reel.links.len(), 2, "one request per connection");
+        assert_eq!(reel.links[0].head_lines()[0], "POST /Discover HTTP/1.1");
+        assert!(
+            !reel.links[0].written().contains("/Ask"),
+            "the spent connection carried only the question about the peer"
+        );
+        assert_eq!(reel.links[1].head_lines()[0], "POST /Ask HTTP/1.1");
+        assert!(
+            !reel.links[1].written().contains("/Discover"),
+            "the new connection opens with the offer"
+        );
+    }
+
+    #[test]
+    fn the_archive_stays_on_the_connection_the_offer_was_answered_on() {
+        // `/Ask` and `/Upload` are one conversation: the offer's `200` names the session
+        // the archive belongs to. Renewing between them would put the archive on a socket
+        // whose receiver is waiting for a question.
+        let ask_then_upload = [
+            answer(200, AskAnswer::new("Air", "MacBook Pro").encode()),
+            answer(200, Vec::new()),
+        ]
+        .concat();
+        let reel = Reel::first(answer(200, DiscoverAnswer::new("Air").encode())).then(ask_then_upload);
+        let mut client = Client::new(reel, "air.local");
+
+        client.discover(&sender()).expect("answers");
+        client.renew().expect("a second connection");
+        client
+            .ask(&sender(), &id(), &[Item::new("a.jpg")], &[])
+            .expect("offers");
+        client
+            .upload(&id(), 0, |out| out.write_all(b""))
+            .expect("accepted");
+
+        let reel = client.into_inner();
+        assert_eq!(reel.links.len(), 2, "no third connection");
+        let second = reel.links[1].written();
+        assert!(second.contains("POST /Ask HTTP/1.1"), "{second}");
+        assert!(second.contains("POST /Upload HTTP/1.1"), "{second}");
+    }
+
+    #[test]
+    fn a_connection_the_peer_closed_is_replaced_rather_than_blamed() {
+        // A receiver that answers `Connection: close` has finished with that socket and
+        // says so. The next request needs a new connection either way, so `renew` clears
+        // the flag instead of leaving the caller holding a refusal that no longer applies.
+        let reel = Reel::first(closed_answer(200, DiscoverAnswer::new("Air").encode()))
+            .then(answer(200, AskAnswer::new("Air", "MacBook Pro").encode()));
+        let mut client = Client::new(reel, "air");
+
+        client.discover(&sender()).expect("answers");
+        assert!(client.is_closed(), "the answer said close");
+        client.renew().expect("a second connection");
+        assert!(!client.is_closed(), "the new connection has said nothing");
+        client
+            .ask(&sender(), &id(), &[Item::new("a.jpg")], &[])
+            .expect("offers");
+    }
+
+    #[test]
+    fn a_renewal_that_cannot_open_a_connection_is_a_transport_failure() {
+        // There is nothing to fall back to: the old socket has already answered its one
+        // request. The failure has to arrive as itself rather than as a stall on a request
+        // that will never be read.
+        let mut client = Client::new(
+            Reel::first(answer(200, DiscoverAnswer::new("Air").encode())),
+            "air",
+        );
+        client.discover(&sender()).expect("answers");
+        let error = client.renew().expect_err("nothing to dial");
+        assert!(matches!(error, Error::Io(_)), "{error:?}");
     }
 
     #[test]

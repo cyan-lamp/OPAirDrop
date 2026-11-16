@@ -54,7 +54,14 @@ final class Publish {
     private static final String TAG = "OPAirDrop";
 
     /** 公共目录下那一层。五类共用，所以永远是 {@code <根>/OPAirDrop}，不再往下建。 */
-    private static final String FOLDER = "OPAirDrop";
+    /**
+     * 落在公共目录下的那层文件夹名。
+     *
+     * <p>2026-11-16 从 {@code OPAirDrop} 改成 {@code AirDrop}，同时把落点收成两处：照片与视频进
+     * {@code DCIM/AirDrop}（相册默认就扫这里，收完能在相册里直接看见），其余一切进
+     * {@code Download/AirDrop}（那是唯一一个什么都收的地方）。
+     */
+    private static final String FOLDER = "AirDrop";
 
     /** 一次传输一个暂存目录，收完就删。 */
     private static final String STAGING = "_staging";
@@ -103,11 +110,8 @@ final class Publish {
      * {@code Xxx/OPAirDrop} 连起来是一堵墙，而人真正要认的是「照片进 Pictures」这件事。
      */
     static String describe() {
-        return "按类型分（都在 " + FOLDER + " 下）：照片 " + Bucket.PHOTO.root
-                + "，视频 " + Bucket.VIDEO.root
-                + "，音乐 " + Bucket.SOUND.root
-                + "，文档 " + Bucket.DOCUMENT.root
-                + "，其他 " + Bucket.OTHER.root;
+        return "照片和视频进 " + Bucket.PHOTO.root + "/" + FOLDER + "，其余进 "
+                + Bucket.OTHER.root + "/" + FOLDER;
     }
 
     /**
@@ -280,12 +284,15 @@ final class Publish {
         return type == null ? "application/octet-stream" : type;
     }
 
-    /** 五类，各自的媒体库集合与公共目录根。 */
+    /**
+     * 三类落点：照片、视频、其余。
+     *
+     * <p>前两类的公共目录根都是 {@code DCIM}——相册扫的是它，不是 {@code Pictures}。声音、文档、
+     * 压缩包一律进 {@code Download}：把它们混进 DCIM 只会让相册里多出一堆打不开的条目。
+     */
     private enum Bucket {
-        PHOTO(Environment.DIRECTORY_PICTURES, MediaStore.Images.Media.EXTERNAL_CONTENT_URI),
-        VIDEO(Environment.DIRECTORY_MOVIES, MediaStore.Video.Media.EXTERNAL_CONTENT_URI),
-        SOUND(Environment.DIRECTORY_MUSIC, MediaStore.Audio.Media.EXTERNAL_CONTENT_URI),
-        DOCUMENT(Environment.DIRECTORY_DOCUMENTS, MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)),
+        PHOTO(Environment.DIRECTORY_DCIM, MediaStore.Images.Media.EXTERNAL_CONTENT_URI),
+        VIDEO(Environment.DIRECTORY_DCIM, MediaStore.Video.Media.EXTERNAL_CONTENT_URI),
         OTHER(Environment.DIRECTORY_DOWNLOADS, MediaStore.Downloads.EXTERNAL_CONTENT_URI);
 
         final String root;
@@ -304,12 +311,6 @@ final class Publish {
             if (VIDEOS.contains(extension)) {
                 return VIDEO;
             }
-            if (SOUNDS.contains(extension)) {
-                return SOUND;
-            }
-            if (DOCUMENTS.contains(extension)) {
-                return DOCUMENT;
-            }
             return OTHER;
         }
     }
@@ -321,14 +322,6 @@ final class Publish {
     private static final java.util.Set<String> VIDEOS = set(
             "mp4", "mov", "m4v", "mkv", "webm", "3gp", "3g2", "avi", "wmv", "flv",
             "mpg", "mpeg", "ts", "mts", "m2ts");
-
-    private static final java.util.Set<String> SOUNDS = set(
-            "mp3", "m4a", "aac", "wav", "flac", "ogg", "oga", "opus", "amr", "aiff", "aif", "wma");
-
-    private static final java.util.Set<String> DOCUMENTS = set(
-            "txt", "md", "pdf", "doc", "docx", "rtf", "pages", "odt",
-            "xls", "xlsx", "csv", "numbers", "ods",
-            "ppt", "pptx", "key", "odp", "epub");
 
     /** 扩展名到 MIME。查不到的一律 {@code application/octet-stream}。 */
     private static final java.util.Map<String, String> TYPES = types();

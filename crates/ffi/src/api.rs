@@ -40,8 +40,13 @@ use crate::buffer::{fill, OpairdropBuffer};
 /// Bumped whenever an export changes meaning, but not when one is added. Version 2 added
 /// the settings argument to [`opairdrop_receive_archive`]: a caller built against 1 would
 /// pass four arguments where five are read, so the number is the only way for either side
-/// to notice before the call.
-pub const ABI_VERSION: u32 = 2;
+/// to notice before the call. Version 3 added the [`DialCallback`] to both send exports, for
+/// the same reason and with the same failure mode: an older caller would pass its context
+/// where a function pointer is now read. Version 4 put `sender_id` between `model` and
+/// `transfer_id` in both send exports: every argument after it shifted by two words, so a
+/// caller built against 3 would hand its transfer id over as a string pointer and its paths
+/// as the transfer id — a `SenderID` that happens to parse and a path list that does not.
+pub const ABI_VERSION: u32 = 5;
 
 /// Status codes. Zero is success; negative is a failure.
 pub mod status {
@@ -98,6 +103,21 @@ pub type ReadCallback = unsafe extern "C" fn(context: *mut c_void, buf: *mut u8,
 /// peer that will never accept more.
 pub type WriteCallback =
     unsafe extern "C" fn(context: *mut c_void, buf: *const u8, len: usize) -> isize;
+
+/// Opens a fresh connection to the same peer and points the read and write callbacks at it.
+///
+/// Return zero when the callbacks now read and write on a new connection, or a negative
+/// number when no new one could be opened — the value is the caller's own and is passed back
+/// through [`status::TRANSPORT`].
+///
+/// This exists because a receiver reads **one request per connection**. `/Discover` and
+/// `/Ask` therefore cannot share a socket: an iPhone answers the first and then stops
+/// reading, leaving the socket open and saying nothing, which from this side is
+/// indistinguishable from a receiver that went to sleep. The library calls this once,
+/// between the two, and the caller is expected to close the old connection and open a new
+/// one — the same pair of read and write callbacks then serve the second request, because
+/// what changed is which socket they are pointed at, not how bytes cross the boundary.
+pub type DialCallback = unsafe extern "C" fn(context: *mut c_void) -> isize;
 
 /// What one archive left behind, in the only shape that crosses the boundary.
 ///

@@ -1,4 +1,18 @@
-//! Outgoing transfers: one `/Discover`, one `/Ask`, one `/Upload`.
+//! Outgoing transfers: one `/Discover`, one `/Ask`, one `/Upload` — on two connections.
+//!
+//! # Why two connections and not one
+//!
+//! A receiver reads **one request per connection**. `/Discover` therefore cannot be
+//! followed by `/Ask` on the same socket: an iPhone answers the first and then stops
+//! reading, leaving the socket open and saying nothing — no status, no reset, no byte — and
+//! a sender has no way to tell that apart from a receiver that went to sleep. `/Ask` on a
+//! connection of its own is answered `200` with a session, and the phone shows its prompt.
+//!
+//! So a caller of this module supplies three things about the wire rather than one: a read
+//! callback, a write callback, and a [`DialCallback`] that opens a second connection and
+//! re-points the first two at it. The library calls it once, between `/Discover` and
+//! `/Ask`, and never again — `/Upload` belongs to the `/Ask` connection, because those two
+//! are one conversation.
 //!
 //! # Why the archive is built while it is sent
 //!
@@ -8,10 +22,11 @@
 //!
 //! # Why the conversation is three calls and not one
 //!
-//! `/Discover` asks whether the peer takes transfers at all, and it is the only call whose
-//! answer can be "no" before the other phone has shown a prompt. Doing it first is what lets
-//! the UI say "this iPhone is not accepting files" instead of raising a prompt and then
-//! failing behind it. `/Ask` is the prompt. `/Upload` is the archive.
+//! `/Discover` learns the peer's name and what it says about itself. It is **not** a
+//! permission check and its `IsAirDropable` is not a verdict: a phone set to everyone
+//! answers without the key at all, and treating that silence as "no" is what once stopped
+//! this sender one request short of the only request that matters. `/Ask` is the prompt —
+//! the one place a person answers — and `/Upload` is the archive.
 //!
 //! # Why progress is counted off disk
 //!
@@ -26,10 +41,12 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 use opairdrop_airdrop::client::Error as ClientError;
-use opairdrop_airdrop::{Client, Item, Sender, TransferId};
-use opairdrop_cpio::{dvzip, Builder, Format, MODE_REGULAR};
+use opairdrop_airdrop::{Client, Dial, Item, Sender, TransferId, PATH_ASK};
+use opairdrop_cpio::{dvzip, Builder, Format, MODE_DIRECTORY, MODE_REGULAR};
 
-use crate::api::{status, CallbackReader, CallbackWriter, ReadCallback, WriteCallback};
+use crate::api::{
+    status, CallbackReader, CallbackWriter, DialCallback, ReadCallback, WriteCallback,
+};
 use crate::buffer::{fill, OpairdropBuffer};
 
 /// Which part of the conversation is running, as the numbers a caller can switch on.
@@ -53,6 +70,14 @@ pub mod phase {
 pub type ProgressCallback =
     unsafe extern "C" fn(context: *mut c_void, phase: i32, sent: u64, total: u64);
 
+/// Reports the peer's own name, once, as soon as `/Discover` answers.
+///
+/// Separate from [`ProgressCallback`] because a name is a string, not a phase: folding it into
+/// the byte counts would either change that callback's signature (and every caller of the C
+/// ABI) or smuggle text through numbers. The bytes are UTF-8 and borrowed for the call only.
+pub type NameCallback =
+    unsafe extern "C" fn(context: *mut c_void, name: *const u8, name_len: usize);
+
 /// How much may pass between two reports.
 ///
 /// 512 KiB: small enough that a 1 GB video moves visibly several times a second, large
@@ -63,6 +88,8 @@ const REPORT_EVERY: u64 = 512 * 1024;
 struct Meter {
     callback: ProgressCallback,
     context: *mut c_void,
+    /// Optional peer-name callback. `None` for callers that only want byte counts.
+    name_callback: Option<NameCallback>,
     /// Bytes taken off disk so far.
     sent: std::cell::Cell<u64>,
     /// Bytes the person chose, from the file sizes.
@@ -86,6 +113,15 @@ impl Meter {
         // SAFETY: the caller of `opairdrop_send_with_progress` promised the callback and its
         // context for the duration of the call.
         unsafe { (self.callback)(self.context, phase, self.sent.get(), self.total) };
+    }
+
+    /// Announces the peer's name. Called once, right after `/Discover` answers.
+    fn say_name(&self, name: &str) {
+        if let Some(callback) = self.name_callback {
+            // SAFETY: `name` borrows a live `String` for the duration of this call, and the
+            // context is the same one promised for the byte callback.
+            unsafe { callback(self.context, name.as_ptr(), name.len()) };
+        }
     }
 }
 
@@ -138,12 +174,19 @@ impl Failure {
 /// rather than as the one number: the sender will want a second row eventually, and a
 /// boundary that carries one integer would have to grow a second parameter to do it.
 ///
+/// `sender_id` is the `SenderID` this device goes by, and it is a parameter of its own rather
+/// than a second life for `transfer_id`: the transfer id names one transfer, this names the
+/// sender, and it has to be the **same string on every transfer** or a receiver sees a new
+/// device each time. The caller derives it from its own identity so it survives restarts
+/// without being stored separately.
+///
 /// # Safety
 ///
 /// `host` must point at `host_len` bytes of UTF-8 readable for the duration; `settings`,
-/// `sender_name`, `model` and `transfer_id` likewise at their stated lengths, or be null where
-/// optional; `paths` must point at `paths_len` bytes of NUL-separated UTF-8; `read` and `write`
-/// must be valid function pointers whose `context` stays valid; `report` must point at a zeroed
+/// `sender_name`, `model`, `sender_id` and `transfer_id` likewise at their stated lengths, or
+/// be null where optional; `paths` must point at `paths_len` bytes of NUL-separated UTF-8; `read` and `write`
+/// must be valid function pointers whose `context` stays valid, and `dial` one that opens a
+/// second connection and re-points them at it; `report` must point at a zeroed
 /// [`OpairdropBuffer`] that outlives the call.
 #[no_mangle]
 pub unsafe extern "C" fn opairdrop_send(
@@ -155,12 +198,15 @@ pub unsafe extern "C" fn opairdrop_send(
     sender_name_len: usize,
     model: *const u8,
     model_len: usize,
+    sender_id: *const u8,
+    sender_id_len: usize,
     transfer_id: *const u8,
     transfer_id_len: usize,
     paths: *const u8,
     paths_len: usize,
     read: ReadCallback,
     write: WriteCallback,
+    dial: DialCallback,
     context: *mut c_void,
     report: *mut OpairdropBuffer,
 ) -> i32 {
@@ -175,12 +221,15 @@ pub unsafe extern "C" fn opairdrop_send(
             sender_name_len,
             model,
             model_len,
+            sender_id,
+            sender_id_len,
             transfer_id,
             transfer_id_len,
             paths,
             paths_len,
             read,
             write,
+            Some(dial),
             context,
             None,
             report,
@@ -204,20 +253,25 @@ pub unsafe extern "C" fn opairdrop_send_with_progress(
     sender_name_len: usize,
     model: *const u8,
     model_len: usize,
+    sender_id: *const u8,
+    sender_id_len: usize,
     transfer_id: *const u8,
     transfer_id_len: usize,
     paths: *const u8,
     paths_len: usize,
     read: ReadCallback,
     write: WriteCallback,
+    dial: DialCallback,
     context: *mut c_void,
     progress: ProgressCallback,
     progress_context: *mut c_void,
+    peer_name: Option<NameCallback>,
     report: *mut OpairdropBuffer,
 ) -> i32 {
     let gauge = Meter {
         callback: progress,
         context: progress_context,
+        name_callback: peer_name,
         sent: std::cell::Cell::new(0),
         total: 0,
         last: std::cell::Cell::new(0),
@@ -233,12 +287,15 @@ pub unsafe extern "C" fn opairdrop_send_with_progress(
             sender_name_len,
             model,
             model_len,
+            sender_id,
+            sender_id_len,
             transfer_id,
             transfer_id_len,
             paths,
             paths_len,
             read,
             write,
+            Some(dial),
             context,
             Some(gauge),
             report,
@@ -261,12 +318,15 @@ unsafe fn drive(
     sender_name_len: usize,
     model: *const u8,
     model_len: usize,
+    sender_id: *const u8,
+    sender_id_len: usize,
     transfer_id: *const u8,
     transfer_id_len: usize,
     paths: *const u8,
     paths_len: usize,
     read: ReadCallback,
     write: WriteCallback,
+    dial: Option<DialCallback>,
     context: *mut c_void,
     meter: Option<Meter>,
     report: *mut OpairdropBuffer,
@@ -280,7 +340,7 @@ unsafe fn drive(
     let parsed = unsafe {
         (|| -> Result<(&str, &str, Sender, Vec<PathBuf>, usize), Failure> {
             let host = text(host, host_len)?;
-            let id = text(transfer_id, transfer_id_len)?;
+            let transfer_text = text(transfer_id, transfer_id_len)?;
             // No settings text at all is "nothing configured", which is every default. Text
             // that is there but does not parse is refused instead: the person edited a row,
             // and a send that silently ignored it is the one outcome that leaves them no way
@@ -293,13 +353,13 @@ unsafe fn drive(
             let sender = Sender::new(
                 text_or(sender_name, sender_name_len, ""),
                 text_or(model, model_len, ""),
-                id,
+                sender_identity(text_or(sender_id, sender_id_len, ""), transfer_text),
             );
             let paths = path_list(text(paths, paths_len)?)?;
-            Ok((host, id, sender, paths, limit))
+            Ok((host, transfer_text, sender, paths, limit))
         })()
     };
-    let (host, id, sender, paths, limit) = match parsed {
+    let (host, transfer_text, sender, paths, limit) = match parsed {
         Ok(parsed) => parsed,
         Err(failure) => {
             // SAFETY: `report` is non-null and zeroed, per the contract.
@@ -307,7 +367,7 @@ unsafe fn drive(
             return failure.status;
         }
     };
-    let Some(id) = parse_transfer_id(id) else {
+    let Some(id) = parse_transfer_id(transfer_text) else {
         // SAFETY: as above.
         unsafe { fill(report, b"the transfer id is not 32 hexadecimal digits".to_vec()) };
         return status::BAD_PATH;
@@ -332,7 +392,15 @@ unsafe fn drive(
     // shape it — the `Host` header and the row `http.response_limit` — are applied in the same
     // scope that read them. A wire that is handed in already limited cannot be raised by
     // accident downstream.
-    let mut client = Client::new(Wire { reader, writer }, host).with_limit(limit);
+    let mut client = Client::new(
+        Wire {
+            reader,
+            writer,
+            reopen: dial.map(|callback| (callback, context)),
+        },
+        host,
+    )
+    .with_limit(limit);
     match transfer(&mut client, &sender, &id, &paths, meter.as_ref()) {
         Ok(sent) => {
             // SAFETY: `report` is non-null and zeroed, per the contract.
@@ -344,6 +412,26 @@ unsafe fn drive(
             unsafe { fill(report, failure.message.into_bytes()) };
             failure.status
         }
+    }
+}
+
+/// Which string the peer will file this device under.
+///
+/// `SenderID` is not the transfer id, and handing one over for the other is the mistake the
+/// separate parameter exists to stop. A receiver groups a sender's activity by this string, so
+/// a value drawn per transfer reads as a brand new device every time — the caller derives it
+/// from its own identity instead (see `Native.send`), which is also why it arrives as an
+/// argument: the derivation needs the certificate, and the certificate is the caller's.
+///
+/// A caller that supplies nothing still gets a body a receiver can read, with the transfer id
+/// standing in. Nothing is grouped across transfers then, which is the degradation and not a
+/// malformed offer: the field is free-form text in the plist, so a value that happens to be the
+/// transfer id is still a well-formed one.
+fn sender_identity<'a>(sender_id: &'a str, transfer_id: &'a str) -> &'a str {
+    if sender_id.is_empty() {
+        transfer_id
+    } else {
+        sender_id
     }
 }
 
@@ -362,25 +450,53 @@ fn transfer(
     let items: Vec<Item> = files.iter().map(|(item, _)| item.clone()).collect();
     let total = opairdrop_airdrop::offered_bytes(&items);
 
-    // `/Discover` first: a peer that is not accepting answers 503 here, and that answer has
-    // to arrive before the other phone shows a prompt.
+    // `/Discover` first, for the name and for what the peer says it can take. Fatal only if
+    // it fails outright: a `200` whose boolean says no is not a failure, and `/Ask` below is
+    // still the request that makes the other phone show a prompt.
     let discovered = client.discover(sender).map_err(describe_error)?;
+    // `/Discover` carries the name a person reads (ReceiverComputerName). The mDNS instance
+    // name is a hash on current iPhones, so this is the first moment the UI can show "青"
+    // instead of `a651a674f3f5`. Report it before the phase so the name is already there when
+    // the "connected" state paints. `/Ask` carries the same field as a fallback for receivers
+    // that leave it blank here, reported after the answer below.
+    let peer_name = if discovered.computer_name.is_empty() {
+        None
+    } else {
+        Some(discovered.computer_name.clone())
+    };
     if let Some(gauge) = meter {
+        if let Some(name) = &peer_name {
+            gauge.say_name(name);
+        }
         gauge.say(phase::READY);
     }
+
+    // The discovery connection is spent: a receiver reads one request per connection, so
+    // `/Ask` has to arrive on one of its own. The phone does not refuse the second request
+    // — it answers nothing at all, which from here is indistinguishable from a receiver that
+    // went to sleep, and cost this sender forty-five seconds of silence per attempt. See
+    // `Client::renew`.
+    client.renew().map_err(describe_error)?;
+
     if let Some(gauge) = meter {
         gauge.say(phase::WAITING);
     }
     let asked = client.ask(sender, id, &items, &[]).map_err(describe_error)?;
+
+    let peer = match peer_name {
+        Some(name) => name,
+        None => {
+            let fallback = asked.computer_name.clone();
+            if let Some(gauge) = meter {
+                gauge.say_name(&fallback);
+            }
+            fallback
+        }
+    };
     if let Some(gauge) = meter {
         gauge.say(phase::SENDING);
     }
 
-    let peer = if discovered.computer_name.is_empty() {
-        asked.computer_name.clone()
-    } else {
-        discovered.computer_name.clone()
-    };
 
     client
         .upload(id, total, |out| archive(out, &files, meter))
@@ -426,6 +542,12 @@ fn describe(paths: &[PathBuf]) -> Result<Vec<(Item, PathBuf)>, Failure> {
 }
 
 /// The archive the upload carries: cpio per member, DVZip per block.
+///
+/// Three parts, in the order the reference sender writes them: the `.` directory member
+/// that is the destination folder, one regular-file member per offer, then the trailer. The
+/// first part is not decoration — it is the only thing in the archive that says where the
+/// members go, and an archive that opens with a file describes a file with no folder around
+/// it.
 fn archive(
     out: &mut dyn Write,
     files: &[(Item, PathBuf)],
@@ -433,21 +555,32 @@ fn archive(
 ) -> io::Result<()> {
     // Odc is what the protocol's upload section asks a sender to produce.
     let mut builder = Builder::new(dvzip::Encoder::new(out), Format::Odc);
+    // An empty `.` member: a directory with no contents costs a header and a name byte, and
+    // it is what makes the members after it land in one folder rather than at the root.
+    builder
+        .add(".", MODE_DIRECTORY, &[])
+        .map_err(io::Error::other)?;
     for (item, path) in files {
         let size = item.size.unwrap_or(0);
+        // The member name is the offer's own `FileBomPath`, `./` and all. UP-7 lets a
+        // receiver drop a member it was never offered, and "offered" means the string that
+        // went out in `/Ask` — so normalising the path here, which reads like tidying,
+        // turns every member into a file that arrives as nothing. `Item::bom_path` answers
+        // with the same string the offer used, by construction.
+        let member = item.bom_path();
         let file = File::open(path)
             .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
         match meter {
             Some(gauge) => {
                 let mut counted = Counted { file, meter: gauge };
                 builder
-                    .add_reader(&item.name, MODE_REGULAR, size, &mut counted)
+                    .add_reader(&member, MODE_REGULAR, size, &mut counted)
                     .map_err(io::Error::other)?;
             }
             None => {
                 let mut plain = file;
                 builder
-                    .add_reader(&item.name, MODE_REGULAR, size, &mut plain)
+                    .add_reader(&member, MODE_REGULAR, size, &mut plain)
                     .map_err(io::Error::other)?;
             }
         }
@@ -515,17 +648,108 @@ fn frame(sent: &Sent) -> Vec<u8> {
 }
 
 /// Turns a client error into a status and a message.
+///
+/// A `503` on `/Ask` is the one answer that means *the person on the other end said no*, or
+/// rather that there is no person to ask: it is what a phone set to "contacts only" tells an
+/// anonymous sender, and it arrives instead of a prompt. Everything else is a transport
+/// failure and is reported as one.
 fn describe_error(error: ClientError) -> Failure {
-    match error {
-        ClientError::Unavailable { computer_name } => {
-            let who = if computer_name.is_empty() {
-                "the peer".to_string()
-            } else {
-                computer_name
-            };
-            Failure::new(status::REFUSED, format!("{who} is not accepting files"))
+    match &error {
+        ClientError::Refused {
+            path, status: 503, ..
+        } if *path == PATH_ASK => {
+            Failure::new(status::REFUSED, "the peer is not accepting files")
         }
-        other => Failure::transport(other),
+        _ => Failure::transport(error),
+    }
+}
+
+/// Asks a peer for its own name, and nothing else.
+///
+/// # Why a separate export
+///
+/// The device list needs the name a person reads before anyone taps a tile. That name lives
+/// only in the `/Discover` answer, which normally arrives as the first step of a transfer —
+/// but a transfer also promises `/Ask` and `/Upload`, and those need a second connection and
+/// a person's decision. This export stops after the first request: one TLS connection (made
+/// by the caller, which owns the pinning), one `/Discover`, one answer, done. No prompt
+/// appears on the peer — `/Ask` is the only request that shows one.
+///
+/// The answer is written to `report` as the bare UTF-8 name on success; on failure, as the
+/// message, with a negative status. An empty name is a valid answer (some receivers leave
+/// the field blank) and still returns `OK`.
+///
+/// # Safety
+///
+/// `report`, `host` and the sender strings must be valid for their lengths; `read`/`write`
+/// must be a callback pair valid for `context` for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn opairdrop_discover_name(
+    host: *const u8,
+    host_len: usize,
+    settings: *const u8,
+    settings_len: usize,
+    sender_name: *const u8,
+    sender_name_len: usize,
+    model: *const u8,
+    model_len: usize,
+    sender_id: *const u8,
+    sender_id_len: usize,
+    read: ReadCallback,
+    write: WriteCallback,
+    context: *mut c_void,
+    report: *mut OpairdropBuffer,
+) -> i32 {
+    if report.is_null() || host.is_null() {
+        return status::NULL_ARGUMENT;
+    }
+    // SAFETY: the caller promises the regions below for their lengths.
+    let parsed = unsafe {
+        (|| -> Result<(&str, Sender, usize), Failure> {
+            let host = text(host, host_len)?;
+            let settings = text_or(settings, settings_len, "");
+            let limit = match crate::settings::values_from(settings.as_bytes()) {
+                Ok(values) => crate::settings::response_limit(&values),
+                Err(message) => return Err(Failure::new(status::SETTINGS, message)),
+            };
+            let sender = Sender::new(
+                text_or(sender_name, sender_name_len, ""),
+                text_or(model, model_len, ""),
+                // No transfer id here — this request is not part of one, so the sender id
+                // stands on its own (see sender_identity's rule for the empty case).
+                text_or(sender_id, sender_id_len, ""),
+            );
+            Ok((host, sender, limit))
+        })()
+    };
+    let (host, sender, limit) = match parsed {
+        Ok(parsed) => parsed,
+        Err(failure) => {
+            unsafe { fill(report, failure.message.into_bytes()) };
+            return failure.status;
+        }
+    };
+
+    // The callbacks and their context are promised valid for this call by the caller.
+    let reader = CallbackReader::new(read, context);
+    let writer = CallbackWriter::new(write, context);
+    // No `reopen`: `/Discover` is one request on one connection. A phone that answers it and
+    // stops reading is exactly why the transfer path renews — but there is no follow-up here.
+    let mut client = Client::new(
+        Wire { reader, writer, reopen: None },
+        host,
+    )
+    .with_limit(limit);
+    match client.discover(&sender) {
+        Ok(answer) => {
+            unsafe { fill(report, answer.computer_name.into_bytes()) };
+            status::OK
+        }
+        Err(error) => {
+            let failure = describe_error(error);
+            unsafe { fill(report, failure.message.into_bytes()) };
+            failure.status
+        }
     }
 }
 
@@ -533,6 +757,9 @@ fn describe_error(error: ClientError) -> Failure {
 struct Wire {
     reader: CallbackReader,
     writer: CallbackWriter,
+    /// How a second connection is obtained, and the context the callback was built for. The
+    /// same context the reader and writer use: what changes is which socket it points at.
+    reopen: Option<(DialCallback, *mut c_void)>,
 }
 
 impl Read for Wire {
@@ -548,6 +775,29 @@ impl Write for Wire {
 
     fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
+    }
+}
+
+impl Dial for Wire {
+    fn dial(&mut self) -> io::Result<()> {
+        let Some((callback, context)) = self.reopen else {
+            // Not a fault in the peer: this call was made by a caller that has no way to
+            // open a second connection, and the request that follows cannot be sent. Saying
+            // so is better than writing `/Ask` onto a socket its receiver has already
+            // finished with and waiting for the silence that produces.
+            return Err(io::Error::other(
+                "no second connection: this caller cannot renew the stream",
+            ));
+        };
+        // SAFETY: the caller of the send export promised this callback and its context for
+        // the duration of the call.
+        let code = unsafe { callback(context) };
+        if code < 0 {
+            return Err(io::Error::other(format!(
+                "the caller could not open a second connection ({code})"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -612,6 +862,21 @@ mod tests {
     }
 
     #[test]
+    fn the_sender_id_is_kept_apart_from_the_transfer_id() {
+        // A `SenderID` drawn per transfer is what this separation exists to prevent: the
+        // receiver files two offers from the same phone under two devices.
+        let identity = "1F0E2C34-AAAA-4BBB-8CCC-0123456789AB";
+        let transfer = "9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+        assert_eq!(sender_identity(identity, transfer), identity);
+    }
+
+    #[test]
+    fn a_caller_without_a_sender_id_still_offers_a_readable_body() {
+        let transfer = "9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+        assert_eq!(sender_identity("", transfer), transfer);
+    }
+
+    #[test]
     fn known_extensions_get_an_apple_type_and_others_get_the_default() {
         assert_eq!(file_type("IMG_0001.JPG"), "public.jpeg");
         assert_eq!(file_type("clip.mov"), "com.apple.quicktime-movie");
@@ -643,6 +908,11 @@ mod tests {
         let files = describe(&[note.clone(), photo.clone()]).unwrap();
         assert_eq!(files[0].0.name, "note.txt");
         assert_eq!(files[0].0.file_type, "public.plain-text");
+        // The offer announces `./note.txt` and the archive carries `./note.txt`: not the
+        // normalised `note.txt`, which is what a receiver matching members against the
+        // offer would have found nothing for.
+        assert_eq!(files[0].0.bom_path, "./note.txt");
+        assert_eq!(files[0].0.bom_path(), "./note.txt");
         assert_eq!(files[0].0.size, Some(5));
         assert_eq!(files[1].0.size, Some(200_000));
 
@@ -653,12 +923,126 @@ mod tests {
         dvzip::Decoder::new(&body[..])
             .read_to_end(&mut plain)
             .unwrap();
-        let entries = opairdrop_cpio::read(&plain).unwrap();
 
+        // The archive on the wire, read before any of our own parsing normalises it: the
+        // first member is the `040755` directory `.`, and each file member carries the
+        // offer's path with its `./` still on the front.
+        assert_eq!(&plain[0..6], b"070707", "the first member is an odc header");
+        assert_eq!(&plain[18..24], b"040755", "the first member is a directory");
+        assert_eq!(&plain[76..78], b".\0", "and it is named `.`");
+        assert!(
+            plain.windows(11).any(|window| window == b"./note.txt\0"),
+            "the member name is the `FileBomPath` the offer announced"
+        );
+
+        // The file member's own type bits. This is the one field a receiver classifies a
+        // member by, and getting it wrong costs the whole transfer: `010644` is a named
+        // pipe, so an iPhone takes the upload, counts the bytes, then resets the
+        // connection when the archive reader reaches this header.
+        let name_at = plain
+            .windows(11)
+            .position(|window| window == b"./note.txt\0")
+            .expect("the file member");
+        let head_at = name_at - 76;
+        assert_eq!(&plain[head_at..head_at + 6], b"070707");
+        assert_eq!(
+            &plain[head_at + 18..head_at + 24],
+            b"100644",
+            "a regular file is 0100644 in octal"
+        );
+
+        let entries = opairdrop_cpio::read(&plain).unwrap();
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        // What a receiver lands after sanitising: the `.` folder is the destination itself,
+        // so it has nowhere to go, and `./x` becomes `x` inside that folder.
         assert_eq!(names, vec!["note.txt", "photo.jpg"]);
         assert_eq!(entries[0].data, b"hello");
         assert_eq!(entries[1].data.len(), 200_000);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Several members in one archive, which is the shape the picker's
+    /// `SEND_MULTIPLE` produces and the one nothing had checked end to end.
+    ///
+    /// The single-file case was compared byte for byte against the reference sender, so
+    /// what is left to pin here is the part that only exists with more than one file:
+    /// member order, inode numbering continuing across members, and a DVZip block
+    /// sequence that still lands exactly on the end of the body.
+    #[test]
+    fn several_files_archive_in_the_order_they_were_offered() {
+        let root = std::env::temp_dir().join(format!("opairdrop-send-many-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let first = root.join("a.txt");
+        let second = root.join("报告.txt");
+        let third = root.join("b.jpg");
+        std::fs::write(&first, b"hello").unwrap();
+        std::fs::write(&second, "七个字".as_bytes()).unwrap();
+        // Two blocks' worth, so the archive crosses a boundary in the middle of a member.
+        std::fs::write(&third, vec![9u8; 70_000]).unwrap();
+
+        let files = describe(&[first.clone(), second.clone(), third.clone()]).unwrap();
+        let mut body = Vec::new();
+        archive(&mut body, &files, None).unwrap();
+
+        // Every block header has to add up to the body exactly: a frame that overruns is
+        // a receiver waiting for bytes that never come.
+        let mut at = 0;
+        while at + 4 <= body.len() {
+            let raw = u32::from_be_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+            at += 4 + (raw & 0x7fff_ffff) as usize;
+        }
+        assert_eq!(at, body.len(), "block framing covers the body exactly");
+
+        let mut plain = Vec::new();
+        dvzip::Decoder::new(&body[..])
+            .read_to_end(&mut plain)
+            .unwrap();
+
+        // Walk the odc members by hand: `read()` would sanitise the names this test is
+        // here to check.
+        let mut head_at = 0;
+        let mut seen: Vec<(String, u32, String, u64)> = Vec::new();
+        while head_at + 76 <= plain.len() {
+            let field = |at: usize, len: usize| {
+                String::from_utf8(plain[head_at + at..head_at + at + len].to_vec()).unwrap()
+            };
+            let name_size = usize::from_str_radix(&field(59, 6), 8).unwrap();
+            let size = u64::from_str_radix(&field(65, 11), 8).unwrap();
+            let name = String::from_utf8(plain[head_at + 76..head_at + 76 + name_size - 1].to_vec())
+                .unwrap();
+            seen.push((
+                name.clone(),
+                u32::from_str_radix(&field(12, 6), 8).unwrap(),
+                field(18, 6),
+                size,
+            ));
+            head_at += 76 + name_size + size as usize;
+            if name == "TRAILER!!!" {
+                break;
+            }
+        }
+        assert_eq!(head_at, plain.len(), "the trailer ends the archive exactly");
+
+        // The `./` on each member is the `FileBomPath` the offer announced; the receiver
+        // finds a member by that string and drops one it was not offered.
+        let names: Vec<&str> = seen.iter().map(|(name, ..)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![".", "./a.txt", "./报告.txt", "./b.jpg", "TRAILER!!!"]
+        );
+        // Inodes run 0, 1, 2, 3 and the trailer goes back to 0, which is what the
+        // reference sender writes.
+        let inodes: Vec<u32> = seen.iter().map(|(_, ino, ..)| *ino).collect();
+        assert_eq!(inodes, vec![0, 1, 2, 3, 0]);
+        // Modes: the directory, then three regular files, then the sentinel's zero.
+        let modes: Vec<&str> = seen.iter().map(|(_, _, mode, _)| mode.as_str()).collect();
+        assert_eq!(modes, vec!["040755", "100644", "100644", "100644", "000000"]);
+        let sizes: Vec<u64> = seen.iter().map(|(_, _, _, size)| *size).collect();
+        // `七个字` is nine bytes, not three: the header counts UTF-8 bytes.
+        assert_eq!(sizes, vec![0, 5, 9, 70_000, 0]);
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -68,8 +68,19 @@ final class Confirmation {
     /** 通知 id 的起点。同一个时刻可能不止一笔，靠编号错开。 */
     private static final int NOTIFICATION_BASE = 0x0A20;
 
-    /** 等人回答多久。AirDrop 的发送端自己也有超时，比它早一点放手更礼貌。 */
+    /** 等人回答多久的回落值。AirDrop 的发送端自己也有超时，比它早一点放手更礼貌。 */
     private static final long TIMEOUT_MS = 30_000;
+
+    /**
+     * 等人回答多久——表里是 {@code receive.decision_timeout_ms}，上面是它成为一行之前的数。
+     *
+     * <p>这个数进文案（{@link #parse}）、进等待（{@link #ask}），也进卡片那条路
+     * （{@code ReceiveHost}）——一个数，三个地方，都在这里取，因为「通知上说三十秒、实际
+     * 五秒就放弃」这种错只有分开取才做得出来。
+     */
+    static long decisionTimeout(Context context) {
+        return Tuning.ms(context, "receive.decision_timeout_ms", TIMEOUT_MS);
+    }
 
     /** 正在等的那些问题，键是 session。 */
     private static final Map<String, Waiter> OPEN = new ConcurrentHashMap<>();
@@ -144,8 +155,14 @@ final class Confirmation {
         }
     }
 
-    /** 把库给的那一行摘要解析成两句人话。 */
-    static Offer parse(String summary) {
+    /**
+     * 把库给的那一行摘要解析成两句人话。
+     *
+     * <p>{@code timeoutMs} 是这次邀请的寿命（{@link #decisionTimeout}）。它进文案是因为
+     * 那句话得跟实际到点时刻对得上：写死「三十秒」而设置里是五秒的话，人会在第 5 秒看见
+     * 一张卡自己变成「已放弃」，而卡上刚刚还说三十秒。
+     */
+    static Offer parse(String summary, long timeoutMs) {
         String[] field = summary == null ? new String[0] : summary.split("\t", -1);
         String sender = field.length > 0 && !field[0].isBlank() ? field[0] : "附近的设备";
         long declared = count(field, 1);
@@ -165,9 +182,14 @@ final class Confirmation {
         }
         // 「当作拒绝」和结果页那句「已放弃」是两句话说了两件事。人没看见这条邀请、或者看见了
         // 还没来得及伸手，都不等于他拒绝了——发送端拿到的是同一个 503，但屏幕上说什么由这里
-        // 决定。三十秒到点之后那张卡写的是「已放弃」，所以在还没到点的时候就得是同一句话。
+        // 决定。到点之后那张卡写的是「已放弃」，所以在还没到点的时候就得是同一句话。
         return new Offer(sender, what + (bytes > 0 ? " · " + size(bytes) : "")
-                + "，30 秒内没人应答就放弃。", entries(field, 4), links);
+                + "，" + seconds(timeoutMs) + " 秒内没人应答就放弃。", entries(field, 4), links);
+    }
+
+    /** 一个超时写成整秒，给文案用。 */
+    private static long seconds(long timeoutMs) {
+        return Math.max(1, Math.round(timeoutMs / 1000.0));
     }
 
     /**
@@ -211,7 +233,8 @@ final class Confirmation {
      * 上一次挂着的通知，而不是叠一条新的——重问只该改内容，不该多出一个框。
      */
     static boolean ask(Context context, String session, String summary) {
-        Offer offer = parse(summary);
+        long timeoutMs = decisionTimeout(context);
+        Offer offer = parse(summary, timeoutMs);
         Waiter waiter = new Waiter(session, offer,
                 NOTIFICATION_BASE + (NEXT.incrementAndGet() % 32));
         Waiter previous = OPEN.put(session, waiter);
@@ -223,7 +246,7 @@ final class Confirmation {
         long askedAt = System.currentTimeMillis();
         try {
             post(context, session, waiter.notification, offer);
-            waiter.latch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            waiter.latch.await(timeoutMs, TimeUnit.MILLISECONDS);
             Log.i(TAG, "confirm " + session + " " + (waiter.accepted ? "accepted" : "declined")
                     + " after " + (System.currentTimeMillis() - askedAt) + " ms");
             return waiter.accepted;
@@ -319,6 +342,17 @@ final class Confirmation {
         manager.notify(notification, builder.build());
         Log.i(TAG, "confirm " + session + " posted as " + notification + ": "
                 + offer.title() + " / " + offer.body());
+    }
+
+    /**
+     * 「接收 / 拒绝」两个按钮的落点，给不是这条通知的另一个表面用（今天就是流体云那张卡）。
+     *
+     * <p>复用的是同一个 {@link DecisionReceiver} 与同一串 session：从哪个表面按下去，答案都
+     * 落到同一个闩上，而那个闩在 {@code ReceiveHost} 手里。requestCode 固定成一对常量，是因为
+     * 云端卡一次只有一张——按通知 id 派生反而会和通知那条路撞号。
+     */
+    static PendingIntent decision(Context context, String session, boolean accepted) {
+        return action(context, session, accepted, accepted ? 0x0B01 : 0x0B02);
     }
 
     private static PendingIntent action(Context context, String session, boolean accepted,

@@ -24,4 +24,15 @@ final class SettingsFile {
     static File of(Context context) {
         return new File(context.getFilesDir(), NAME);
     }
+
+    /**
+     * The same file, addressed from the directory rather than from a {@link Context}.
+     *
+     * <p>For the two callers that only ever have the data directory: {@code ServiceId} is handed
+     * one, and the settings table lives beside the file it is handed. A second spelling of the
+     * name would be exactly the two-settings-files bug this class exists to prevent.
+     */
+    static File of(File directory) {
+        return new File(directory, NAME);
+    }
 }

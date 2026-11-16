@@ -106,6 +106,19 @@ pub trait Receiver {
     /// so nothing here can delay the peer's `200`.
     fn saw_ask(&mut self, offer: &Ask);
 
+    /// The raw `/Ask` body, handed over before it is parsed.
+    ///
+    /// Exists because "the offer parsed as nothing" and "the sender offered nothing" look
+    /// identical from every other angle: both produce an empty file list and a prompt with
+    /// no content, and the peer's bytes are the only thing that can tell them apart. After
+    /// a parse that produced no files, the body is the whole evidence trail — and it is
+    /// gone the moment the connection ends, because it arrived inside a TLS session.
+    ///
+    /// Called on the serving thread, before [`Receiver::saw_ask`], for every `/Ask` whose
+    /// body arrived. A receiver that keeps it must bound what it keeps: the body is a
+    /// peer's file names, and a share sheet can name a hundred of them.
+    fn saw_ask_body(&mut self, _body: &[u8]) {}
+
     /// The name a peer gave for itself in its `/Discover` body.
     ///
     /// Not a courtesy. It is the only place an Apple device states a name a person would
@@ -330,6 +343,7 @@ impl<R: Receiver> Server<R> {
             // the offer, which is the only thing on this endpoint that names the sender
             // and says what is about to arrive. A body that does not parse costs nothing
             // now, because the peer has its `200`.
+            self.receiver.saw_ask_body(&body);
             if let Ok(parsed) = Ask::parse(&body) {
                 self.receiver.saw_ask(&parsed);
                 *offer = Some(parsed);
@@ -345,6 +359,9 @@ impl<R: Receiver> Server<R> {
             drain(input, self.drain_limit);
             return Ok(false);
         }
+        // Before the parse, not after: a body that fails to parse is exactly the case whose
+        // bytes nobody can reconstruct later.
+        self.receiver.saw_ask_body(&body);
         let parsed = match Ask::parse(&body) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -664,7 +681,7 @@ mod tests {
 
         assert_eq!(statuses(&output), [200], "the answer went out anyway");
         let answer = DiscoverAnswer::parse(body_of(&output)).expect("a plist answer");
-        assert!(answer.airdropable);
+        assert_eq!(answer.airdropable, Some(true));
         assert_eq!(answer.computer_name, "Air");
         // Nothing to name: the body never arrived, and a truncated plist is not parsed.
         assert!(receiver.senders.is_empty());

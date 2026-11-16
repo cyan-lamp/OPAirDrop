@@ -163,8 +163,8 @@ public final class SettingsCheck {
 
         refuse(file, screen, "receive.overwrite", "maybe", "a switch that is neither true nor false");
         refuse(file, screen, "server.read_timeout_ms", "10", "a number below its floor");
-        refuse(file, screen, "log.preview_bytes", "999999", "a number above its ceiling");
-        refuse(file, screen, "discover.window_ms", "2.5", "a number that is not whole");
+        refuse(file, screen, "client.read_timeout_ms", "9999999", "a number above its ceiling");
+        refuse(file, screen, "receive.decision_timeout_ms", "2.5", "a number that is not whole");
         refuse(file, screen, "log.level", "verbose", "a value outside its options");
         refuse(file, screen, "device.name", repeat('x', 300), "text longer than its field");
         refuse(file, screen, "device.name", "a\tb", "text that would break the storage line");

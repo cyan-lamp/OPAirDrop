@@ -49,7 +49,14 @@ const MAX_NAME: u64 = 4096;
 /// behind.
 pub const MODE_DIRECTORY: u32 = 0o040755;
 /// Regular file, permissions included.
-pub const MODE_REGULAR: u32 = 0o010644;
+///
+/// `0100644`, not `010644`. The leading `1` is the file-type half (`S_IFREG`); without
+/// it the same six octal digits say "named pipe with 0644", and a receiver that
+/// classifies members by their type bits reads every file we send as a FIFO it cannot
+/// land. That is not a cosmetic difference against iOS: the upload is accepted, the
+/// bytes are counted, and the connection is reset once the archive reader refuses the
+/// first member.
+pub const MODE_REGULAR: u32 = 0o100644;
 /// Symlink, permissions included.
 pub const MODE_SYMLINK: u32 = 0o120777;
 
@@ -498,7 +505,8 @@ impl<W: Write> Builder<W> {
 
     /// Appends one member from memory.
     pub fn add(&mut self, name: &str, mode: u32, data: &[u8]) -> Result<(), Error> {
-        self.write_head(name, mode, data.len() as u64)?;
+        let inode = self.take_inode();
+        self.write_head(name, mode, data.len() as u64, inode)?;
         self.out.write_all(data)?;
         self.write_data_pad(data.len() as u64)?;
         Ok(())
@@ -515,31 +523,54 @@ impl<W: Write> Builder<W> {
         size: u64,
         reader: &mut R,
     ) -> Result<(), Error> {
-        self.write_head(name, mode, size)?;
+        let inode = self.take_inode();
+        self.write_head(name, mode, size, inode)?;
         copy_exact(&mut self.out, reader, size, name)?;
         self.write_data_pad(size)?;
         Ok(())
     }
 
+    /// The number for the next member: `0` for the first, then one apiece.
+    ///
+    /// Matches the reference sender, which numbers the root `.` member `0` and its files
+    /// from `1`. The values only have to distinguish members, but a byte-level diff
+    /// against a capture from that sender is one of the few checks this side has, so the
+    /// numbering is the same on purpose.
+    fn take_inode(&mut self) -> u32 {
+        let inode = self.inode;
+        self.inode = self.inode.wrapping_add(1);
+        inode
+    }
+
     /// Writes the terminating member and returns the underlying writer.
+    ///
+    /// The trailer's inode is zero, which is what the reference sender writes and what a
+    /// capture from it shows. Inode numbers are not load-bearing for an archive whose
+    /// members are all distinct, but a diff against that capture should only ever show
+    /// values that legitimately differ, and a counter that reached the trailer would.
     pub fn finish(mut self) -> Result<W, Error> {
         // The trailer is an ordinary member whose name happens to be the sentinel, so
         // it goes through the same path as everything else. Writing its header by hand
         // was a bug worth remembering: the name bytes were left out, leaving a header
         // that promised eleven name bytes and delivered one NUL, so every archive
         // ended in `Truncated` on the reading side.
-        self.write_head(TRAILER, 0, 0)?;
+        self.write_head(TRAILER, 0, 0, 0)?;
         Ok(self.out)
     }
 
-    fn write_head(&mut self, name: &str, mode: u32, size: u64) -> Result<(), Error> {
-        self.inode = self.inode.wrapping_add(1);
+    fn write_head(
+        &mut self,
+        name: &str,
+        mode: u32,
+        size: u64,
+        inode: u32,
+    ) -> Result<(), Error> {
         let head = head_bytes(
             self.format,
             name,
             mode,
             size,
-            self.inode,
+            inode,
             self.mtime.unwrap_or_else(now_seconds),
         );
         self.out.write_all(&head)?;
@@ -1002,6 +1033,52 @@ mod tests {
             assert!(parsed[0].is_directory());
             assert!(!parsed[1].is_directory());
         }
+    }
+
+    /// The header text itself, because a round trip through this crate cannot see a
+    /// wrong type bit: reader and writer share the constant, so both sides agreed that
+    /// `010644` was a regular file while every other reader in the world called it a
+    /// FIFO. This asserts the digits a receiver actually classifies.
+    #[test]
+    fn odc_wire_fields_are_the_ones_a_receiver_reads() {
+        let mut bytes = Vec::new();
+        {
+            let mut builder = Builder::new(&mut bytes, Format::Odc).with_mtime(0);
+            builder.add(".", MODE_DIRECTORY, &[]).unwrap();
+            builder.add("./probe.txt", MODE_REGULAR, b"hi").unwrap();
+            builder.finish().unwrap();
+        }
+        let field = |head: &[u8], at: usize, len: usize| {
+            String::from_utf8(head[at..at + len].to_vec()).unwrap()
+        };
+        let member = |bytes: &[u8], at: usize| {
+            let head = bytes[at..at + 76].to_vec();
+            let name_size = usize::from_str_radix(&field(&head, 59, 6), 8).unwrap();
+            let size = usize::from_str_radix(&field(&head, 65, 11), 8).unwrap();
+            (head, name_size, size)
+        };
+
+        // `.` first: inode 0, mode 040755, nlink 2 (the entry itself and its `..`).
+        let (head, name_size, size) = member(&bytes, 0);
+        assert_eq!(field(&head, 0, 6), "070707");
+        assert_eq!(field(&head, 12, 6), "000000", "first inode is 0");
+        assert_eq!(field(&head, 18, 6), "040755", "directory type bits");
+        assert_eq!(field(&head, 36, 6), "000002", "nlink of a directory");
+        assert_eq!((name_size, size), (2, 0));
+
+        // The file: inode 1, and the six digits that make it a regular file.
+        let file_at = 76 + name_size + size;
+        let (head, _, size) = member(&bytes, file_at);
+        assert_eq!(field(&head, 12, 6), "000001");
+        assert_eq!(
+            field(&head, 18, 6),
+            "100644",
+            "a regular file is 0100644 in octal, not 010644"
+        );
+        assert_eq!(field(&head, 36, 6), "000001", "nlink of a file");
+        assert_eq!(field(&head, 59, 6), "000014", "namesize of `./probe.txt` + NUL");
+        assert_eq!(field(&head, 65, 11), "00000000002");
+        assert_eq!(size, 2);
     }
 
     #[test]

@@ -16,44 +16,21 @@ import java.io.IOException;
 import java.util.List;
 
 /**
- * 功能页：会影响行为的那几个开关，加上此刻的状态。
+ * 功能页：装驱动、卸载驱动，加一根共享 Wi-Fi 射频的开关。
  *
- * <p># 为什么开关单独一页
+ * <p># 这一页现在只有两件事
  *
- * <p>开关和数字读起来完全不像同一类东西。数字是「值」，改完按保存，改坏了有范围可查；开关是
- * 「行为」，拨一下立刻生效，没有保存这一步可等。放在同一页里，人拨完开关会去找保存按钮，而
- * 在数字页按了保存之后会以为开关也一起存了。分开之后，两页各自只有一种操作。
- *
- * <p># 为什么这里的开关一拨就写
- *
- * <p>保存按钮在另一页，所以这里没有可等的时机。拨动即写入、写入即生效，失败就把开关拨回去并
- * 在它下面写清楚原因——一个拨过去却没生效的开关，是这一页唯一会骗人的样子。
- *
- * <p># 为什么接收端那个开关有时是灰的
- *
- * <p>跟随一加互传开着的时候，接收端的主人就不是这一页了，而是互传的接收范围。此时让这个开关
- * 还能拨，等于让界面能显示「在接收」而对外一个应答都发不出去。
+ * <p>接收板块挪到了首页（接收文件那一行），名字与机型挪到了设置页，那几个开关随「脱离一加互传」
+ * 一起删掉（同名文件固定加编号、不再跟随互传），传输状态也不需要了。于是这一页只剩两块：驱动
+ * 和射频。驱动管装和卸——有时候要恢复原厂驱动和网络环境；射频是唯一还留着的开关，因为它拨错
+ * 了手机就上不了网。
  *
  * <p># 驱动为什么在最前面
  *
  * <p>它一天只按一次，按完之后整天都不再碰——按「常用程度」排，它应该在最下面。但它换的是
- * 手机的内核驱动：下面每一张卡说的都是「此刻的链路」，而冷启动之后 {@code wonder0} 根本还
- * 不存在，那些卡在说的是一个没有的东西。把前提放在末尾，等于让最要紧的那件事要滚过三张
- * 「此刻没有链路」的卡才找得到。所以它排第一，而它下面那句话也只说一件事：这条链路现在到
- * 哪一步了。
- *
- * <p># 版式从哪来
- *
- * <p>legacy 那一版这一页叫「服务状态」：一张 66dp 行的状态卡、一块传输状态。这里的骨架照搬，
- * 只是把「AWDL / QuickShare / OShare 三个服务」换成了这一版真正有的两样东西（接收端、一加
- * 互传），并把手上的开关接在它们下面。
- *
- * <p># 原来那颗「刷新状态」按钮为什么没了
- *
- * <p>它调的是外壳的整页重建：把首页和这一页都丢掉重画一遍。但这一页拨完任何一个开关都已经
- * 就地刷过对应的那行字（{@code syncReceive()}、{@code write()} 之后重读），首页进
- * {@code onResume} 时也会自己重建——那颗按钮按下去能看到的变化，本来就已经在屏幕上了。
- * 留着它只是教人以为「状态会过期，得手动打一针」。
+ * 手机的内核驱动：下面那张卡说的是「此刻的链路」，而冷启动之后 {@code wonder0} 根本还不存在，
+ * 那张卡在说的是一个没有的东西。把前提放在末尾，等于让最要紧的那件事要滚过一张「此刻没有链路」
+ * 的卡才找得到。所以它排第一，而它下面那句话也只说一件事：这条链路现在到哪一步了。
  */
 final class FeaturePage {
     private static final String TAG = "OPAirDrop";
@@ -93,33 +70,6 @@ final class FeaturePage {
     private final Runnable onChanged;
 
     /**
-     * 接收端那一行：拨杆和它下面那句话。
-     *
-     * <p>「跟随」这一项在下面那张卡里也能改，改完这一行必须立刻跟着变——跟随开着时接收端的
-     * 拨杆是灰的（它归一加互传管），关掉跟随它才该能按。留着这两个引用，是为了改完就地刷新这
-     * 一行，而不是整页重建：重建会把滚动位置、正在播的拨杆动画一起丢掉。
-     */
-    private Toggle receiveToggle;
-    private TextView receiveState;
-
-    /**
-     * 两行自报名字右侧那个值。
-     *
-     * <p>改完就地换，不重建这一页：重建会把滚动位置和正在播的动画一起丢掉，而这两行在接收
-     * 那一块的最下面，重建之后人还得再滚回来。
-     */
-    private TextView nameValue;
-    private TextView modelValue;
-
-    /**
-     * 建这一页时另开的那份表，只用来回答「这两行存了什么」。
-     *
-     * <p>不是 {@link #screen}：那份是随这一页一起读的，人在设置页改完名字再滑回来，它就已经
-     * 旧了。这两行说的是「对端此刻会读到什么」，旧值比不显示更糟。
-     */
-    private SettingsScreen reported;
-
-    /**
      * 驱动卡上的四个零件：徽章、那句话、按钮、回执原文。
      *
      * <p>装一次要半分钟，这半分钟里这四样都得变（按钮置灰、跳秒、最后换成回执），而这一页
@@ -127,8 +77,12 @@ final class FeaturePage {
      */
     private TextView driverPill;
     private TextView driverNote;
+    private TextView uninstallButton;
     private TextView driverButton;
     private TextView driverReceipt;
+
+    /** 卸载在跑。和安装互斥：两个都动内核模块，一起来只会把回执写乱。 */
+    private boolean uninstallBusy;
 
     /**
      * 这一页自己记的「正在装」。
@@ -165,12 +119,9 @@ final class FeaturePage {
         body.addView(driverHint);
         body.addView(driverCard(), chrome.margins(0, 8));
 
-        body.addView(chrome.sectionTitle("接收"), chrome.margins(6, 0));
-        body.addView(receiveCard(), chrome.margins(0, 12));
-        body.addView(identityCard(), chrome.margins(0, 8));
-
-        // 射频排在接收后面、表里那些开关前面：它是这一页唯一一个「拨错了手机就上不了网」的
-        // 开关，而且它有一个别人写回来的回执要显示，和表里那几项拨完只写文件的不一样。
+        // 接收板块已撤：接收开关在首页「接收文件」那一行，名字/机型在设置页，这里不再重复。
+        // 开关板块也撤了：同名文件固定加编号、跟随一加互传随脱离互传一起去掉，没有可拨的开关；
+        // 射频这一项是唯一仍要拨的，留在这一页。传输状态也不需要了。
         body.addView(chrome.sectionTitle("射频"), chrome.margins(6, 0));
         TextView radioNote = chrome.caption(
                 "共用一根天线：共用时会丢一部分包，丢多少取决于 Wi-Fi 落在哪个信道，回执里的 MHz 就是落点。");
@@ -178,13 +129,15 @@ final class FeaturePage {
         body.addView(radioNote);
         body.addView(radioCard(), chrome.margins(0, 8));
 
-        // 按钮占掉的那一段还回去：卡的下留白 12 + 这里 6 = 18，和首页「卡→下一段标题」的
-        // 16 是同一个节奏。
-        body.addView(chrome.sectionTitle("开关"), chrome.margins(6, 0));
-        body.addView(switchCard(), chrome.margins(0, 16));
+        // 接收文件保存位置原先在设置页的「接收」里。那一块撤了，但这一项是唯一还在用的接收设置，
+        // 于是单独拎出来放在这里：它和驱动/射频一样是「按了就换行为」的东西，留一席之地。
+        body.addView(chrome.sectionTitle("保存位置"), chrome.margins(6, 0));
+        body.addView(directoryCard(), chrome.margins(0, 8));
 
-        body.addView(chrome.sectionTitle("传输状态"));
-        body.addView(statusCard(), chrome.margins(0, 16));
+        // 设备显示：原来在设置页叫「设备」，两行文本设置（对端看到的名字 / 机型）。都是「改完
+        // 对端立刻读到什么」的行为，和这一页其余「拨一下就换行为」的东西同类，于是搬过来。
+        body.addView(chrome.sectionTitle("设备显示"), chrome.margins(6, 0));
+        body.addView(deviceCard(), chrome.margins(0, 8));
 
         return chrome.scroller(body);
     }
@@ -225,29 +178,57 @@ final class FeaturePage {
         // 新一轮实例读到的 RUNNING 还是 true，于是接着画那颗灰按钮，而不是又给一颗能按的。
         driverBusy = DriverSetup.running();
         StackState.State state = StackState.read(filesDir());
+        // stop 不清回执文件：卸载后 stack-state 里还是那行「stack up」，boot 又没变，于是按回执
+        // 读出来仍是「已就绪」——刚好说反。用一份持久标记记住「人按过卸载且成功」，重画时以它
+        // 为准，直到下一次装成功才清掉。安装只会置回，不会凭空冒出「已就绪」。
+        boolean uninstalled = uninstalled();
         LinearLayout card = chrome.card();
 
         LinearLayout head = chrome.row();
         head.addView(chrome.text("内核驱动", 16, true, S.text),
                 chrome.mm(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         driverPill = chrome.statusPill(
-                driverBusy ? "正在装" : standingLabel(state),
-                driverBusy ? S.accent : standingColor(state));
+                driverBusy ? "正在装" : uninstallBusy ? "正在卸"
+                        : uninstalled ? "未安装" : standingLabel(state),
+                driverBusy || uninstallBusy ? S.accent
+                        : uninstalled ? S.gray : standingColor(state));
         head.addView(driverPill);
         card.addView(head);
 
-        driverNote = chrome.text(driverBusy ? RUNNING_LINE : state.subtitle(), 13.5f, false,
-                driverBusy ? S.textDim : noteColor(state));
+        driverNote = chrome.text(
+                driverBusy ? RUNNING_LINE
+                        : uninstalled ? "已恢复原厂驱动与网络环境，需要时按【安装】重新建链"
+                        : state.subtitle(),
+                13.5f, false,
+                driverBusy ? S.textDim : uninstalled ? S.textDim : noteColor(state));
         driverNote.setPadding(0, chrome.dp(8), 0, chrome.dp(12));
         card.addView(driverNote);
 
+        // 卸载在左、安装在右，同一行各占一半：卸载是「回到原厂」的退路，装是常规动作。
+        // 装/卸都会动内核模块，同一时刻只允许一个在跑，另一个跟着置灰。
+        LinearLayout actions = chrome.row();
+        uninstallButton = chrome.ghostButton("卸载", view -> startUninstall());
         driverButton = chrome.mainButton(driverBusy ? "正在装…" : buttonLabel(state),
                 view -> startDriver());
-        driverButton.setEnabled(!driverBusy);
-        driverButton.setAlpha(driverBusy ? 0.5f : 1f);
-        card.addView(driverButton, chrome.mm(
+        // mainButton 默认 padding 20/13、字 15sp，比 ghostButton 的 16/11、字 14sp 大一圈，
+        // 两个并排时蓝底比灰底高一截。改成和卸载一致的内边距与字号，蓝底灰底一般大。
+        driverButton.setPadding(chrome.dp(16), chrome.dp(11), chrome.dp(16), chrome.dp(11));
+        driverButton.setTextSize(14);
+        LinearLayout.LayoutParams half = new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        actions.addView(uninstallButton, half);
+        LinearLayout.LayoutParams halfRight = new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        halfRight.setMargins(chrome.dp(8), 0, 0, 0);
+        actions.addView(driverButton, halfRight);
+        card.addView(actions, chrome.mm(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 0f));
+        boolean busy = driverBusy || uninstallBusy;
+        uninstallButton.setEnabled(!busy);
+        uninstallButton.setAlpha(busy ? 0.5f : 1f);
+        driverButton.setEnabled(!busy);
+        driverButton.setAlpha(busy ? 0.5f : 1f);
 
         driverReceipt = chrome.caption(receiptText(state));
         driverReceipt.setTextColor(receiptColor(state));
@@ -300,6 +281,78 @@ final class FeaturePage {
             DriverSetup.Result result = DriverSetup.boot(host, airdropName);
             host.runOnUiThread(() -> showDriver(run, result));
         }, "opairdrop-driver").start();
+    }
+
+    /**
+     * 卸载：跑 {@code awdl-stack.sh stop}，卸掉打过补丁的驱动、恢复原厂驱动和网络环境。
+     *
+     * <p>和安装走同一条 su 通道（{@link DriverSetup#run}），只是参数是 stop；它是「有时候我也要用
+     * 回原厂」的那条退路，装/卸期间两个按钮都置灰，避免两个改内核的动作叠在一起。
+     */
+    private void startUninstall() {
+        if (uninstallBusy || driverBusy || DriverSetup.running() || uninstallButton == null) {
+            return;
+        }
+        uninstallBusy = true;
+        uninstallButton.setEnabled(false);
+        uninstallButton.setAlpha(0.5f);
+        uninstallButton.setText("正在卸…");
+        driverButton.setEnabled(false);
+        driverButton.setAlpha(0.5f);
+        if (driverPill != null) {
+            chrome.setPill(driverPill, "正在卸", S.accent);
+        }
+        driverNote.setTextColor(S.textDim);
+        driverNote.setText("正在卸载驱动、恢复原厂驱动与网络环境…");
+
+        new Thread(() -> {
+            DriverSetup.Result result = DriverSetup.run("stop", host);
+            host.runOnUiThread(() -> showUninstall(result));
+        }, "opairdrop-uninstall").start();
+    }
+
+    /**
+     * 「人按过卸载且成功」的标记。stop 不清 stack-state 回执，只能靠这个把徽章从「已就绪」改回
+     * 「未安装」；写进 SharedPreferences，重启应用也不会把卸载后的状态记回「已就绪」。
+     */
+    private static final String PREFS_DRIVER = "driver_state";
+    private static final String KEY_UNINSTALLED = "uninstalled";
+
+    private boolean uninstalled() {
+        return host.getSharedPreferences(PREFS_DRIVER, android.content.Context.MODE_PRIVATE)
+                .getBoolean(KEY_UNINSTALLED, false);
+    }
+
+    private void setUninstalled(boolean value) {
+        host.getSharedPreferences(PREFS_DRIVER, android.content.Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_UNINSTALLED, value).apply();
+    }
+
+    /** 卸载收尾：不论成败都整页重画——盘面（原厂驱动）已经变了，就地改四个控件改不完。 */
+    private void showUninstall(DriverSetup.Result result) {
+        uninstallBusy = false;
+        for (String line : result.lines()) {
+            Log.i(TAG, "uninstall| " + line);
+        }
+        Log.i(TAG, "uninstall| code=" + result.code()
+                + (result.problem().isEmpty() ? "" : " problem=" + result.problem()));
+        boolean ok = result.problem().isEmpty() && result.code() == 0;
+        if (ok) {
+            // 置位后重画，徽章才会从旧回执的「已就绪」改成「未安装」。
+            setUninstalled(true);
+            chrome.say("已卸载驱动，恢复原厂驱动与网络环境", S.green);
+        } else {
+            chrome.say("卸载未成功：" + result.subtitle(), S.orange);
+        }
+        // 整页重画，让驱动徽章、note、按钮、回执都回到「原厂」的真实状态。
+        refreshSelf();
+    }
+
+    /** 让 MainActivity 重画这一页（它才有 pages[] 的句柄）。 */
+    private void refreshSelf() {
+        if (onChanged != null) {
+            onChanged.run();
+        }
     }
 
     /**
@@ -370,6 +423,8 @@ final class FeaturePage {
             chrome.say(result.problem().isEmpty() ? "没装成，原因在卡片上" : result.problem(), S.red);
             return;
         }
+        // 装成功，清掉「已卸载」标记：下一次重画才会按新回执显示「已就绪」。
+        setUninstalled(false);
         chrome.say("AWDL 已就绪", S.green);
         if (onChanged != null) {
             onChanged.run();
@@ -419,19 +474,14 @@ final class FeaturePage {
     }
 
     /**
-     * 按钮上那几个字，按回执说。
+     * 安装按钮上那几个字：一律「安装」。
      *
-     * <p>「重新装一次」在成功之后仍然给：驱动是每重启一次就要再跑一遍的东西，而这个按钮是
-     * 唯一一条能把已经起来的栈重跑一遍的路（{@code boot} 认本轮标记，第二次会走短路径）。
-     *
-     * <p>回执来自上一次开机时，按钮退回「装驱动并建链」，和从没装过一样：这一次开机确实还
-     * 没跑过，而这几个字正是该做的事。成功之后按它走的是短路径，五秒，不会又换一遍驱动。
+     * <p>不按回执分「装驱动并建链 / 重新装一次 / 再试一次」：对人来说按下去都是同一件事——装。
+     * 回执的细节在卡片上那句话和回执原文里，不该再挤到按钮上。boot 认本轮标记，装过之后再按
+     * 走短路径，几秒就回，所以「安装」既是第一次也是重试时该说的话。
      */
     private String buttonLabel(StackState.State state) {
-        if (!state.present() || state.stale()) {
-            return "装驱动并建链";
-        }
-        return state.up() ? "重新装一次" : "再试一次";
+        return "安装";
     }
 
     /**
@@ -484,8 +534,8 @@ final class FeaturePage {
         Toggle toggle = toggle(state.want() == RadioShare.Want.SHARE);
         TextView[] sub = new TextView[1];
         LinearLayout row = chrome.featureRow(
-                IconView.CHIP, "WiFi 共享射频", state.subtitle(), toggle, sub);
-        // 说明是一句完整的话，两行放不下：定高会把它裁在卡片下沿上。见 switchCard() 里同一句。
+                IconView.NO_ICON, "WiFi 共享射频", state.subtitle(), toggle, sub);
+        // 说明是一句完整的话，两行放不下：定高会把它裁在卡片下沿上。
         chrome.addWrappingRow(card, row);
         chrome.pressableRow(row, Scheme.CORNERS_ALL);
 
@@ -549,147 +599,59 @@ final class FeaturePage {
         sub.postDelayed(() -> followAnswer(sub, record, tick + 1), ANSWER_TICK_MS);
     }
 
-    private java.io.File filesDir() {
-        return host.getFilesDir();
-    }
+    /**
+     * 保存位置一行：显示当前生效的目录，点一下弹输入框改。
+     *
+     * <p>值取自设置表 receive.directory；空的意思是按文件类型分目录保存，这一句写在副标题里，
+     * 免得空值被读成「没设置好」。写盘走 SettingsScreen 的校验 + save，和设置页同一套，错误的
+     * 路径会被库挡下来并说清楚原因。
+     */
+    /** 设备显示那两行的副标题引用，保存后就地刷新。 */
+    private TextView nameDisplayValue;
+    private TextView modelDisplayValue;
 
     /**
-     * 两行状态：接收端本身和一加互传的接收范围。
+     * 设备显示：对端在列表里看到的名字和机型。
      *
-     * <p>接收端不是设置表里的一项，而是这个进程里那个 {@link Listener}——它不写文件，它启停
-     * socket。跟随开着时它显示此刻真实的状态并置灰：「界面说在接收，对端找不到我」是这一行
-     * 唯一可能出的错，置灰就是为了不让人亲手制造它。
+     * <p>两行都是空着就跟着下一级走（名字空→跟随机型，机型空→用系统型号），副标题要把「此刻
+     * 真正生效的那个值」写出来，否则空行会被读成「对端什么都看不到」。点开弹框改存下来的原文。
      */
-    private View receiveCard() {
+    private View deviceCard() {
         LinearLayout card = chrome.rowCard();
-        boolean following = Oshare.following(host);
-
-        boolean running = listener.running();
-        TextView[] sub = new TextView[1];
-        Toggle receiver = toggle(running);
-        receiveToggle = receiver;
-        receiver.setEnabled(!following);
-        LinearLayout listenRow = chrome.featureRow(
-                IconView.RADAR, "接收端", listenLine(following), receiver, sub);
-        chrome.addRow(card, listenRow, chrome.rowHeight());
-        receiver.setOnChange((button, checked) -> {
-            // 先记下这次是「人拨的」，再动线程：服务那边靠这个凭据区分「人开的」和
-            // 「窗口开的」，否则窗口一过期，接收端会以「我还在收」为由活下去。
-            ReceiveService.setManual(host, checked);
-            if (checked) {
-                listener.start();
-            } else {
-                listener.stop();
-            }
-            // 手动开的接收端也要有前台身份，否则离开这一页九十秒后系统就把进程收走了。
-            // 服务自己的判断会看「已经在收」这一条，所以这里不需要另传一个理由。
-            ReceiveService.apply(host);
-            // 接收端从自己的线程报告结果，所以这里等一拍再按它说的把开关摆正：绑定失败时
-            // 开关必须自己弹回去，否则它就成了一句假话。
-            button.postDelayed(() -> button.setChecked(listener.running()), 120);
-        });
-        // 状态那句话随接收端变，但这一页不重建，所以拨完立刻改一次
-        receiveState = sub[0];
-        if (receiveState != null) {
-            receiveState.setText(listenLine(following));
-        }
-
-        card.addView(chrome.divider(), chrome.insetDivider());
-
-        int share = Oshare.stateOf(host);
-        TextView sharePill = chrome.statusPill(
-                share == 1 ? "所有人" : share == 2 ? "仅联系人" : share == 0 ? "已关闭" : "读不到",
-                share == 1 ? S.green : share < 0 ? S.red : S.gray);
-        LinearLayout shareRow = chrome.featureRow(
-                IconView.PHONE, "一加互传", Oshare.label(host), sharePill);
-        chrome.addRow(card, shareRow, chrome.rowHeight());
-        chrome.setRowAction(shareRow, false, null, null);
-        return card;
-    }
-
-    /**
-     * 接收端那行下面那句：先说此刻在干什么，再说这个开关归谁管。
-     *
-     * <p>两个信息合成一句，是因为这一行只有一个位置——右侧已经给了拨杆。跟随开着时拨杆是灰
-     * 的，那句话必须解释它为什么是灰的；跟随关着时那句话只剩状态。
-     */
-    private String listenLine(boolean following) {
-        String state = listener.state();
-        // 「在收听但没人找得到我」是这一行唯一说不出口的错，所以广播那边的抱怨必须拼在这里：
-        // 端口在监听、分享面板里却空着，人只会去查 iPhone 或者查网络，而真正的原因是
-        // AWDL 链路没建起来。只在有话说时才拼，正常时不占位置。
-        String aside = listener.aside();
-        if (!aside.isEmpty()) {
-            state = state + " · " + aside;
-        }
-        // 窗口开着的时候，「跟随一加互传」这句话是错的：那十分钟里接收端恰恰不听互传的。
-        // 说出真正的原因和还剩多久，人才知道要不要再按一次面板。
-        return following ? state + " · 跟随一加互传" : state;
-    }
-
-    /**
-     * 按「跟随」此刻的意思把接收端那一行重画一遍。
-     *
-     * <p>只重画这一行：整页重建会把滚动位置和正在播的动画一起丢掉，而改的只是这两个属性。
-     */
-    private void syncReceive() {
-        if (receiveToggle == null) {
-            return;
-        }
-        boolean following = Oshare.following(host);
-        receiveToggle.setEnabled(!following);
-        if (receiveState != null) {
-            receiveState.setText(listenLine(following));
-        }
-    }
-
-    /**
-     * 两行自报的名字：对端在列表里看到的、以及在探测应答里读到的。
-     *
-     * <p># 为什么这两行不跟「开关」那片待在一起
-     *
-     * <p>那一片是「改完立刻生效、没有回执可看」的东西。这两行改完，应答确实立刻换了，但证书
-     * 里的 CN 和 mDNS 里的 SRV target 是建 socket 那一刻定下的，要重启接收端才跟着换——混在
-     * 开关里，人改完看不到变化，只会以为没生效。
-     *
-     * <p># 为什么显示生效值，而不是存下来的那个串
-     *
-     * <p>空着也是一项设置：空的意思是「跟着下一级走」。把空印成一个空行，人读到的是「对端
-     * 什么都看不到」，而实际对端读到的是系统型号。括号里那几个字是给这种时候用的——名字空着
-     * 而机型写着，两行会显示同一个串，不说明就像排错了版。
-     */
-    private View identityCard() {
-        LinearLayout card = chrome.rowCard();
-        reported = settingsNow();
 
         TextView[] nameSub = new TextView[1];
         LinearLayout nameRow = chrome.featureRow(
-                IconView.PHONE, "对端看到的名字", nameLine(), chevron(), nameSub);
-        nameValue = nameSub[0];
-        chrome.addWrappingRow(card, nameRow);
+                IconView.NO_ICON, "对端看到的名字", nameLine(),
+                chrome.text("›", 20, true, S.textDim), nameSub);
+        nameDisplayValue = nameSub[0];
+        chrome.addRow(card, nameRow, chrome.rowHeight());
         chrome.setRowAction(nameRow, true, Scheme.CORNERS_TOP,
-                () -> ask("device.name", "对端看到的名字",
-                        "留空则跟着机型：" + listener.peerModel()));
+                () -> askSetting("device.name", "对端看到的名字",
+                        "留空则跟随机型", () -> {
+                            if (nameDisplayValue != null) {
+                                nameDisplayValue.setText(nameLine());
+                            }
+                        }));
 
         card.addView(chrome.divider(), chrome.insetDivider());
 
         TextView[] modelSub = new TextView[1];
         LinearLayout modelRow = chrome.featureRow(
-                IconView.ANDROID, "对端看到的机型", modelLine(), chevron(), modelSub);
-        modelValue = modelSub[0];
-        chrome.addWrappingRow(card, modelRow);
+                IconView.NO_ICON, "对端看到的机型", modelLine(),
+                chrome.text("›", 20, true, S.textDim), modelSub);
+        modelDisplayValue = modelSub[0];
+        chrome.addRow(card, modelRow, chrome.rowHeight());
         chrome.setRowAction(modelRow, true, Scheme.CORNERS_BOTTOM,
-                () -> ask("device.model", "对端看到的机型",
-                        "留空则用系统型号：" + Listener.systemModel()));
+                () -> askSetting("device.model", "对端看到的机型",
+                        "留空则用系统型号", () -> {
+                            if (modelDisplayValue != null) {
+                                modelDisplayValue.setText(modelLine());
+                            }
+                        }));
         return card;
     }
 
-    /** 行尾那个「›」：这一行点进去有事可做。 */
-    private TextView chevron() {
-        return chrome.text("›", 20, true, S.textDim);
-    }
-
-    /** 名字此刻对端会读到的那个串，加一句它是自己来的还是跟上来的。 */
+    /** 对端此刻会读到的名字，空值时注明它跟随机型还是系统型号。 */
     private String nameLine() {
         String shown = listener.peerName();
         if (!storedText("device.name").isEmpty()) {
@@ -698,46 +660,68 @@ final class FeaturePage {
         return shown + (storedText("device.model").isEmpty() ? "（系统型号）" : "（跟随机型）");
     }
 
-    /** 机型此刻对端会读到的那个串。 */
+    /** 对端此刻会读到的机型。 */
     private String modelLine() {
         String shown = listener.peerModel();
         return storedText("device.model").isEmpty() ? shown + "（系统型号）" : shown;
     }
 
-    /** 一行存下来的原文（去空白）；表读不出来或者没有这一行，就是空串。 */
+    /** 一行存下来的原文（去空白）；表读不出来或没这一行就是空串。 */
     private String storedText(String key) {
-        SettingsScreen.Setting setting = reported == null ? null : reported.setting(key);
+        SettingsScreen fresh = settingsNow();
+        SettingsScreen.Setting setting = fresh == null ? null : fresh.setting(key);
         return setting == null ? "" : setting.value().trim();
     }
 
-    /**
-     * 此刻盘面上的表，现开一份。
-     *
-     * <p>不用 {@link #screen}：那份跟着这一页一起读，人在设置页改完再滑回来它就已经旧了。写也
-     * 一样现开一份——拿旧快照保存，会把人在设置页改过的别的行一起写回旧值。
-     */
-    private SettingsScreen settingsNow() {
-        try {
-            return SettingsScreen.open(SettingsFile.of(host).toPath());
-        } catch (IOException | RuntimeException unreadable) {
-            return null;
-        }
+    private TextView directoryValue;
+
+    private View directoryCard() {
+        LinearLayout card = chrome.rowCard();
+        TextView[] sub = new TextView[1];
+        LinearLayout row = chrome.featureRow(
+                IconView.NO_ICON, "接收文件保存位置", directoryLine(),
+                chrome.text("›", 20, true, S.textDim), sub);
+        directoryValue = sub[0];
+        chrome.addRow(card, row, chrome.rowHeight());
+        chrome.setRowAction(row, true, Scheme.CORNERS_ALL, this::askDirectory);
+        return card;
+    }
+
+    /** 目录那行的副标题：填了就显示路径，空就说明默认行为。 */
+    private String directoryLine() {
+        // 现读盘，不依赖构造时那份 screen：保存之后要立刻显示新值，而 screen 是 final 的旧快照。
+        SettingsScreen fresh = settingsNow();
+        SettingsScreen.Setting setting = fresh == null ? null : fresh.setting("receive.directory");
+        String value = setting == null ? "" : setting.value().trim();
+        return value.isEmpty() ? "留空：按文件类型分目录保存" : value;
+    }
+
+    /** 弹一个输入框改保存位置；框里是存下来的原文，不是加了说明的副标题。 */
+    private void askDirectory() {
+        askSetting("receive.directory", "接收文件保存位置", "留空则按文件类型分目录保存",
+                () -> {
+                    if (directoryValue != null) {
+                        directoryValue.setText(directoryLine());
+                    }
+                });
     }
 
     /**
-     * 弹一个输入框改一行。
+     * 弹一个输入框改一行文本设置。所有「点一下弹框改一个字符串」的行共用：目录、名字、机型。
      *
-     * <p>框里填的是存下来的原文，不是上面印着的生效值：生效值可能是从下一级跟上来的，把它填
-     * 进框里再保存，等于把「跟随」改成「写死」——而人只是想改一个字。
+     * @param key      设置表的键
+     * @param title    对话框标题
+     * @param hint     输入框占位提示
+     * @param onSaved  保存成功后回调，用来就地刷新那一行
      */
-    private void ask(String key, String title, String hint) {
+    private void askSetting(String key, String title, String hint, Runnable onSaved) {
+        SettingsScreen fresh = settingsNow();
+        SettingsScreen.Setting stored = fresh == null ? null : fresh.setting(key);
         EditText field = chrome.darkInput(hint);
         field.setInputType(InputType.TYPE_CLASS_TEXT);
-        SettingsScreen.Setting stored = reported == null ? null : reported.setting(key);
         field.setText(stored == null ? "" : stored.value());
         field.setSelection(field.getText().length());
 
-        // 输入框自己带着底色和圆角，对话框不给边距，所以垫一层；宽高交给这一层，输入框满宽。
         FrameLayout frame = new FrameLayout(host);
         frame.setPadding(chrome.dp(24), chrome.dp(8), chrome.dp(24), 0);
         frame.addView(field, new FrameLayout.LayoutParams(
@@ -749,13 +733,8 @@ final class FeaturePage {
                 .setView(frame)
                 .setNegativeButton("取消", null)
                 .setPositiveButton("保存",
-                        (dialog1, which) -> written(key, field.getText().toString()))
+                        (d, which) -> saveSetting(key, field.getText().toString(), onSaved))
                 .create();
-
-        // 键盘要自己请，且得在窗口真出现之后请。实测（PJZ110 / Android 15）：只在 show() 之前
-        // 设 SOFT_INPUT_STATE_ALWAYS_VISIBLE，键盘不弹，框上连光标都没有——对话框的初焦点没给
-        // 这个输入框，输入法按「没有可写字的框」算了一遍。onShow 里先抢焦点，再等一帧让输入法
-        // 接上这个新窗口，然后直接点名要它显示。
         dialog.setOnShowListener(shown -> {
             field.requestFocus();
             field.postDelayed(() -> {
@@ -768,22 +747,14 @@ final class FeaturePage {
         dialog.show();
     }
 
-    /**
-     * 写一行，然后把这两行按盘面重算。
-     *
-     * <p>两行一起重算，因为它们是同一条链：名字空着的时候名字就等于机型，改机型也就改了名字。
-     *
-     * <p>拒绝时不重开对话框：这里唯一会拒绝的是太长或带制表符这类输错，库给出的那句话（形如
-     * {@code device.name: 最多 200 个字符}）说得很清楚，而盘上一行都没动——上面显示的那一行
-     * 仍然是真话。把刚敲的字再摆一遍，只会让人以为第一次没按到。
-     */
-    private void written(String key, String text) {
+    /** 写一行文本设置；成功回调刷新，失败把库给的原因说出来。 */
+    private void saveSetting(String key, String value, Runnable onSaved) {
         SettingsScreen fresh = settingsNow();
         if (fresh == null) {
             chrome.say("设置读不出来，没保存", S.red);
             return;
         }
-        fresh.set(key, text);
+        fresh.set(key, value);
         List<String> problems;
         try {
             problems = fresh.save();
@@ -795,157 +766,21 @@ final class FeaturePage {
             chrome.say(problems.get(0), S.red);
             return;
         }
-        reported = fresh;
-        if (nameValue != null) {
-            nameValue.setText(nameLine());
-        }
-        if (modelValue != null) {
-            modelValue.setText(modelLine());
-        }
-        // 运行中改名只改了一半：应答每次连接都重读设置，证书与广播名要到下次启动才换。这就是
-        // 一句话的后半截，不能省——省掉它，人会在 iPhone 上看到一个还没换的名字，以为没存。
-        chrome.say(listener.running()
-                ? "已保存 · 证书与广播名要重启接收端才换"
-                : "已保存", S.green);
+        onSaved.run();
+        chrome.say("已保存", S.green);
     }
 
-    /**
-     * 表里每一个开关，按目录给的顺序。
-     *
-     * <p>这里不点名任何一个键：加一个开关只需在 Rust 的表里加一行，这页不用改。
-     */
-    private View switchCard() {
-        LinearLayout card = chrome.rowCard();
-        List<SettingsScreen.Setting> settings = switches();
-        for (int i = 0; i < settings.size(); i++) {
-            if (i > 0) {
-                card.addView(chrome.divider(), chrome.insetDivider());
-            }
-            // 只有一行时四个角都圆：先判 first 再判 last 会让独苗只剩上两个圆角
-            boolean first = i == 0;
-            boolean last = i == settings.size() - 1;
-            float[] corners = first && last ? Scheme.CORNERS_ALL
-                    : first ? Scheme.CORNERS_TOP
-                    : last ? Scheme.CORNERS_BOTTOM : null;
-            addSwitch(card, settings.get(i), corners);
+    /** 现开一份设置表：这一页的 screen 可能已经旧了，拿旧快照保存会覆盖别处的改动。 */
+    private SettingsScreen settingsNow() {
+        try {
+            return SettingsScreen.open(SettingsFile.of(host).toPath());
+        } catch (IOException | RuntimeException unreadable) {
+            return null;
         }
-        if (settings.isEmpty()) {
-            TextView empty = chrome.caption("这份设置表里没有开关。");
-            empty.setPadding(chrome.dp(18), chrome.dp(16), chrome.dp(18), chrome.dp(16));
-            card.addView(empty);
-        }
-        return card;
     }
 
-    private void addSwitch(LinearLayout card, SettingsScreen.Setting setting, float[] corners) {
-        // 开关在表里的取值是 "true"/"false"，不是 "on"/"off"：crates/settings 的 check() 只认这两
-        // 个字面量，写别的会被拒（拒得对——它是设置的唯一真相）。这里曾经按 "on" 读、按 "on" 写，
-        // 于是默认开着的那一项在页面上显示成关着，拨一下就报「只能是开或关」。
-        boolean on = "true".equals(setting.value());
-
-        LinearLayout box = chrome.column();
-        Toggle toggle = toggle(on);
-        LinearLayout row = chrome.featureRow(
-                IconView.SLIDERS, setting.title(), setting.summary(), toggle);
-        // 这一行的右边被拨杆占去 50dp，中间那条文字就只剩下一百来 dp——设置表里的说明常常是
-        // 一句完整的话，两行放不下、要折成三行。66dp 是下限不是定高：定高会把第三行裁在卡片
-        // 下沿上，而且裁得只剩半行字，看起来像字号坏了（设备信息卡里的内核那一行同病）。
-        row.setMinimumHeight(chrome.dp(chrome.rowHeight()));
-        row.setPadding(chrome.dp(18), chrome.dp(8), chrome.dp(18), chrome.dp(8));
-        box.addView(row, chrome.mm(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT, 0f));
-
-        TextView problem = chrome.text("", 12.5f, false, S.red);
-        problem.setVisibility(View.GONE);
-        LinearLayout.LayoutParams plp = chrome.margins(4, 8);
-        plp.leftMargin = chrome.dp(74);
-        box.addView(problem, plp);
-
-        card.addView(box, chrome.mm(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT, 0f));
-
-        // 按下高亮挂在整块上：一行里除了文字还有一个开关，只有整块一起亮才读得出是哪一行
-        chrome.pressableRow(box, corners);
-
-        toggle.setOnChange((button, checked) -> {
-            // 先记下拨之前的值。写入是「先记在内存、save() 时才校验」的两段式，存不下的话内存
-            // 里留着的就是那个被拒的坏值——只把开关拨回去是不够的，模型本身也得一起退回来，
-            // 否则下一次读 setting.value() 读到的还是它。
-            String before = setting.value();
-            screen.set(setting.key(), checked ? "true" : "false");
-            List<String> problems;
-            try {
-                problems = screen.save();
-            } catch (IOException failed) {
-                problems = List.of("写不进去：" + failed.getMessage());
-            }
-            if (problems.isEmpty()) {
-                problem.setVisibility(View.GONE);
-                // 跟随这一项改了之后，接收端要立刻按新的意思对齐，不然这一页自己就前后矛盾。
-                ReceiveService.follow(host);
-                syncReceive();
-                chrome.say(setting.title() + (checked ? " 已打开" : " 已关闭"), S.text);
-                return;
-            }
-            // 存不下就把开关拨回文件里的值：留着它拨过去的样子，等于让人以为设置生效了。
-            screen.set(setting.key(), before);
-            button.setChecked("true".equals(before));
-            problem.setText(String.join("\n", problems));
-            problem.setVisibility(View.VISIBLE);
-        });
-    }
-
-    /**
-     * 传输状态：上一次收到了什么，文件落在哪里。
-     *
-     * <p>legacy 那块是实时速度双列（↑/↓ 加两个大数字），这一版的接收端一次只答一个对端、
-     * 报告是整次传输结束后才回来的，没有实时的字节流可以印。所以同一张卡改成印「上次接收」：
-     * 一个 30sp 的标题位换成一句话——数字没有的时候，一个「—」比一个假的 0.0 更诚实。
-     */
-    private View statusCard() {
-        LinearLayout card = chrome.card();
-        String last = listener.last();
-
-        LinearLayout head = chrome.row();
-        head.addView(chrome.text("上次接收", 16, true, S.text),
-                chrome.mm(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        head.addView(chrome.statusPill(
-                last.isEmpty() ? "空闲" : "已收到", last.isEmpty() ? S.gray : S.green));
-        card.addView(head);
-
-        TextView line = chrome.text(last.isEmpty() ? "还没有收到文件" : last, 15, false,
-                last.isEmpty() ? S.textDim : S.text);
-        line.setPadding(0, chrome.dp(10), 0, chrome.dp(4));
-        card.addView(line);
-
-        card.addView(chrome.divider(), chrome.margins(12, 12));
-
-        card.addView(chrome.caption("接收目录"));
-        TextView directory = chrome.text(directory(), 13.5f, false, S.textDim);
-        directory.setPadding(0, chrome.dp(3), 0, 0);
-        card.addView(directory);
-        return card;
-    }
-
-    private String directory() {
-        SettingsScreen.Setting setting = screen.setting("receive.directory");
-        String value = setting == null ? "" : setting.value().trim();
-        return value.isEmpty() ? listener.directory() : value;
-    }
-
-    /** 表里的开关，保持目录的分组顺序。 */
-    private List<SettingsScreen.Setting> switches() {
-        List<SettingsScreen.Setting> found = new java.util.ArrayList<>();
-        for (SettingsScreen.Section section : screen.sections()) {
-            for (SettingsScreen.Setting setting : section.settings()) {
-                if (setting.control() == SettingsScreen.Control.SWITCH) {
-                    found.add(setting);
-                }
-            }
-        }
-        return found;
+    private java.io.File filesDir() {
+        return host.getFilesDir();
     }
 
     /**

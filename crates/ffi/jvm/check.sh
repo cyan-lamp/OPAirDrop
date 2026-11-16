@@ -46,6 +46,37 @@ inbox=$(native "$work/inbox")
 names=$(native "$work/names.txt")
 classes=$(native "$work/classes")
 
+# The fingerprint's TXT key is named in three files, in two languages, and nothing here
+# compiles all three together: `Responder` publishes it, `browse.rs` decides it is one of the
+# keys worth reporting, `Peers.absorb` reads it back off the line into `Peer.fingerprint`.
+# They disagreed once — the reader said `phash`, which is a name this side had invented, while
+# every real peer sends `h` — and the symptom was not an error: the sender found no
+# fingerprint, took the "nothing to compare, connect anyway" branch, and every handshake went
+# unpinned while the log claimed the check was on. So the three literals are compared here,
+# before anything is built. Whoever renames one of them gets told which file to open.
+echo "checking that one fingerprint key is published, reported and read"
+published=$(sed -n 's/^[[:space:]]*pairs\.put("\([^"]*\)", certHash);$/\1/p' \
+  "$root/android/app/src/main/java/com/oshare/airdrop/Responder.java")
+read=$(sed -n 's/^[[:space:]]*} else if ("\([^"]*\)"\.equals(field\[2\])) {$/\1/p' \
+  "$root/android/app/src/main/java/com/oshare/airdrop/Peers.java")
+reported=$(sed -n 's/^const TEXT_KEYS: &\[&str\] = &\[\(.*\)\];$/\1/p' \
+  "$root/crates/ffi/src/browse.rs")
+if [ -z "$published" ] || [ -z "$read" ] || [ -z "$reported" ]; then
+  echo "could not find the key in one of the three files: published='$published'" >&2
+  echo "reported='$reported' read='$read'; this check is out of date, fix it before trusting" >&2
+  echo "anything below" >&2
+  exit 1
+fi
+if [ "$published" != "$read" ]; then
+  echo "Responder publishes the fingerprint as '$published' but Peers reads '$read'" >&2
+  exit 1
+fi
+if ! printf '%s' "$reported" | grep -q "\"$published\""; then
+  echo "browse.rs does not report TXT key '$published' (it reports: $reported), so the line" >&2
+  echo "Peers is waiting for never arrives" >&2
+  exit 1
+fi
+
 echo "building the library"
 (cd "$root" && cargo build -q -p opairdrop-ffi)
 
@@ -64,12 +95,26 @@ echo "building the fixture archive"
 (cd "$root" && cargo run -q -p opairdrop-ffi --example fixture -- "$archive") >"$work/names.txt"
 
 echo "compiling the Java side"
-mkdir -p "$work/classes"
+mkdir -p "$work/classes" "$work/stubs/android/content"
+# `bleAdvertise` takes an `android.content.Context`, and there is no Android on this machine.
+# It is still worth compiling: it is one more native method whose descriptor the library side
+# has to match, and dropping it from the set would mean the one declaration that passes an
+# object rather than a string is also the one no desktop javac ever saw. A stub of the same
+# name satisfies the compiler, and the JVM resolves the parameter type lazily, so the class is
+# never loaded here — nothing below calls it. The stub lives in the run's own temp directory
+# and not in the repository: on the device the real `android.jar` provides this class, and a
+# second copy in the source set would collide with it.
+cat >"$work/stubs/android/content/Context.java" <<'CONTEXT'
+package android.content;
+
+/** Enough of Android's Context for {@code Native.bleAdvertise} to compile off the device. */
+public class Context {}
+CONTEXT
 # `-encoding` and not the platform default: these sources are UTF-8 and half of them have
 # Chinese in them. A JDK 17 on a GBK host (this one) reads them as mojibake and refuses to
 # compile, which looks like a code error and is not one. The `run_java` below already says
 # `-Dfile.encoding=UTF-8` for the same reason.
-javac -encoding UTF-8 -d "$classes" \
+javac -encoding UTF-8 -sourcepath "$(native "$work/stubs")" -d "$classes" \
   "$here"/com/oshare/airdrop/Native.java \
   "$here"/com/oshare/airdrop/Report.java \
   "$here"/com/oshare/airdrop/RoundTrip.java \
@@ -82,6 +127,7 @@ javac -encoding UTF-8 -d "$classes" \
   "$here"/com/oshare/airdrop/Der.java \
   "$here"/com/oshare/airdrop/Identity.java \
   "$here"/com/oshare/airdrop/IdentityStore.java \
+  "$here"/com/oshare/airdrop/PeerMismatch.java \
   "$here"/com/oshare/airdrop/IdentityCheck.java
 
 # The two entry points take different arguments, so they cannot share a command line: the

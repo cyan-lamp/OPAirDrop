@@ -1,8 +1,13 @@
 package com.oshare.airdrop;
 
+import android.Manifest;
 import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.app.Dialog;
+import android.content.ActivityNotFoundException;
+import android.content.ClipData;
+import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -17,6 +22,7 @@ import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.VelocityTracker;
@@ -31,13 +37,16 @@ import android.view.animation.AccelerateInterpolator;
 import android.view.animation.DecelerateInterpolator;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.io.File;
+import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
-import java.security.SecureRandom;
-import java.security.cert.X509Certificate;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
+import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -45,10 +54,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 
-import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocket;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509TrustManager;
 
 /**
  * 发送面板：仿一加互传「与 iPhone 互传」那一页，形态是一块从底边上滑的玻璃。
@@ -93,8 +99,52 @@ import javax.net.ssl.X509TrustManager;
  */
 public final class SendActivity extends Activity implements Peers.Watcher {
 
-    private static final int CONNECT_TIMEOUT_MS = 8000;
-    private static final int READ_TIMEOUT_MS = 300_000;
+    /**
+     * 两个超时在表里各有行：{@code client.connect_timeout_ms} 与 {@code client.read_timeout_ms}。
+     *
+     * <p>这里的常量是它们成为一行之前的值，也是表读不出来时的回落。读取的超时是
+     * {@code SO_TIMEOUT} 的语义——「多久收不到任何字节」，不是「整次投送多久」，
+     * 所以慢速大文件靠的是数据一直在流动，而不是把总数估得足够大。
+     *
+     * <p># 为什么是十五秒，而不是四十五秒
+     *
+     * <p>这里原来按 ASK-2a 那句「senders wait about 45 s」定成 45 s，理由是「接收端自己
+     * 有 15 s 弹窗超时，比它短就等于没等人回答」。那个理由是错的，错在一个前提上：
+     * {@code /Ask} 的 {@code 200} **不是**人点了接受之后才来的，它是「我已经问过我的主人了」
+     * ——会话在那里就建好了，弹窗才开始显示。等真人在对面手机上做决定的那一段，是
+     * {@code /Upload} 在等它的答复，不是 {@code /Ask}。
+     *
+     * <p>所以两个等待要分开给耐心：问一句 HTTP 十五秒足够（本就该是毫秒级的），
+     * 人对着弹窗做决定的那段才需要长——见 {@link #UPLOAD_READ_TIMEOUT_MS}。
+     * 四十多秒全压在第一个上，唯一的实际效果是把「对方不答」这件事也拖长了三倍。
+     */
+    private static final String TAG = "OPAirDrop";
+
+    private static final int CONNECT_TIMEOUT_MS = 15_000;
+    private static final int READ_TIMEOUT_MS = 15_000;
+
+    /**
+     * 等「对面收完没有」的读超时。
+     *
+     * <p>档案已经在发了，对面手机上那个人多半正看着弹窗。这一段他犹豫多久都合法，所以
+     * 放宽到九十秒——与参考实现一致。它只在这条连接上生效，从 {@link Native.Progress#SENDING}
+     * 那一刻起才换上去（见 {@link #transfer}），所以不会把「对方根本不答」也一起拖成九十秒。
+     */
+    private static final int UPLOAD_READ_TIMEOUT_MS = 90_000;
+
+    /**
+     * 发送缓冲区的上限，六十四 KB。
+     *
+     * <p>不设的时候平台会把它长到一兆以上，于是「写完了」这句话就不再是「发出去了」：整份
+     * 档案落进内核队列时调用就返回了，界面上那一圈立刻走到 100%，而线路上一块还没走完。
+     * 留在这里的数字与参考实现相同（{@code HttpCall.SEND_BUFFER}），它的日志里记着代价：
+     * 24 MB 的视频在 50 ms 内报「已写 1.06 MB」，然后是 7.24 秒的静默。
+     *
+     * <p>这个尺寸仍然远大于这条链路的带宽时延积，所以它限制的是「最多能抢跑多少」，不是
+     * 吞吐。必须在下 {@code connect} 之前设：平台在建 socket 的时候就把队列定好，事后再设
+     * 只是给一个尺寸已经错了的队列换个标签。
+     */
+    private static final int SEND_BUFFER = 64 * 1024;
 
     /** 上滑进来的时长。比系统对话框略慢：它是整块面板在动，不是一个小窗在淡入。 */
     private static final int ENTER_MS = 340;
@@ -141,7 +191,24 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     private final List<File> files = new ArrayList<>();
     private long totalBytes;
 
+    /**
+     * {@link #senderId()} 算过一次之后留在这里。
+     *
+     * <p>整个进程一份，因为它是这台设备的身份，不是这一次投送的名字；进程重启后重新派生，
+     * 但派生的输入是证书，所以下次还是这个值。
+     */
+    private static volatile String senderId;
+
     private Peers peers;
+
+    /**
+     * 蓝牙广播的开启请求码。
+     *
+     * <p>没有这条广播，iPhone 不会把 AirDrop 服务拉起来——我们的 mDNS 查询会一路走到
+     * 无线侧、每两秒一次、帧帧合法，然后一个回包都收不到。原因和组播、和 QU 位都无关：
+     * 对端的服务没开。
+     */
+    private static final int ASK_BLE = 0x0B1E;
 
     /** 根：负责下滑关闭与上滑进入。它在配置变更时**不**重建，重建的是它里面的内容。 */
     private Sheet sheet;
@@ -165,9 +232,43 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     /** 当前这一份视图里的头像与状态字。重建时清空重填，进度更新按名字找。 */
     private final Map<String, Nick> nicks = new LinkedHashMap<>();
     private final Map<String, TextView> stateViews = new LinkedHashMap<>();
+    /**
+     * 设备格子的名字那一行，键是 mDNS 实例名（hash）。
+     *
+     * <p>/Discover 回来之前只有 hash，回来之后才换成对方自己起的名字。视图重建时按 hash 找回
+     * 来重填，所以这个 map 跟着视图走；真名本身另存在 {@link #realNames} 里，跨重建常在。
+     */
+    private final Map<String, TextView> nameViews = new LinkedHashMap<>();
+    /** hash → 对方在 AirDrop 里设的真名。发现阶段拿不到，/Discover 应答到达后填入。 */
+    private final Map<String, String> realNames = new LinkedHashMap<>();
+    /** 已经查过/正在查名字的稳定地址。hash 每次广播都变，只有地址能认出「还是那一台」。 */
+    private final java.util.Set<String> probed = java.util.Collections.synchronizedSet(
+            new java.util.HashSet<>());
 
     /** 正在滑出。防止连按两次返回键跑两遍动画。 */
     private boolean closing;
+
+    /**
+     * 「先选文件」那条路的请求码。
+     *
+     * <p>只有从首页点进来才走它：系统分享面板那条路进来时文件已经在 intent 里，没有可选的。
+     */
+    private static final int PICK_FILES = 0x5E4D;
+
+    /** 选择器已经弹出去了。它回来之前再点一次不该叠出第二个。 */
+    private boolean picking;
+
+    /**
+     * 正在跑的那条连接。
+     *
+     * <p>取消发送只有一条路：把这个 socket 关掉，正在读/写的线程立刻抛出来。协议里没有
+     * 「收手」这种说法——对面已经在收字节，唯一的停法就是断线。所以这个字段不是为了优雅，
+     * 是为了让人点了取消之后真的停。
+     */
+    private volatile Socket live;
+
+    /** 这一次停是用户点的，不是出故障。catch 里靠它决定说「已取消」还是说原因。 */
+    private volatile boolean cancelling;
     /** 面板的窗口。它不参与任务栈，也就不会被系统摆成小窗、不会在最近任务里留一张卡。 */
     private Dialog panel;
 
@@ -193,18 +294,174 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     private View tint;
     private volatile boolean sending;
 
+    /**
+     * 这一次投送的名字，卡片期间不变。
+     *
+     * <p>随机串而不是对端名字：同一台 iPhone 连着发两次是两件事，用名字当键会让第二次的
+     * 进度接到第一次那张已经结束的卡上——那张卡的状态是终态，于是第二次看上去一直没动。
+     *
+     * <p>{@code volatile}：写在主线程（{@link #send}），读在卡片那条线程（取消从流体云
+     * 进来），中间没有锁，靠它保证读到的是这一次的那个串。
+     */
+    private volatile String sendSession = "";
+
+    /**
+     * 卡片上那个「取消」落回这里。
+     *
+     * <p>先比 {@link #sendSession} 再比 {@link #sending}：卡片可能停在一张上一次留下的
+     * 卡上（它还没走完那段收尾动画），那时点取消不该把这一次打断。两次发送对人来说听起来
+     * 一样，只有那个随机串分得开。
+     */
+    private final SendHost.Canceller cardCancel = session -> {
+        if (!sending || !session.equals(sendSession)) {
+            return false;
+        }
+        cancelSend();
+        return true;
+    };
+
+    /**
+     * 一台设备占多宽、头像画多大。都按 dp 定，因为要拿来算「一行能放几个」。
+     *
+     * <p>头像比原先小了一号：这一版要的是「一眼看见身边都有谁」，而不是把某一台放大。
+     */
+    private static final int CELL_DP = 86;
+    private static final int NICK_DP = 62;
+
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
 
         S = schemeOf(getResources().getConfiguration());
         density = getResources().getDisplayMetrics().density;
+        PeerNames.load(this);
 
         buildShell();
         showPanel();
         slideIn();
 
-        new Thread(this::intake, "opairdrop-intake").start();
+        // 这一页在人眼前的这段时间里，流体云该有（判据见 {@link SendSession}）。
+        SendSession.opened();
+        // 告诉卡片由谁画：不 attach 的话 SendHost 没有 Context，begin/progress/finished 全都
+        // 悄悄 return——卡片一帧都不会出现，而日志里什么都没有。页面活着它就活着。
+        SendHost.attach(this);
+        // 卡片上那个「取消」要说回这里。装/卸在页面这一层，而不是每次发送：卡片在两次
+        // 发送之间也可能是活的（终态那张还要放一段动画），那时按下去什么都不该发生。
+        SendHost.register(cardCancel);
+
+        Intent source = getIntent();
+        if (shared(source)) {
+            new Thread(() -> intake(source), "opairdrop-intake").start();
+        } else {
+            // 空手来的（首页「发送文件」）：先把文件选出来，再谈发给谁。
+            requestFiles();
+        }
+    }
+
+    /**
+     * 页面还活着的时候，又来了一条分享。
+     *
+     * <p>不接这一段会很难查：系统把新的 {@code SEND} 交给已经在栈顶的这一页，不会重建它，
+     * 而 {@link #onCreate} 早就跑完了——于是手上还是上一次的文件，人会以为「分享没生效」。
+     * 换掉文件就够了；正在跑的那次传输不动，它读的是自己那份路径列表。
+     */
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        if (!shared(intent)) {
+            return;
+        }
+        setIntent(intent);
+        new Thread(() -> intake(intent), "opairdrop-intake").start();
+    }
+
+    /**
+     * 这条 intent 里有没有现成的文件。
+     *
+     * <p>看 action 而不是看有没有 data：{@code SEND} 里附带一段文字也算有内容，而文字要在
+     * {@link ShareIntake#resolve} 里才变成文件——在这里替它判空会让「只分享一句话」变成静默失败。
+     */
+    private static boolean shared(Intent intent) {
+        if (intent == null) {
+            return false;
+        }
+        String action = intent.getAction();
+        return Intent.ACTION_SEND.equals(action) || Intent.ACTION_SEND_MULTIPLE.equals(action);
+    }
+
+    /**
+     * 让人挑文件。
+     *
+     * <p>用 {@code OPEN_DOCUMENT} 而不是 {@code GET_CONTENT}：前者给的是长期可读的 URI、来源是
+     * 系统文档服务，相册、云盘、下载都在同一个选择器里，而且不需要任何存储权限。
+     *
+     * <p>选完之后不直接发：这一页本来就是「先看见谁在，再点谁」。选择器只是把手上空着这件事
+     * 补上，发不发仍然由人决定。
+     */
+    private void requestFiles() {
+        if (picking) {
+            return;
+        }
+        picking = true;
+        Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        picker.addCategory(Intent.CATEGORY_OPENABLE);
+        picker.setType("*/*");
+        picker.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        try {
+            startActivityForResult(picker, PICK_FILES);
+        } catch (ActivityNotFoundException none) {
+            picking = false;
+            Log.w(TAG, "no document picker on this device", none);
+            subtitleText = "这台机器没有文件选择器";
+            if (subtitle != null) {
+                subtitle.setText(subtitleText);
+            }
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int request, int result, Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request != PICK_FILES) {
+            return;
+        }
+        picking = false;
+
+        Intent share = shareOf(result, data);
+        if (share == null) {
+            // 取消就是「不发了」。面板这时还是空的，留着它只会让人再点一次返回。
+            close();
+            return;
+        }
+        // 换成那条 intent 再走一遍：下面所有代码只有「读这条 intent 里的文件」一种说法，
+        // 不会出现「选出来的文件」和「分享进来的文件」两套处理。
+        setIntent(share);
+        new Thread(() -> intake(share), "opairdrop-intake").start();
+    }
+
+    /** 选择器的结果拼成一条我们认识的 {@code SEND_MULTIPLE}；一个文件都没有时返回 {@code null}。 */
+    private static Intent shareOf(int result, Intent data) {
+        if (result != RESULT_OK || data == null) {
+            return null;
+        }
+        ArrayList<android.net.Uri> uris = new ArrayList<>();
+        ClipData clip = data.getClipData();
+        if (clip != null) {
+            for (int index = 0; index < clip.getItemCount(); index++) {
+                android.net.Uri uri = clip.getItemAt(index).getUri();
+                if (uri != null) {
+                    uris.add(uri);
+                }
+            }
+        } else if (data.getData() != null) {
+            uris.add(data.getData());
+        }
+        if (uris.isEmpty()) {
+            return null;
+        }
+        Intent share = new Intent(Intent.ACTION_SEND_MULTIPLE);
+        share.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);
+        return share;
     }
 
     /**
@@ -240,11 +497,117 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         sheet.post(this::installGlass);
     }
 
+    /**
+     * 页面走了。
+     *
+     * <p>只记「页面不在了」，不停传输：{@link SendSession} 把「页面」和「字节」分成两个布尔，
+     * 正是为了这一刻——人把应用划掉时，传输该继续跑完，云也该继续在。
+     */
+    @Override
+    protected void onDestroy() {
+        SendSession.closed();
+        // 取消的落点没了：{@link #cardCancel} 停的是这一页握着的那条 socket，页面销毁之后
+        // 按下去只会调到一个已经没有传输可停的对象上。让它自己承认「这次我管不了」，卡片
+        // 会把按钮收回去，而不是按了没反应。
+        SendHost.unregister(cardCancel);
+        super.onDestroy();
+    }
+
     @Override
     protected void onStart() {
         super.onStart();
+        if (preview()) {
+            return;
+        }
+        // 顺序是有意义的：先敲门，再问路。BLE 广播是 iPhone 把 AirDrop 服务拉起来的那声
+        // 敲门，mDNS 查询是问路。反过来的话，第一轮查询问的是一台还没开门的设备。
+        wake();
         peers = new Peers(this, this);
         peers.start();
+    }
+
+    /**
+     * 发那条叫醒 iPhone 的 AirDrop BLE 广播。
+     *
+     * <p>这一层不运任何数据，它只是让对端把 8770 端口上的服务打开。没有它，我们这边的
+     * 查询会一路走到无线侧（抓包能看见，每两秒一帧，`_airdrop._tcp.local`、跳数 255、地址
+     * 帧尾都对），回包一个也没有——因为对端"无线开着、服务没开"，而帧再怎么对也开不了一扇
+     * 没装的门。
+     *
+     * <p>权限没给就先要，要到再发：{@code BLUETOOTH_ADVERTISE} 在 API 31+ 是运行时权限。
+     * 用户拒绝也不拦着搜索——已经醒着的对端照样会答。
+     */
+    private void wake() {
+        if (checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE)
+                != PackageManager.PERMISSION_GRANTED
+                || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{
+                    Manifest.permission.BLUETOOTH_ADVERTISE,
+                    Manifest.permission.BLUETOOTH_CONNECT}, ASK_BLE);
+            return;
+        }
+        say(Native.bleAdvertise(this));
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int request, String[] granted, int[] state) {
+        super.onRequestPermissionsResult(request, granted, state);
+        if (request != ASK_BLE) {
+            return;
+        }
+        // 拒绝是允许的结局：这条路只是"叫醒"，不是"通信"。页面不会因此变成一张错误页。
+        say(Native.bleAdvertise(this));
+    }
+
+    /**
+     * 把广播的现状写进日志。
+     *
+     * <p>句子是 Rust 写的（{@code ble::explained}），这里只落笔：状态机在那边，话也该由
+     * 那边说，否则同一个原因会有两种措辞，而人只会在其中一种里找线索。
+     */
+    private static void say(byte[] line) {
+        if (line == null) {
+            Log.w("OPAirDrop", "ble: (no state line)");
+            return;
+        }
+        String text = new String(line, java.nio.charset.StandardCharsets.UTF_8);
+        if (text.startsWith("failed: ")) {
+            Log.w("OPAirDrop", "ble: " + text);
+        } else {
+            Log.i("OPAirDrop", "ble: " + text);
+        }
+    }
+
+    /**
+     * 调试用：{@code am start … -e preview 5} 时拿假设备把版式演出来，不真的搜索。
+     *
+     * <p>真机上凑不齐那么多台对端，而「一行放几个、在第几个折行、长名字会不会顶出格子」只有看着
+     * 截图才改得动。只在 debug 包里认这个参数；release 包里这段是死的。
+     */
+    private boolean preview() {
+        if (!BuildConfig.DEBUG) {
+            return false;
+        }
+        int count = getIntent().getIntExtra("preview", 0);
+        if (count <= 0) {
+            return false;
+        }
+        // 名字故意长短不一：一格 86dp，装不下就该被省略号截掉，而不是把旁边那台挤走。
+        String[] names = {"青", "张三的 iPhone 15 Pro", "MacBook Pro", "林子"};
+        List<Peers.Peer> fake = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            Peers.Peer peer = new Peers.Peer(names[i % names.length]);
+            peer.host = "fake" + i + ".local";
+            peer.address = "fe80::" + (i + 1);
+            peer.port = 8770;
+            fake.add(peer);
+        }
+        stage.postDelayed(() -> {
+            found = fake;
+            renderStage();
+        }, 400);
+        return true;
     }
 
     @Override
@@ -254,6 +617,9 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             peers.stop();
             peers = null;
         }
+        // 人离开了这一页，就别再叫对端起床：广播一直在，iPhone 会一直把 AWDL 和 AirDrop
+        // 服务供着，那是白花的电，也不是我们的功能。
+        Native.bleStop();
     }
 
     /**
@@ -428,6 +794,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         content.removeAllViews();
         nicks.clear();
         stateViews.clear();
+        nameViews.clear();
 
         LinearLayout column = new LinearLayout(this);
         column.setOrientation(LinearLayout.VERTICAL);
@@ -440,8 +807,8 @@ public final class SendActivity extends Activity implements Peers.Watcher {
 
         stage = new LinearLayout(this);
         stage.setOrientation(LinearLayout.VERTICAL);
-        // 中部整块上下居中：雷达与它下面那行字是一个整体，居中的是整体，不是雷达自己。
-        stage.setGravity(Gravity.CENTER);
+        // 设备列表从左上角排起，所以这一层不能被居中；空态的雷达自己带居中。
+        stage.setGravity(Gravity.TOP);
         column.addView(stage, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
@@ -549,14 +916,17 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         bar.setGravity(Gravity.CENTER_VERTICAL);
         bar.setPadding(0, dp(14), 0, dp(10));
 
-        TextView back = new TextView(this);
-        back.setText("‹");
-        back.setTextSize(24);
-        back.setTextColor(S.text);
-        back.setGravity(Gravity.CENTER);
-        // 用卡片色而不是 cardHi：cardHi 和页底色几乎同值（#F1F3F6 / #F0F1F3），浅色下那圈底
-        // 完全看不出来，只剩一个孤零零的「‹」浮在玻璃上。
-        back.setBackground(round(S.card, 22));
+        // 返回键：圆底 + 正中央的箭头。用图片而不是「‹」字形——字形在不同字体里重心偏上偏左，
+        // 看着总不像居中；矢量箭头几何重心就在视口中心，配 Gravity.CENTER 才是真的居中。
+        // 圆底 75% 透明：和下面那张说明卡同一档透度，页面是一整块玻璃而不是几块实心补丁。
+        FrameLayout back = new FrameLayout(this);
+        back.setBackground(round(alpha(S.card, 0.75f), 22));
+        android.widget.ImageView arrow = new android.widget.ImageView(this);
+        arrow.setImageResource(R.drawable.ic_back);
+        // 用文字色给箭头上色，深浅色主题都跟得上；写死白色在浅色下会看不见。
+        arrow.setColorFilter(S.text);
+        arrow.setScaleType(android.widget.ImageView.ScaleType.CENTER_INSIDE);
+        back.addView(arrow, new FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER));
         back.setOnClickListener(view -> close());
         bar.addView(back, new LinearLayout.LayoutParams(dp(44), dp(44)));
 
@@ -602,12 +972,18 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         stage.removeAllViews();
         nicks.clear();
         stateViews.clear();
+        nameViews.clear();
 
         if (found.isEmpty()) {
+            // 空态自己居中：外面这一层已经改成顶部对齐，留给设备列表从左上角排。
+            LinearLayout middle = new LinearLayout(this);
+            middle.setOrientation(LinearLayout.VERTICAL);
+            middle.setGravity(Gravity.CENTER);
+
             Radar radar = new Radar();
             LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(dp(180), dp(180));
             size.gravity = Gravity.CENTER_HORIZONTAL;
-            stage.addView(radar, size);
+            middle.addView(radar, size);
 
             TextView hint = new TextView(this);
             hint.setText(searching);
@@ -615,17 +991,51 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             hint.setTextColor(S.textDim);
             hint.setGravity(Gravity.CENTER);
             hint.setPadding(0, dp(20), 0, 0);
-            stage.addView(hint);
+            middle.addView(hint);
+
+            stage.addView(middle, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT));
             return;
         }
 
-        LinearLayout grid = new LinearLayout(this);
-        grid.setOrientation(LinearLayout.HORIZONTAL);
-        grid.setGravity(Gravity.CENTER);
-        for (Peers.Peer peer : found) {
-            grid.addView(deviceCell(peer));
+        // 从文件信息下面那行的左上角开始，向右排，排满一行折到下一行。行首对齐，不整行居中。
+        //
+        // 这条对齐规则是数出来的，不是审美：格子宽度取「整行平分」，即 320dp 可用宽度分三格，
+        // 每格 106dp。于是
+        //   一台   —— 第一格，靠左；
+        //   两台   —— 第二台的中心正好落在屏幕中线上（20dp + 一格半 = 屏宽一半）；
+        //   三台   —— 第一台与第三台到中线的距离相等，互为镜像。
+        // 如果改整行居中，两台时整行会整体右移半格，第二台就离开中线了——那是不对的。
+        //
+        // 用平分而不是死板的 86dp：三台 86dp 塞进 320dp，右边会空出小半屏，看着像没排完。
+        int span = getResources().getDisplayMetrics().widthPixels - dp(40);
+        int columns = Math.max(1, span / dp(CELL_DP));
+        int cellW = span / columns;
+        LinearLayout rows = new LinearLayout(this);
+        rows.setOrientation(LinearLayout.VERTICAL);
+        rows.setGravity(Gravity.START);
+        LinearLayout row = null;
+        for (int i = 0; i < found.size(); i++) {
+            if (i % columns == 0) {
+                row = new LinearLayout(this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                // 顶对齐：名字有的占一行有的占两行，居中会让同一行的头像高低错开。
+                row.setGravity(Gravity.TOP);
+                rows.addView(row, new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+            }
+            row.addView(deviceCell(found.get(i)), new LinearLayout.LayoutParams(
+                    cellW, LinearLayout.LayoutParams.WRAP_CONTENT));
         }
-        stage.addView(grid);
+
+        // 设备可能比这一屏多（一间办公室里同时开着十几台）。能滚，但不越过边框。
+        ScrollView scroller = new ScrollView(this);
+        scroller.setVerticalScrollBarEnabled(false);
+        scroller.setClipToPadding(false);
+        scroller.addView(rows, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT));
+        stage.addView(scroller, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT));
     }
 
     @Override
@@ -643,6 +1053,17 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         if (!nicks.keySet().equals(namesOf(usable))) {
             renderStage();
         }
+
+        // 缓存没有名字的设备，后台问一次 /Discover。按稳定地址去重：hash 与 UUID 每次广播
+        // 都变，用它们当键会让同一台设备每两秒重查一遍。问不到的地址也记进去，进程内不再
+        // 重试——对面锁屏时反复握手只会白耗电，下次打开页面再试。
+        for (Peers.Peer peer : usable) {
+            String key = PeerNames.key(peer);
+            if (key == null || PeerNames.get(peer) != null || !probed.add(key)) {
+                continue;
+            }
+            probeName(peer);
+        }
     }
 
     private static java.util.Set<String> namesOf(List<Peers.Peer> peers) {
@@ -658,40 +1079,79 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         LinearLayout cell = new LinearLayout(this);
         cell.setOrientation(LinearLayout.VERTICAL);
         cell.setGravity(Gravity.CENTER_HORIZONTAL);
-        cell.setPadding(dp(8), 0, dp(8), dp(16));
+        cell.setPadding(dp(5), 0, dp(5), dp(14));
 
         Nick nick = new Nick();
-        cell.addView(nick, new LinearLayout.LayoutParams(dp(92), dp(92)));
+        cell.addView(nick, new LinearLayout.LayoutParams(dp(NICK_DP), dp(NICK_DP)));
 
         TextView name = new TextView(this);
-        name.setText(peer.name);
-        name.setTextSize(14);
+        // 真名两条来源：本次会话里 /Discover 刚问到的，或上次存下的（按稳定地址查）。
+        // 后者让同一台设备下次一出现就显示名字，不必等预查询跑完。
+        String knownName = realNames.get(peer.name);
+        if (knownName == null) {
+            knownName = PeerNames.get(peer);
+        }
+        name.setText(knownName == null ? peer.name : knownName);
+        name.setTextSize(12.5f);
         name.setTextColor(S.text);
         name.setGravity(Gravity.CENTER);
-        name.setMaxLines(1);
+        // 名字换行，不硬截成一行：格子就 106dp 宽，「张三的 iPhone 15 Pro」这类名字截一行只剩
+        // 「张三的 iP…」，认不出是谁。两行封顶，还不下才省略——一台设备不该把下面顶出屏幕。
+        name.setMaxLines(2);
         name.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        name.setPadding(0, dp(8), 0, 0);
+        name.setLineSpacing(0, 0.95f);
+        name.setPadding(0, dp(6), 0, 0);
         cell.addView(name);
 
         TextView state = new TextView(this);
-        state.setTextSize(12);
+        state.setTextSize(10.5f);
         state.setTextColor(S.accent);
         state.setGravity(Gravity.CENTER);
-        state.setPadding(0, dp(4), 0, 0);
+        state.setPadding(0, dp(2), 0, 0);
         String known = statuses.get(peer.name);
         state.setText(known == null ? "" : known);
         cell.addView(state);
 
         nicks.put(peer.name, nick);
         stateViews.put(peer.name, state);
+        nameViews.put(peer.name, name);
         // 重建之前就已经在传的那台，环要接着上一次的位置画，而不是从 0 开始。
         Float progress = progressOf.get(peer.name);
         if (progress != null) {
             nick.progress(progress);
         }
 
-        cell.setOnClickListener(view -> send(peer));
+        // 一次只跑一个传输，所以「正在传」时点任何一台都当作取消：那时页面上没有第二件事
+        // 可以开始，而人点下去的意思只可能是「停下」。
+        cell.setOnClickListener(view -> {
+            if (sending) {
+                cancelSend();
+            } else {
+                send(peer);
+            }
+        });
         return cell;
+    }
+
+    /**
+     * 停下正在跑的那一次。
+     *
+     * <p>关 socket 而不是发信号：传输线程此刻多半停在 {@code read} 上等对端回话，唯一能把它
+     * 叫醒的只有「这条连接没了」。异常会在发送线程里抛出，走和失败同一条收尾路径，只是说法
+     * 不同——{@link #cancelling} 记着这次是谁做的决定。
+     */
+    private void cancelSend() {
+        Socket open = live;
+        if (open == null) {
+            return;
+        }
+        cancelling = true;
+        Log.i(TAG, "send cancelled by the person");
+        try {
+            open.close();
+        } catch (Exception alreadyGone) {
+            Log.w(TAG, "cancel: socket was already closed", alreadyGone);
+        }
     }
 
     // ------------------------------------------------------------------ 底部
@@ -700,7 +1160,8 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     private View bottomCard() {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackground(round(S.card, 22));
+        // 75% 透明：背后是玻璃面板，卡片只压暗一点点，不再是一块实心补丁。
+        card.setBackground(round(alpha(S.card, 0.75f), 22));
         card.setPadding(dp(18), dp(16), dp(18), dp(16));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -708,15 +1169,17 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         card.setLayoutParams(params);
 
         TextView head = new TextView(this);
-        head.setText("如何与 iPhone 互传？");
+        head.setText("iPhone 那边要做什么？");
         head.setTextSize(15);
         head.setTypeface(Typeface.DEFAULT_BOLD);
         head.setTextColor(S.text);
         card.addView(head);
 
         TextView body = new TextView(this);
-        body.setText("方式一：在控制中心打开 NFC，碰触一下 iPhone 即可互传\n"
-                + "方式二：iPhone 安装并打开「OPPO 互联」应用");
+        // 只说 iPhone 上真正需要动的那两件事。它不需要打开任何分享面板，也不需要装任何东西：
+        // AirDrop 在「所有人」状态下自己会在这条直连链路上应答。
+        body.setText("① 控制中心把 AirDrop 设为「所有人」，10 分钟内有效\n"
+                + "② 屏幕保持解锁亮着——锁屏后 iPhone 会暂时离开这条直连链路");
         body.setTextSize(12.5f);
         body.setTextColor(S.textDim);
         body.setLineSpacing(dp(4), 1f);
@@ -727,8 +1190,8 @@ public final class SendActivity extends Activity implements Peers.Watcher {
 
     // ------------------------------------------------------------------ 传输
 
-    private void intake() {
-        ShareIntake.Batch batch = ShareIntake.resolve(this, getIntent());
+    private void intake(Intent source) {
+        ShareIntake.Batch batch = ShareIntake.resolve(this, source);
         runOnUiThread(() -> {
             files.clear();
             files.addAll(batch.files);
@@ -736,6 +1199,8 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             for (File file : files) {
                 totalBytes += file.length();
             }
+            Log.i(TAG, "intake: " + files.size() + " file(s), " + totalBytes + " bytes"
+                    + (batch.problem == null ? "" : ", problem: " + batch.problem));
             subtitleText = files.isEmpty()
                     ? (batch.problem == null ? "没有可发送的内容" : batch.problem)
                     : files.size() + " 个文件 · " + size(totalBytes);
@@ -753,8 +1218,18 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             status(peer, "没有可发送的内容");
             return;
         }
+        // 先起名字，再置 {@link #sending}：反过来的话，中间那一瞬 sending 已经是 true 而键
+        // 还是上一次那个，卡片上的取消会越过 cardCancel 里「是不是这一次」的判断。
+        sendSession = UUID.randomUUID().toString();
         sending = true;
+        SendSession.began();
+        Log.i(TAG, "send to " + peer.name + " — " + peer.address + ":" + peer.port
+                + " host=" + peer.host + ", " + files.size() + " file(s)");
         status(peer, "正在连接…");
+        SendNotice.waiting(this, peer.name, "正在连接…");
+        // 也从这一刻起卡片接手这块屏幕（它接手时会来一条 {@code send_card}，那条通知据此
+        // 让位）。两边的数字取自下面同一个进度回调，不各算一遍。
+        SendHost.begin(sendSession, peer.name, files.size() + " 个文件");
 
         List<String> paths = new ArrayList<>();
         for (File file : files) {
@@ -762,68 +1237,359 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         }
 
         new Thread(() -> {
+            // 字节有没有真的开始走。失败时用来分辨「对面没点接受」和「走到一半对面不
+            // 读了」——这两件事在异常里长得一样（都是一个超时或一个 reset），在人那边
+            // 却是两句不同的话。写在数组里是因为它由进度回调填、由 catch 读。
+            boolean[] moving = {false};
             try {
-                byte[] frame = transfer(peer, paths);
+                byte[] frame = transfer(peer, paths, moving);
                 Report report = Report.parse(
                         new String(frame, java.nio.charset.StandardCharsets.UTF_8));
                 runOnUiThread(() -> {
                     sending = false;
+                    live = null;
+                    cancelling = false;
+                    SendSession.ended();
                     // 环褪回未开始：留着满圈会读成「还在跑」，而它已经跑完了。
                     progressOf.remove(peer.name);
                     redrawProgress(peer.name);
                     status(peer, "已发送 · " + size(report.bytes));
+                    SendNotice.finished(this, "已发送到 " + peer.name,
+                            files.size() + " 个文件 · " + size(report.bytes));
+                    // 终态。卡片只在 SUCCESS 上放成功的动画，所以这个码不能换成别的。
+                    SendHost.finished(sendSession, peer.name, SendHost.SUCCESS,
+                            files.size() + " 个文件 · " + size(report.bytes));
                 });
             } catch (Exception failed) {
-                String message = failed.getMessage() == null ? failed.toString() : failed.getMessage();
+                Log.w(TAG, "send failed: " + peer.name, failed);
+                // 先把这个决定记下来：下面那段 lambda 里 cancelling 会被清掉，那时再问就
+                // 只会得到 false，标题永远是「发送失败」。
+                boolean stopped = cancelling;
+                // 对端说「不收」是这条链上唯一一种不算故障的失败：连接通了、TLS 握手成了、
+                // /Discover 回了 200、连名字都拿到了，缺的只有那台手机上的一档设置。所以
+                // 它有自己的说法——英文那一句（"… is not accepting files"）留给日志，页面
+                // 上要说的是该去改什么。类型是 Rust 那边给的（status::REFUSED 对应
+                // RefusedException），不是在这里比对文案：比文案判定了，改一次措辞就会
+                // 悄悄退化成「发送失败」。
+                boolean refused = failed instanceof RefusedException;
+                // 第三种「不算故障」的失败：对面出示的证书不是它广播的那一份。和「不收」一样，
+                // 该说的不是「发送失败」，而是「对面不是它说的那台机器、已经停了」。类型由
+                // {@link PeerMismatch} 给，理由同上：文案会改，类型不会。
+                boolean impostor = failed instanceof PeerMismatch;
+                // 等不到回答。分成两档说，是因为人要做的事不同：还没走字节，等的是对面手机
+                // 上那一下「接受」；走了一半才超时，是对面不再读这条连接了。
+                boolean timedOut = failed instanceof SocketTimeoutException;
+                String message = stopped ? "已取消"
+                        : refused ? "对方暂时不收文件"
+                        : impostor ? "对方身份不符"
+                        : timedOut ? (moving[0] ? "对方不再回应" : "对方没有接受")
+                        // 原文（"Connection reset" 之类）只进日志：页面那行是给站在两台手机
+                        // 中间的人看的，他要知道的是「还得再试一次」，不是异常类名。
+                        : "连接被中断";
+                String title = stopped ? "已取消发送"
+                        : refused || timedOut ? "没有发出去"
+                        : impostor ? "对方身份不符"
+                        : "发送失败";
+                // 页面上那行只有几个字（磁贴很窄），通知栏里可以说完：谁、为什么、去改
+                // 哪里。这句是给「手机在别人手里」那一刻写的，所以只点名设置和屏幕。
+                String detail = refused
+                        ? peer.name + " 现在不收文件 · 把 iPhone 的隔空投送改成「所有人（10 分钟）」并保持亮屏"
+                        : impostor
+                        ? message + " · 已中止，没有发出任何内容。对方的证书若是刚换过，重新搜索一次设备再试"
+                        : timedOut
+                        ? peer.name + (moving[0]
+                                ? " 不再回应 · 保持亮屏、别切走隔空投送，再点一次设备重试"
+                                : " 没有接受 · 弹窗出现后十五秒内点「接受」；"
+                                        + "没有弹窗就把隔空投送改成「所有人（10 分钟）」并保持亮屏")
+                        : message + " · 保持两台设备都亮屏、隔空投送不切走，再点一次设备重试";
                 runOnUiThread(() -> {
                     sending = false;
+                    live = null;
+                    cancelling = false;
+                    SendSession.ended();
                     progressOf.remove(peer.name);
                     redrawProgress(peer.name);
                     status(peer, message);
+                    SendNotice.finished(this, title, detail);
+                    // 各有各的码：人按了取消是 1009，对面不收是 1008，等不到回答是 1010，
+                    // 其余（含「对方身份不符」「连接被中断」）都是失败。卡片按这个码选动画
+                    // 和那行字，不读上面那几个布尔——词表只有这一份。
+                    SendHost.finished(sendSession, peer.name,
+                            stopped ? SendHost.CANCELLED
+                                    : refused ? SendHost.REFUSED
+                                    : timedOut ? SendHost.TIMEOUT
+                                    : SendHost.FAILED,
+                            detail);
                 });
             }
         }, "opairdrop-send").start();
     }
 
-    private byte[] transfer(Peers.Peer peer, List<String> paths) throws Exception {
-        Socket raw = new Socket();
-        raw.connect(new InetSocketAddress(peer.address, peer.port), CONNECT_TIMEOUT_MS);
-        raw.setSoTimeout(READ_TIMEOUT_MS);
-        SSLSocket tls = (SSLSocket) trusting().getSocketFactory()
-                .createSocket(raw, peer.host.isEmpty() ? peer.address : peer.host, peer.port, true);
-        tls.setUseClientMode(true);
-        tls.startHandshake();
+    private byte[] transfer(Peers.Peer peer, List<String> paths, boolean[] moving) throws Exception {
+        // 每次投送都重读一次表，和接收端一样：改完设置不必重启应用，下一次点设备就是新值。
+        SettingsScreen tuned = Tuning.read(this);
+        int connectMs = (int) Tuning.ms(tuned, "client.connect_timeout_ms", CONNECT_TIMEOUT_MS);
+        int readMs = (int) Tuning.ms(tuned, "client.read_timeout_ms", READ_TIMEOUT_MS);
+        int uploadReadMs =
+                (int) Tuning.ms(tuned, "client.upload_read_timeout_ms", UPLOAD_READ_TIMEOUT_MS);
+        // 上一次记日志时的十分位。只用来去重，跨传输复用没有意义，所以是局部变量。
+        int[] quarter = {-1};
 
-        try (SSLSocket session = tls) {
+        // 第一条：/Discover 走这里，答完就作废。
+        SSLSocket[] held = {open(peer, connectMs, readMs)};
+
+        // 第二条：/Ask 和 /Upload 走这里。谁来换、什么时候换由 Rust 定——它在 /Discover
+        // 与 /Ask 之间调一次 {@code connect}——这里只负责「再连一次」这件事本身。
+        //
+        // 为什么非换不可：iPhone 一条连接只读一个请求。答完 /Discover 之后它就不读了，而
+        // socket 还开着，于是写进同一条连接的 /Ask 换回来的不是 401、不是 reset、不是关闭，
+        // 是什么都没有。本仓为此白等了整整一个读超时，界面停在「正在请求发送…」。
+        Native.Link second = () -> {
+            if (cancelling) {
+                // 人已经点了取消。再连一条只会让取消慢一步，所以让传输就地从这里失败。
+                throw new IOException("cancelled before the second connection");
+            }
+            Log.i(TAG, "second connection for /Ask");
+            closeQuietly(held[0]);
+            held[0] = null;
+            SSLSocket next = open(peer, connectMs, readMs);
+            held[0] = next;
+            return next;
+        };
+
+        try {
             return Native.sendWithProgress(
                     peer.host.isEmpty() ? peer.address : peer.host,
                     settingsText(),
                     senderName(),
                     modelName(),
+                    senderId(),
                     UUID.randomUUID().toString(),
                     paths.toArray(new String[0]),
-                    session.getInputStream(),
-                    session.getOutputStream(),
-                    (phase, sent, total) -> runOnUiThread(() -> {
-                        switch (phase) {
-                            case Native.Progress.READY -> status(peer, "已连接，正在请求发送…");
-                            case Native.Progress.WAITING -> status(peer, "等待对方接受…");
-                            case Native.Progress.SENDING -> {
-                                progressOf.put(peer.name,
-                                        total == 0 ? 0f : Math.min(1f, (float) sent / total));
-                                redrawProgress(peer.name);
-                                status(peer, "发送中 "
-                                        + (total == 0 ? 0 : sent * 100 / total) + "%");
-                            }
-                            case Native.Progress.DONE -> {
-                                progressOf.put(peer.name, 1f);
-                                redrawProgress(peer.name);
-                                status(peer, "已发送，等待确认…");
-                            }
-                            default -> {
+                    held[0].getInputStream(),
+                    held[0].getOutputStream(),
+                    second,
+                    new Native.Progress() {
+                        @Override public void name(String peerName) {
+                            // Rust 在发送线程上回调；改视图必须回到主线程。
+                            runOnUiThread(() -> showRealName(peer, peerName));
+                        }
+
+                        @Override public void report(int phase, long sent, long total) {
+                        if (phase == Native.Progress.SENDING) {
+                            // 从这一刻起等的不再是「对方要不要」，而是「那个档案收完没有」
+                            // ——人要先在对面手机上点接受，档案才可能开始落地。两个等待
+                            // 该给的耐心不一样：弹窗十五秒内就该有结果，点了接受之后不设
+                            // 上限会让人以为卡住。
+                            moving[0] = true;
+                            try {
+                                held[0].setSoTimeout(uploadReadMs);
+                            } catch (Exception noTimeout) {
+                                Log.w(TAG, "cannot lengthen the read timeout for the archive",
+                                        noTimeout);
                             }
                         }
-                    }));
+                        runOnUiThread(() -> {
+                            switch (phase) {
+                                case Native.Progress.READY -> {
+                                    Log.i(TAG, "phase ready (handshake done, asking)");
+                                    status(peer, "已连接，正在请求发送…");
+                                    SendNotice.waiting(SendActivity.this, peer.name, "已连接，正在请求发送…");
+                                    SendHost.waiting(sendSession, peer.name, "已连接，正在请求发送…");
+                                }
+                                case Native.Progress.WAITING -> {
+                                    Log.i(TAG, "phase waiting (the person has been asked)");
+                                    status(peer, "等待对方接受…");
+                                    SendNotice.waiting(SendActivity.this, peer.name, "等待对方接受…");
+                                    SendHost.waiting(sendSession, peer.name, "等待对方接受…");
+                                }
+                                case Native.Progress.SENDING -> {
+                                    progressOf.put(peer.name,
+                                            total == 0 ? 0f : Math.min(1f, (float) sent / total));
+                                    redrawProgress(peer.name);
+                                    String count = "发送中 " + (total == 0 ? 0 : sent * 100 / total) + "%";
+                                    status(peer, count);
+                                    // 页面上那行字和通知栏那句是同一句。通知里的人没在看页面，
+                                    // 所以多给一个「走到哪了」的分数：2.6 MB 里的百分比看不出还剩多久。
+                                    SendNotice.progress(SendActivity.this, peer.name,
+                                            total == 0 ? -1f : (float) sent / total,
+                                            total == 0 ? count : count + " · " + size(sent) + " / " + size(total));
+                                    // 卡片上的百分比走胶囊，第二行给的是字节数：同一句「45%」在
+                                    // 两个地方各写一遍，晚一帧就是两个数。
+                                    // 胶囊标题用真名（/Discover 带回的那个），不是 hash。
+                                    String cardName = realNames.getOrDefault(peer.name, peer.name);
+                                    SendHost.progress(sendSession, cardName,
+                                            total == 0 ? -1 : (int) (sent * 100 / total),
+                                            files.size() + " 个文件" + (total == 0 ? ""
+                                                    : " · " + size(sent) + " / " + size(total)));
+                                    // 回调每秒来几十上百次。只在一成、两成……这些整点上留痕，
+                                    // 否则一个 200 MB 的文件能把整段日志冲掉。
+                                    int step = total == 0 ? -1 : (int) (sent * 10 / total);
+                                    if (step != quarter[0]) {
+                                        quarter[0] = step;
+                                        Log.i(TAG, "phase sending " + (total == 0 ? "?"
+                                                : sent * 100 / total + "%") + " (" + sent
+                                                + "/" + total + " bytes)");
+                                    }
+                                }
+                                case Native.Progress.DONE -> {
+                                    Log.i(TAG, "phase done (all bytes written, waiting for the report)");
+                                    progressOf.put(peer.name, 1f);
+                                    redrawProgress(peer.name);
+                                    status(peer, "已发送，等待确认…");
+                                }
+                                default -> {
+                                }
+                            }
+                        });
+                        }
+                    });
+        } finally {
+            // 关最后那一条。中途换过连接的话，前一条已经在 second 里关掉了——那条连接上
+            // 已经答过一个请求，留着它没有任何用处。
+            closeQuietly(held[0]);
+            held[0] = null;
+        }
+    }
+
+    /**
+     * 连一次，握手完，返回一条能收发字节的 TLS 连接。
+     *
+     * <p>{@link #live} 在握手之前就指向裸 socket、握手之后改指 TLS 那一层：取消只有一条路
+     * ——把 socket 关掉——而握手正卡着的时候，能关的也只有下面那条。
+     *
+     * <p># 握手只认它广播的那份证书
+     *
+     * <p>上下文按对端的 {@code fingerprint} 建（{@code Identity.clientContext}），所以对面
+     * 出示的证书必须正好哈希成它在 TXT 里登出来的那个值。这不是「多一层校验」的洁癖：发现和
+     * 连接是两次独立的交换，中间谁都可以插进来先答查询、再拿自己的证书完成握手。钉住之后，
+     * 答查询的那台机器必须同时握着那张证书的私钥。
+     *
+     * <p>指纹是空的时候照常连（{@code clientContext(null)} 接受任意自签链）：TXT 分几条记录
+     * 到达，型号到了指纹可能还没到，此时拒绝发送等于把「记录还没收全」判成「对端有问题」。
+     * 代价是这一条连接没有任何东西可钉，日志里会记一行。
+     */
+    /**
+     * 开一条到对方的连接，并把它登记成「当前这条可以被取消」。
+     *
+     * <p>连接本身在 {@link #connectTls}——预查询那条不碰 live 的连接也走它，证书钉住的逻辑
+     * 因此只有一份。
+     */
+    private SSLSocket open(Peers.Peer peer, int connectMs, int readMs) throws IOException {
+        live = rawSocket(peer, connectMs, readMs);
+        try {
+            SSLSocket tls = connectTls(peer, live);
+            live = tls;
+            return tls;
+        } catch (IOException failed) {
+            closeQuietly(live);
+            live = null;
+            throw failed;
+        }
+    }
+
+    /** TCP 连接：选项在 connect 之前设，地址带 scope。预查询也用这条，不登记 live。 */
+    private static Socket rawSocket(Peers.Peer peer, int connectMs, int readMs) throws IOException {
+        Socket raw = new Socket();
+        // 两个选项都要在 connect 之前设，理由见 {@link #SEND_BUFFER}：队列的尺寸是建 socket
+        // 时定的。失败不算致命——不设也能传，只是进度会变成「写进队列了多少」。
+        try {
+            raw.setTcpNoDelay(true);
+        } catch (SocketException refused) {
+            Log.i(TAG, "tcp nodelay refused: " + refused);
+        }
+        try {
+            raw.setSendBufferSize(SEND_BUFFER);
+        } catch (SocketException refused) {
+            Log.i(TAG, "send buffer " + SEND_BUFFER + " refused: " + refused);
+        }
+        // 地址不能直接当字符串用：链路本地 IPv6 少了 scope，connect 会立刻回 EINVAL。
+        raw.connect(new InetSocketAddress(Peers.address(peer), peer.port), connectMs);
+        raw.setSoTimeout(readMs);
+        // 关掉 linger：对端先走的时候，本端已经写下去、还没被确认的那一段不该让 close 卡住。
+        try {
+            raw.setSoLinger(false, 0);
+        } catch (SocketException refused) {
+            Log.i(TAG, "so_linger refused: " + refused);
+        }
+        return raw;
+    }
+
+    /** TLS 握手 + 证书钉住。{@code raw} 由调用方拥有，失败时由调用方关。 */
+    private static SSLSocket connectTls(Peers.Peer peer, Socket raw) throws IOException {
+        if (peer.fingerprint.isEmpty()) {
+            Log.i(TAG, "no fingerprint for " + peer.name + ": the certificate cannot be pinned");
+        }
+        try {
+            SSLSocket tls = (SSLSocket) Identity.clientContext(peer.fingerprint).getSocketFactory()
+                    .createSocket(raw, peer.host.isEmpty() ? peer.address : peer.host, peer.port, true);
+            tls.setUseClientMode(true);
+            tls.startHandshake();
+            Log.i(TAG, "connected to " + peer.name + ", sndbuf " + raw.getSendBufferSize()
+                    + ", nodelay " + raw.getTcpNoDelay());
+            return tls;
+        } catch (Exception failed) {
+            // 指纹不符是这条链上唯一一种「对方不是它说的那台机器」的失败，而且它到这一层已经
+            // 被 JSSE 套了两三层。先把它捞出来换成自己的类型，界面上才不会说成「发送失败」。
+            PeerMismatch mismatch = PeerMismatch.of(failed);
+            if (mismatch != null) {
+                throw mismatch;
+            }
+            if (failed instanceof IOException) {
+                throw (IOException) failed;
+            }
+            throw new IOException("TLS did not start: " + failed, failed);
+        }
+    }
+
+    /**
+     * 后台问一台设备「你叫什么」，不开始传输。
+     *
+     * <p>只在缓存没有这台设备时跑。连接与握手走 {@link #rawSocket}/{@link #connectTls}，和真正
+     * 发送用的是同一套（证书钉住也在内），但绝不碰 {@link #live}——否则一次后台查询会把正在
+     * 传的那条连接顶掉。问完就关：{@code /Discover} 只发一条请求，对面不会弹窗。
+     */
+    private void probeName(Peers.Peer peer) {
+        if (PeerNames.get(peer) != null) {
+            return;
+        }
+        new Thread(() -> {
+            SettingsScreen tuned = Tuning.read(this);
+            int connectMs = (int) Tuning.ms(tuned, "client.connect_timeout_ms", CONNECT_TIMEOUT_MS);
+            int readMs = (int) Tuning.ms(tuned, "client.read_timeout_ms", READ_TIMEOUT_MS);
+            Socket raw = null;
+            SSLSocket tls = null;
+            try {
+                raw = rawSocket(peer, connectMs, readMs);
+                tls = connectTls(peer, raw);
+                byte[] answer = Native.discoverName(
+                        peer.host.isEmpty() ? peer.address : peer.host,
+                        settingsText(), senderName(), modelName(), senderId(),
+                        tls.getInputStream(), tls.getOutputStream());
+                String name = new String(answer, java.nio.charset.StandardCharsets.UTF_8);
+                if (!name.trim().isEmpty()) {
+                    PeerNames.put(peer, name);
+                    runOnUiThread(() -> showRealName(peer, name));
+                    Log.i(TAG, "probed name for " + peer.name + " -> " + name);
+                }
+            } catch (Exception failed) {
+                // 问不到很正常：对面锁屏、AirDrop 关了、或者还没答完。留着 hash，下一次
+                // 广播会再试。不记日志——每台设备每两秒一次，会把日志冲掉。
+            } finally {
+                closeQuietly(tls != null ? tls : raw);
+            }
+        }, "opairdrop-name-" + peer.name).start();
+    }
+
+    /** 关掉一条连接，关不掉也只是记一笔——它本来就可能是对面先关的。 */
+    private static void closeQuietly(Socket socket) {
+        if (socket == null) {
+            return;
+        }
+        try {
+            socket.close();
+        } catch (Exception alreadyGone) {
+            Log.i(TAG, "closing a connection that was already gone", alreadyGone);
         }
     }
 
@@ -834,6 +1600,26 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         if (state != null) {
             state.setText(line);
         }
+    }
+
+    /**
+     * /Discover 应答带回了对方自己起的名字：把格子下方那行 hash 换掉。
+     *
+     * <p>真名在发现阶段拿不到（iPhone 广播的 mDNS 实例名是加密的 hash），只有连上、问过
+     * /Discover 才知道。所以这里允许改变已经画出来的视图，也把真名记进 {@link #realNames}：
+     * 重建（重扫、换主题）之后那一行仍要是真名，不能退回去显示 hash。
+     */
+    private void showRealName(Peers.Peer peer, String real) {
+        if (real == null || real.trim().isEmpty()) {
+            return;
+        }
+        realNames.put(peer.name, real);
+        PeerNames.put(peer, real);
+        TextView label = nameViews.get(peer.name);
+        if (label != null) {
+            label.setText(real);
+        }
+        Log.i(TAG, "peer name from /Discover: " + peer.name + " -> " + real);
     }
 
     /** 按 {@link #progressOf} 重画某一台的环。视图可能不在（还没建或已重建）。 */
@@ -1352,6 +2138,12 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         return shape;
     }
 
+    /** 取一个颜色的 rgb，把 alpha 换成 {@code fraction}（0–1）。深浅色都从同一张表取色。 */
+    private static int alpha(int color, float fraction) {
+        return Color.argb(Math.round(Color.alpha(color) * fraction),
+                Color.red(color), Color.green(color), Color.blue(color));
+    }
+
     private int dp(float value) {
         return Math.round(value * density);
     }
@@ -1363,6 +2155,29 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             return model;
         }
         return (maker + " " + model).trim();
+    }
+
+    /**
+     * 本机在对方手机上的身份，装一次就是这一个值。
+     *
+     * <p>它**不是** `TransferID`。那个是一次传输的名字，每次点设备都会重新生成；`SenderID`
+     * 是这台设备的身份，iPhone 按它归并「同一个发送方」，所以每次换一个值等于每次都让自己
+     * 变成一个陌生设备。派生自证书（{@link Identity#senderId()}）同时拿到稳定性和「不用另存
+     * 一份」。
+     *
+     * <p>缓存不是为了省 CPU，是为了省一次密钥生成：身份不存在时 {@code loadOrCreate} 会当场
+     * 生成一份证书，那是几百毫秒；放在第二次点设备上白等没有意义。
+     */
+    private String senderId() throws IOException, GeneralSecurityException {
+        String known = senderId;
+        if (known == null) {
+            known = new IdentityStore(getFilesDir()).loadOrCreate(senderName()).senderId();
+            senderId = known;
+            // 真机上唯一能核对的东西就是这一行：两次投送之间它必须一模一样。不一样，就是接收
+            // 端把同一台手机记成了两台，而这在对面手机上是看不到原因的一串同名记录。
+            Log.i(TAG, "sender id " + known);
+        }
+        return known;
     }
 
     /** 我在这台机器上的名字：设置里的 {@code device.name}，没设就用型号。 */
@@ -1396,26 +2211,6 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             // 读不出来就用默认：这一项不是必填，而挡住发送是比默认值更坏的答案。
             return null;
         }
-    }
-
-    private static SSLContext trusting() throws Exception {
-        TrustManager[] trust = {new X509TrustManager() {
-            @Override
-            public void checkClientTrusted(X509Certificate[] chain, String authType) {
-            }
-
-            @Override
-            public void checkServerTrusted(X509Certificate[] chain, String authType) {
-            }
-
-            @Override
-            public X509Certificate[] getAcceptedIssuers() {
-                return new X509Certificate[0];
-            }
-        }};
-        SSLContext context = SSLContext.getInstance("TLS");
-        context.init(null, trust, new SecureRandom());
-        return context;
     }
 
     private static final class Report {
