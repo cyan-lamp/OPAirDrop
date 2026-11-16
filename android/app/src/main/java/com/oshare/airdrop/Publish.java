@@ -19,14 +19,15 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * 把收到的文件放进公共目录：相册、文档、音乐、下载，各一个 {@code OPAirDrop} 子目录。
+ * 把收到的文件放进公共目录：照片与视频进 {@code DCIM/AirDrop}，其余进
+ * {@code Download/AirDrop}；{@code receive.directory} 填了目录则全部进那一个。
  *
  * <p># 为什么不能直接写文件
  *
  * <p>这个应用是 {@code targetSdk 37}，从 Android 11 起，公共目录就不再是「路径」而是
  * 「媒体库里的行」：{@code File} 往 {@code /sdcard/Pictures} 里写会被 FUSE 直接拒掉。
  * 唯一的路是 {@link ContentResolver#insert} —— 先插一行，拿到内容 Uri，再往里写字节。
- * 实测过三条目标路径（{@code Pictures/}、{@code Movies/}、{@code Documents/}、
+ * 实测过四个目标路径（{@code Pictures/}、{@code Movies/}、{@code Documents/}、
  * {@code Download/}）都收，而绝对路径 {@code /sdcard/Pictures/OPAirDrop} 会被改写成
  * {@code (invalid)/sdcard/...}，所以这里只传相对路径。
  *
@@ -53,7 +54,6 @@ final class Publish {
 
     private static final String TAG = "OPAirDrop";
 
-    /** 公共目录下那一层。五类共用，所以永远是 {@code <根>/OPAirDrop}，不再往下建。 */
     /**
      * 落在公共目录下的那层文件夹名。
      *
@@ -106,8 +106,8 @@ final class Publish {
     /**
      * 页面上「接收目录」那一行，留空时显示的就是这个。
      *
-     * <p>写成一类一句而不是五个路径并排：那一行只有 13.5sp，五个
-     * {@code Xxx/OPAirDrop} 连起来是一堵墙，而人真正要认的是「照片进 Pictures」这件事。
+     * <p>写成一类一句而不是把目录并排列出来：那一行只有 13.5sp，两条
+     * {@code Xxx/AirDrop} 连起来已经是一堵墙，而人真正要认的是「照片进相册」这件事。
      */
     static String describe() {
         return "照片和视频进 " + Bucket.PHOTO.root + "/" + FOLDER + "，其余进 "

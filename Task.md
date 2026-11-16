@@ -856,6 +856,28 @@ URI，不要存储权限）。选出来的 `ClipData` 再拼成一条 `SEND_MULT
 
 ## 13. 变更日志（新的在上）
 
+- **2026-11-16 20:10**：**新增 `CHANGELOG.md` 与 `LICENSE`，顺带修掉 `Publish` 里两处过期注释。**
+
+  - **`CHANGELOG.md`**：仿 `Weverses/OPAirDrop` 的版式——一级标题 `# OPAirDrop 更新日志`，
+    每个版本一个 `## x.y.z`，条目是连着排的无序列表（不空行），末尾一段讲验收边界；不写日期。
+    内容按**代码现状**写，不照抄 `Task.md` 的旧表述：落盘那一节原先记的是「五桶
+    Pictures/Movies/Music/Documents/Download + OPAirDrop」，而 2026-11-16 起代码已经收成
+    两处（`DCIM/AirDrop` + `Download/AirDrop`），CHANGELOG 按后者写。写了 1.0.0 与 0.1.0 两条，
+    0.1.0 标明是内部基线、未发行未打 tag。
+  - **`LICENSE`**：GPL-2.0 全文（339 行 / 17,987 字节），与 `Cargo.toml` 里一直声明的
+    `license = "GPL-2.0-only"` 对齐。取的是纯正文、无附加版权行的版本，与参考仓库的做法一致
+    （它那份是 GPL-3.0 正文，同样没有前置版权声明）。注意：**随包的四个 `.ko.gz` 与
+    `wonder-ven` 不是我们的版权**，GPL-2.0 覆盖不到它们，将来若要正经分发应补一份
+    `THIRD_PARTY_NOTICES.md`，本次未做。
+  - **`Publish` 注释纠偏**（只改注释，不动行为）：类注释还写着「相册、文档、音乐、下载，各一个
+    `OPAirDrop` 子目录」，与现在的两处落点、`AirDrop` 目录名都不符；同处「实测过**三条**目标路径」
+    后面却列了四条，改成「四个」。`FOLDER` 常量上方还留着一份没删干净的旧 javadoc
+    （「五类共用，所以永远是 `<根>/OPAirDrop`」），删掉——它后面紧跟的就是新写的那份，两个
+    javadoc 相邻时前者是孤儿。`describe()` 的注释里「五个路径并排」「照片进 Pictures」一并改成现状。
+  - **构建**：`build.sh assembleDebug` 通过，`cargo test --workspace` **419 passed / 0 failed
+    （1 ignored）**——这个数字比 `Task.md` §9 里记的 377/380 新，因为此后又加过测试，此处按本次
+    实测结果记。未装机，未发 Release。
+
 - **2026-11-16 19:55**：**发布 1.0.0（versionCode 10000）——清理、去死代码、干净重编。**
 
   - **版本**：`versionName 1.0.0` / `versionCode 10000`；`Cargo.toml` workspace `version = "1.0.0"`，
