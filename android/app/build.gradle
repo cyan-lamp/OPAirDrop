@@ -34,8 +34,7 @@ android {
     // and compiling against the same platform the app targets is the only way the two cannot
     // drift. The published platform here is Android 17, which calls itself API level 37.0;
     // `platforms/android-37` is a copy of it whose `source.properties` says 37, because AGP
-    // 8.9 has no way to spell a minor level and looks the platform up by that integer. The
-    // whole story is Task.md 10.1.
+    // 8.9 has no way to spell a minor level and looks the platform up by that integer.
     compileSdk 37
 
     defaultConfig {

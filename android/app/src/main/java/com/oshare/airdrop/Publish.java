@@ -74,7 +74,7 @@ final class Publish {
      * 这一次接收的暂存目录。
      *
      * <p>建在应用自己的外部目录里：那里不需要权限，和公共目录同一个分区，而且它本来
-     * 就是这个应用唯一一直写的地方（见 {@code Task.md} 5.x）。每次一个时间戳子目录，
+     * 就是这个应用唯一一直写的地方。每次一个时间戳子目录，
      * 上一轮万一没清干净，也不会和这一轮的文件名撞上。
      */
     static File stage(Context context) throws IOException {

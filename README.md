@@ -96,7 +96,6 @@ repo-OPAirDrop/
 │   └── build.sh       一条命令出 APK：先 Rust，后 Gradle
 ├── tools/             链路拉起、抓包与真机自测脚本
 ├── CHANGELOG.md
-├── Task.md
 └── LICENSE
 ```
 
@@ -121,7 +120,6 @@ JDK、SDK 与 Gradle 都放在 `tools/` 下，脚本按名字取而不查 `PATH`
 ## 文档
 
 - [更新日志](CHANGELOG.md)：每个版本做了什么。
-- [任务书](Task.md)：架构取舍、协议事实、真机实测数据、踩过的坑与下一步。
 - [许可证](LICENSE)：GPL-2.0 全文。
 
 ## 项目标识

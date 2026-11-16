@@ -9,3 +9,9 @@ android/app/build/
 # Kept on disk because they answer "what did the screen actually look like", which is
 # the one question a log cannot. Never worth a commit.
 .workbuddy/
+
+# The engineering log: 250 KB of protocol notes, measurements, dead ends and
+# half-decided plans, written alongside the code and only useful next to it. A
+# changelog records what shipped; this records what was being thought about.
+# Kept on disk, kept out of the tree.
+Task.md

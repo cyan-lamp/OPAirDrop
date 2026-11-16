@@ -143,7 +143,8 @@ final class LiveCard {
                        android.app.PendingIntent accept, android.app.PendingIntent refuse) {
         // 高重要性，不是低：**提升成实时通知并不会让它自己出现**，会不会抬头由渠道重要性决定。
         // 2026-11-16 实测：同一条提升通知，低重要性渠道只有一颗 chip；换成高重要性渠道后它
-        // 自动展开浮在别的应用之上（前提是应用的通知设置里「横幅」勾上，见 Task.md）。
+        // 自动展开浮在别的应用之上（前提是应用的通知设置里「横幅」勾上，这一项不在本应用
+        // 的控制范围内）。
         invite(context, CHANNEL_LOUD, title, shortText, accept, refuse);
     }
 
