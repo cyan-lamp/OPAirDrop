@@ -22,3 +22,14 @@ Task.md
 android/keystore.properties
 *.jks
 *.keystore
+
+# Packet captures: 126 MB across seven files, and every question they can answer has
+# already been turned into a number in the notes. The scripts that read them are worth
+# a commit (they are the argument); the bytes underneath are not — GitHub refuses a
+# single file over 100 MB anyway, and `t1-air.pcap` alone is 48.8 MB. Kept on disk,
+# readable by the committed scripts, never in the tree.
+*.pcap
+
+# Python leaves these behind the first time anyone runs a probe.
+__pycache__/
+*.pyc
