@@ -26,6 +26,34 @@
 pub use crate::frame::TU_US;
 
 /// One availability window, in time units.
+///
+/// **16 is not a guess, and it is not ours alone.** `tools-probe/air/psfdecode.py`
+/// decodes the Synchronization Parameters TLV out of the presence frames in a capture,
+/// and on 2026-11-17 it was run over three of them (`n3-air.pcap` Xs Max 824 frames,
+/// `t1-air.pcap` iPhone 13 1486 frames, and our own side in both): every frame from
+/// every station carries `aw_period = 16`, `extended = 16`, `common = 16`, presence
+/// mode 4/4, counts `03 03 03 03`, body length **73** — byte-for-byte the shape
+/// [`crate::action::presence`] writes. Their AW counter steps **61.03 times per second**,
+/// one AW per 16.38 ms, so the grid on the air is this grid.
+///
+/// **Do not change this to move throughput.** That was tried on paper and killed by two
+/// measurements before a build was spent on it:
+///
+/// * Presence mode is already **4 of 4** — present for every AW of the slot. The amount
+///   of availability we can announce is maxed out; the AW period only changes the *unit*
+///   it is counted in. There is no larger window to offer.
+/// * The Xs Max's bursts arrive every **24.45 ms**, which is **1.49 AW** and **0.37
+///   slot** — an integer multiple of neither. A sender pacing itself against the windows
+///   this constant defines would land on 16.4 or 65.5 ms. Its period is therefore a
+///   timer of its own, and it is the same on both links (`n3` 24.45 ms, `n4` 24.50 ms)
+///   while the throughput differs by 8× — which is the sign of a constant that does not
+///   participate in the rate at all.
+/// * And it is load-bearing here: `SLOT_TU` is `AW_PERIOD_TU * PRESENCE_MODE`, so this
+///   value is what "a slot is 64 TU" means in a dozen tests (`a_slot_is_sixty_four_time_units`,
+///   `a_whole_slot_of_error_is_refused`, `every_slot_still_names_the_host_a_minute_in`, …).
+///   Doubling it fails 12 of them, all of which encode protocol facts rather than
+///   tunables. An experiment that has to rewrite the contract to run has already
+///   answered its own question.
 pub const AW_PERIOD_TU: u8 = 16;
 
 /// How many AWs a node is present for, out of the same number. Four is "always on".

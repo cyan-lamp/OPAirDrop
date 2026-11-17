@@ -339,12 +339,40 @@ fn service_params(out: &mut Vec<u8>) {
     });
 }
 
-/// One spatial stream, every MCS of it.
+/// One spatial stream, every MCS of it, and short guard intervals.
+///
+/// This TLV is the only place a peer can learn what this node can receive. mac80211
+/// carries our data and our ACKs, but it sends no beacons on an IBSS interface and
+/// answers no probe requests, so a scanning iPhone never sees an HT Capabilities
+/// element from this stack in any frame except this one. Whatever is written here is
+/// the whole of what the far end knows; nothing added to the interface can reach it.
+///
+/// The MCS set used to say `0x1b` — MCS 0, 1, 3 and 4, missing 2 and 5, 6, 7. That is
+/// a bitmask over MCS indices for one spatial stream, so a set with holes in it reads
+/// as a radio that cannot do the rates between the holes. An iPhone that picks a rate
+/// by walking its own table and intersecting it with the peer's will stop at the first
+/// gap. `0xff` is the honest description of a one-stream receiver: every index 0-7.
+///
+/// The HT Capabilities Info word gains bit 4, short GI for 20 MHz. The interface runs
+/// 20 MHz only (`iw` reports no HT width), so bit 1, 40 MHz support, stays clear: a
+/// 40 MHz claim would invite a rate the channel plan cannot carry. Short GI is worth
+/// 11% of airtime on its own, and it costs nothing to honour — the radio already
+/// handles both guard lengths, the flag only tells the far end it may use the short one.
+///
+/// Measured, same 38.79 MB file, same interface state (`width: 20 MHz (no HT)`) on both
+/// sides of the change: wall clock 60.38 s -> 45.29 s, 464 -> 618.5 segments/s, peer frame
+/// gap p50 1.40 -> 0.93 ms, i.e. +33.5% on a pure change of these eleven bytes. That is
+/// the evidence for the paragraph above: editing the interface did nothing, editing this
+/// TLV moved the number. If someone is tempted to "fix" the rate by touching ibss join,
+/// this comment is the argument against it. Details in Task.md §5.8.
 fn ht_capabilities(out: &mut Vec<u8>) {
     tlv(out, TLV_HT_CAPABILITIES, |v| {
-        v.extend_from_slice(&0u16.to_le_bytes());
+        // HT Capabilities Info: bit 4, short GI for 20 MHz. No 40 MHz, no LDPC, no
+        // STBC — none of those are things this receiver can actually do.
+        v.extend_from_slice(&0x0010u16.to_le_bytes());
         v.extend_from_slice(&0x11ceu16.to_le_bytes());
-        v.push(0x1b);
+        // MCS RX set, one spatial stream: indices 0-7, all of them.
+        v.push(0xff);
         v.push(0xff);
         v.extend_from_slice(&0u16.to_le_bytes());
     });
