@@ -452,23 +452,79 @@ load_stack() {
     mark qca-swapped
     insmod "$BASE/opairshare_wonder_provider.ko" || return 11
     mark provider-added
-    # turbo default: phy=2 (HT), mcs=7, A-MSDU 4 x 6000. `turbo-fast` in the old
-    # module used mcs=4; measured 20.8% retransmits at mcs=8 vs 0.9% at mcs=4
-    # when the STA shares the channel, so if throughput disappoints, this is the
-    # knob — not the app.
+    # --- the throughput tuning set, 2026-11-18 -----------------------------------
+    #
+    # This block is the measured best, not a guess. Same 24.7 MB video, same phone,
+    # same receiver, 1-second granularity on `awdltun0/tx_bytes`:
+    #
+    #   2.08 MB/s   A-MSDU 4x6000, nss=1, capacity=32
+    #   2.25 MB/s   A-MSDU 5x7935, nss=2, capacity=32
+    #   2.59 MB/s   A-MSDU 5x7935, nss=2, capacity=256   <- this file
+    #   3.24 MB/s   the same run, steady state (last 6 s); peak 3.48
+    #
+    # The single change between the last two rows was capacity 32 -> 256 /
+    # lowmark 16 -> 128, and it bought +15% average / +30% steady. It looks
+    # backwards -- a deeper queue on a 17 ms link -- but the queue was not
+    # buffering, it was throttling: `wma_opairshare_pas_mgmt.h:1403` stops the
+    # flow once `opairshare_bridge_pending >= passthru_awdl_capacity`, and at 32
+    # that put the TCP congestion window at ~34 segments (2.2 MB/s x 20.6 ms /
+    # 1386 B). Window headroom was 89 KB, i.e. 5.0 MB/s. The queue, not the air,
+    # was the ceiling.
+    #
+    # nss=2 is what the 3.2 MB/s snapshot actually ran (`opairshare_tx_pack_stats`
+    # printed `nss=2`); this file had never set it, so every measurement before
+    # 2026-11-18 was single-stream and half the airtime. `phy=2` (HT) is what makes
+    # the second stream legal, and `iw ... ibss join ... HT20` below is what makes
+    # phy=2 reachable -- a NOHT vdev silently pins the rate to the highest legacy
+    # mandatory rate, 24 Mb/s.
+    #
+    # A-MSDU 5 x 7935: 7935 is the largest value the driver accepts, and the 5th
+    # slot only fits because the PPDU is HT (`:477` — a non-HT PPDU may not carry
+    # an MPDU above 2346 octets). Before the HT20 join `p5` was 0; after it, 5878
+    # packets. Bigger is *not* automatically better: 4x6000 gives 4150 B per
+    # aggregate at 27.8 ms, 5x7935 gives 5641 B at 41.5 ms on a NOHT link, which is
+    # why the pair only pays off together with HT20 (now 17.2 ms at 5x7935).
+    #
+    # collect_us=1500 turns the aggregation timer on. At 0
+    # `opairshare_collect_delay_locked()` returns on its first line, so an A-MSDU
+    # ships only when the ring happens to fill: 3.6 msdu/agg, `deferrals` 0. At
+    # 1500 the timer defers and the average went to 4.54 msdu/agg.
+    #
+    # retry=0 and tid=-1 are negative results, kept as defaults because both were
+    # measured to hurt:
+    #   * `passthru_awdl_retry=1` (link-layer NO_ACK retransmit) maps 1:1 onto the
+    #     drop counter (+590 retransmits / +590 `status3`, `retry_gaveup=0`): it
+    #     resends the same frame inside the same 28 ms slot, so it cannot recover a
+    #     loss and still burns the slot.
+    #   * `passthru_awdl_tid=100` (QoS byte rotating 0..7) splits the BlockAck
+    #     session per TID; the iPhone then reorders per TID and the sender's
+    #     `ssthresh` collapsed 1400 -> 28, 2.08 -> 0.93 MB/s.
+    #
+    # These are module parameters, so insmod is the durable way to set them: they
+    # are correct from the first frame, before any traffic exists. (`apply_tuning`
+    # below re-asserts them at runtime for the paths that skip the reload.)
+    TUNE_INSMOD="
+        passthru_awdl_amsdu=2 passthru_awdl_amsdu_max=5 passthru_awdl_amsdu_bytes=7935
+        passthru_awdl_collect_us=1500
+        passthru_awdl_phy=2 passthru_awdl_mcs=7 passthru_awdl_rate_mbps=54 passthru_awdl_nss=2
+        passthru_awdl_capacity=256 passthru_awdl_lowmark=128 passthru_awdl_backpressure=1
+        passthru_awdl_attempts=3 passthru_awdl_retry=0 passthru_awdl_retry_max=8
+        passthru_awdl_retry_budget_ms=500
+        passthru_awdl_ba_window=64 passthru_awdl_addba=1 passthru_awdl_ack_policy=0
+        passthru_awdl_ackfilter=0 passthru_awdl_tid=-1 passthru_awdl_host_seq=1
+        passthru_awdl_rx_order_ms=0"
+    # shellcheck disable=SC2086  # word splitting is the point: one insmod argument per word
     insmod "$BASE/qca_cld3_peach_v2.ko" \
         passthru_awdl_addba=1 passthru_awdl_native_rx=1 passthru_ht=1 passthru_fwtype=7 \
         passthru_mon_rings=0 passthru_dry_run=0 passthru_mon_chan_sync=1 passthru_ndi_peer=1 \
         passthru_ndi_no_up=1 passthru_mgmt_bridge=1 passthru_aux_monitor=1 passthru_tx_audit=1 \
         passthru_ndi_fw_authorize=0 passthru_awdl_wmi_raw=1 passthru_awdl_target_mac="" \
         passthru_awdl_target_auto=1 passthru_awdl_target_enable=1 passthru_awdl_target_auth=2 \
-        passthru_native_data_rx=1 passthru_awdl_backpressure=1 passthru_awdl_raw_rx=1 \
-        passthru_awdl_rate_mbps=54 passthru_awdl_host_seq=1 passthru_awdl_rx_dedup=1 \
-        passthru_awdl_attempts=3 passthru_awdl_rx_auto=1 passthru_awdl_rx_rearm=1 \
+        passthru_native_data_rx=1 passthru_awdl_raw_rx=1 passthru_awdl_rx_dedup=1 \
+        passthru_awdl_rx_auto=1 passthru_awdl_rx_rearm=1 \
         passthru_sta_coexist=3 passthru_sta_regular_rx=1 passthru_sta_action_rx=1 \
         passthru_pas_discovery_actions=1 \
-        passthru_awdl_amsdu=2 passthru_awdl_amsdu_max=4 passthru_awdl_amsdu_bytes=6000 \
-        passthru_awdl_phy=2 passthru_awdl_mcs=7 \
+        $TUNE_INSMOD \
         || return 12
     rmmod mac80211 || return 13
     mark mac-swapped
@@ -620,6 +676,76 @@ wait_sta() {
     return 1
 }
 
+# The tuning set, re-asserted at runtime.
+#
+# `load_stack` passes every one of these to insmod, and on a cold boot that is the
+# only place they need to exist -- the values are right before the first frame is
+# built. This exists for the paths that do not reload: `start`/`boot` when the
+# stack is already swapped for this boot id, a bare `link`, and the case where an
+# older build's script left a module loaded with the previous numbers. A stale
+# `capacity` is not cosmetic -- 32 instead of 256 is 2.25 vs 2.59 MB/s -- so
+# "already loaded" is worth one read-back rather than an assumption.
+#
+# A refused write is reported, not retried: `backpressure` is compiled in (0444)
+# and everything else is writable. A value that reads back different from what was
+# written means the driver clamped it, which is the one thing worth knowing.
+TUNE_RUNTIME="amsdu=2 amsdu_max=5 amsdu_bytes=7935 collect_us=1500 phy=2 mcs=7
+    rate_mbps=54 nss=2 capacity=256 lowmark=128 attempts=3 retry=0 retry_max=8
+    retry_budget_ms=500 ba_window=64 ack_policy=0 ackfilter=0 tid=-1 host_seq=1
+    rx_order_ms=0"
+
+passthru_dir() { echo /sys/module/qca_cld3_peach_v2/parameters; }
+
+apply_tuning() {
+    P=$(passthru_dir)
+    [ -d "$P" ] || return 0
+    bad=
+    for kv in $TUNE_RUNTIME; do
+        k=${kv%%=*}
+        v=${kv#*=}
+        f="$P/passthru_awdl_$k"
+        [ -w "$f" ] || continue
+        printf '%s' "$v" > "$f" 2>/dev/null || { bad="$bad $k=refused"; continue; }
+        got=$(cat "$f" 2>/dev/null)
+        # bools read back as Y/N, so accept either spelling of the same intent.
+        case "$v" in
+            1) { [ "$got" = 1 ] || [ "$got" = Y ]; } || bad="$bad $k=$got" ;;
+            0) { [ "$got" = 0 ] || [ "$got" = N ]; } || bad="$bad $k=$got" ;;
+            *) [ "$got" = "$v" ] || bad="$bad $k=$got" ;;
+        esac
+    done
+    if [ -n "$bad" ]; then
+        say "TUNING_MISMATCH${bad}"
+    else
+        say 'TUNING ok'
+    fi
+
+    # Backlog. A transfer stopped mid-flight leaves frames owned by the bridge
+    # worker, and the next `send` queues behind them. `opairshare_bridge_pending`
+    # is read-only (0444), so this cannot clear the count -- what it can do is
+    # wait for the worker to drain it, which is what actually happens once the
+    # flow is resumed, and say so when it does not. A number that stays put is
+    # the difference between "slow first transfer" and "the link is wedged".
+    first=$(cat "$P/opairshare_bridge_pending" 2>/dev/null)
+    case "$first" in
+        ''|0) ;;
+        *)
+            n=0
+            while [ "$n" -lt 10 ]; do
+                [ "$(cat "$P/opairshare_bridge_pending" 2>/dev/null)" = 0 ] && break
+                sleep 0.3
+                n=$((n + 1))
+            done
+            now=$(cat "$P/opairshare_bridge_pending" 2>/dev/null)
+            if [ "$now" = 0 ]; then
+                say "BRIDGE_BACKLOG drained ($first -> 0)"
+            else
+                say "BRIDGE_BACKLOG stuck=${now:-?} (was $first); a stopped flow is holding it"
+            fi
+            ;;
+    esac
+}
+
 link_up() {
     phy=$(find_wonder_phy) || { say 'wonder wiphy not present (did wonder.ko load?)'; return 1; }
     say "wonder_phy=$phy"
@@ -731,10 +857,20 @@ link_up() {
         say 'ibss already joined'
     else
         iw dev "$AWDL_IF" ibss leave 2>/dev/null
+        # HT20 is load bearing for throughput, not decoration. Without it the
+        # join lands on NL80211_CHAN_WIDTH_20_NOHT (`iw dev wonder0 info` says
+        # `width: 20 MHz (no HT)`), and every HT rate handed down afterwards is
+        # ignored by firmware: `wonder-ven rate 1 0 1 2 7` still logs
+        # `nss:2 mcs:7` at the vdev, yet the measured air rate stays at the
+        # highest *mandatory* legacy rate, 24 Mbps (band_config.c keeps only
+        # 6/12/24 as mandatory in 5 GHz). That is the whole 2 MB/s ceiling:
+        # 4200 B / 24 Mbps + 0.6 ms = 2.0 ms per aggregate. Asking for HT20 at
+        # join is the only way to make the vdev HT -- the tx_param and
+        # fixed-rate paths cannot promote a non-HT vdev on their own.
         # fixed-freq is load bearing: without it mac80211 keeps rescanning to
         # merge with other IBSS networks of the same SSID, taking the radio off
         # this channel every 30s.
-        iw dev "$AWDL_IF" ibss join "$AWDL_SSID" "$freq" fixed-freq "$AWDL_BSSID" 2>/dev/null \
+        iw dev "$AWDL_IF" ibss join "$AWDL_SSID" "$freq" HT20 fixed-freq "$AWDL_BSSID" 2>/dev/null \
             || say 'ibss join failed'
         wait_carrier "$AWDL_IF" || say 'carrier still down after 10s'
     fi
@@ -753,6 +889,11 @@ link_up() {
     # reintroduced by ordering instead of by a constant. A failure above leaves
     # the previous note alone, which still describes the radio as it stands.
     echo "$freq" > "$BASE/link-freq" 2>/dev/null
+    # Last, not first: the parameters describe how to build a frame on a link that
+    # exists. Running this after the join means the read-back also proves the
+    # values survived the vdev coming up, which is where HT20 and nss=2 get their
+    # teeth.
+    apply_tuning
     say "AWDL_LINK_UP iface=$AWDL_IF freq=$freq source=$freq_source ll=${ll:-none}"
 }
 

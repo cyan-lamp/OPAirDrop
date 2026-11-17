@@ -16,6 +16,11 @@ android/app/build/
 # Kept on disk, kept out of the tree.
 Task.md
 
+# Snapshots taken before a rewrite of that log. Same reasoning, and they exist so
+# that a conclusion which got compressed away can still be found again -- which is
+# a job for the disk, not for the archive.
+Task-archive-*.md
+
 # Release signing. The key already lives outside the tree; this keeps its password
 # and any stray keystore that gets dropped in here from reaching the archive, where
 # the only fix is rotating the key for every clone.
