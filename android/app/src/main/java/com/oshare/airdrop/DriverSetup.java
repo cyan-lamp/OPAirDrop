@@ -284,19 +284,22 @@ public final class DriverSetup {
     }
 
     /**
-     * A name as one shell word.
+     * A shell word for the name, without deciding what a name may contain.
      *
-     * <p>Everything outside {@code [A-Za-z0-9._-]} is dropped rather than escaped: the name
-     * becomes the daemon's mDNS host, and an apostrophe in it would have to survive an
-     * {@code su -c} string, a {@code sh -c} string and whatever `--name` does with it. Dropping
-     * is the option with one failure mode.
+     * <p>It used to keep only {@code [A-Za-z0-9._-]} and delete the rest, which meant a phone
+     * called {@code 青(Air)} reached the daemon as {@code Air} and one called {@code 青} reached
+     * it as nothing at all — silently, because the argument was still well formed. The name
+     * travels to the MIF of every presence frame, so a wrong one is not cosmetic.
+     *
+     * <p>Control characters go, and only those: the string is spliced into a multi-line
+     * {@code su -c} command, where a newline would end the script and start a second one.
      */
     static String quote(String name) {
         if (name == null) {
             return "''";
         }
-        String safe = name.replaceAll("[^A-Za-z0-9._-]", "");
-        return "'" + safe + "'";
+        String cleaned = name.replaceAll("\\p{Cntrl}", "");
+        return "'" + cleaned.replace("'", "'\\''") + "'";
     }
 
     private static String read(InputStream in) throws IOException {

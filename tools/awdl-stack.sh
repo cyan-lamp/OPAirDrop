@@ -324,6 +324,47 @@ mem_avail_kb() {
     sed -n 's/^MemAvailable: *\([0-9][0-9]*\) kB/\1/p' /proc/meminfo 2>/dev/null
 }
 
+# Largest free block in the Normal zone as a buddy order (0 = 4 KB or nothing).
+#
+# This, not `MemAvailable`, is the number that decides whether `insmod wonder`
+# can register: see `defrag_memory`.
+mem_max_order() {
+    awk '/zone +Normal/ { for (i = NF; i > 4; i--) if ($i != 0) { print i - 5; exit } }' \
+        /proc/buddyinfo 2>/dev/null
+}
+
+# Makes contiguous memory available before `insmod wonder`.
+#
+# `ieee80211_txq_setup_flows()` allocates `fq->flows` as a single block (8192
+# flows, ~1 MB, i.e. order 8 on this 4K-page kernel) and returns -ENOMEM when
+# the buddy lists hold nothing that large. Measured 2026-11-17 on the Normal
+# zone, with 6 GB MemAvailable and 4.7 GB of it page cache:
+#
+#     129329 63105 7962 930 21 4 1 0 0 0 0      <- orders 0..10, order 6+ empty
+#
+# Six `insmod` attempts, six seconds of backoff and a stopped HAL later, every
+# one still failed with `ieee80211_txq_setup_flows+0x1e8` under
+# `ieee80211_register_hw` -- so the retry was treating a fragmentation problem
+# as a transient one. Dropping the clean page cache and asking for compaction
+# took the same zone to
+#
+#     180383 117747 51894 19149 8695 3081 708 151 86 61 78
+#
+# (86 blocks at order 8, 78 at order 10) and the next `insmod` registered its
+# wiphy on the first attempt. Hence this runs before the first attempt instead
+# of being hoped for between attempts.
+#
+# Both writes are global but harmless: drop_caches drops only clean cache,
+# compact_memory migrates only movable pages. Best effort -- `insmod` decides.
+defrag_memory() {
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+    echo 1 > /proc/sys/vm/compact_memory 2>/dev/null
+    # The sysfs write runs compaction synchronously; the pause is what the
+    # measurement above was taken with, and costs one second of a cold path.
+    sleep 1
+}
+
 # Stops the vendor Wi-Fi HAL and waits for it to be stopped.
 #
 # Called for two different reasons, which is why it is not named after one of
@@ -454,9 +495,14 @@ load_stack() {
     # while `warn_alloc` / `__alloc_pages_slowpath` sat next to
     # `ieee80211_txq_setup_flows+0x1e8` in the trace, i.e. `ieee80211_register_hw`
     # ran out of memory. Four attempts at three seconds did not outlast it, so
-    # this goes to six with a backoff, and prints MemAvailable on each failure:
-    # the number is what tells the two apart next time -- a leaking HAL leaves
-    # figures in the hundreds of MB, a phone under pressure does not.
+    # this went to six with a backoff. Measured again 2026-11-17: six attempts
+    # did not outlast it either, because the shortage is contiguous memory and
+    # no amount of waiting creates it. `defrag_memory` is now called before the
+    # first attempt and between attempts, and the retry prints the largest free
+    # buddy order -- that is the number that separates the two causes: a leaking
+    # HAL shows up as plenty of order-10 blocks with the insmod still failing,
+    # fragmentation shows up as order 6+ empty with MemAvailable in the GB.
+    defrag_memory
     stop_hal || say 'HAL would not stop; wonder.ko may fail to register'
     n=0
     delay=3
@@ -469,7 +515,8 @@ load_stack() {
             say 'wonder.ko loaded but registered no wiphy; see dmesg for wonder_probe'
             return 16
         fi
-        say "wonder registered no wiphy (mem=${mem_avail_kb}k); retry $n in ${delay}s"
+        say "wonder registered no wiphy (mem=$(mem_avail_kb)k max_order=$(mem_max_order)); retry $n in ${delay}s"
+        defrag_memory
         sleep "$delay"
         delay=$((delay + 2))
     done
@@ -1374,7 +1421,10 @@ cmd_exclusive() {
 
 case "${1:-status}" in
     start) cmd_start ;;
-    boot) cmd_boot ;;
+    # The arguments are passed on: `cmd_boot` reads `$2` as the name the app wants
+    # announced, and a call with no arguments leaves the function's `$2` empty --
+    # which is how `boot 'Air'` used to start a daemon called `OPAirDrop`.
+    boot) cmd_boot "$@" ;;
     stop) cmd_stop ;;
     link) link_up ;;
     share) cmd_share ;;
