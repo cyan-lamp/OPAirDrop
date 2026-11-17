@@ -1,15 +1,42 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  磁贴图标：**同一组路径**，只把视口收紧。
+  控制中心磁贴【AirDrop】的图标。
 
-  应用图标（`ic_launcher_foreground`）画在 108×108 的网格上，但那一点两环只占中间约 48×48
-  的区域（四周留 30 是自适应图标的安全边）。控制中心按 24dp 画这个 drawable，于是整幅图里只有
-  六成是实心——看起来就比旁边那些图标小一圈。
+  ====== 它为什么是单独一份，而不是复用应用图标 ======
 
-  这里没有重画任何一条曲线：路径原样搬过来，外面套一个 `translate(-30,-30)`，视口从 108 收到
-  48。图形因此铺满那一格，占比和系统图标一致。
+  同一组路径，区别只在 viewport：应用图标那份四周留了余量（观感上要能在桌面格子中间呼吸），
+  直接塞进磁贴那一格会比旁边的系统图标小一圈。这份把 viewport 收到 48 并让图形顶格画，
+  于是描到磁贴槽位里时占满那一格。
+
+  ====== 为什么是 1.04 倍，而不是 1.2 倍 ======
+
+  想再放大 20%，做不到：槽位是硬的。实测（一加 13 / PJZ110，640dpi，1440x3168）：
+
+    · 每单位 = 2.043px。图形最外直径 46 单位，viewport 48  =>  槽位 98px（24.5dp）；
+    · 改前图形 46 单位  =>  94px。也就是说它本来就占掉了槽位的 96%；
+    · 1.2 倍需要 94 x 1.2 = 112.8px，比槽位多 14.7px，每边多 7.4px。
+
+  这一点用探针验过（在 48 的 viewport 里再套一层 scale 1.2，pivot 取圆心 54）：量到 98x98px，
+  而且外圈两道圆弧的左上、右上被切成了直线，整枚图标变成八角形。98px 就是系统给的边界，
+  超出的部分不是被缩回去，是被裁掉。
+
+  所以这里取的是不裁切的上限：23 x 1.04 = 23.92，外圆落在 0.08..47.92，距 viewport 边还有
+  0.16px 的余量（留给抗锯齿）。再往上就开始缺角，而缺角在磁贴里比小一圈更难看。
+
+  顺带记两条死路，免得以后再来一遍：
+
+    · 改 android:width/height（试过 24dp -> 28.8dp）：系统把图标 setBounds 到固定的 24dp
+      槽位，根本不读固有尺寸。重启 SystemUI 之后量到的像素一个不差，仍是 94x89。
+    · 在视口里放大到 1.2 以上：见上，裁边。
+
+  ====== 为什么 scale 绕 (54,54) 而不是绕视口中心 ======
+
+  路径是照 (54,54) 这一个圆心写出来的一组同心弧（外圆 r23、内环 r17.5、中心点 r6.5）。
+  绕圆心缩放，三条弧的同心关系不变；绕 (24,24) 缩放会把它们各自推开，圆心就对不上，
+  两道缺口会歪。外层的 translate(-30,-30) 负责把圆心 (54,54) 挪到 viewport 中心 (24,24)。
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="24dp"
     android:height="24dp"
     android:viewportWidth="48"
@@ -17,24 +44,30 @@
     <group
         android:translateX="-30"
         android:translateY="-30">
-        <path android:pathData="
-            M47.5,54 a6.5,6.5 0 1 0 13,0 a6.5,6.5 0 1 0 -13,0 Z
-            M42.5,73.92 A23,23 0 1 1 65.5,73.92
-            L62.75,69.16 A17.5,17.5 0 1 0 45.25,69.16 Z
-            M41.13,71.54 a2.75,2.75 0 1 0 5.5,0 a2.75,2.75 0 1 0 -5.5,0 Z
-            M61.38,71.54 a2.75,2.75 0 1 0 5.5,0 a2.75,2.75 0 1 0 -5.5,0 Z
-            M46.63,66.77 A14.75,14.75 0 1 1 61.38,66.77
-            L58.63,62.01 A9.25,9.25 0 1 0 49.38,62.01 Z
-            M45.25,64.39 a2.75,2.75 0 1 0 5.5,0 a2.75,2.75 0 1 0 -5.5,0 Z
-            M57.25,64.39 a2.75,2.75 0 1 0 5.5,0 a2.75,2.75 0 1 0 -5.5,0 Z">
-            <aapt:attr name="android:fillColor" xmlns:aapt="http://schemas.android.com/aapt">
-                <gradient
-                    android:type="linear"
-                    android:startX="30" android:startY="26"
-                    android:endX="78" android:endY="82"
-                    android:startColor="#FF47A3F8"
-                    android:endColor="#FF1B5CF0" />
-            </aapt:attr>
-        </path>
+        <group
+            android:scaleX="1.04"
+            android:scaleY="1.04"
+            android:pivotX="54"
+            android:pivotY="54">
+            <path android:pathData="
+                M47.5,54 a6.5,6.5 0 1 0 13,0 a6.5,6.5 0 1 0 -13,0 Z
+                M42.5,73.92 A23,23 0 1 1 65.5,73.92
+                L62.75,69.16 A17.5,17.5 0 1 0 45.25,69.16 Z
+                M41.13,71.54 a2.75,2.75 0 1 0 5.5,0 a2.75,2.75 0 1 0 -5.5,0 Z
+                M61.38,71.54 a2.75,2.75 0 1 0 5.5,0 a2.75,2.75 0 1 0 -5.5,0 Z
+                M46.63,66.77 A14.75,14.75 0 1 1 61.38,66.77
+                L58.63,62.01 A9.25,9.25 0 1 0 49.38,62.01 Z
+                M45.25,64.39 a2.75,2.75 0 1 0 5.5,0 a2.75,2.75 0 1 0 -5.5,0 Z
+                M57.25,64.39 a2.75,2.75 0 1 0 5.5,0 a2.75,2.75 0 1 0 -5.5,0 Z">
+                <aapt:attr name="android:fillColor">
+                    <gradient
+                        android:type="linear"
+                        android:startX="30" android:startY="26"
+                        android:endX="78" android:endY="82"
+                        android:startColor="#FF47A3F8"
+                        android:endColor="#FF1B5CF0" />
+                </aapt:attr>
+            </path>
+        </group>
     </group>
 </vector>

@@ -200,7 +200,7 @@ final class SettingsPage {
             if (file.delete() || !file.exists()) {
                 host.recreate();
             } else {
-                chrome.say("删不掉：" + file.getAbsolutePath(), S.red);
+                chrome.say("删不掉：" + file.getAbsolutePath());
             }
         });
         page.addView(delete, chrome.margins(0, 0));
@@ -227,7 +227,7 @@ final class SettingsPage {
 
         TextView revert = chrome.ghostButton("还原", view -> {
             if (!screen.dirty()) {
-                chrome.say("没有改动", S.textDim);
+                chrome.say("没有改动");
                 return;
             }
             ask("放弃诊断的改动？", "回到上次保存的内容。", "放弃", () -> {
@@ -295,8 +295,9 @@ final class SettingsPage {
 
         for (SettingsScreen.Section section : screen.sections()) {
             // 发现、发送、接收三块都撤了：发现没有可拨的，发送没有可设的，接收里唯一还用的
-            // 「接收文件保存位置」已移到功能页的【保存位置】板块。设备那两行（名字/机型）也
+            // 「接收文件保存位置」已移到功能页的【保存位置】板块。设备名（对端看到的名字）也
             // 移到功能页，改名【设备显示】——都是「拨一下就换对端看到什么」的行为，归到一处。
+            // 那一页原来还有一行改机型，已撤（理由见 FeaturePage.deviceCard）。
             // 这一页只剩诊断和关于。
             String heading = section.title();
             if ("发现".equals(heading) || "发送".equals(heading)
@@ -332,12 +333,17 @@ final class SettingsPage {
         body.addView(chrome.sectionTitle("关于"), chrome.margins(4, 0));
         body.addView(aboutCard(), chrome.margins(0, 16));
 
-        // 这一页写的是哪个文件，放在最后：「我的设置去哪了」是一个关于路径的问题，而这个应用
-        // 里没有第二个地方能读到路径。
-        TextView footer = chrome.caption(
-                rows.size() + " 行 → " + SettingsFile.of(host).getAbsolutePath());
-        footer.setPadding(chrome.dp(6), chrome.dp(4), chrome.dp(6), 0);
-        body.addView(footer);
+        // 这一行原来是「N 行 → /data/user/0/com.oshare.airdrop/files/settings.conf」。
+        //
+        // 撤掉它有三条理由，按分量排：
+        //
+        // 1. 它答的是一个几乎没人问的问题。设置文件的路径是排障时才需要的东西，而排障的人
+        //    手里有 adb 和日志，不靠在设置页最后一行找。对其他人来说那是一行十六进制的噪音。
+        // 2. 它是这一页唯一一个不吃页面栅格的东西——卡里的字从 36dp 起笔（页面 18 + 卡内
+        //    18），这一行挂着 6dp 的内边距，从 24dp 起笔。它长得像一条脚注，但位置上像是
+        //    另一层的内容，于是看着总有一点没对齐。
+        // 3. 「N 行」这个数没有任何用处：行数是表决定的，不是人改得动的，写出来既不能验证
+        //    什么也不能操作什么。
     }
 
     /**
@@ -608,7 +614,7 @@ final class SettingsPage {
         try {
             problems = screen.save();
         } catch (IOException failed) {
-            chrome.say("没保存成功：" + failed.getMessage(), S.red);
+            chrome.say("没保存成功：" + failed.getMessage());
             return;
         }
 
@@ -621,7 +627,7 @@ final class SettingsPage {
             // 之后发的那个文件，日志里一行报文都不会多——旋钮看着转动了，线还没接上。
             Log.reload(host);
             refreshLevelHint();
-            chrome.say("已保存", S.green);
+            chrome.say("已保存");
             return;
         }
 
@@ -629,7 +635,7 @@ final class SettingsPage {
         for (String problem : problems) {
             mark(problem);
         }
-        chrome.say("有 " + problems.size() + " 项需要改正，一项都没写入", S.red);
+        chrome.say("有 " + problems.size() + " 项需要改正，一项都没写入");
     }
 
     /** 把一条拒绝（形如 {@code key: 说明}）写到它点名的那一行下面。 */
@@ -638,12 +644,12 @@ final class SettingsPage {
         if (colon < 0) {
             // 没有键的消息意味着页面和库对一个谁都不认领的值有分歧——那是 bug 不是手误，所以
             // 整条照原样显示。
-            chrome.say(problem, S.red);
+            chrome.say(problem);
             return;
         }
         Row row = rows.get(problem.substring(0, colon));
         if (row == null) {
-            chrome.say(problem, S.red);
+            chrome.say(problem);
             return;
         }
         row.problem.setText(problem.substring(colon + 2));

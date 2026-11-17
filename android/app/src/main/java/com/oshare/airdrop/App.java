@@ -33,6 +33,11 @@ public final class App extends Application {
         Log.i(TAG, "process started: " + BuildConfig.VERSION_NAME + " (" + BuildConfig.VERSION_CODE
                 + ") on " + Build.MANUFACTURER + " " + Build.MODEL
                 + ", Android " + Build.VERSION.RELEASE + " / SDK " + Build.VERSION.SDK_INT);
+        // 再写一条只有这里说得清的状态：系统让不让这个进程在后台活着。它不是运行时权限，不在
+        // dumpsys package 的权限表里，于是成了排问题时最容易被漏掉的一条——2026-11-17 那次
+        // 「iPhone 一点接收，流体云通知自己就关了」查到最后就是它：ColorOS 在应用离开前台的
+        // 同一毫秒关掉了 8770 上那条 socket。有这一行，下次不必再靠抓包才能看见。
+        Log.i(TAG, "background running: " + (Notices.awake(this) ? "allowed" : "restricted"));
         // 不传页面：这里没有页面，也不该碰任何一个页面正在用的观察者。
         ReceiveService.follow(this);
     }

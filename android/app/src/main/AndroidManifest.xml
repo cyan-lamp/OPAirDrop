@@ -49,6 +49,21 @@
          而且无论怎么 `appops set allow` 都改不动，因为那条 AppOp 是跟着这条权限走的。 -->
     <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
 
+    <!-- 「允许后台运行」。这一条不是运行时权限，它是一枚**能自己弹框的凭证**：电池优化白名单
+         只有系统能改，而 Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS 那个确认框要求
+         发起方持有本条权限。不声明它，startActivity 抛 SecurityException，人看到的是「点了没
+         反应」——比不弹框更糟，因为它看起来像我们写了但没生效。
+         
+         为什么非进这个名单不可：2026-11-17 实测，ColorOS 的 nwpower 在应用一离开前台就打印
+         `Close socket:[10456] cause:App bg(IMMEDIATELY)`，同一毫秒抓包里是本机发出的 RST。
+         于是 iPhone 点发送、邀请正常弹出、人点接收——那一刻 socket 已经断了 3.4 秒，客户端
+         只拿到 Software caused connection abort，界面表现为「流体云通知自己关了」。
+         把本应用写进 deviceidle 白名单之后，同样的动作两次都完整跑完了（0% → 100% →
+         `接收完成 · 2 份 · 2.9 MiB`）。
+         
+         前台服务挡不住这一层：出事那次 dumpsys 里服务明确标着 fg-service，它照掐。 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <application
         android:name=".App"
         android:allowBackup="false"
@@ -134,6 +149,16 @@
             android:exported="false"
             android:label="@string/about_title"
             android:parentActivityName=".MainActivity" />
+
+        <!-- The licence full text, opened from the about page. Not exported for the same
+             reason as AboutActivity: nothing outside this app should be able to push a page
+             in front of the user. parentActivityName points at AboutActivity, not at the
+             main window, so the system's "up" lands where the person came from. -->
+        <activity
+            android:name=".LicenseActivity"
+            android:exported="false"
+            android:label="@string/license_title"
+            android:parentActivityName=".AboutActivity" />
 
         <!-- The receiver's foreground identity: started when something says we should be
              listening (the control-centre window, or OShare's own everyone mode) and stopped

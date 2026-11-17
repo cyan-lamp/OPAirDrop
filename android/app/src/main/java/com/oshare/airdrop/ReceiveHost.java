@@ -311,6 +311,14 @@ final class ReceiveHost {
         /** 结果已经说过了。收尾不再覆盖它。 */
         private boolean settled;
 
+        /**
+         * 最后一次说出去的进度；负数表示对端什么都没声明。
+         *
+         * <p>留着它是为了失败卡：一条断在中途的连接，轨道该停在她真正走到的那个数上，而不是
+         * 拉满（失败画成功）也不该转圈（那是「还在动」）。见 {@link LiveCard#failed}。
+         */
+        private int percent = -1;
+
         /** 最后说出去的那条，用来重放。跨线程读，所以是 volatile。 */
         private volatile JSONObject last;
 
@@ -443,7 +451,7 @@ final class ReceiveHost {
                 return;
             }
             try {
-                int percent = total > 0 ? (int) Math.min(100L, done * 100L / total) : -1;
+                percent = total > 0 ? (int) Math.min(100L, done * 100L / total) : -1;
                 if (cloud) {
                     // 同一个 id，同一朵云：邀请那张卡在这里变成进度，不需要先撤再发。
                     LiveCard.update(context, "正在接收", percent >= 0 ? percent + "%" : "准备中", percent);
@@ -513,9 +521,23 @@ final class ReceiveHost {
             ReceiveHost.forget(session);
         }
 
-        /** 没收到，或者收到了没存下来。{@code message} 是给人看的那句话。 */
+        /**
+         * 没收到，或者收到了没存下来。{@code message} 是给人看的那句话。
+         *
+         * <p>和其余出口唯一的区别是**不撤卡**。卡片是这次接收唯一一个一直跟在人眼前的东西
+         * （页面可能根本没开着，普通通知可能因为没授通知权限而从来没出现），而撤掉它等于把
+         * 「刚才那一下为什么没成」一起撤掉。
+         *
+         * <p>2026-11-17 那次「点发送、点接收，流体云通知自己关了」正是这么来的：连接在回话
+         * 之前就被 ColorOS 的后台限网掐断，失败一路被当成「对端走掉」，卡片按常规收尾撤掉，
+         * 人看到的是通知无故消失——一次**失败**被画成了一次**没有发生**。
+         */
         void failed(String message) {
-            end("failed", FAILED, message);
+            if (cloud) {
+                LiveCard.failed(context, "接收失败", message, percent);
+                cloud = false;
+            }
+            settle("failed", FAILED, message);
         }
 
         /**
@@ -523,10 +545,26 @@ final class ReceiveHost {
          *
          * <p>只收自己说过话的那一次。一次都没说过话的连接——握手的、探测的、设置读不出来
          * 的——不该在卡片上留下任何痕迹。
+         *
+         * <p>「没有结果」分三种，第三种不能漏：
+         *
+         * <ul>
+         *   <li>人自己按了取消 —— 那张卡该干脆利落地消失。
+         *   <li>人还没回答，连接就没了（分享面板关了、文件发给了别的设备、这分钟里第四次
+         *       重连）—— 撤卡，不留话。这是 {@code Listener.routine} 想保住的那份安静。
+         *   <li>**人说了「收」，东西却没到手** —— 这是失败，而且原来走的也是撤卡那条路。
+         *       走那条路的结果是：native 侧把错误吞掉、返回一个空 frame 的那些情形，Java
+         *       这边一行异常都看不到，卡片照样被撤掉，人看到的还是「通知自己关了」。
+         * </ul>
+         *
+         * <p>判据用 {@code accepted} 而不是异常类型，是因为「值不值得说」这件事跟异常长什么
+         * 样无关，跟人做过什么有关：人点了接收之后，任何一个断法都是「这次没收到」。
          */
         void abandon() {
             if (cancelled) {
                 end("cancelled", CANCELLED, "已取消");
+            } else if (accepted) {
+                failed("连接意外断开");
             } else {
                 end("failed", FAILED, "连接已断开");
             }
@@ -619,9 +657,14 @@ final class ReceiveHost {
         private void end(String phase, int status, String message) {
             if (cloud) {
                 // 没有收成就没有可留的东西：一张停在中间态、也没人能再点的常驻卡，比没有更糟。
+                // 失败是唯一的例外，它走 {@link #failed}——那一句解释值得留在屏幕上几秒。
                 LiveCard.drop(context);
                 cloud = false;
             }
+            settle(phase, status, message);
+        }
+
+        private void settle(String phase, int status, String message) {
             if (announced && !settled) {
                 settled = true;
                 try {

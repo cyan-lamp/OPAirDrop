@@ -54,6 +54,9 @@ final class LiveCard {
     /** 最近一次画卡用的 Context。{@link #dropLater} 需要一个，而它没有参数可以拿。 */
     private static Context lastContext;
 
+    /** 失败卡在胶囊上停多久：够读完一句话，又不至于一直占着那个位置（见 {@link #failed}）。 */
+    private static final long FAILED_MS = 8000;
+
     /** 撤掉那张已完成卡片用的计时器（见 {@link #finishAndDismiss}）。 */
     private static final android.os.Handler LATER =
             new android.os.Handler(android.os.Looper.getMainLooper());
@@ -126,6 +129,29 @@ final class LiveCard {
     static void finishAndDismiss(Context context, String title, String shortText, long afterMs) {
         update(context, title, shortText, 100);
         LATER.postDelayed(() -> drop(context), Math.max(1000, afterMs));
+    }
+
+    /**
+     * 一张收尾的失败卡：停在被切断的那个数上，写清为什么，八秒后自己下去。
+     *
+     * <p># 为什么不是 {@link #finishAndDismiss}
+     *
+     * <p>那条路把进度拉满。拉满的轨道在胶囊上就是「收完了」这个意思，而把失败画成成功是这里
+     * 最不能犯的错——2026-11-17 那次「点接收，通知自己关了」的另一半原因就在这儿：卡片按常规
+     * 收尾撤掉，屏幕上没有留下任何一句解释。所以这一张保留断开那一刻的 {@code percent}：
+     * 收到 4% 断的，轨道就停在 4%，人自己看得出断在中途。
+     *
+     * <p>{@code percent} 为负（一个字节都还没落地）时画的是 0%，不是不确定态：那个转圈的动画
+     * 说的是「正在动」，这条连接已经不会再动了。0% 恰好是最诚实的一句话——一个字节都没收到。
+     *
+     * <p># 为什么几句短话写得这么具体
+     *
+     * <p>读到这张卡的人不知道 socket 是什么。他要的不是 errno，是「刚才那一下为什么没成、
+     * 下回该改哪里」。所以调用方传进来的短句是一句能拿去改设置的话，而不是一句异常原文。
+     */
+    static void failed(Context context, String title, String shortText, int percent) {
+        update(context, title, shortText, Math.max(0, percent));
+        dropLater(FAILED_MS);
     }
 
     /**

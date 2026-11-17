@@ -235,18 +235,29 @@ public final class MainActivity extends Activity {
             // 只对这一次生效。留着它，转个屏重建出来的这一页会以为自己又被人从磁贴点了一次。
             came.removeExtra(EXTRA_PERMISSIONS);
         }
-        // 提示条只在缺口是真的（接收端在跑，或他刚从磁贴点名要开）时才出。其余情况先不说——
+        // 缺口只在「有人要收东西」时才说：接收端在跑，或他刚从磁贴点名要开。其余情况先不说——
         // 人还没表示要收东西，摆一条「收不到邀请」是在替他回答一个他还没问的问题。
-        String gap = insisted || ReceiveService.listening(this) ? Notices.gap(this) : null;
+        boolean collecting = insisted || ReceiveService.listening(this);
+        String gap = collecting ? Notices.gap(this) : null;
         if (gap != null) {
             // 先说话，再问。权限框会盖住这条气泡，但人关掉框之后读到的还是它——而如果他点了
             // 拒绝，这句话就是屏幕上唯一还站着的解释。
             showNotice(gap, S.orange);
         }
-        if (insisted) {
-            Notices.ensure(this);
-        } else {
-            Notices.first(this);
+        if (!Notices.allowed(this) || !Notices.radio(this)) {
+            if (insisted) {
+                Notices.ensure(this);
+            } else {
+                Notices.first(this);
+            }
+            return;
+        }
+        // 通知和蓝牙都齐了，缺的只可能是「后台能不能活着」。这一条弹的不是权限框，是会盖住
+        // 整屏的系统确认框，所以分两种问法：他刚点过磁贴就随叫随问；单纯打开应用只问一次
+        // （见 Notices.unseenAwake）——启动时把整屏交给一个对话框，和启动时把人扔进设置页
+        // 是同一类冒犯。
+        if (insisted || (collecting && Notices.unseenAwake(this))) {
+            Notices.wake(this);
         }
     }
 
@@ -291,6 +302,12 @@ public final class MainActivity extends Activity {
         // 不说「可以收到邀请了」（那要有东西在听才成立），说一句两边都站得住的。
         showNotice(gap == null ? "权限齐了，可以开始互传了" : gap,
                 gap == null ? S.green : S.orange);
+        // 权限框刚走完，人是主动的，这时候接上「允许后台运行」最顺——那一串框本来就是同一个
+        // 动作：「让它真的收得到东西」。缺这一步，人刚点完两个允许，屏幕上剩下的仍是
+        // 「后台被限网，点接收会断开」，而他下一步不知道该点哪儿。
+        if (!Notices.ready(this) && Notices.allowed(this) && Notices.radio(this)) {
+            Notices.wake(this);
+        }
         // 接收端已经在跑，而蓝牙广播是它启动那一刻敲的一次门——那次敲在权限到手之前，必然
         // 落空。补这一下，人才不必为了「刚点过允许」再把开关拨一次。
         Listener.of(this).reannounce();

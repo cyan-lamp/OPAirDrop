@@ -47,7 +47,7 @@ final class IconView extends View {
     static final int KERNEL = 10;
     /** 三条带旋钮的滑杆：一般设置。 */
     static final int SLIDERS = 11;
-    /** 首页「接收文件」：就是 SEND 那只托盘转 180°（见 onDraw 的 case）。 */
+    /** 首页「接收文件」：同一只托盘，箭头尖端朝下落进托盘（见 {@link #receive}）。 */
     static final int RECEIVE = 15;
     /** 哨兵：这一行不要图标砖，文字从卡片左缘起笔（见 Chrome.featureRow）。 */
     static final int NO_ICON = -1;
@@ -172,17 +172,37 @@ final class IconView extends View {
     }
 
     /**
-     * 下载：托盘照旧开口朝上，只把那支箭头绕中心转 180°——尖端翻到下面、落进托盘里。
+     * 下载：托盘照旧开口朝上，箭头尖端朝下落进托盘。
      *
-     * <p>不转整个图标：托盘要是跟着翻过来，开口就朝下了，看着像一个倒扣的碗而不是接东西的托盘。
-     * 只有箭头该反向，所以 save/rotate 只裹住画箭头的那几笔。
+     * <p># 为什么不再用 {@code rotate(180)} 复用 {@link #arrow}
+     *
+     * <p>上一版是「托盘不动、把箭头绕中心转 180°」。{@code rotate} 是**点对称**：图形上每一点
+     * {@code (cx+dx, cy+dy)} 变成 {@code (cx-dx, cy-dy)}。{@code arrow} 的竖线占
+     * {@code cy-0.38h ~ cy+0.18h}，点对称之后变成 {@code cy-0.18h ~ cy+0.38h}——整支箭**下移
+     * 0.20h**。而托盘底在 {@code cy+0.36h}，于是箭尾（{@code cy+0.38h}）比托盘底还低 0.02h，
+     * 从托盘下方扎了出来；箭尖（{@code cy-0.18h}）又悬在托盘开口上方。两截都在托盘轮廓上，
+     * 读起来就是「箭头和 U 型重合」。
+     *
+     * <p>而且形状也变小了：发送图标占 {@code cy-0.38h ~ cy+0.36h}，旋转后的接收图标只占
+     * {@code cy-0.18h ~ cy+0.38h}，上半屏空着——并排两行，接收那只看起来明显小一号。
+     *
+     * <p># 现在怎么画
+     *
+     * <p>竖线与 {@link #arrow} 画的是**同一根线段**（{@code cy-0.38h ~ cy+0.18h}），只把那一撇
+     * 从顶端换到底端、并且朝下张开。于是两支箭互为镜像：
+     * <ul>
+     *   <li>外接框完全一致（{@code x: ±0.28w}，{@code y: cy-0.38h ~ cy+0.36h}），两个图标等大；</li>
+     *   <li>箭尖落在 {@code cy+0.18h}，在托盘开口（{@code cy+0.02h}）之内 0.16h，离托盘底
+     *       （{@code cy+0.36h}）还空 0.18h——没有任何一笔压在托盘轮廓上。</li>
+     * </ul>
      */
     private void receive(Canvas c, float cx, float cy, float w, float h) {
         tray(c, cx, cy, w, h);
-        c.save();
-        c.rotate(180, cx, cy);
-        arrow(c, cx, cy, w, h);
-        c.restore();
+        // 箭杆：与 arrow() 同一根，长度 0.56h，尾端在 cy-0.38h（和发送图标一样高）。
+        c.drawLine(cx, cy - h * 0.38f, cx, cy + h * 0.18f, paint);
+        // 两撇从箭尖往回斜上去，夹角与 arrow() 的两撇一致（同一组 0.19w / 0.19h 比例）。
+        c.drawLine(cx, cy + h * 0.18f, cx - w * 0.19f, cy - h * 0.01f, paint);
+        c.drawLine(cx, cy + h * 0.18f, cx + w * 0.19f, cy - h * 0.01f, paint);
     }
 
     /** 收发共用：开口朝上的托盘。 */

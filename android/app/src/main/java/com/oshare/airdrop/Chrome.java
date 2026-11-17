@@ -84,14 +84,24 @@ final class Chrome {
         hooks = sink;
     }
 
-    /** 说一句话，用外壳那颗浮动胶囊。没有外壳时（单元里）什么也不做。 */
+    /**
+     * 说一句话，用外壳那颗浮动胶囊。
+     *
+     * <p># 为什么只有一种颜色
+     *
+     * <p>这颗胶囊是**同一块玻璃**：同一个 {@code noticeWrap}、同一个模糊半径、同一个圆角。
+     * 既然外壳只有一条，文字就不该有三种颜色——以前调用方各自传 {@code S.red} / {@code S.green}
+     * / {@code S.orange}，同一颗玻璃上跳出红字绿字，读起来像三条不同的提示条，而它们其实是同一
+     * 条。现在颜色由这里定死成正文色，调用方只说「说什么」，不说「用什么颜色说」。
+     *
+     * <p>失败要不要标红，是另一个问题：标红的地方在这张卡片自己的副标题上（例如功能页回执那一
+     * 行），那里有空间写清原因，而胶囊只有一行字、两秒半。
+     *
+     * <p>没有外壳时（单元里、或这一页自己 new 的 {@link Chrome}）什么也不做。
+     */
     void say(String message) {
-        say(message, scheme.text);
-    }
-
-    void say(String message, int color) {
         if (notice != null) {
-            notice.show(message, color);
+            notice.show(message, scheme.text);
         }
     }
 
@@ -233,6 +243,25 @@ final class Chrome {
     LinearLayout.LayoutParams insetDivider() {
         LinearLayout.LayoutParams lp = mm(ViewGroup.LayoutParams.MATCH_PARENT, dp(1), 0f);
         lp.leftMargin = dp(ROW_PAD + TILE + GAP);
+        return lp;
+    }
+
+    /**
+     * 卡片内的分隔线，左端与**没有图标砖**的那一行的文字左缘对齐（18dp）。
+     *
+     * <p># 为什么需要第二条线
+     *
+     * <p>{@link #insetDivider} 的 74 是「18 行内边距 + 44 图标砖 + 12 间隙」——那是行里**有**
+     * 砖时文字起笔的位置。可{@code IconView.NO_ICON} 的行没有砖，文字从 18 起笔。拿 74 那条线
+     * 去配它们，线就从标题字中间穿过去，左边凭空多出一截 56dp 的空当，右边反而短了。
+     *
+     * <p>关于页「开源许可」那两行（GNU 通用公共许可 / 第三方组件许可）就是这种情况：两行都
+     * 是 {@code NO_ICON}，它们对齐的参照是文字，不是图标。原先功能页「设备显示」也是这种行，
+     * 后来那两行只剩一行、中间不需要线了，这条参数就只服务关于页。
+     */
+    LinearLayout.LayoutParams textDivider() {
+        LinearLayout.LayoutParams lp = mm(ViewGroup.LayoutParams.MATCH_PARENT, dp(1), 0f);
+        lp.leftMargin = dp(ROW_PAD);
         return lp;
     }
 

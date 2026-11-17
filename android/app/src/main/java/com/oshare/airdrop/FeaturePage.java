@@ -23,12 +23,12 @@ import java.util.List;
 /**
  * 功能页：装驱动、卸载驱动，加一根共享 Wi-Fi 射频的开关。
  *
- * <p># 这一页现在只有两件事
+ * <p># 这一页有哪几块
  *
- * <p>接收板块挪到了首页（接收文件那一行），名字与机型挪到了设置页，那几个开关随「脱离一加互传」
- * 一起删掉（同名文件固定加编号、不再跟随互传），传输状态也不需要了。于是这一页只剩两块：驱动
- * 和射频。驱动管装和卸——有时候要恢复原厂驱动和网络环境；射频是唯一还留着的开关，因为它拨错
- * 了手机就上不了网。
+ * <p>驱动、射频、保存位置、设备显示。接收开关在首页（接收文件那一行），其余几个开关随「脱离
+ * 一加互传」一起删掉（同名文件固定加编号、不再跟随互传），传输状态也不需要了。驱动管装和
+ * 卸——有时候要恢复原厂驱动和网络环境；射频是唯一还留着的开关，因为它拨错了手机就上不了网；
+ * 保存位置决定文件落哪个目录；设备显示决定对端在列表里看到什么名字。
  *
  * <p># 驱动为什么在最前面
  *
@@ -76,6 +76,31 @@ final class FeaturePage {
      * 页面与 Chrome 之间只走方法，不互相翻对方的常量表。要改就两处一起改，注释互相指着。
      */
     private static final float SHEET_RADIUS_DP = 22f;
+
+    /**
+     * 浮窗霜面的模糊半径，单位是 {@link RealtimeBlurView} 的「scratch 像素」（屏幕上看到
+     * 的扩散约是这个数的两倍，见它里面的 {@code FACTOR}）。
+     *
+     * <p># 为什么从 5 改成 20
+     *
+     * <p>5 是这条玻璃原来的值，和导航胶囊、顶部霜面一样。那三块都是**窄条**（高度不到 60dp），
+     * 背后露出来的内容只是「一条边」，5 已经够糊。浮窗不一样：它是 86% 屏宽、一两百 dp 高的一
+     * 整块，背后是整页的文字。同样 5 的半径，在这么大片面积上只够把字糊成灰色轮廓——人眼仍
+     * 然认得出那是哪一行，于是读起来是「卡片是透明的」。
+     *
+     * <p>20 是 5 的四倍，屏幕上约 40px 的扩散。到这个程度，背后那页只剩色块与明暗，卡片才
+     * 真的是一张卡，而不是一块盖在字上的玻璃。
+     */
+    private static final float SHEET_BLUR_RADIUS = 20f;
+
+    /**
+     * 浮窗里输入框、取消、保存三件东西的底色不透明度，单位 0-255。
+     *
+     * <p>0xBF = 191 ≈ 75%。这三块原来是实底（{@code cardHi} / {@code accent} 原样），压在
+     * 一片强模糊的霜面上显得像贴上去的三张纸；给到 75%，霜面的明暗能从底下透上来一点，它们
+     * 才像长在这张卡上的一层。
+     */
+    private static final int SHEET_CONTROL_ALPHA = 0xBF;
 
     private final Activity host;
     private final Chrome chrome;
@@ -136,7 +161,7 @@ final class FeaturePage {
         body.addView(driverHint);
         body.addView(driverCard(), chrome.margins(0, 8));
 
-        // 接收板块已撤：接收开关在首页「接收文件」那一行，名字/机型在设置页，这里不再重复。
+        // 接收板块已撤：接收开关在首页「接收文件」那一行，设备名在设置页，这里不再重复。
         // 开关板块也撤了：同名文件固定加编号、跟随一加互传随脱离互传一起去掉，没有可拨的开关；
         // 射频这一项是唯一仍要拨的，留在这一页。传输状态也不需要了。
         body.addView(chrome.sectionTitle("射频"), chrome.margins(6, 0));
@@ -151,8 +176,9 @@ final class FeaturePage {
         body.addView(chrome.sectionTitle("保存位置"), chrome.margins(6, 0));
         body.addView(directoryCard(), chrome.margins(0, 8));
 
-        // 设备显示：原来在设置页叫「设备」，两行文本设置（对端看到的名字 / 机型）。都是「改完
-        // 对端立刻读到什么」的行为，和这一页其余「拨一下就换行为」的东西同类，于是搬过来。
+        // 设备显示：原来在设置页叫「设备」，是一行文本设置（对端看到的名字）。它是「改完对端
+        // 立刻读到什么」的行为，和这一页其余「拨一下就换行为」的东西同类，于是搬过来。原先还有
+        // 第二行改机型，已撤——理由见 deviceCard()。
         body.addView(chrome.sectionTitle("设备显示"), chrome.margins(6, 0));
         body.addView(deviceCard(), chrome.margins(0, 8));
 
@@ -357,9 +383,9 @@ final class FeaturePage {
         if (ok) {
             // 置位后重画，徽章才会从旧回执的「已就绪」改成「未安装」。
             setUninstalled(true);
-            chrome.say("已卸载驱动，恢复原厂驱动与网络环境", S.green);
+            chrome.say("已卸载驱动，恢复原厂驱动与网络环境");
         } else {
-            chrome.say("卸载未成功：" + result.subtitle(), S.orange);
+            chrome.say("卸载未成功：" + result.subtitle());
         }
         // 整页重画，让驱动徽章、note、按钮、回执都回到「原厂」的真实状态。
         refreshSelf();
@@ -437,12 +463,12 @@ final class FeaturePage {
             driverReceipt.setVisibility(state.present() ? View.VISIBLE : View.GONE);
         }
         if (!state.up()) {
-            chrome.say(result.problem().isEmpty() ? "没装成，原因在卡片上" : result.problem(), S.red);
+            chrome.say(result.problem().isEmpty() ? "没装成，原因在卡片上" : result.problem());
             return;
         }
         // 装成功，清掉「已卸载」标记：下一次重画才会按新回执显示「已就绪」。
         setUninstalled(false);
-        chrome.say("AWDL 已就绪", S.green);
+        chrome.say("AWDL 已就绪");
         if (onChanged != null) {
             onChanged.run();
         }
@@ -554,13 +580,19 @@ final class FeaturePage {
                 IconView.NO_ICON, "WiFi 共享射频", state.subtitle(), toggle, sub);
         // 说明是一句完整的话，两行放不下：定高会把它裁在卡片下沿上。
         chrome.addWrappingRow(card, row);
-        chrome.pressableRow(row, Scheme.CORNERS_ALL);
+        // 这里不挂 pressableRow。理由和「有开关的行不按」是同一条：这一行没有点击动作，唯一
+        // 能按的东西是右边那颗开关本身。整行泛起的涟漪会把「按这里能拨」指到空白处，而空白处
+        // 按下去什么也不会发生——一处按下去没反应的高亮，比没有高亮更让人以为界面卡了。
 
         // 回执原文，一行、灰的，失败时红的。人话在上面那句，这一行是不能被人话改写的原始记录：
         // 落在哪个信道、失败的理由原文，都在这里。
         TextView record = chrome.caption(state.receipt().present() ? state.receipt().line() : "");
         record.setTextColor(state.failed() ? S.red : S.textDim);
-        record.setPadding(chrome.dp(74), 0, chrome.dp(18), chrome.dp(12));
+        // 左缘 18dp，和上面「WiFi 共享射频」那行文字落在同一条竖线上。原来给的是 74
+        // （= 18 行内边距 + 44 图标砖 + 12 间隙，那是**有图标砖**时文字的左缘），可这一行没有
+        // 砖：74 让它单独往右缩进一大截，看起来像卡片里又套了一块东西，而不是紧跟着上面那句
+        // 话的补充说明。
+        record.setPadding(chrome.dp(18), 0, chrome.dp(18), chrome.dp(12));
         record.setVisibility(state.receipt().present() ? View.VISIBLE : View.GONE);
         card.addView(record);
 
@@ -623,15 +655,24 @@ final class FeaturePage {
      * 免得空值被读成「没设置好」。写盘走 SettingsScreen 的校验 + save，和设置页同一套，错误的
      * 路径会被库挡下来并说清楚原因。
      */
-    /** 设备显示那两行的副标题引用，保存后就地刷新。 */
+    /** 设备显示那一行的副标题引用，保存后就地刷新。 */
     private TextView nameDisplayValue;
-    private TextView modelDisplayValue;
 
     /**
-     * 设备显示：对端在列表里看到的名字和机型。
+     * 设备显示：对端在列表里看到的名字。
      *
-     * <p>两行都是空着就跟着下一级走（名字空→跟随机型，机型空→用系统型号），副标题要把「此刻
-     * 真正生效的那个值」写出来，否则空行会被读成「对端什么都看不到」。点开弹框改存下来的原文。
+     * <p>名字空着的时候对端读到的是机型（{@code Listener.peerName} 的兜底链，和 Rust 那边
+     * {@code settings::name} 是同一条），副标题要把「此刻真正生效的那个值」写出来，否则空行
+     * 会被读成「对端什么都看不到」。
+     *
+     * <p># 这里原本还有第二行，改「对端看到的机型」，已经撤掉
+     *
+     * <p>撤的理由不是嫌多，是<b>它下面没有东西可改</b>：机型这一项的全部作用就是喂
+     * {@code /Ask} 的应答和名字的兜底，而这两处读的是同一张设置表；改了它，对端看到的
+     * 列表条目里的名字会跟着变——一个「机型」输入框悄悄改掉了「名字」，这比没有这个框更
+     * 容易让人困惑。真正要改名字的人用上面那一行就够，剩下的人要的是系统报的那个型号。
+     * {@code device.model} 这个键留在设置表里（Rust 侧、协议应答都还读它），只是这一页不再
+     * 提供修改入口。
      */
     private View deviceCard() {
         LinearLayout card = chrome.rowCard();
@@ -642,45 +683,25 @@ final class FeaturePage {
                 chrome.text("›", 20, true, S.textDim), nameSub);
         nameDisplayValue = nameSub[0];
         chrome.addRow(card, nameRow, chrome.rowHeight());
-        chrome.setRowAction(nameRow, true, Scheme.CORNERS_TOP,
+        // 卡片里只剩这一行，四个角都给满：CORNERS_TOP/BOTTOM 是给「上下两行拼一张卡」用的，
+        // 单行用它会得到一对平角压在卡片圆角上。
+        chrome.setRowAction(nameRow, true, Scheme.CORNERS_ALL,
                 () -> askSetting("device.name", "对端看到的名字",
-                        "留空则跟随机型", () -> {
+                        "留空则用设备型号", () -> {
                             if (nameDisplayValue != null) {
                                 nameDisplayValue.setText(nameLine());
-                            }
-                        }));
-
-        card.addView(chrome.divider(), chrome.insetDivider());
-
-        TextView[] modelSub = new TextView[1];
-        LinearLayout modelRow = chrome.featureRow(
-                IconView.NO_ICON, "对端看到的机型", modelLine(),
-                chrome.text("›", 20, true, S.textDim), modelSub);
-        modelDisplayValue = modelSub[0];
-        chrome.addRow(card, modelRow, chrome.rowHeight());
-        chrome.setRowAction(modelRow, true, Scheme.CORNERS_BOTTOM,
-                () -> askSetting("device.model", "对端看到的机型",
-                        "留空则用系统型号", () -> {
-                            if (modelDisplayValue != null) {
-                                modelDisplayValue.setText(modelLine());
                             }
                         }));
         return card;
     }
 
-    /** 对端此刻会读到的名字，空值时注明它跟随机型还是系统型号。 */
+    /** 对端此刻会读到的名字；名字留空时注明它其实是机型。 */
     private String nameLine() {
         String shown = listener.peerName();
         if (!storedText("device.name").isEmpty()) {
             return shown;
         }
-        return shown + (storedText("device.model").isEmpty() ? "（系统型号）" : "（跟随机型）");
-    }
-
-    /** 对端此刻会读到的机型。 */
-    private String modelLine() {
-        String shown = listener.peerModel();
-        return storedText("device.model").isEmpty() ? shown + "（系统型号）" : shown;
+        return shown + "（名字留空，用的是设备型号）";
     }
 
     /** 一行存下来的原文（去空白）；表读不出来或没这一行就是空串。 */
@@ -724,7 +745,7 @@ final class FeaturePage {
     }
 
     /**
-     * 弹一个输入框改一行文本设置。所有「点一下弹框改一个字符串」的行共用：目录、名字、机型。
+     * 弹一个输入框改一行文本设置。所有「点一下弹框改一个字符串」的行共用：目录、名字。
      *
      * <p># 为什么不再用 {@code AlertDialog}
      *
@@ -800,6 +821,10 @@ final class FeaturePage {
         LinearLayout content = chrome.column();
         content.setPadding(chrome.dp(22), chrome.dp(20), chrome.dp(22), chrome.dp(18));
         content.addView(chrome.text(title, 17, true, S.text));
+        // 输入框与两颗按钮的底色统一压到 75%（见 washControl）。圆角沿用 Chrome 里
+        // darkInput / ghostButton / mainButton 各自那一档（14 / 16 / 16），不顺手统一成一个
+        // 数：14 的输入框配 16 的按钮，两个角不一样圆，上下挨着就看得出来。
+        washControl(field, S.cardHi, 14);
         content.addView(field, chrome.margins(14, 0));
 
         LinearLayout actions = chrome.row();
@@ -810,6 +835,8 @@ final class FeaturePage {
             dialog.dismiss();
             saveSetting(key, field.getText().toString(), onSaved);
         });
+        washControl(cancel, S.cardHi, 16);
+        washControl(save, S.accent, 16);
         LinearLayout.LayoutParams cancelLp = chrome.mm(0, chrome.dp(46), 1f);
         cancelLp.rightMargin = chrome.dp(10);
         actions.addView(cancel, cancelLp);
@@ -832,15 +859,21 @@ final class FeaturePage {
         glass.setCornerRadius(radius);
         glass.setFill(S.card);
         glass.setLiquidGlass(true);
-        glass.setBlurRadius(5f);
-        glass.setSheen(lightMode() ? 0x1FFFFFFF : 0x26FFFFFF);
-        glass.setGlassLift(lightMode() ? 8 : 0);
-        glass.setOpacity(240);
+        glass.setBlurRadius(SHEET_BLUR_RADIUS);
+        // 完全不透明地画那层糊过的东西。原来给的是 240（94%），剩下那 6% 足够让背后的字露出
+        // 笔画，于是整张卡看着是「蒙了一层」而不是「一块材料」。
+        glass.setOpacity(255);
         glass.setTint((S.navTint & 0x00FFFFFF) | 0x4D << 24);
-        glass.setRim(true, chrome.dp(1.2f),
-                lightMode() ? 0x8CFFFFFF : 0x59FFFFFF,
-                lightMode() ? 0x29FFFFFF : 0x14FFFFFF);
-        glass.setRimDual(true);
+        // 下面三样是这颗玻璃原来挂着的「立体感」，现在一律不挂：
+        //
+        //   setRim(...)        —— 沿卡片内缘的一圈渐变描边。它在窄条胶囊上是「轮廓」，在这么
+        //                         大一张卡上就是一圈发白的框，四角尤其明显。
+        //   setSheen(...)      —— 一条斜穿的白色高光带，12% 白。卡片一大，它就从「一道反光」
+        //                         变成「一块斜着贴上去的亮片」。
+        //   setGlassLift(...)  —— 整体提亮 8 级。提亮是为了让玻璃比页面「亮一档」，可这一页的
+        //                         卡片本来就比页底亮，再提就是发灰。
+        //
+        // 三样都不设，也就是它们各自的默认值（无描边、无高光、不提亮）。
 
         // 玻璃的高度是算出来的，不是 MATCH_PARENT——这一条是这张卡片能不能贴合内容的关键。
         //
@@ -878,16 +911,37 @@ final class FeaturePage {
         return host instanceof MainActivity ? ((MainActivity) host).blurRoot() : null;
     }
 
-    /** 与导航胶囊同一判据：深色/浅色决定高光和投影的强弱。 */
-    private boolean lightMode() {
-        return S.light;
+    /**
+     * 把浮窗里一件控件的实底换成 75% 不透明的同色底，圆角不变。
+     *
+     * <p># 为什么重新画一张，而不是改原来那张
+     *
+     * <p>{@code GradientDrawable} 只进不出：{@code setColor} 之后没有 {@code getColor}，读不回
+     * {@code darkInput} / {@code ghostButton} / {@code mainButton} 当时填的是哪个色。而这三个
+     * 颜色都有出处（{@link Scheme#cardHi}、{@link Scheme#accent}），调用方本来就拿着——直接再
+     * 画一张，比给 Chrome 加三个「带 alpha」的重载干净：那三个重载只有这里会用。
+     *
+     * <p># 为什么只改这三件
+     *
+     * <p>设置页、关于页里的同一个 {@code darkInput} 仍然是不透明实底。它们底下没有霜面，压到
+     * 75% 只会把页面底色透出来，看起来像没画完。这一条限定在浮窗内。
+     *
+     * @param control  输入框或按钮
+     * @param color    它原来的实底色（只看低 24 位）
+     * @param radiusDp 圆角，必须和控件原来那一档一致（14 是输入框、16 是按钮）
+     */
+    private void washControl(View control, int color, int radiusDp) {
+        GradientDrawable bg = new GradientDrawable();
+        bg.setCornerRadius(chrome.dp(radiusDp));
+        bg.setColor((color & 0x00FFFFFF) | SHEET_CONTROL_ALPHA << 24);
+        control.setBackground(bg);
     }
 
     /** 写一行文本设置；成功回调刷新，失败把库给的原因说出来。 */
     private void saveSetting(String key, String value, Runnable onSaved) {
         SettingsScreen fresh = settingsNow();
         if (fresh == null) {
-            chrome.say("设置读不出来，没保存", S.red);
+            chrome.say("设置读不出来，没保存");
             return;
         }
         fresh.set(key, value);
@@ -895,15 +949,15 @@ final class FeaturePage {
         try {
             problems = fresh.save();
         } catch (IOException failed) {
-            chrome.say("没保存成功：" + failed.getMessage(), S.red);
+            chrome.say("没保存成功：" + failed.getMessage());
             return;
         }
         if (!problems.isEmpty()) {
-            chrome.say(problems.get(0), S.red);
+            chrome.say(problems.get(0));
             return;
         }
         onSaved.run();
-        chrome.say("已保存", S.green);
+        chrome.say("已保存");
     }
 
     /** 现开一份设置表：这一页的 screen 可能已经旧了，拿旧快照保存会覆盖别处的改动。 */

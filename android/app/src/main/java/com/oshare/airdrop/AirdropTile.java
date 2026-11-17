@@ -88,9 +88,14 @@ public final class AirdropTile extends TileService {
         boolean on = ReceiveService.listening(this);
         tile.setState(on ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
         tile.setLabel(getString(R.string.tile_airdrop));
-        // 用应用自己的图标（蓝色圆点 + 两道环）。给的是**裁剪过视口**的那一份
-        // （{@code tile_airdrop.xml}：同一组路径，视口从 108 收到 48），所以它在磁贴里占满
-        // 那一格，和旁边系统图标同样大；颜色交给系统着色——磁贴本来就是单色语义的地方。
+        // 用应用自己的图标（蓝色圆点 + 两道环），取的是**裁剪过视口**的那一份
+        // （{@code tile_airdrop.xml}：同一组路径，viewport 收到 48 并让图形顶格画）。
+        // 颜色不用管：磁贴本来就按状态给图标上 tint（开=亮、关=暗），drawable 里那个蓝色渐变
+        // 在这一格会被刷成纯白，只在别处（比如以后直接当图标用）才看得见。
+        //
+        // 尺寸这件事到此为止了：系统把图标 setBounds 到固定的 24dp 槽位，不读 drawable 的
+        // 固有尺寸，所以「再放大一点」只能靠 drawable 里把图形画得更满。上限与实测数字见
+        // tile_airdrop.xml 的文件头（结论：当前已占槽位 96%，最多到 1.04 倍，再多就裁边）。
         tile.setIcon(Icon.createWithResource(this, R.drawable.tile_airdrop));
         tile.updateTile();
     }

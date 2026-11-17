@@ -92,7 +92,7 @@ final class HomePage {
                 host.startActivity(send);
             } catch (Throwable unavailable) {
                 // 起不来只可能是这一版的清单里没有它。说清楚，而不是什么都不发生。
-                chrome.say("发送页打不开：" + unavailable, S.orange);
+                chrome.say("发送页打不开：" + unavailable);
             }
         });
 
@@ -113,7 +113,7 @@ final class HomePage {
             if (wasOn) {
                 ReceiveService.setManual(host, false);
                 ReceiveService.apply(host);
-                chrome.say("接收文件已关闭", S.text);
+                chrome.say("接收文件已关闭");
             } else {
                 ReceiveService.enable(host, 0);
                 // 先起接收端、再要权限：这两件事的顺序决定了人看到什么。反过来问，人可能
@@ -125,8 +125,7 @@ final class HomePage {
                 // 一条，这个开关都是假的。
                 Notices.ensure(host);
                 String gap = Notices.gap(host);
-                chrome.say(gap == null ? "接收文件已开启" : "接收已开启，但" + gap,
-                        gap == null ? S.text : S.orange);
+                chrome.say(gap == null ? "接收文件已开启" : "接收已开启，但" + gap);
             }
             // 就地刷新胶囊与副标题（这一页此刻不重建），磁贴下次展开会自己按新凭据重画。
             // 权限那条要在拨完之后重新算：`ensure` 只是把框弹出去，答案不会立刻回来。
@@ -202,7 +201,7 @@ final class HomePage {
         chrome.addRow(card, rootRow, chrome.rowHeight());
         // 可按压：点一下重新测一次授权（人刚在 KernelSU / Magisk 里点了授权，不必重启应用）。
         chrome.setRowAction(rootRow, true, Scheme.CORNERS_ALL, () -> {
-            chrome.say("正在重新检测 root 权限", S.text);
+            chrome.say("正在重新检测 root 权限");
             RootInfo.probe(host, onRootChecked);
         });
 

@@ -673,9 +673,9 @@ final class Listener {
      * reads is built per connection. Two implementations of the same rule is the cost of
      * freezing one of them.
      *
-     * <p>Package-private because the feature page prints it. The two rows there answer "what
-     * will a peer read", and a second copy of the chain in a view class would not be a frozen
-     * twin but a third rule to keep in step.
+     * <p>Package-private because the feature page prints it: that row answers "what will a peer
+     * read", and a second copy of the chain in a view class would not be a frozen twin but a
+     * third rule to keep in step. (It used to feed two rows there; the model row is gone.)
      */
     String peerName() {
         SettingsScreen screen = settingsNow();
@@ -689,11 +689,11 @@ final class Listener {
      * <p>Only ever appears in the {@code /Ask} answer — {@code /Discover} carries the name and
      * the capability blob, nothing about the hardware — so this is the field a person sees on
      * the other device after tapping their own.
+     *
+     * <p>Private: this used to have a package-private twin for the feature page's "model" row,
+     * which has been removed. The chain is still the second step of {@link #peerName}, so it
+     * keeps answering {@code /Ask} — it just no longer has a caller that prints it.
      */
-    String peerModel() {
-        return peerModel(settingsNow());
-    }
-
     private String peerModel(SettingsScreen screen) {
         String model = value(screen, "device.model");
         return model.isEmpty() ? systemModel() : model;
@@ -849,12 +849,18 @@ final class Listener {
             // 对端走掉和真正出错，在异常类型上是同一件事，在意思上是两件。legacy 的同一处
             // catch 也只把 "Connection reset" 写进日志、不上报，理由写得很直白：分享面板关了、
             // 文件发给了别的设备、这是这一分钟里第四次重连——每两秒闪一次的红线不是证据。
-            // 真正需要人看一眼的失败（设置读不出来、目录写不进去）仍然上线。
+            // 真正需要人看一眼的失败（设置读不出来、目录写不进去、连接被系统掐断）仍然上线。
             if (routine(refused)) {
                 Log.i(TAG, "connection from " + where(peer) + " ended: " + describe(refused));
                 return;
             }
-            setState("接收失败：" + describe(refused), true);
+            String because = because(refused);
+            Log.w(TAG, "receive from " + where(peer) + " failed: " + describe(refused));
+            setState("接收失败：" + because, true);
+            // 页面、卡片、日志说的是同一句话，但页面可能是关着的——而人刚刚是从胶囊上点的
+            // 「接收」，那颗胶囊才是他此刻还在看的东西。所以失败必须推到卡片上，而且不能
+            // 像其余出口那样把卡撤掉（见 ReceiveHost.Attempt#failed）。
+            attempt.failed(because);
         } finally {
             // 暂存里的东西只有两种下场：搬进公共目录，或者被删掉。走到这里时两种都已经发生
             // 过了，剩下的是空目录和搬失败的那几份——留着它们只是让 app 的数据目录一直长大。
@@ -948,13 +954,35 @@ final class Listener {
             if (cause instanceof SocketException) {
                 // Reset by peer, broken pipe, socket closed: all "the other end stopped
                 // listening", which is what a closed share sheet looks like from here.
-                return true;
+                //
+                // 一个例外：「Software caused connection abort」（ECONNABORTED）。它不是对端
+                // 发来的 RST，而是**本机内核**中止了这条连接——和上面那几种恰好相反。归纳进
+                // 「对端走掉」的代价在 2026-11-17 付过一次：ColorOS 的后台限网（nwpower）在
+                // 应用离开前台的同一毫秒掐掉 socket，人点「接收」时已经晚了三秒，这里把
+                // 它当成别人自己走了，于是屏幕上什么都没有。
+                return !aborted(cause);
             }
             if (cause.getCause() == cause) {
                 break;
             }
         }
         return false;
+    }
+
+    /**
+     * 这条连接是不是被本机掐断的（{@code ECONNABORTED}）。
+     *
+     * <p>Java 把 errno 丢在异常消息里，所以只能读那句话。选消息而不是选异常类型，是因为
+     * {@code SocketException} 在这一层已经把 reset、broken pipe、closed 全都收进了同一个类，
+     * 而这三句是 libcore 的固定译文、Android 每个版本都这么写。
+     *
+     * <p>为什么不把 ECONNABORTED 归成「对端走掉」：这两个 errno 的方向相反。reset 是**对面**
+     * 发了 RST（分享面板关了），abort 是**我们自己**的内核把 fd 收了（后台限网、VPN 掉了、
+     * 息屏断网）。前者不该打扰人，后者恰恰是这台机器出了问题——而它偏偏长得最像前者。
+     */
+    private static boolean aborted(Throwable socket) {
+        String message = socket.getMessage();
+        return message != null && message.contains("Software caused connection abort");
     }
 
     /**
@@ -1043,6 +1071,29 @@ final class Listener {
     private static String describe(Throwable failed) {
         String message = failed.getMessage();
         return message == null || message.isEmpty() ? failed.toString() : message;
+    }
+
+    /**
+     * 同一件事给人看的说法。
+     *
+     * <p>{@link #describe} 是给日志的：异常原文，能拿去搜。这一句是给拿着手机的人的——他
+     * 不知道 socket 是什么，他要的是「刚才那一下为什么没成、下回该改哪里」。
+     *
+     * <p>只有 ECONNABORTED 需要翻译。其余非例行的失败（目录写不进去、设置读不出来）原文
+     * 本来就带着人能看懂的那半句，比如文件名和路径。
+     */
+    private static String because(Throwable failed) {
+        for (Throwable cause = failed; cause != null; cause = cause.getCause()) {
+            if (aborted(cause)) {
+                // 把可行动的那一步一起说出来。措辞与首屏那条提示条、设置页同一个说法对齐
+                // （见 Notices.gap 的「后台被限网」），否则人会以为是两件事。
+                return "连接被系统切断，检查后台限网";
+            }
+            if (cause.getCause() == cause) {
+                break;
+            }
+        }
+        return describe(failed);
     }
 
     /** The peer's address, for a log line; "?" when the socket never had one. */

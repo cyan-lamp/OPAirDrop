@@ -6,6 +6,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.os.PowerManager;
 import android.provider.Settings;
 
 import java.util.Arrays;
@@ -96,6 +97,16 @@ final class Notices {
      */
     private static final String LEGACY_ASKED = "notice.asked";
 
+    /**
+     * 问过「允许后台运行」没有。
+     *
+     * <p>和 {@link #ASKED} 分开记，因为它根本不是一条权限：答案不从
+     * {@code onRequestPermissionsResult} 回来，而是一个会盖住整屏的系统对话框，人可以选择
+     * 直接返回。这种东西不该每次启动都弹一次——那是骚扰，而不是提问。记一个布尔，只为压住
+     * **启动时**那一条路；人自己拨接收开关、点磁贴时要的那次不受它管（见 {@link #ensure}）。
+     */
+    private static final String ASKED_AWAKE = "notice.asked.awake";
+
     /** 请求码。只有一处请求点，但也只该有一个号。 */
     static final int REQUEST = 0x0C01;
 
@@ -122,36 +133,69 @@ final class Notices {
                 == PackageManager.PERMISSION_GRANTED;
     }
 
-    /** 两条都有：接收开关此刻说的话才是真的。 */
+    /**
+     * 这台机器肯不肯让我们在没人看着的时候继续收。
+     *
+     * <p>它不是第三条运行时权限，而是一份**系统策略名单**：AOSP 的电池优化白名单，也就是
+     * {@code dumpsys deviceidle whitelist} 那一份。第三方应用读得到、也能通过系统确认框把自己
+     * 写进去，但没法绕过那个框。
+     *
+     * <p>为什么它和通知、蓝牙并列：2026-11-17 实测的因果链是
+     * {@code App bg(IMMEDIATELY)} → {@code Close socket:[10456]} → 抓包里同一毫秒的本机 RST。
+     * 也就是说 iPhone 点发送、邀请正常弹出、人点接收的那一刻，连接已经断了 3.4 秒。通知那两条
+     * 权限管的是「人知不知道」，这一条管的是「知道了还接不接得住」——缺它的表现是**一路都像
+     * 正常的，只在最后一步断**，比前两种更难反推。
+     *
+     * <p>设备上的策略写在 {@code /system_ext/etc/oappnetcontrol_config.xml}：默认
+     * {@code config="011"}，淘宝、拼多多那类白名单应用是 {@code config="111"}。那份 XML 只有
+     * 系统能改，但 nwpower 判「这个 uid 该不该被掐」时读的正是上面这份 AOSP 白名单，所以我们
+     * 能把自己写进去。加进去之后同样的动作两次都跑完了。
+     *
+     * <p>取不到 PowerManager 时当作放行：这条缺口只会让后台变脆，不该在系统本身缺件的机器上
+     * 把接收开关一起判成坏的。
+     */
+    static boolean awake(Context context) {
+        PowerManager power = context.getSystemService(PowerManager.class);
+        return power == null || power.isIgnoringBatteryOptimizations(context.getPackageName());
+    }
+
+    /** 三条都在：接收开关此刻说的话才是真的。 */
     static boolean ready(Context context) {
-        return allowed(context) && radio(context);
+        return allowed(context) && radio(context) && awake(context);
     }
 
     /**
      * 缺的是哪一条——短到能塞进胶囊的写法；齐了返回 {@code null}。
      *
-     * <p>两条权限对应两个完全不同的事实，而人看到的都是「开着但没用」：缺通知是**人被蒙在鼓里**
-     * （有邀请，没人被告知）；缺蓝牙广播是**这台机器不存在**（对端根本不会发起）。胶囊只有一格，
-     * 写不下理由，只能写缺哪一样；完整那句话在 {@link #gap}。
+     * <p>三条权限对应三个完全不同的事实，而人看到的都是「开着但没用」：缺通知是**人被蒙在鼓里**
+     * （有邀请，没人被告知）；缺蓝牙广播是**这台机器不存在**（对端根本不会发起）；缺后台存活是
+     * **接不住**（邀请看得见、点下去就断）。胶囊只有一格，写不下理由，只能写缺哪一样；完整那句
+     * 话在 {@link #gap}。
      */
     static String shortGap(Context context) {
         if (!allowed(context)) {
             return "缺通知权限";
         }
-        return radio(context) ? null : "缺蓝牙权限";
+        if (!radio(context)) {
+            return "缺蓝牙权限";
+        }
+        return awake(context) ? null : "受后台限网";
     }
 
     /**
      * 同一个缺口的完整说法，给副标题和提示条用；齐了返回 {@code null}。
      *
-     * <p>这两句话写在这里，而不是各页面各写一份：三处（首页、磁贴、主界面）说的是同一件事，写
+     * <p>这三句话写在这里，而不是各页面各写一份：三处（首页、磁贴、主界面）说的是同一件事，写
      * 散了就会出现「胶囊说缺蓝牙、副标题却说缺通知」这种自相矛盾的界面。
      */
     static String gap(Context context) {
         if (!allowed(context)) {
             return "通知权限未开，收不到邀请";
         }
-        return radio(context) ? null : "蓝牙广播没开，iPhone 发现不了这台设备";
+        if (!radio(context)) {
+            return "蓝牙广播没开，iPhone 发现不了这台设备";
+        }
+        return awake(context) ? null : "后台被限网，点接收会断开";
     }
 
     /** 缺的里面，从没问过的那几条。 */
@@ -260,22 +304,94 @@ final class Notices {
         if (ready(activity)) {
             return true;
         }
-        String[] fresh = unseen(activity);
-        // 有没问过的就先问那些——升级新增权限时，旧标记不能把新权限一起挡掉。只有全都问过，
-        // 才轮到「系统还愿不愿意再问」这个判据。
-        String[] ask = fresh.length > 0 ? fresh : again(activity);
-        if (ask.length > 0) {
-            // 系统按传进去的顺序弹框，而这个顺序来自 NEEDED：通知在前。别在这里重排——同一个
-            // 请求在两次启动里换顺序，人会以为自己点错了。
-            remember(activity, ask);
-            Log.i(TAG, "asking for " + ask.length + " permission(s)"
-                    + (fresh.length > 0 ? " (not asked before)" : " (again)"));
-            activity.requestPermissions(ask, REQUEST);
-        } else {
-            Log.w(TAG, "permissions are off for good; opening the system page");
-            open(activity);
+        // 通知和蓝牙那两条要一个权限框，后台存活要的是另一个东西。分开走，因为它们的
+        // 「不再问」语义不同：权限问过两次后系统自己闭嘴，而这条只在启动路径上闭嘴。
+        if (!allowed(activity) || !radio(activity)) {
+            String[] fresh = unseen(activity);
+            // 有没问过的就先问那些——升级新增权限时，旧标记不能把新权限一起挡掉。只有全都问过，
+            // 才轮到「系统还愿不愿意再问」这个判据。
+            String[] ask = fresh.length > 0 ? fresh : again(activity);
+            if (ask.length > 0) {
+                // 系统按传进去的顺序弹框，而这个顺序来自 NEEDED：通知在前。别在这里重排——同一个
+                // 请求在两次启动里换顺序，人会以为自己点错了。
+                remember(activity, ask);
+                Log.i(TAG, "asking for " + ask.length + " permission(s)"
+                        + (fresh.length > 0 ? " (not asked before)" : " (again)"));
+                activity.requestPermissions(ask, REQUEST);
+            } else {
+                Log.w(TAG, "permissions are off for good; opening the system page");
+                open(activity);
+            }
+            return false;
         }
+        // 两条权限都齐了，缺的只可能是「后台能不能活着」。这一条不设「问过就别问」：
+        // 走到这里的人刚拨了开关或点了磁贴，他已经等了文件，这个框正是他要的东西。
+        wake(activity);
         return false;
+    }
+
+    /**
+     * 启动路径上该不该主动问「允许后台运行」。
+     *
+     * <p>和 {@link #ensure} 的分工只有一条：这里问过一次就不再问。启动时把整屏交给一个系统
+     * 确认框，和启动时把人扔进设置页是同一类冒犯——他还没表达任何意图，而这条缺口只在实际
+     * 接收时才咬人。缺口改由胶囊和副标题说（{@link #shortGap}、{@link #gap}）。
+     */
+    static boolean unseenAwake(Context context) {
+        if (awake(context)) {
+            return false;
+        }
+        return !context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+                .getBoolean(ASKED_AWAKE, false);
+    }
+
+    /**
+     * 弹系统那个「允许后台运行」的确认框。弹出去返回 {@code true}。
+     *
+     * <p>这一条没有 {@code onRequestPermissionsResult}：答案只能在下次回到页面时用
+     * {@link #awake} 读回来。所以这里做的事只有半件——把框递到人眼前。
+     *
+     * <p>两级退路，选法和 {@link #open} 一致：哪一页能让人一次解决。直接对话框最好，一句话、
+     * 一个「允许」；ROM 拦掉这个 action 时退到电池优化列表，那里能找到本应用；再不行退到应用
+     * 详情，「耗电管理」就在那一页里。都不通就算了——这条缺口不致命，只是后台变脆。
+     */
+    static boolean wake(Activity activity) {
+        if (awake(activity)) {
+            return false;
+        }
+        // 先记下「问过」。只影响 {@link #unseenAwake} 那一条路，所以放在跳转之前——跳出去了
+        // 也可能一个框都没弹（ROM 拦 action），那时候更不该下次再试一遍。
+        activity.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+                .edit().putBoolean(ASKED_AWAKE, true).apply();
+        Intent ask = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.fromParts("package", activity.getPackageName(), null));
+        try {
+            activity.startActivity(ask);
+            Log.i(TAG, "asking to be left running in the background");
+            return true;
+        } catch (RuntimeException unavailable) {
+            Log.w(TAG, "no dialog for battery optimizations", unavailable);
+            return openBattery(activity);
+        }
+    }
+
+    /** 「允许后台运行」那两级退路。都走不通返回 {@code false}。 */
+    private static boolean openBattery(Activity activity) {
+        try {
+            activity.startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            return true;
+        } catch (RuntimeException alsoMissing) {
+            // 列表页也没有。退到应用详情——ColorOS 的「耗电管理」入口在那一页，人还能自己
+            // 找到路；什么都不做，等于让他对着一个会断的开关。
+            Log.w(TAG, "no battery optimization page either", alsoMissing);
+            try {
+                activity.startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.fromParts("package", activity.getPackageName(), null)));
+            } catch (RuntimeException nowhere) {
+                Log.w(TAG, "nowhere to send them for background running", nowhere);
+            }
+            return false;
+        }
     }
 
     /**

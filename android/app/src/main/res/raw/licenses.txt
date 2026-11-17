@@ -11,10 +11,10 @@ OPAirDrop — 第三方许可 / Third-party licenses
 名称：OPAirDrop
 实现：Rust 核心（crates/）+ Java 外壳（android/），
       双方经 JNI 相连
-源码：本仓库 repo-OPAirDrop（本地工作副本，尚未建立远端）
-许可：仓库根目录没有 LICENSE 文件，因此本项目尚未声明许可，
-      按著作权法默认保留所有权利。
-      若日后加入 LICENSE，请同时改这一段。
+源码：本仓库 repo-OPAirDrop
+      https://github.com/cyan-lamp/OPAirDrop.git
+许可：仓库根的 LICENSE，GPL-2.0。
+      随 APK 分发，全文见「关于 → 开源许可」。
 
 本应用不包含 Google QuickShare / Nearby 的任何源码或二进制，
 不包含任何 Google Play 服务组件，Java 侧除 Android 框架外
@@ -22,7 +22,7 @@ OPAirDrop — 第三方许可 / Third-party licenses
 dependencies 块）。下面列出的全部是 Rust 依赖。
 
 ============================================================
-二、随包分发的 Rust crate（13 个）
+二、随包分发的 Rust crate（14 个）
 ============================================================
 
 名称           版本     许可
@@ -34,6 +34,7 @@ flate2         1.1.11   MIT OR Apache-2.0
 jni-sys        0.3.1    MIT OR Apache-2.0
 jni-sys        0.4.1    MIT OR Apache-2.0
 jni-sys-macros 0.4.1    MIT OR Apache-2.0
+libc           0.2.191  MIT OR Apache-2.0
 miniz_oxide    0.9.1    MIT OR Zlib OR Apache-2.0
 proc-macro2    1.0.107  MIT OR Apache-2.0
 quote          1.0.47   MIT OR Apache-2.0
@@ -79,6 +80,8 @@ MIT / 0BSD / Zlib 的著作权声明逐条保留，因为那是这些许可
             Copyright (c) 2015 The rust-jni-sys Developers
   jni-sys 0.4.1
             Copyright (c) 2015 The rust-jni-sys Developers
+  libc 0.2.191
+            Copyright (c) The Rust Project Developers
   miniz_oxide 0.9.1
             Copyright 2013-2014 RAD Game Tools and Valve
       Software
@@ -140,88 +143,29 @@ SOFTWARE.
 许可：Apache-2.0
 ------------------------------------------------------------
   adler2 2.0.1
-            copyright notice that is included in or attached
-      to the work
-            copyright license to reproduce, prepare
-      Derivative Works of,
-            (c) You must retain, in the Source form of any
-      Derivative Works
             Copyright [yyyy] [name of copyright owner]
   cfg-if 1.0.5
-            copyright notice that is included in or attached
-      to the work
-            copyright license to reproduce, prepare
-      Derivative Works of,
-            (c) You must retain, in the Source form of any
-      Derivative Works
             Copyright [yyyy] [name of copyright owner]
   crc32fast 1.5.5
-            copyright notice that is included in or attached
-      to the work
-            copyright license to reproduce, prepare
-      Derivative Works of,
-            (c) You must retain, in the Source form of any
-      Derivative Works
             Copyright {yyyy} {name of copyright owner}
   flate2 1.1.11
-            copyright notice that is included in or attached
-      to the work
-            copyright license to reproduce, prepare
-      Derivative Works of,
-            (c) You must retain, in the Source form of any
-      Derivative Works
             Copyright [yyyy] [name of copyright owner]
   jni-sys 0.3.1
-            copyright notice that is included in or attached
-      to the work
-            copyright license to reproduce, prepare
-      Derivative Works of,
-            (c) You must retain, in the Source form of any
-      Derivative Works
             Copyright {yyyy} {name of copyright owner}
   jni-sys 0.4.1
-            copyright notice that is included in or attached
-      to the work
-            copyright license to reproduce, prepare
-      Derivative Works of,
-            (c) You must retain, in the Source form of any
-      Derivative Works
             Copyright {yyyy} {name of copyright owner}
+  libc 0.2.191
+      原文没有著作权行（署名写在 Cargo.toml 或 README 里）
   miniz_oxide 0.9.1
-            copyright notice that is included in or attached
-      to the work
-            copyright license to reproduce, prepare
-      Derivative Works of,
-            (c) You must retain, in the Source form of any
-      Derivative Works
+      原文没有著作权行（署名写在 Cargo.toml 或 README 里）
   proc-macro2 1.0.107
-            copyright notice that is included in or attached
-      to the work
-            copyright license to reproduce, prepare
-      Derivative Works of,
-            (c) You must retain, in the Source form of any
-      Derivative Works
+      原文没有著作权行（署名写在 Cargo.toml 或 README 里）
   quote 1.0.47
-            copyright notice that is included in or attached
-      to the work
-            copyright license to reproduce, prepare
-      Derivative Works of,
-            (c) You must retain, in the Source form of any
-      Derivative Works
+      原文没有著作权行（署名写在 Cargo.toml 或 README 里）
   syn 2.0.119
-            copyright notice that is included in or attached
-      to the work
-            copyright license to reproduce, prepare
-      Derivative Works of,
-            (c) You must retain, in the Source form of any
-      Derivative Works
+      原文没有著作权行（署名写在 Cargo.toml 或 README 里）
   unicode-ident 1.0.27
-            copyright notice that is included in or attached
-      to the work
-            copyright license to reproduce, prepare
-      Derivative Works of,
-            (c) You must retain, in the Source form of any
-      Derivative Works
+      原文没有著作权行（署名写在 Cargo.toml 或 README 里）
 
 Apache License
                            Version 2.0, January 2004

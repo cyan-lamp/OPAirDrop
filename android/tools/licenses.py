@@ -72,7 +72,19 @@ SIGNS = [
     ("Unicode-3.0", "UNICODE LICENSE V3", None),
 ]
 
-COPYRIGHT = re.compile(r"^\s*(copyright|\(c\)|©)", re.IGNORECASE)
+# 大小写敏感，而且要顶格（允许缩进）以 Copyright 开头。
+#
+# 这行正则看着朴素，它专门排掉 Apache-2.0 正文里的 "the copyright owner" 和 "copyright
+# notice that is included in or attached to the work" —— 那些是条款里的普通名词，不是谁的
+# 版权声明。原来带 re.IGNORECASE，于是这些行被当成版权行抓出来，页面上就出现
+#   libc 0.2.191
+#       copyright notice that is included in or attached to the work
+# 这种谁也读不懂的条目（重新生成时真的出现了）。
+#
+# `(c)` 这种写法后面必须是年份。条款 4(c) 的正文是 "(c) You must retain, in the Source
+# form of any Derivative Works…"，只写 `\(c\)` 会把这一整行当成版权行提走，正文里就少了
+# 半句条款——那已经不是排版问题，是篡改。
+COPYRIGHT = re.compile(r"^\s*(?:Copyright|COPYRIGHT|©|\([cC]\)\s*\d{4})")
 
 # The title line some copies carry and others omit; see canonical().
 TITLE = re.compile(
@@ -191,6 +203,52 @@ def canonical(text):
     )
 
 
+def remote_url():
+    """``origin`` 的地址，取不到就返回空串。
+
+    这一段以前是写死的中文（「本地工作副本，尚未建立远端」）。写死的状态一定会过期，而这份
+    清单唯一的价值就是「说的一定是现在的事实」——所以状态类的东西一律现场查。
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", ROOT, "remote", "get-url", "origin"],
+            capture_output=True, text=True,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except OSError:
+        return ""
+
+
+def own_license_lines():
+    """本仓库自己声明的许可，从仓库根读出来，返回要写进清单的那几行。
+
+    同样是不写死：以前这几行断言「仓库根目录没有 LICENSE 文件」，后来真加了 GPL-2.0，
+    那段话就从「不完整」升级成了「错误」——而错误的法务声明比缺失更糟。
+    """
+    for name in ("LICENSE", "LICENSE.md", "COPYING", "LICENCE"):
+        path = os.path.join(ROOT, name)
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            head = handle.read(2000)
+        if "GNU GENERAL PUBLIC LICENSE" in head and "Version 2" in head:
+            spdx = "GPL-2.0"
+        elif "Apache License" in head and "Version 2.0" in head:
+            spdx = "Apache-2.0"
+        elif "Permission is hereby granted, free of charge" in head:
+            spdx = "MIT"
+        else:
+            spdx = "见文件头"
+        return [
+            "仓库根的 %s，%s。" % (name, spdx),
+            "随 APK 分发，全文见「关于 → 开源许可」。",
+        ]
+    return [
+        "仓库根没有 LICENSE 文件，因此本项目尚未声明许可，",
+        "按著作权法默认保留所有权利。",
+    ]
+
+
 def main():
     graph = metadata()
     packages = {package["id"]: package for package in graph["packages"]}
@@ -231,6 +289,9 @@ def main():
         crates.append((name, version, declared, keys))
 
     lines = []
+
+    remote = remote_url()
+    own = own_license_lines()
 
     def cells(text):
         """How many columns this line takes, counting a CJK glyph as two."""
@@ -292,10 +353,14 @@ def main():
     add("名称：OPAirDrop")
     add("实现：Rust 核心（crates/）+ Java 外壳（android/），")
     add("      双方经 JNI 相连")
-    add("源码：本仓库 repo-OPAirDrop（本地工作副本，尚未建立远端）")
-    add("许可：仓库根目录没有 LICENSE 文件，因此本项目尚未声明许可，")
-    add("      按著作权法默认保留所有权利。")
-    add("      若日后加入 LICENSE，请同时改这一段。")
+    add("源码：本仓库 repo-OPAirDrop")
+    if remote:
+        # 远端是从 git 里读的，不写死。这句话以前写的是「尚未建立远端」，等远端真的建起
+        # 来，整份清单就开始对用户说假话——而它的全部意义就是「说的一定是现在的事实」。
+        add("      " + remote)
+    add("许可：%s" % own[0])
+    for extra in own[1:]:
+        add("      " + extra)
     add("")
     add("本应用不包含 Google QuickShare / Nearby 的任何源码或二进制，")
     add("不包含任何 Google Play 服务组件，Java 侧除 Android 框架外")
