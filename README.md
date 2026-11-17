@@ -35,6 +35,21 @@
 - **附近的设备**（蓝牙广播与连接）：用 BLE 广播叫醒 iPhone。未授权时链路仍可被已经知道地址的对端连上，但发现不了新设备。第一次进发送页时应用会申请一次。
 - **网络与组播**：发现与传输，安装即授予，无需操作。
 
+## 驱动
+
+随包的四个内核模块不是原厂的，也不是另找一个版本替换：**相对原厂只动了该动的地方，其余字节保持原样**。这一点每次装载前都会验一遍，不是「看着能跑」。
+
+| 模块 | 改了什么 | 硬读数 |
+| --- | --- | --- |
+| `qca_cld3_peach_v2` | 开出一条 passthru 通路，把 802.11 帧的收发从固件手里交回主机 | 符号 CRC 588/588 与原厂逐条相同、0 条不符、0 条只存在于原厂；新增 12 条依赖全在 KMI 白名单里；导出 2 个符号给 provider；62 个 `passthru_*` 参数（原厂共 6 个参数，没有一个 passthru） |
+| `mac80211` | 把 minstrel_ht 编进模块本身 | 原厂 `sun_perf.config` 根本没开速率控制，`wonder.ko` 因此注册不上（`Failed to select rate control algorithm` / `Ret: -2`）；现在 RC 符号 317→319（`+kmalloc_large`、`+param_ops_bool`），导出 136 条不变 |
+| `wonder` | 新模块，`wonder0` 的驱动 | 装载后创建 IBSS `wonder0`：ch149 / 20 MHz / BSSID `00:25:00:ff:94:73` |
+| `opairshare_wonder_provider` | 新模块，把 qca 导出的两个符号接到 wonder 上 | 缺它 `wonder_probe` 找不到 wiphy，`insmod wonder` 会报「registered no wiphy」 |
+
+四颗的 `vermagic` 与原厂逐字符相同（`6.6.118-android15-8-o-4k SMP preempt mod_unload modversions aarch64`）。能顶掉原厂而**不是**替换文件，靠的是 `insmod` + 符号 CRC 一致：`/vendor` 分毫没动，`rmmod` 或重启即回原厂，这是这条路线唯一的回滚保证。
+
+这些字节的源码就在同一仓库：`android/kernel-assets/source/` 是上游的驱动覆盖层（44 个文件，`source-map.json` 逐条给出平台树落点）、7 个补丁和那串构建脚本。载荷清单、每个文件的 sha256、以及「从源码重建到哪一步了」都写在 [kernel-assets/README.md](android/kernel-assets/README.md)。一句话现状：**未打补丁的基线已经从官方源码复现过**（1359/1359 actions 全绿，`__versions` 588/588 与原厂一致，实机上 `rmmod` 原厂 → `insmod` 自建零报错、Wi-Fi 起来零丢包）；**打过补丁的这一颗还没有从源码复现**——现在跑的是上游给出的字节。
+
 ## 使用入口
 
 第一次使用：
