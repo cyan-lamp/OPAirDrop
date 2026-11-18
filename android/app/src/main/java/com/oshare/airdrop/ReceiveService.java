@@ -366,6 +366,11 @@ public final class ReceiveService extends Service {
         startForeground(NOTIFICATION, notification(this));
         shown = true;
         running = true;
+        // 磁贴那一格此刻可能还停在「正在启动…」：它上一次画是在点击的那一刻，而服务要靠一次
+        // 异步绑定才建得出来，中间没有任何东西会去重画它。这一句就是那个「有人该重画了」。
+        // 没有它，一格图标会一直灰着，而 8770 其实已经在听——2026-11-18 19:55 真机上就是这样，
+        // 而且那一格当时还被写成了点不动的 STATE_UNAVAILABLE。
+        AirdropTile.refresh(this);
         Listener.of(this).start();
         // 应用层到这里就齐了。内核层（模块、awdld、awdltun0）这里**不建**：建它要关二十五秒
         // Wi-Fi，只有功能页那个按钮该做这件事。看护者只负责在它不在时如实说，理由见 StackKeeper。

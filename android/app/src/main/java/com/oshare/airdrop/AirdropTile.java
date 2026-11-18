@@ -5,6 +5,9 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.drawable.Icon;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
 import android.service.quicksettings.Tile;
 import android.service.quicksettings.TileService;
 
@@ -33,18 +36,57 @@ import android.service.quicksettings.TileService;
  * {@link StackKeeper} 去对齐，而它给出的结论必须有人显示——否则「开着」与「开着但谁也看不见」
  * 在屏幕上长得一模一样，那正是 2026-11-18 16:56 那次的现象。
  *
- * <p>所以磁贴多了【不可用】这一格，说的是链路的事，不是开关的事：开关还在开的位置，接收端
+ * <p>所以磁贴多了【说了话的灰】这一格，说的是链路的事，不是开关的事：开关还在开的位置，接收端
  * 也还在听，只是这台机器此刻报不出名字。第二次点它仍然是「关」——一个开关只该有一个含义，
  * 状态另开一格去讲。
+ *
+ * <p># 为什么那一格是灰的，不是 {@code STATE_UNAVAILABLE}
+ *
+ * <p>因为后者在 Android 里不是「一种灰」而是「不存在」：{@code Tile.click()} 见到
+ * {@code STATE_UNAVAILABLE} 直接 return，点击连 {@link #onClick} 都到不了。2026-11-18 19:55
+ * 真机上它长成了一次死锁——开、关、再开之后这一格变灰且点不动，而它自己那句说明正是「点一下
+ * 重试」。现在两种异常都用 {@code STATE_INACTIVE}：同样是暗的，但还接得住下一次点击。
  */
 public final class AirdropTile extends TileService {
 
     private static final String TAG = "OPAirDrop";
 
+    /** 磁贴的样子只能在主线程上改，而 {@link #refresh} 是从看护线程上被叫到的。 */
+    private static final Handler MAIN = new Handler(Looper.getMainLooper());
+
+    /**
+     * 此刻被系统绑着的那一个实例。没有人在看这一格的时候是 {@code null}。
+     *
+     * <p>有这个引用，{@link #refresh} 才能**当场**把图标改掉。{@link #requestListeningState}
+     * 是绕系统一圈：系统要愿意在下拉面板可见时回调 {@link #onStartListening}，而那一次回调
+     * 在 ColorOS 上不保证来（真机上量到过：服务在跑、链路在、这一格还是灰的，直到面板被重新
+     * 展开）。一格图标不该依赖一次不确定的回调。
+     */
+    private static volatile AirdropTile bound;
+
+    /**
+     * 上一次有人点「开」的时刻，用来把「正在启动」与「起不来」分开。
+     *
+     * <p>点完那一瞬间服务确实还没起来——{@code bindService} 是异步的，而 {@code render()}
+     * 紧接着就跑。没有这一位，那一格会在每次打开时先说一句「起不来」，然后才被改成好的；
+     * 有了它，同一句话在头两秒里是「正在启动…」。
+     */
+    private static volatile long askedAt;
+
     @Override
     public void onStartListening() {
         super.onStartListening();
+        bound = this;
+        Log.i(TAG, "tile| listening");
         render();
+    }
+
+    @Override
+    public void onStopListening() {
+        if (bound == this) {
+            bound = null;
+        }
+        super.onStopListening();
     }
 
     @Override
@@ -72,6 +114,7 @@ public final class AirdropTile extends TileService {
             // 一个开关只该有一个含义（见 2026-11-16 15:10 那条：别人的十分钟窗口正是"又收不到
             // 了"的来源）。
             ReceiveService.enable(this, 0);
+            askedAt = SystemClock.uptimeMillis();
             // 再敲一次门，用绑定而不是 startForegroundService：应用在后台时后者会被系统
             // 「接受但不执行」（真机上量到过 app=null、startForegroundCount=0），于是开关
             // 亮着、8770 没人听，直到把应用切到前台。理由与实测见 ReceiveService#poke。
@@ -87,6 +130,11 @@ public final class AirdropTile extends TileService {
             }
         }
         render();
+        // 再画一次，而且这一次要落在 {@code settling} 之外（1.5 秒）：上面那一画发生在「开」
+        // 的请求刚发出去的时候，服务要靠一次异步绑定才建得出来，那一刻 {@code running} 还是
+        // false。一秒八之后它要么已经在了（这一格转绿），要么是真的没起来（这一格说出那句
+        // 重试）。只画一次就会一直停在中间那个说法上。
+        MAIN.postDelayed(this::render, 1_800);
     }
 
     /**
@@ -139,6 +187,14 @@ public final class AirdropTile extends TileService {
      * 面板没展开的时候这一次是空的，而那时也没有人在看这格图标。
      */
     static void refresh(Context context) {
+        // 有人在看这一格：当场改。这一条是 2026-11-18 19:55 那条「关掉再打开，磁贴变成灰的、
+        // 点不动」的一半答案——服务起来之后没有任何东西重画过它，而 service 起来本身不会让
+        // 系统去问一次。见 {@link #bound}。
+        AirdropTile self = bound;
+        if (self != null) {
+            MAIN.post(self::render);
+            return;
+        }
         try {
             requestListeningState(context, new ComponentName(context, AirdropTile.class));
         } catch (RuntimeException refused) {
@@ -152,6 +208,9 @@ public final class AirdropTile extends TileService {
     private void render() {
         Tile tile = getQsTile();
         if (tile == null) {
+            // 系统还没把这一格交到手上。没有 tile 对象就没有地方可以写，而这不是错误路径：
+            // 面板收起时它本来就可能是 null。留一行，是因为「图标不听话」时要先排除这一种。
+            Log.i(TAG, "tile| no tile object");
             return;
         }
         // 绿灯要同时满足三件事：他想要收（{@code receive.manual}）、进程真的在听（服务在跑）、
@@ -159,22 +218,33 @@ public final class AirdropTile extends TileService {
         // 比红灯难查得多。
         boolean wanted = ReceiveService.listening(this);
         boolean live = wanted && ReceiveService.running();
+        boolean linked = StackKeeper.linked();
+        // 刚点过「开」的两秒里，服务还可能在那次异步绑定的路上。这一段不该被说成失败。
+        boolean settling = SystemClock.uptimeMillis() - askedAt < 1_500;
+        Log.i(TAG, "tile| wanted=" + wanted + " live=" + live + " linked=" + linked
+                + " settling=" + settling);
+
         if (wanted && !live) {
-            // 开关拨上去了，服务却没起来。磁贴从后台叫 startForegroundService 会被系统拒
-            // （Android 12 起），而人此刻已经在 iPhone 上找设备了。这一格必须说这件事，
-            // 而且点它有救：下一次点击会再叫一次。
-            tile.setState(Tile.STATE_UNAVAILABLE);
-            tile.setSubtitle("监听没起来，点一下重试");
-        } else if (live && !StackKeeper.linked()) {
+            // 开关拨上去了，服务却没起来。这一格必须说这件事，而且点它有救：下一次点击会再
+            // 叫一次。**所以这里不能用 STATE_UNAVAILABLE**——那个状态在 AOSP 里就是「不可用」，
+            // {@code Tile.click()} 见到它直接 return，点击根本到不了 onClick。旧版正是这样：
+            // 说「点一下重试」，同时把这一格变成点不动的灰块，于是那句重试永远等不到人。
+            //
+            // 剩下的两种状态都可点，选灰的那个：ACTIVE 会是一盏假绿灯（服务没起来，却亮着）。
+            tile.setState(Tile.STATE_INACTIVE);
+            tile.setSubtitle(settling ? "正在启动…" : "监听没起来，点一下重试");
+        } else if (live && !linked) {
             // 在听，但没有 awdltun0：mDNS 没有网卡可发。「亮着 = 能被发现」在这台机器上曾经
-            // 是假的，所以这里不点绿灯；点它会去功能页，那里才有建链按钮。
-            tile.setState(Tile.STATE_UNAVAILABLE);
+            // 是假的，所以这里不点绿灯；点它会去功能页，那里才有建链按钮。同样必须是可点的
+            // 状态——不可用的一格会把「点这里建链」也一起废掉。
+            tile.setState(Tile.STATE_INACTIVE);
             String trouble = StackKeeper.note();
             tile.setSubtitle(trouble.isEmpty() ? "链路未建立，点这里建链" : trouble);
         } else {
             tile.setState(live ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
             tile.setSubtitle(null);
         }
+        Log.i(TAG, "tile| state=" + tile.getState());
         tile.setLabel(getString(R.string.tile_airdrop));
         // 用应用自己的图标（蓝色圆点 + 两道环），取的是**裁剪过视口**的那一份
         // （{@code tile_airdrop.xml}：同一组路径，viewport 收到 48 并让图形顶格画）。
