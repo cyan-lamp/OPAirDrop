@@ -988,6 +988,19 @@ final class Listener {
                 // 没有浏览目录的入口，除了这里没有第二个地方会说出来。
                 attempt.delivered(published);
                 setState("正在监听 " + PORT + "，等待附近设备", false);
+            } else if (attempt.deliveredLinks()) {
+                // 一次纯链接分享：`Items` 里有地址，`Files` 是空的，所以一个字节都不会
+                // `/Upload`，`report` 也就是空的——上面那条分支永远走不到它。
+                //
+                // 不在这里结账的后果不是「少一张卡」，而是一张**说假话的卡**：finally 里的
+                // {@link ReceiveHost.Attempt#abandon} 看见「人说收了」却没结过账，会把这次
+                // 成功画成「接收失败：连接意外断开」。线是通的、对面拿到了 200，只有屏幕上
+                // 那句话是假的。
+                //
+                // 页面上那句话仍然要换掉：人刚刚在卡片上点了接收，页面还停在「等待附近设备」
+                // 就等于什么都没发生。链接没有落点也没有字节数，所以这句只说到"收到了"为止。
+                last = "已收到链接";
+                setState("正在监听 " + PORT + "，等待附近设备", false);
             }
         } catch (IOException | RuntimeException refused) {
             // 对端走掉和真正出错，在异常类型上是同一件事，在意思上是两件。legacy 的同一处

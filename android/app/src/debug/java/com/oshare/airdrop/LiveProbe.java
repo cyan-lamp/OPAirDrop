@@ -19,6 +19,7 @@ import android.util.Log;
  *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode send_done
  *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode send_fail
  *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode recv_done
+ *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode recv_link
  *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode recv_fail
  *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode drop
  * </pre>
@@ -74,6 +75,14 @@ public final class LiveProbe extends BroadcastReceiver {
             case "recv_done":
                 LiveCard.finishWithActions(context, "接收完成", "2 个文件 · 4.8 MB",
                         open(context, 45));
+                break;
+            case "recv_link":
+                // 一次纯链接分享的收尾，和 ReceiveHost.deliveredLinks 走的是同一条路：
+                // 同一个 finishWithLink、同一个 openLink。所以这张卡上看到的按钮、按下去
+                // 落到的组件，就是真收到链接时会看到的那些。
+                LiveCard.finishWithLink(context, "接收完成", "1 个链接 · apps.apple.com",
+                        ReceiveHost.openLink(context, java.util.Collections.singletonList(
+                                "https://apps.apple.com/app/id6451407032")));
                 break;
             case "recv_fail":
                 // 接收侧没有「重发」这个动作可做——传过来这件事取决于对面，所以只挂【完成】。

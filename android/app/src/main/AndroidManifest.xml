@@ -137,6 +137,19 @@
             android:taskAffinity=""
             android:noHistory="true" />
 
+        <!-- 【打开链接】的落点：先撤卡，再把那条 http(s) 地址交给浏览器。
+
+             和上一条同一个理由：通知点下去的 PendingIntent 只允许落到界面上。区别只在打开的
+             东西——那边是我们自己刚写进媒体库的文件，这边是**对面那台手机说的**一条地址，所以
+             那一层只放行 http/https，其余 scheme 一律不打开（见 OpenLink 的类注释）。 -->
+        <activity
+            android:name=".OpenLink"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:noHistory="true" />
+
         <!-- 「完成」按钮的落点：撤掉那张卡。不导出——只有本应用的通知会带这条 PendingIntent。 -->
         <receiver
             android:name=".CardDismiss"

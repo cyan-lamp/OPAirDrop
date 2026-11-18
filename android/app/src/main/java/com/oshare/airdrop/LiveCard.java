@@ -114,7 +114,7 @@ final class LiveCard {
      * @param percent 0–100；负数表示「不知道进度」，这时卡片画成不确定态而不是停在 0%
      */
     static void update(Context context, String title, String shortText, int percent) {
-        post(context, title, shortText, percent, false, false, null, null);
+        post(context, title, shortText, percent, false, false, null, null, null);
     }
 
     /**
@@ -125,12 +125,12 @@ final class LiveCard {
      * 的一个布尔参数：调用点写的是意图，不是标志位。
      */
     static void announce(Context context, String title, String shortText, int percent) {
-        post(context, title, shortText, percent, true, false, null, null);
+        post(context, title, shortText, percent, true, false, null, null, null);
     }
 
     /** 收尾：进度拉满，短句换成结果。 */
     static void finish(Context context, String title, String shortText) {
-        post(context, title, shortText, 100, true, true, null, null);
+        post(context, title, shortText, 100, true, true, null, null, null);
     }
 
     /**
@@ -140,12 +140,24 @@ final class LiveCard {
      * 完成提示，等于把「东西在哪」这个问题留给了人去翻相册。留到他按「完成」为止，才是把最后
      * 一步交还在他手上。
      *
-     * @param open 打开那份文件的 intent；没有可打开的（比如只有链接）时传 {@code null}，
-     *             那就只挂「完成」
+     * @param open 打开那份文件的 intent；没有可打开的时传 {@code null}，那就只挂「完成」
      */
     static void finishWithActions(Context context, String title, String shortText,
                                   PendingIntent open) {
-        post(context, title, shortText, 100, true, true, open, null);
+        post(context, title, shortText, 100, true, true, open, "打开文件", null);
+    }
+
+    /**
+     * 收到的是链接时的那张卡：和 {@link #finishWithActions} 只差一个词。
+     *
+     * <p>为什么值得为这一个词多一个入口：【打开文件】按在那个位置上，人期待的是相册或文件
+     * 管理起来。一次纯链接分享没有文件，那串地址就是收到的全部东西——按钮写错一个词，
+     * 人按下去之前会以为点开的是自己刚收下的那份文件。
+     *
+     * @param open 打开那条链接的 intent
+     */
+    static void finishWithLink(Context context, String title, String shortText, PendingIntent open) {
+        post(context, title, shortText, 100, true, true, open, "打开链接", null);
     }
 
     /**
@@ -168,7 +180,7 @@ final class LiveCard {
      */
     static void failedWithActions(Context context, String title, String shortText, int percent,
                                   PendingIntent retry) {
-        post(context, title, shortText, Math.max(0, percent), true, true, null, retry);
+        post(context, title, shortText, Math.max(0, percent), true, true, null, null, retry);
     }
 
     /**
@@ -319,11 +331,13 @@ final class LiveCard {
      *                  两者缺一不可：低重要性渠道上把 onlyAlertOnce 设成 false 也不抬。
      * @param terminal  这张卡是不是「这件事已经结束」。终态必须挂【完成】——传输结束不是这件事的
      *                  结束，人还要按一下才算收尾；而进度中的卡一颗按钮都不该有。
-     * @param open      【打开文件】的 intent，没有就不挂这颗按钮
+     * @param open      【打开文件】/【打开链接】的 intent，没有就不挂这颗按钮
+     * @param openLabel {@code open} 那颗按钮写什么。收的是文件就是「打开文件」，收的是一条链接
+     *                  就是「打开链接」——同一个位置，两种东西，说错一个词人就会按错期待
      * @param retry     【重试】的 intent，没有就不挂这颗按钮
      */
     private static void post(Context context, String title, String shortText, int percent,
-                             boolean alert, boolean terminal, PendingIntent open,
+                             boolean alert, boolean terminal, PendingIntent open, String openLabel,
                              PendingIntent retry) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.BAKLAVA) {
             return;
@@ -354,10 +368,11 @@ final class LiveCard {
                 .setOnlyAlertOnce(!alert)
                 .setShowWhen(false)
                 .setRequestPromotedOngoing(true);
-        // 顺序就是左右顺序：【打开文件】/【重试】说的是「接下来做什么」，排在左边；
-        // 【完成】是「这件事到此为止」，永远在最右。两者不会同时出现，所以最多两颗。
+        // 顺序就是左右顺序：【打开文件】/【打开链接】/【重试】说的是「接下来做什么」，排在
+        // 左边；【完成】是「这件事到此为止」，永远在最右。前两颗不会同时出现，所以最多两颗。
         if (open != null) {
-            builder.addAction(new Notification.Action.Builder(null, "打开文件", open).build());
+            builder.addAction(new Notification.Action.Builder(null,
+                    openLabel == null ? "打开文件" : openLabel, open).build());
         }
         if (retry != null) {
             builder.addAction(new Notification.Action.Builder(null, "重试", retry).build());

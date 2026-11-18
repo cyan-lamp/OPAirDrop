@@ -67,9 +67,9 @@ use crate::settings;
 
 /// Asks a person whether a transfer should be taken.
 ///
-/// Called with a one-line summary (`sender<TAB>files<TAB>bytes<TAB>links<TAB>names`, UTF-8)
-/// after the offer has been read and before `/Ask` is answered. A positive return accepts; zero
-/// refuses; a negative value is the caller's own error code and is treated as a refusal,
+/// Called with a one-line summary (`sender<TAB>files<TAB>bytes<TAB>links<TAB>names<TAB>urls`,
+/// UTF-8) after the offer has been read and before `/Ask` is answered. A positive return accepts;
+/// zero refuses; a negative value is the caller's own error code and is treated as a refusal,
 /// because the only safe reading of "the prompt broke" is "do not take what nobody saw".
 pub type DecideCallback =
     unsafe extern "C" fn(context: *mut c_void, summary: *const u8, len: usize) -> i32;
@@ -145,7 +145,7 @@ impl Watcher {
 /// called.
 ///
 /// Tab-separated rather than pretty-printed, because the caller renders it and knows the
-/// language: three numbers and a name do not deserve a sentence assembled down here.
+/// language: four numbers and a name do not deserve a sentence assembled down here.
 ///
 /// The fourth field is the link count, and it is not decoration. A share from Safari is a
 /// links offer — `Files` empty, `Items` full — so a three-field summary describes it as
@@ -157,15 +157,22 @@ impl Watcher {
 /// photos or one document and one archive; the names decide whether the prompt is worth
 /// reading. Without them the card falls back to saying the file details are unknown, which
 /// is what it said for every invitation until this field existed.
+///
+/// The sixth field is the links themselves, and it is the one that makes a links offer
+/// usable rather than merely visible. The fourth field can say "1 link"; only this one says
+/// *which* link, and "which" is the whole point of a link — there is no file to open
+/// afterwards, so the URL is the entire thing being sent. Field five's discipline applies
+/// unchanged: `\x1e` between entries, the line-breaking characters replaced.
 fn summary_of(offer: &Ask) -> String {
     let bytes: u64 = offer.files.iter().filter_map(|file| file.size).sum();
     format!(
-        "{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}",
         offer.display_name(),
         offer.files.len(),
         bytes,
         offer.links.len(),
-        names_of(&offer.files)
+        names_of(&offer.files),
+        links_of(&offer.links)
     )
 }
 
@@ -214,6 +221,40 @@ fn names_of(files: &[Item]) -> String {
         text.push(BETWEEN_NAME_AND_SIZE);
         if let Some(size) = file.size {
             text.push_str(&size.to_string());
+        }
+    }
+    text
+}
+
+/// The sixth field: the links themselves, `\x1e` between them.
+///
+/// Same character discipline as [`names_of`], with one difference that is worth stating:
+/// a URL has no second component, so `\x1f` is not structure here — it is just another
+/// character that must not reach the caller, because the field is split on `\x1e` and a
+/// stray `\x1f` would ride along inside a link.
+///
+/// Control characters in a URL are not a real possibility — a sender that means one
+/// percent-encodes it — which is exactly why replacing them costs nothing and guessing
+/// does. What arrives here is whatever the peer wrote in `Items`, and it is about to be
+/// handed to an intent that opens a browser.
+fn links_of(links: &[String]) -> String {
+    let mut text = String::new();
+    for link in links {
+        if !text.is_empty() {
+            text.push(BETWEEN_FILES);
+        }
+        for ch in link.chars() {
+            let ch = if ch == BETWEEN_NAME_AND_SIZE
+                || ch == BETWEEN_FILES
+                || ch == '\t'
+                || ch == '\n'
+                || ch == '\r'
+            {
+                ' '
+            } else {
+                ch
+            };
+            text.push(ch);
         }
     }
     text
@@ -865,7 +906,7 @@ mod tests {
             "a refusing answer closes"
         );
         assert_eq!(
-            summary, "Ada 的 iPhone\t1\t7\t0\ta.pdf\u{1f}7",
+            summary, "Ada 的 iPhone\t1\t7\t0\ta.pdf\u{1f}7\t",
             "the fifth field names the file, so the prompt can say what it is"
         );
     }
@@ -891,7 +932,7 @@ mod tests {
 
         assert_eq!(code, status::OK);
         assert!(String::from_utf8_lossy(&answers).starts_with("HTTP/1.1 200"));
-        assert_eq!(summary, "Mac\t1\t7\t0\ta.pdf\u{1f}7");
+        assert_eq!(summary, "Mac\t1\t7\t0\ta.pdf\u{1f}7\t");
     }
 
     #[test]
@@ -920,8 +961,11 @@ mod tests {
         );
 
         assert_eq!(
-            summary, "链接探针\t0\t0\t2\t",
-            "the link count is the fourth field, and a links offer names no files"
+            summary,
+            "链接探针\t0\t0\t2\t\thttps://example.com/a\u{1e}https://example.com/b",
+            "the link count is the fourth field, and a links offer names no files — \
+             but the sixth field is where the links themselves finally cross over, \
+             because a link with no URL on this side is a card that cannot be opened"
         );
     }
 

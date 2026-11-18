@@ -93,7 +93,7 @@ final class Confirmation {
      *
      * <p>三个表面（通知、卡片、以及将来的任何一个）说的是同一件事，就必须说同样的话。所以
      * 措辞不再散在 {@code post} 里，而是从摘要一次解析出来，谁要谁拿。{@code summary} 是库给
-     * 的那一行：{@code "名字\t件数\t字节数\t链接数"}。
+     * 的那一行：{@code "名字\t件数\t字节数\t链接数\t文件名表\t链接表"}，后两段可以没有。
      */
     static final class Offer {
         /** 对面叫什么。它是「要不要收这个人的东西」的唯一判断依据。 */
@@ -117,17 +117,42 @@ final class Confirmation {
          */
         final long links;
 
+        /**
+         * 这次要发过来的那些链接本身，按对面的顺序。
+         *
+         * <p>第六个字段才把 URL 送过界。{@link #links} 只说「几个」，而链接这东西的全部
+         * 内容就是「哪一个」——收完之后没有文件可以点开，那串地址就是收到的全部。少了它，
+         * 卡上会出现「1 个链接」和一颗按不出东西的【打开链接】。
+         *
+         * <p>它可能比 {@link #links} 短，甚至为空（老库只给五个字段）。两者不一致时以这个
+         * 表为准：能点开的只有它。
+         */
+        final List<String> urls;
+
         private final String body;
 
-        private Offer(String sender, String body, List<Item> files, long links) {
+        private Offer(String sender, String body, List<Item> files, long links, List<String> urls) {
             this.sender = sender;
             this.body = body;
             this.files = files;
             this.links = links;
+            this.urls = urls;
         }
 
         String title() {
-            return sender + " 想给你发文件";
+            // 纯链接分享不是一个「文件」。卡上写「想给你发文件」、正文再说「1 个链接」，
+            // 两句就互相打脸——只有链接的时候按它的真名说。
+            return sender + (linksOnly() ? " 想给你发链接" : " 想给你发文件");
+        }
+
+        /**
+         * 这次是不是「只有链接」。
+         *
+         * <p>{@code files} 为空还有另一个来源：一个连文件名都不报的老发送端。那时
+         * {@link #links} 是零，所以这里不会把它误认成链接分享。
+         */
+        private boolean linksOnly() {
+            return files.isEmpty() && links > 0;
         }
 
         /** 正文说清几件、多大。 */
@@ -183,7 +208,30 @@ final class Confirmation {
         // 还没来得及伸手，都不等于他拒绝了——发送端拿到的是同一个 401，但屏幕上说什么由这里
         // 决定。到点之后那张卡写的是「已放弃」，所以在还没到点的时候就得是同一句话。
         return new Offer(sender, what + (bytes > 0 ? " · " + size(bytes) : "")
-                + "，" + seconds(timeoutMs) + " 秒内没人应答就放弃。", entries(field, 4), links);
+                + "，" + seconds(timeoutMs) + " 秒内没人应答就放弃。",
+                entries(field, 4), links, urls(field, 5));
+    }
+
+    /**
+     * 第六个字段：{@code 地址<RS>地址…}。
+     *
+     * <p>和第五个字段用同一个分隔符，理由也一样（见 {@link #entries}）。地址里的分隔符由
+     * 库那一侧替换掉了，所以这里切一刀就是切对了。
+     *
+     * <p>空条目跳过。一个空格子不是「一个空链接」，它是「这一格没有」——把它当成地址传下去
+     * 只会得到一次打不开的跳转。
+     */
+    private static List<String> urls(String[] field, int at) {
+        if (field.length <= at || field[at].isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<String> list = new ArrayList<>();
+        for (String entry : field[at].split("\u001e", -1)) {
+            if (!entry.isBlank()) {
+                list.add(entry);
+            }
+        }
+        return list;
     }
 
     /** 一个超时写成整秒，给文案用。 */

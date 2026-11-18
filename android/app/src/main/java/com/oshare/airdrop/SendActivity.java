@@ -968,12 +968,27 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         dragging = on;
         if (!on) {
             // 还回层之后把雷达叫醒。
+            //
+            // 只 invalidate 面板不够：层里的子 View 各自有一份已经录好的显示列表，父容器重放
+            // 一遍并不会重新调它们的 onDraw，于是雷达那个「画完再排下一帧」的自我续命就没被
+            // 挂回去——手指抬起来了，环却停在上一次画到的那一圈。见 {@link Radar#wake}。
             sheet.invalidate();
+            if (radarView != null) {
+                radarView.wake();
+            }
         }
     }
 
     /** 正在拖动 / 正在做位移动画。它决定雷达要不要每 32ms invalidate 一次。 */
     private boolean dragging;
+
+    /**
+     * 此刻屏上那个雷达。空态才有，设备列表一出来就没有了。
+     *
+     * <p>留一个引用是为了「叫醒」这条唯一的路：{@link #layer} 停下它之后，能把帧循环挂回去的
+     * 只有发起停下的那个人，而它手上只有这个字段。
+     */
+    private Radar radarView;
 
     // ------------------------------------------------------------------ 顶部
 
@@ -1037,6 +1052,9 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             return;
         }
         stage.removeAllViews();
+        // 上一帧的雷达已经随 removeAllViews 脱离窗口，它的帧循环由 onDetachedFromWindow 停掉；
+        // 这里把引用也放掉，免得还回去的时候叫醒一个不在屏上的。
+        radarView = null;
         nicks.clear();
         stateViews.clear();
         nameViews.clear();
@@ -1048,6 +1066,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             middle.setGravity(Gravity.CENTER);
 
             Radar radar = new Radar();
+            radarView = radar;
             LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(dp(180), dp(180));
             size.gravity = Gravity.CENTER_HORIZONTAL;
             middle.addView(radar, size);
@@ -1925,6 +1944,31 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             copy.recycle();
         }
 
+        /**
+         * 抬手时把层还回去——不管这一次触摸最后被谁接住。
+         *
+         * <p>点一个按钮、点一格设备，DOWN 之后就往子 view 去了，{@link #onTouchEvent} 再也
+         * 不会被调用，于是那里的 {@code layer(false)} 永远等不到。留下来的不只是「层一直挂着」：
+         * 雷达在 DOWN 那一刻已经停了，而它停下来之后就没人会再叫它——**点一下界面，搜索动画
+         * 就死在那一圈上**。这是人一眼就看得见的那种坏。
+         *
+         * <p>拖动那条路不在这里收尾：那时 {@code moving} 为真，层要跟着回弹动画一起还回去
+         * （见 {@link SendActivity#springBack()}）。提前还掉，回弹的那三百毫秒就会重新逐帧
+         * 栅格化，抖的正是它。
+         */
+        @Override
+        public boolean dispatchTouchEvent(MotionEvent event) {
+            int action = event.getActionMasked();
+            // 先记下来：onTouchEvent 的 UP 分支会把 moving 清掉，等 super 返回之后就读不到了。
+            boolean dragged = moving;
+            boolean handled = super.dispatchTouchEvent(event);
+            if (!dragged && !closing
+                    && (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL)) {
+                layer(false);
+            }
+            return handled;
+        }
+
         @Override
         public boolean onInterceptTouchEvent(MotionEvent event) {
             switch (event.getActionMasked()) {
@@ -2032,10 +2076,9 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     boolean dragged = moving;
                     moving = false;
                     if (!dragged) {
-                        // 只是点了一下（或者按在空白处又抬手）：层是按下时建的，这里还回去，
-                        // 否则它会和雷达的呼吸动画长期叠在一起——层里每一次 invalidate 都要
-                        // 重画整块纹理。
-                        layer(false);
+                        // 只是点了一下：层是按下时建的。还层这件事统一在
+                        // {@link #dispatchTouchEvent} 里做——那里连「被子 view 接住的点击」
+                        // 也收得到，而这里收不到。所以这一支什么也不做，只把手势状态清掉。
                         return true;
                     }
                     tracker.computeCurrentVelocity(1000);
@@ -2283,6 +2326,23 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             // 还在 postInvalidateDelayed 的孤儿，等于每次换主题都多一条永不停止的心跳。
             attached = false;
             super.onDetachedFromWindow();
+        }
+
+        /**
+         * 把帧循环重新挂上。
+         *
+         * <p>呼吸环是靠 {@link #onDraw} 末尾的那一次 {@code postInvalidateDelayed(32)} 自我
+         * 续命的——它没有独立的定时器，所以「暂停一次」就等于**把这条链剪断**，而不是踩一脚
+         * 刹车。剪断之后没有人会再叫它，于是手指一抬，环就停在上一次画到的那一圈不动了。
+         *
+         * <p>2026-11-18 的真机现场就是这样：点一下页面（甚至只是按在空白处再抬手），搜索动画
+         * 从此静止，直到下一次发现设备把整块中部重建。所以暂停的人必须负责叫醒，见
+         * {@link SendActivity#layer(boolean)}。
+         */
+        void wake() {
+            if (attached && !dragging) {
+                postInvalidateDelayed(32);
+            }
         }
 
         @Override

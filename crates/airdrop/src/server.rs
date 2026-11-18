@@ -354,11 +354,13 @@ impl<R: Receiver> Server<R> {
             // and says what is about to arrive. A body that does not parse costs nothing
             // now, because the peer has its `200`.
             self.receiver.saw_ask_body(&body);
+            let mut nothing_to_upload = false;
             if let Ok(parsed) = Ask::parse(&body) {
                 self.receiver.saw_ask(&parsed);
+                nothing_to_upload = parsed.files.is_empty();
                 *offer = Some(parsed);
             }
-            return Ok(keep);
+            return Ok(keep && !nothing_to_upload);
         }
 
         if request.expects_continue() {
@@ -424,9 +426,28 @@ impl<R: Receiver> Server<R> {
             return Ok(false);
         }
         let answer = self.receiver.ask(Some(&parsed));
+        // An offer that names no files is over the moment it is accepted. `Files` empty
+        // means no `/Upload` follows, so there is no next request on this connection — only
+        // a read that will never return. Waiting for it anyway is what this loop used to
+        // do, and the wait is the caller's read timeout: a minute on the phone. Then a
+        // transfer that had already succeeded was reported as `Read timed out`, and the
+        // card that should have said "tap to open the link" said "接收失败".
+        //
+        // Measured, 2026-11-18 23:34, iPhone → this phone, one link shared:
+        //
+        // ```text
+        // offer from … 0 0 1  https://apps.apple.com/app/id6459478672
+        // live card: 正在接收 · 准备中 · -1%
+        // receive from … failed: Read timed out            (exactly 60 s later)
+        // ```
+        //
+        // The peer had not hung up because it had nothing left to say and no reason to be
+        // the one to close. Nothing is lost by closing first: the offer — which for a links
+        // share *is* the whole transfer — was parsed above.
+        let nothing_to_upload = parsed.files.is_empty();
         *offer = Some(parsed);
         send(output, &plist_response(answer.encode(), keep))?;
-        Ok(keep)
+        Ok(keep && !nothing_to_upload)
     }
 
     /// Accepts `/Upload`, or refuses it before a byte of archive is read.
@@ -784,6 +805,52 @@ mod tests {
         let answer = AskAnswer::parse(body_of(&output)).expect("a plist answer");
         assert_eq!(answer.model_name, "1 items");
         assert_eq!(receiver.offers.len(), 1);
+    }
+
+    #[test]
+    fn an_offer_with_no_files_ends_the_conversation_instead_of_waiting_for_an_upload() {
+        // A links share: `Files` empty, `Items` full. The queue below deliberately carries a
+        // second request behind the `/Ask`, because that is the only way a test can see the
+        // difference — a loop that went back for one more request would read it, and this
+        // receiver would end up holding an upload it should never have been offered.
+        let links = ["https://example.com/a".to_string()];
+        let body =
+            crate::ask_request(&Sender::new("iPhone", "iPhone15,2", "id"), &id(), &[], &links);
+        let mut raw = post(PATH_ASK, "", &body);
+        raw.extend_from_slice(&post(
+            PATH_UPLOAD,
+            "Content-Type: application/x-cpio\r\n",
+            b"nothing",
+        ));
+
+        let (receiver, output) = run(Recorder::default(), &raw);
+
+        // Accepted, and the `200` is the last word on the connection: no upload was waited
+        // for, so no read sat there until the caller's timeout turned success into failure.
+        assert_eq!(statuses(&output), [200]);
+        assert_eq!(receiver.offers.len(), 1);
+        assert_eq!(receiver.offers[0].links, ["https://example.com/a"]);
+        assert!(receiver.uploads.is_empty(), "nothing was read after the offer");
+    }
+
+    #[test]
+    fn an_offer_with_files_still_waits_for_its_upload() {
+        // The other half of the rule above, and the reason it is `files.is_empty()` rather
+        // than "a links share": a normal offer must still be served to its archive.
+        let files = [Item::new("a.pdf").with_size(7)];
+        let body = crate::ask_request(&Sender::new("Mac", "MacBookPro18,3", "id"), &id(), &files, &[]);
+        let mut raw = post(PATH_ASK, "", &body);
+        raw.extend_from_slice(&post(
+            PATH_UPLOAD,
+            "Content-Type: application/x-cpio\r\n",
+            b"07",
+        ));
+
+        let (receiver, output) = run(Recorder::default(), &raw);
+
+        assert_eq!(statuses(&output), [200, 200]);
+        assert_eq!(receiver.uploads.len(), 1);
+        assert_eq!(receiver.uploads[0].bytes, b"07");
     }
 
     #[test]

@@ -194,6 +194,39 @@ final class ReceiveHost {
         return null;
     }
 
+    /**
+     * 【打开链接】按下去要去哪儿。
+     *
+     * <p>{@code OpenLink} 那一层是必需的，不是顺手抽出来的。两条理由，缺一条这条路都不成立：
+     *
+     * <ul>
+     *   <li>通知上的 PendingIntent 只允许直接落到**界面**上。落到广播或服务、再由它去起浏览器，
+     *       会被平台按 {@code BAL_BLOCK} 拦掉，一点提示都没有——这就是 {@link OpenDownload}
+     *       当初那一课（见它的类注释里的 {@code isPendingIntent: false}）。</li>
+     *   <li>按下去还得先把这张卡收掉。撤卡只能在我们自己的代码里做，而那一刻我们要么在一个
+     *       界面上，要么什么也做不了。</li>
+     * </ul>
+     *
+     * <p>request code 与【打开文件】的 0x0B03 不同：同一个 request code 的两个 PendingIntent
+     * 会互相覆盖 extras，而这两颗按钮会先后出现在同一台机器上（先收文件，再收链接）。
+     *
+     * <p>三条链接也只有一颗按钮：这里只交第一条。一次点击开出三个标签页不是"都打开"，是把人
+     * 丢进三个他自己没选过的页面。
+     *
+     * <p>可见性放到包内，是为了让 {@code LiveProbe} 那张探针卡用的就是这一条真实路径——
+     * 探针里另写一份的话，它证明的是探针自己，不是这张卡。
+     */
+    static android.app.PendingIntent openLink(Context context, List<String> urls) {
+        android.content.Intent open = new android.content.Intent(context, OpenLink.class)
+                .putExtra(OpenLink.EXTRA_URL, urls.get(0))
+                // 还有几条没开。只进日志，不进界面：卡上那句话说的是「几个链接」，而这里是
+                // 「这一下开了几个」。两件事，不混。
+                .putExtra(OpenLink.EXTRA_MORE, urls.size() - 1);
+        return android.app.PendingIntent.getActivity(context, 0x0B05, open,
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT
+                        | android.app.PendingIntent.FLAG_IMMUTABLE);
+    }
+
     private static Attempt find(String session) {
         if (session == null || session.isEmpty()) {
             return null;
@@ -305,6 +338,15 @@ final class ReceiveHost {
          */
         private JSONArray offered;
 
+        /**
+         * 这次邀请解析出来之后的那一份，留着给收尾用。
+         *
+         * <p>链接分享的收尾拿不到任何字节作凭据：那些地址只在邀请那一帧的摘要里出现过一次。
+         * 不在这里留住，等 {@code serve} 返回时就已经没有地方还记得对面到底发了哪几条——
+         * 而「哪一条」正是链接的全部内容。
+         */
+        private Confirmation.Offer offer;
+
         /** 有没有对外说过话。没说过就不用收尾。 */
         private boolean announced;
 
@@ -348,6 +390,9 @@ final class ReceiveHost {
             // 那是「同一个数」靠人记得；现在它们读同一行设置，是结构上的同一个数。
             long decisionMs = Confirmation.decisionTimeout(context);
             Confirmation.Offer offer = Confirmation.parse(summary, decisionMs);
+            // 同一份解析结果留一份在字段上：链接收尾要用它（见 {@link #deliveredLinks}），
+            // 而摘要是这条连接里唯一一次出现过那些地址的地方。
+            this.offer = offer;
             sender = offer.sender;
             announced = true;
             // 先把「哪几份」记下来再报事件：卡片看到邀请的那一帧就该看得到件数和名字，
@@ -377,15 +422,14 @@ final class ReceiveHost {
             // 退回流体云那张卡。两条路的答案都落进同一个闩，所以这里的先后只影响"人看到什么"。
             // 问在哪：只有流体云这一条。应用级的浮窗已经撤掉（2026-11-16 15:10）——它要么
             // 抢走前台、要么把胶囊挡住，为了"更醒目"付出的代价比收益大。
-            Confirmation.Offer shown = Confirmation.parse(summary, decisionMs);
-            // 接到东西了，这张卡本该自己摊开：消息藏在胶囊里等于没送到。但摊开这件事
-            // 应用侧没有开关——原先靠 Xposed 模块进 SystemUI 调插件的 onExpand，代价是
-            // 通知中心里看不见这张卡、点空白区域收不回去。现在改由系统决定：这条通知带
-            // 高重要性渠道 + setOnlyAlertOnce(false)，会先抬头一次把人叫到；看不看得清
-            // 那两个按钮，交给用户点一下胶囊。
             cloud = LiveCard.allowed(context);
             if (cloud) {
-                LiveCard.invite(context, shown.title(), shown.body(),
+                // 接到东西了，这张卡本该自己摊开：消息藏在胶囊里等于没送到。但摊开这件事
+                // 应用侧没有开关——原先靠 Xposed 模块进 SystemUI 调插件的 onExpand，代价是
+                // 通知中心里看不见这张卡、点空白区域收不回去。现在改由系统决定：这条通知带
+                // 高重要性渠道 + setOnlyAlertOnce(false)，会先抬头一次把人叫到；看不看得清
+                // 那两个按钮，交给用户点一下胶囊。
+                LiveCard.invite(context, offer.title(), offer.body(),
                         Confirmation.decision(context, session, true),
                         Confirmation.decision(context, session, false));
             }
@@ -556,6 +600,69 @@ final class ReceiveHost {
                 Log.w(TAG, "receive completion unavailable", impossible);
             }
             ReceiveHost.forget(session);
+        }
+
+        /**
+         * 收到的是链接，不是文件。
+         *
+         * <p># 为什么它得是单独一个出口
+         *
+         * <p>一次纯链接分享一个字节都不会 {@code /Upload}：对面只是把 {@code Items} 里那串
+         * 地址报过来，问一声要不要，这边说收，事情就结束了。所以 {@link Listener#serve} 里
+         * 那条「有东西落地」的收尾分支（{@code report} 非空）永远走不到它——牌面上「什么都
+         * 没收到」，而实际收到的是这次分享的全部内容。
+         *
+         * <p>不走这里的代价是明确可见的：{@link #abandon} 看见 {@code accepted} 为真、
+         * {@code settled} 为假，会把一次**成功**画成「接收失败：连接意外断开」。线是通的、
+         * 邀请是收了的、对面也拿到了 200，只有这张卡在说假话。
+         *
+         * @return 这次是不是按链接收下并结账了。{@code false} 表示「这不是一条能结账的链接
+         *         offer」（没接受、没有地址、或者早就结过账），调用方该继续走原来的收尾路径
+         */
+        boolean deliveredLinks() {
+            if (!announced || settled || offer == null || offer.urls.isEmpty()) {
+                return false;
+            }
+            settled = true;
+            if (cloud) {
+                // 和文件那一份同样的形状、同样的理由：收完不自己消失，留到人按【完成】——
+                // 人拿到链接之后的下一步是打开它，而这张卡是唯一告诉他「东西在哪」的东西。
+                LiveCard.finishWithLink(context, "接收完成", linkLine(offer),
+                        openLink(context, offer.urls));
+                cloud = false;
+            }
+            try {
+                JSONArray list = new JSONArray();
+                for (String url : offer.urls) {
+                    list.put(url);
+                }
+                JSONObject event = newEvent("complete", COMPLETE)
+                        .put("progress", 100)
+                        .put("terminal", true)
+                        .put("published", true)
+                        .put("links", list);
+                emit(event);
+            } catch (JSONException impossible) {
+                Log.w(TAG, "receive completion unavailable", impossible);
+            }
+            ReceiveHost.forget(session);
+            return true;
+        }
+
+        /**
+         * 链接那张卡的第二行：{@code 1 个链接 · apps.apple.com}。
+         *
+         * <p>和文件那张「N 个文件 · 4.2 MiB」是同一个形状：先说几个，再说是什么。文件用
+         * 字节数说「多大」，链接没有重量，能说的只有它落在哪台主机上——而这一句正好回答
+         * 人能问的唯一问题：「这是不是我认识的那个站」。
+         *
+         * <p>主机读不出来时（自定义 scheme、对面塞了个不成形的地址）退回整条地址。少写这
+         * 一段，这张卡就等于什么也没说。
+         */
+        private static String linkLine(Confirmation.Offer offer) {
+            String first = offer.urls.get(0);
+            String host = android.net.Uri.parse(first).getHost();
+            return offer.links + " 个链接 · " + (host == null || host.isEmpty() ? first : host);
         }
 
         /**
