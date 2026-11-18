@@ -100,6 +100,26 @@ final class LiveCard {
     /** 两次响铃之间至少隔这么久，免得同一件事被重投时连叫两声。 */
     private static final long CHIME_GAP = 1500L;
 
+    /**
+     * 振动节奏，按 {@code R.raw.chime_airdrop} 那四下敲击的时刻排的。
+     *
+     * <p>实测音效起振在 12 / 130 / 245 / 369ms（间隔 118/115/124）。所以这里用前导 12ms
+     * 空档对上第一下，之后每下震 45ms、按「下一个起振点 − 上一段结束」精确补空档，
+     * 四个起点一毫秒不差地压在四次敲击上。
+     *
+     * <p>为什么每下只写 45ms 而不是音效那样的 ~100ms：ColorOS 收到**带振幅**的 waveform
+     * 会把它拆成它自己的预烘焙脉冲（dumpsys 里是 {@code OplusPrebakedSegment}，
+     * {@code mDuration=45}），无论你请求多长都只给 45ms，但「停」的段原样保留。第一版写的
+     * 62ms 就吃了这个亏：四段各被砍 17ms，到第四下已经提前 51ms，听起来跟音效脱拍。
+     * 按 45ms 写，两种设备都对——ColorOS 上原样执行，原生 Android 上（不压缩）节奏点也一致，
+     * 只是震感短一点。
+     *
+     * <p>振幅递减跟着音效的 -4.2 / -4.8 / -6.4 / -11.8dB 走，最后一下压到 120：
+     * 那一下本来就是个余响，震太实反而像四下等重的机械提示音。
+     */
+    private static final long[] CHIME_VIBRATE_TIMINGS = {12, 45, 73, 45, 70, 45, 79, 45};
+    private static final int[] CHIME_VIBRATE_AMPLITUDES = {0, 255, 0, 235, 0, 200, 0, 120};
+
     /** 上一次响铃的时刻（{@code uptimeMillis}）。0 表示还没响过。 */
     private static long sLastChime;
 
@@ -539,15 +559,16 @@ final class LiveCard {
     }
 
     /**
-     * 响一声 + 震两下。这是「有人要发东西给你」这件事**唯一**的提醒来源。
+     * 响一声 + 震四下。这是「有人要发东西给你」这件事**唯一**的提醒来源。
      *
-     * <p>振动写成 {@code {0, 220, 180, 220}} 是「两下」而不是「长震一下」：来文件是个待办，
-     * 不是警报，两下足够让人低头看一眼胶囊，也不至于把旁边的人一起叫过来。
+     * <p>振动节奏不是随手定的，是照着音效排的：{@link #CHIME_VIBRATE_TIMINGS} 里每个「震」
+     * 的起点正好压在音效的每次敲击上，连力度递减都跟着走。所以听到的和摸到的是同一件事，
+     * 而不是「有声音、另外还有一组无关的嗡嗡」。
      *
-     * <p>声音用自带的一段合成音频（{@code R.raw.chime_dong}，两下 120~230Hz 的鼓点），
-     * 不是系统默认通知音。换来的是：节奏固定、和下面那两下振动对得上点。代价是不跟着用户的
-     * 铃声走——所以音量仍然走通知音量，静音模式、振动模式、勿扰的语义一个都不少，
-     * 只换音色，不换礼仪。
+     * <p>声音用自带的 {@code R.raw.chime_airdrop}（由一段「隔空投送铃声」转成 PCM，
+     * 见 {@code make_chime.py}），不是系统默认通知音。换来的是：节奏固定、能和振动对点。
+     * 代价是不跟着用户的铃声走——所以音量仍然走通知音量，静音模式、振动模式、勿扰的语义
+     * 一个都不少，只换音色，不换礼仪。
      *
      * <p>为什么不用渠道挂一个自定义铃声：{@code NotificationChannel#setSound} 只认
      * {@code content://} / {@code file://}，{@code android.resource://} 交给系统会静默失效，
@@ -595,7 +616,7 @@ final class LiveCard {
                 playChimeSound(context);
             }
             if (ringer != AudioManager.RINGER_MODE_SILENT) {
-                vibrate(context, new long[]{0, 220, 180, 220});
+                vibrate(context, CHIME_VIBRATE_TIMINGS, CHIME_VIBRATE_AMPLITUDES);
             }
             Log.i(TAG, "chime: ringer=" + ringer + (quiet ? " (勿扰，只振动)" : ""));
         } catch (Throwable t) {
@@ -605,7 +626,7 @@ final class LiveCard {
     }
 
     /**
-     * 播一遍「咚~咚~」。
+     * 播一遍那段四下敲击。
      *
      * <p>用 {@link MediaPlayer} 而不是 {@code Ringtone}：raw 资源没有 URI，{@code Ringtone}
      * 拿不到它。{@code MediaPlayer.create} 会同步准备好，直接 {@code start} 就行。
@@ -617,6 +638,10 @@ final class LiveCard {
      * <p>{@code USAGE_NOTIFICATION} + {@code CONTENT_TYPE_SONIFICATION}：这两个决定了它走
      * 通知音量、被静音模式掐掉、在勿扰里走「允许通知」这条规则——和系统通知音同等待遇。
      * 换音色不该顺手换掉这些。
+     *
+     * <p>音源是 44.1kHz 单声道 PCM。之所以先转成 wav 再进 raw，是因为原文件 151KB 里
+     * 有 141KB 是 ID3（含一张 36KB 封面），真正的音频只占 10KB；而且原音峰值只有 -16dBFS，
+     * 太轻，{@code setVolume} 又只能往下调，所以放大在转码时一次性做掉（+14.8dB，峰值 0.85）。
      */
     private static void playChimeSound(Context context) {
         try {
@@ -632,7 +657,7 @@ final class LiveCard {
                     .build());
             player.setDataSource(context,
                     Uri.parse("android.resource://" + context.getPackageName()
-                            + "/" + R.raw.chime_dong));
+                            + "/" + R.raw.chime_airdrop));
             player.setOnCompletionListener(mp -> {
                 mp.release();
                 if (sChimePlayer == mp) {
@@ -668,8 +693,22 @@ final class LiveCard {
         }
     }
 
-    /** 按给定的波形振一次，{@code -1} 表示不重复。 */
+    /** 按给定的波形振一次，{@code -1} 表示不重复，每段都用满振幅。 */
     private static void vibrate(Context context, long[] pattern) {
+        int[] amplitudes = new int[pattern.length];
+        for (int i = 0; i < pattern.length; i++) {
+            amplitudes[i] = (i % 2 == 1) ? 255 : 0;
+        }
+        vibrate(context, pattern, amplitudes);
+    }
+
+    /**
+     * 按给定的波形 + 每段振幅振一次。
+     *
+     * <p>{@code amplitudes} 与 {@code timings} 一一对应，0 表示「这段停」。
+     * 有了它，重音才能跟着音效走：只是「四下一样重」的话，听起来仍像机械提示音。
+     */
+    private static void vibrate(Context context, long[] pattern, int[] amplitudes) {
         Vibrator vibrator = null;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             VibratorManager manager = context.getSystemService(VibratorManager.class);
@@ -683,7 +722,12 @@ final class LiveCard {
         if (vibrator == null || !vibrator.hasVibrator()) {
             return;
         }
-        VibrationEffect effect = VibrationEffect.createWaveform(pattern, -1);
+        VibrationEffect effect;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            effect = VibrationEffect.createWaveform(pattern, amplitudes, -1);
+        } else {
+            effect = VibrationEffect.createWaveform(pattern, -1);
+        }
         // 必须写明是「通知」类振动。不写的话系统按 USAGE_TOUCH 记（实测 dumpsys 里就是 TOUCH），
         // 而触摸反馈走的是另一套开关：勿扰不管它、系统设置里的「通知振动」也不管它。
         // 我们这是在替一条通知发声，就该让这条通知的振动设置说了算。
