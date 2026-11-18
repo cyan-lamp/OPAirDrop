@@ -353,7 +353,7 @@ def main():
     add("名称：OPAirDrop")
     add("实现：Rust 核心（crates/）+ Java 外壳（android/），")
     add("      双方经 JNI 相连")
-    add("源码：本仓库 repo-OPAirDrop")
+    add("源码：本仓库 repo-src")
     if remote:
         # 远端是从 git 里读的，不写死。这句话以前写的是「尚未建立远端」，等远端真的建起
         # 来，整份清单就开始对用户说假话——而它的全部意义就是「说的一定是现在的事实」。

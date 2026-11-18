@@ -98,7 +98,7 @@
 ## 项目结构
 
 ```text
-repo-OPAirDrop/
+repo-src/
 ├── crates/            Rust 协议栈，八个 crate，协议知识只在这里
 │   ├── bplist/        Apple 二进制 plist 读写
 │   ├── cpio/          cpio odc/newc、DVZip 分块、gzip 识别

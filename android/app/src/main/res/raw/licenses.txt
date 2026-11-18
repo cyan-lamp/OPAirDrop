@@ -11,7 +11,7 @@ OPAirDrop — 第三方许可 / Third-party licenses
 名称：OPAirDrop
 实现：Rust 核心（crates/）+ Java 外壳（android/），
       双方经 JNI 相连
-源码：本仓库 repo-OPAirDrop
+源码：本仓库 repo-src
       https://github.com/cyan-lamp/OPAirDrop.git
 许可：仓库根的 LICENSE，GPL-2.0。
       随 APK 分发，全文见「关于 → 开源许可」。
