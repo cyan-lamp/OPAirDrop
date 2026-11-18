@@ -306,6 +306,14 @@ final class Peers {
         /** 「它凑齐地址和端口」这一刻是否已经记过日志。见 {@link #absorb}。 */
         boolean reported;
 
+        /**
+         * 它**第一次**凑齐地址和端口的时刻，也就是它在列表里第一次可能出现的那一刻。
+         *
+         * <p>页面拿它当「还可以等一下名字」的起点：真名要连上去问 {@code /Discover} 才有，
+         * 而先画一个占位名再改成真名，人看到的是名字在跳。0 表示还不知道能不能连。
+         */
+        long readyAt;
+
         Peer(String name) {
             this.name = name;
         }
@@ -395,6 +403,23 @@ final class Peers {
      */
     private int sendFails;
 
+    /**
+     * 自 {@link #open()} 起，读到过几条**别人**的地址记录。
+     *
+     * <p>这是「我们到底听不听得见」唯一可靠的判据，{@code heard} 那一类计数不行：自己的宣告
+     * 会绕回来，一台没开 AirDrop 的手机旁边也照样有别人的组播，两个都让「收到过包」为真，而
+     * 真正要问的是「别人说的话进来了没有」。
+     *
+     * <p>0 加上问过几次，就是 {@link #DEAF_QUERIES} 说的那种哑：发得出去，收不到。
+     */
+    private int foreign;
+
+    /** 下一次「哑了」检查允许重开 socket 的时刻。 */
+    private long nextDeaf;
+
+    /** 下次重开要等多久。见 {@link #DEAF_RETRY_MS}。 */
+    private long deafWait = DEAF_RETRY_MS;
+
     /** 下一次核网卡的时间。 */
     private long nextRebind;
 
@@ -408,6 +433,26 @@ final class Peers {
 
     /** 连续几次发不出去就认定这块 socket 已经不属于这条链路。 */
     private static final int REBIND_FAILS = 3;
+
+    /**
+     * 问了几次仍然只读到自己的地址，就认定「我们在发、但听不见」。
+     *
+     * <p>4 次 × {@link #ASK_EAGER_MS} = 1.2 秒：够长，不至于把一台答得慢的对端误判成聋；够短，
+     * 人还站在分享面板前面。
+     */
+    private static final int DEAF_QUERIES = 4;
+
+    /** 第一次重开 socket 之前等多久；之后每哑一次翻倍，直到 {@link #DEAF_CEIL_MS}。 */
+    private static final long DEAF_RETRY_MS = 5_000;
+
+    /**
+     * 重开间隔的上限。
+     *
+     * <p>重开会放掉组播锁再拿回来，而「一个人都没有」是这一页最正常的状态之一。一分钟一次是
+     * 「还醒着、但不慌」的位置：边上真来了一台，最多一分钟之后就有一位新的赢家。
+     */
+    private static final long DEAF_CEIL_MS = 60_000;
+
     /** 这一次浏览问的是哪个组。地址族跟着网卡走，见 {@link #open()}。 */
     private volatile InetAddress group;
 
@@ -515,6 +560,31 @@ final class Peers {
                     nextRebind = now + REBIND_CHECK_MS;
                     rebind();
                 }
+                // 「在发、但听不见」——和「没人应答」是两件事，必须分开。
+                //
+                // 2026-11-18 冷启动的现场：从相册分享第一次打开发送面板，查询每 300 毫秒发一次、
+                // `ip -s link show awdltun0` 上 TX 一路涨，RX 一动不动，30 秒里一台设备都没出现；
+                // 下滑关掉面板再分享打开，537 毫秒就 ready。原因是 5353 上不止我们一个 socket——
+                // 接收端（Responder）在我们之后 28 毫秒也绑了同一个端口，而内核把**单播**报文只
+                // 交给最后绑的那一个。查询带着 QU 位（见 `crates/ffi/src/browse.rs`），对端的应答
+                // 于是全是单播，一条条都进了接收端，浏览这一路一个字节也看不到。
+                //
+                // 不试图指定谁先绑——那要看两条线程谁先跑完 bind，而 bind 之后还会被 AirDrop 的
+                // 开关重来一次。做法是：听不见就把自己的 socket 重开一遍，重开的那个一定是最新的，
+                // 单播于是回到我们这边。重开之后接收端会失去单播，但它在 AWDL 上只靠组播活着
+                // （实测 iPhone 在浏览链路上只答不问，见 {@link #CONNECTABLE_MS}），而面板一关
+                // 我们就让出端口，它下一个包照样收得到。
+                if (foreign == 0 && asked >= DEAF_QUERIES && now >= nextDeaf) {
+                    nextDeaf = now + deafWait;
+                    deafWait = Math.min(deafWait * 2, DEAF_CEIL_MS);
+                    trace("deaf: " + asked + " queries sent, not one address but our own —"
+                            + " reopening the socket (someone else is bound to 5353)");
+                    sendFails = 0;
+                    reopen();
+                } else if (foreign > 0 && deafWait != DEAF_RETRY_MS) {
+                    // 听见了。下一次万一又哑，还是从最短的那一档开始等。
+                    deafWait = DEAF_RETRY_MS;
+                }
                 if (DIAG && now - lastDigest >= DIAG_EVERY_MS) {
                     lastDigest = now;
                     digest();
@@ -569,6 +639,8 @@ final class Peers {
         // 一定与它不同，{@link #rebind} 就会把我们搬过去。
         nicIndex = nic == null ? 0 : nic.getIndex();
         bound = nic == null ? null : nic.getName();
+        // 这一块 socket 得自己证明听得见。上一次听到的别人的地址不算数——那可能来自上一个 socket。
+        foreign = 0;
         try {
             socket.setTimeToLive(255);
         } catch (Exception ignored) {
@@ -680,13 +752,26 @@ final class Peers {
                 ? "link moved to " + nic.getName() + " (" + nicIndex + " → " + index + ")"
                 : sendFails + " sends in a row went nowhere"));
         sendFails = 0;
+        reopen();
+    }
+
+    /**
+     * 关掉重开一块 socket，其余什么都不动。
+     *
+     * <p>两种场合用它：网卡换了（{@link #rebind}），和「在发但听不见」（{@link #loop}）。
+     * 后者的道理是内核的一条规矩：几个 socket 用 {@code SO_REUSEADDR} 绑同一个端口时，**单播**
+     * 报文只交给最后绑的那一个。重开就是把我们放回那一位——不需要知道谁先谁后，也不用和接收端
+     * 商量，重开的那一个一定是最新的。
+     *
+     * <p>重开失败只记一行，线程活着：这一页还开着，人随时会把 AirDrop 再打开一次，而下一轮
+     * 检查（{@link #REBIND_CHECK_MS}）会再试。
+     */
+    private void reopen() {
         close();
         try {
             open();
         } catch (Exception failed) {
-            // 搬不过去就下一轮再试。线程活着比起一个干净的失败更重要：这一页还开着，
-            // 人随时会把 AirDrop 再打开一次。
-            trace("rebind failed: " + failed);
+            trace("reopen failed: " + failed);
         }
     }
 
@@ -906,6 +991,9 @@ final class Peers {
                             // 自己的宣告绕回来了。地址不填，它就进不了可连接的列表。
                             continue;
                         }
+                        // 别人的地址进来了——不论这条记录最后有没有用上，它都证明了一件事：
+                        // 这条 socket 听得见。{@link #foreign} 只记这个，不记「谁说的」。
+                        foreign++;
                         // 地址行属于主机名，回填给所有指向这台主机的实例。
                         for (Peer peer : peers.values()) {
                             if (peer.host.equals(field[1])) {
@@ -953,6 +1041,7 @@ final class Peers {
             for (Peer peer : peers.values()) {
                 if (peer.connectable() && !peer.reported) {
                     peer.reported = true;
+                    peer.readyAt = now;
                     trace("ready " + peer.name + "@" + peer.address + ":" + peer.port
                             + " after " + (now - startedAt) + " ms of browsing");
                 }

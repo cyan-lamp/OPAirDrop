@@ -224,6 +224,15 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     /** 最近一次发现到的、能连的设备。 */
     private List<Peers.Peer> found = new ArrayList<>();
 
+    /**
+     * 最近一次浏览报上来的全部对端，包含还没上屏的。
+     *
+     * <p>{@link #found} 是「该画的」，这一份是「见过的」。两者的差别只有一个原因：名字还没到，
+     * 所以先不画（见 {@link #settle}）。真名晚到时（{@link #showRealName}）要靠这一份把那一台
+     * 补上——不然它得等下一个 mDNS 报文，而那个报文可能一秒后才来。
+     */
+    private List<Peers.Peer> reachable = new ArrayList<>();
+
     /** 每台设备一句话状态，键是设备名；重扫与换主题时复用，避免文字闪一下。 */
     private final Map<String, String> statuses = new LinkedHashMap<>();
     /** 每台设备当前的进度 [0..1]。环只认它，所以重建之后环还在原处。 */
@@ -250,6 +259,25 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     private final Map<String, Long> probed = new LinkedHashMap<>();
     /** 同一台设备两次问名字至少隔这么久。问一次要连 TLS，问得太勤纯耗电。 */
     private static final long NAME_RETRY_MS = 15_000;
+
+    /**
+     * 一台设备凑齐地址端口之后，为了等名字最多先不上屏多久。
+     *
+     * <p>1.5 秒是量出来的位置：真机日志里「ready」到「probed name」之间是 71 / 195 / 200 /
+     * 600 / 718 毫秒（{@code ready ...:8770 after 544 ms} → {@code probed name for 7bda... ->
+     * 不辛苦命苦} 相隔 600 毫秒）。1.5 秒把正常的那一段全都盖住，剩下的时间只留给「问了它
+     * 不答」——那时照型号显示，不能让一台设备因为问不到名字就一直隐形。
+     */
+    private static final long NAME_HOLD_MS = 1_500;
+
+    /**
+     * 「等名字的窗口到期」那一下，由 {@link #armSettle} 排出来，到点再算一次。
+     *
+     * <p>道理在 {@link #settle} 的注释里：这一页的重算以前完全靠报文驱动，而「放弃等名字」
+     * 是一个不看报文的时刻。iPhone 锁屏、或者它只是一遍遍重复答同一个地址（那种重复只更新
+     * 时刻，不算「变了」，连重画都不触发）时，没人来叫我们——那台设备就会一直停在「没上屏」。
+     */
+    private final Runnable settleDue = () -> settle(System.currentTimeMillis());
 
     /** 正在滑出。防止连按两次返回键跑两遍动画。 */
     private boolean closing;
@@ -645,6 +673,10 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     @Override
     protected void onStop() {
         super.onStop();
+        // 这一页要走了，别再为一个已经没人看的格子排重算。
+        if (stage != null) {
+            stage.removeCallbacks(settleDue);
+        }
         if (peers != null) {
             peers.stop();
             peers = null;
@@ -847,6 +879,9 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         column.addView(bottomCard());
 
         renderStage();
+        // 上面换了 stage，旧 stage 上排着的那次「等名字到期」跟着一起没了（回调挂在视图上），
+        // 不在这儿重排，那几台正在等名字的设备就要等到下一条 mDNS 才知道该上屏了。
+        armSettle(System.currentTimeMillis());
     }
 
     /**
@@ -1072,14 +1107,67 @@ public final class SendActivity extends Activity implements Peers.Watcher {
 
     @Override
     public void onPeers(List<Peers.Peer> peers, String problem) {
-        List<Peers.Peer> usable = new ArrayList<>();
-        for (Peers.Peer peer : peers) {
-            if (peer.connectable()) {
-                usable.add(peer);
+        reachable = peers;
+        searching = problem != null ? problem : "正在搜索附近设备……";
+        long now = System.currentTimeMillis();
+        settle(now);
+        probeNames(now);
+    }
+
+    /**
+     * 排一次「窗口到期就重算」，时间是还没上屏的那几台里最近的那个期限。
+     *
+     * <p>只给还在窗口里的排：窗口已经过的那台在 {@link #settle} 里必然被放上屏，再为它排一次
+     * 就是排一个 {@code 0 毫秒} 的即时任务，而重算又会为它再排一次——那就成了空转。
+     *
+     * <p>每次都是「删掉旧的、按最早的期限重排」，晚到的设备不会把先到的那台往后推。
+     */
+    private void armSettle(long now) {
+        stage.removeCallbacks(settleDue);
+        long due = Long.MAX_VALUE;
+        for (Peers.Peer peer : reachable) {
+            if (!peer.connectable() || known(peer) != null) {
+                continue;
+            }
+            long window = peer.readyAt + NAME_HOLD_MS;
+            if (window > now) {
+                due = Math.min(due, window);
             }
         }
+        if (due != Long.MAX_VALUE) {
+            stage.postDelayed(settleDue, due - now);
+        }
+    }
+
+    /**
+     * 按「能连的」算出「该上屏的」，然后画。
+     *
+     * <p>两张表分开，是因为名字要连上去问才知道，而人在屏上看到的是「一格头像 + 一行名字」。
+     * 以前这两件事同时发生：格子画出来的那一刻名字还没有，于是先写型号，一两秒后再被真名换
+     * 掉——2026-11-18 的现场是这样：
+     *
+     * <pre>
+     *   iPhone 出现了，下方先写「附近设备」，随即被真名替换成真名
+     * </pre>
+     *
+     * <p>「附近设备」是最坏的一种占位：它连「这是台 iPhone」都没说出来，而且换的那一下，宽度
+     * 和高度都可能变，看着像列表在抖。既然真名几乎一定到（{@link #NAME_HOLD_MS} 说的就是多
+     * 久），就别先画一个假的——等名字到了，头像和名字一起出现。
+     *
+     * <p>等不到也不能让设备隐形：过了那一小段时间照型号显示，这是「问了它不答」唯一的出路。
+     */
+    private void settle(long now) {
+        List<Peers.Peer> usable = new ArrayList<>();
+        for (Peers.Peer peer : reachable) {
+            if (!peer.connectable()) {
+                continue;
+            }
+            if (known(peer) == null && now - peer.readyAt < NAME_HOLD_MS) {
+                continue;
+            }
+            usable.add(peer);
+        }
         found = usable;
-        searching = problem != null ? problem : "正在搜索附近设备……";
 
         // 设备集合没变就不重建：重建会把正在跑的那圈进度丢掉一帧，而进度每秒来两次。
         if (!nicks.keySet().equals(namesOf(usable))) {
@@ -1087,16 +1175,30 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         }
 
         // 名字可能在这一轮才到（型号、缓存、刚问回来的真名），而设备集合没变——那种情况下
-        // 不重建整屏，只把那一行字换掉。占位「iPhone」变成「张三的 iPhone」就是这条路。
+        // 不重建整屏，只把那一行字换掉。
         for (Peers.Peer peer : usable) {
             setLabel(nameViews.get(peer.name), label(peer));
         }
 
-        // 缓存里没有名字的设备，后台问一次 /Discover。按稳定地址去重：hash 与 UUID 每次广播
-        // 都变，用它们当键会让同一台设备每秒重查一遍。问不到的地址留个时刻，隔
-        // {@link #NAME_RETRY_MS} 再试——问一次要连 TLS，但一直不试就等于这格子永远没名字。
-        long now = System.currentTimeMillis();
-        for (Peers.Peer peer : usable) {
+        // 还在等名字的那几台，到点得有人再来算一次：报文不一定来，见 {@link #armSettle}。
+        armSettle(now);
+    }
+
+    /**
+     * 缓存里没有名字的设备，后台问一次 {@code /Discover}。
+     *
+     * <p>按稳定地址去重：hash 与 UUID 每次广播都变，用它们当键会让同一台设备每秒重查一遍。
+     * 问不到的地址留个时刻，隔 {@link #NAME_RETRY_MS} 再试——问一次要连 TLS，但一直不试就等
+     * 于这格子永远没名字。
+     *
+     * <p>这一圈走的是**能连的全部**，不只是上屏的那些：正因为还在等名字的那几台没上屏，它们
+     * 才最需要这一问。反过来的话（只问已经上屏的），等待就永远结束不了。
+     */
+    private void probeNames(long now) {
+        for (Peers.Peer peer : reachable) {
+            if (!peer.connectable()) {
+                continue;
+            }
             String key = PeerNames.key(peer);
             if (key == null || PeerNames.get(peer) != null || realNames.containsKey(peer.name)) {
                 continue;
@@ -1121,11 +1223,20 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * iPhone」说得对，而且它和真名的差别只是前缀，换上去时宽度不会突然翻倍。
      */
     private String label(Peers.Peer peer) {
-        String known = realNames.get(peer.name);
-        if (known == null) {
-            known = PeerNames.get(peer);
-        }
+        String known = known(peer);
         return known == null ? peer.kind() : known;
+    }
+
+    /**
+     * 这台设备的真名，知道的话；不知道返回 {@code null}。
+     *
+     * <p>两道来源，都是「对方自己说的」：本次会话里 {@code /Discover} 刚问到的，或上次按稳定
+     * 地址存下的。{@link #label} 在场，{@link #onPeers} 拿它决定这一台该不该上屏——所以它单独
+     * 一个方法，两处必须是同一个答案。
+     */
+    private String known(Peers.Peer peer) {
+        String name = realNames.get(peer.name);
+        return name != null ? name : PeerNames.get(peer);
     }
 
     /**
@@ -1699,7 +1810,13 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         }
         realNames.put(peer.name, real);
         PeerNames.put(peer, real);
-        setLabel(nameViews.get(peer.name), label(peer));
+        // 名字到的那一刻就重算，而不是等下一个报文。
+        //
+        // 这一台很可能正压在 {@link #settle} 的「等名字」窗口里、还没上屏：那时 nameViews 里
+        // 没有它，单独去换那一行字什么都不会发生，而它下一次有机会出现要等 mDNS 再来一条——
+        // iPhone 重复答同一个地址时那条记录不算「变了」，连重画都不会触发。重算一次，头像和
+        // 这个名字就会一起出现，而不是先画个占位再被换掉。
+        settle(System.currentTimeMillis());
         Log.i(TAG, "peer name from /Discover: " + peer.name + " -> " + real);
     }
 
