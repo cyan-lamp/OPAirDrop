@@ -235,6 +235,14 @@ public final class SendActivity extends Activity implements Peers.Watcher {
 
     /** 每台设备一句话状态，键是设备名；重扫与换主题时复用，避免文字闪一下。 */
     private final Map<String, String> statuses = new LinkedHashMap<>();
+    /**
+     * 这一句要不要用告警色（红）说。
+     *
+     * <p>和 {@link #statuses} 分开存，而不是从文字里认出「对方拒绝」四个字：判定在这里是一次
+     * 异常类型的比较（{@link RefusedException}），在渲染那边再比对文案就成了第二套判据——改一次
+     * 措辞，颜色会悄悄退回蓝。换主题重建时也要能在，所以存在这张表里而不是直接写在视图上。
+     */
+    private final Map<String, Boolean> statusAlarms = new LinkedHashMap<>();
     /** 每台设备当前的进度 [0..1]。环只认它，所以重建之后环还在原处。 */
     private final Map<String, Float> progressOf = new LinkedHashMap<>();
     /** 当前这一份视图里的头像与状态字。重建时清空重填，进度更新按名字找。 */
@@ -1319,7 +1327,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
 
         TextView state = new TextView(this);
         state.setTextSize(10.5f);
-        state.setTextColor(S.accent);
+        state.setTextColor(Boolean.TRUE.equals(statusAlarms.get(peer.name)) ? S.red : S.accent);
         state.setGravity(Gravity.CENTER);
         state.setPadding(0, dp(2), 0, 0);
         String known = statuses.get(peer.name);
@@ -1517,14 +1525,14 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     SendSession.ended();
                     progressOf.remove(peer.name);
                     redrawProgress(peer.name);
-                    status(peer, message);
+                    status(peer, message, refused);
                     String who = label(peer);
-                    // 「拒绝」和「不收」在这里是同一件事的两个可能：`/Ask` 上只有非 200 这一个
-                    // 事实，人和设置给不出区别。所以标题写人做的那件事（拒绝），副行再给另一种
-                    // 可能（对面根本没看见询问）——只写「不收文件」会把一次明确的拒绝说成状态。
+                    // 副行只说人做的那个动作，不再补「也许对面根本没看见询问」。补了就是两件事
+                    // 并列摆着，让一句已经确定的话听起来像猜测——401 是 iPhone 自己回的，
+                    // 它就是在问过之后被拒的。要改设置、要亮屏那类指导在页面底部的说明卡里，
+                    // 那里才是一份「对方没出现该去动哪里」的清单。
                     String detail = refused
-                            ? who + " 拒绝了这次发送 · 若对方并没有看到询问，把 iPhone 的隔空投送"
-                                    + "改成「所有人（10 分钟）」并保持亮屏"
+                            ? who + " 拒绝了这次发送"
                             : impostor
                             ? message + " · 已中止，没有发出任何内容。对方的证书若是刚换过，重新搜索一次设备再试"
                             : timedOut
@@ -1809,10 +1817,22 @@ public final class SendActivity extends Activity implements Peers.Watcher {
 
     /** 写一句状态。存进表里，重建之后还能重放。 */
     private void status(Peers.Peer peer, String line) {
+        status(peer, line, false);
+    }
+
+    /**
+     * 写一句状态，并决定它是普通色还是告警色。
+     *
+     * <p>{@code alarm} 传 {@code true} 的只有「对方拒绝」这一种：它不是一个过渡中的进度，而是
+     * 这一轮投送的结论，和其余几行（正在连接…、已发送…）不是一类话，用同一个蓝色会读成同一种事。
+     */
+    private void status(Peers.Peer peer, String line, boolean alarm) {
         statuses.put(peer.name, line);
+        statusAlarms.put(peer.name, alarm);
         TextView state = stateViews.get(peer.name);
         if (state != null) {
             state.setText(line);
+            state.setTextColor(alarm ? S.red : S.accent);
         }
     }
 
