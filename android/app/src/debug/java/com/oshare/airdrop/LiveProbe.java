@@ -48,6 +48,35 @@ public final class LiveProbe extends BroadcastReceiver {
             case "invite_high":
                 invite(context, accept, refuse);
                 break;
+            case "invite_pri":
+                // 只多一件事：Builder.setPriority(PRIORITY_HIGH)。
+                // 判据不在应用侧，在 SystemUI：addLiveAlert 会打 remindType=?。
+                LiveCard.priorityProbe = true;
+                try {
+                    invite(context, accept, refuse);
+                } finally {
+                    LiveCard.priorityProbe = false;
+                }
+                break;
+            case "invite_call":
+                // 同上，换成 CATEGORY_CALL。
+                LiveCard.categoryProbe = true;
+                try {
+                    invite(context, accept, refuse);
+                } finally {
+                    LiveCard.categoryProbe = false;
+                }
+                break;
+            case "invite_loud":
+                // 换成一条带提示音的渠道。这是最后一个官方变量：
+                // 如果连它都换不来 remindType != 0，那官方这条路就到此为止了。
+                LiveCard.loudChannelProbe = true;
+                try {
+                    invite(context, accept, refuse);
+                } finally {
+                    LiveCard.loudChannelProbe = false;
+                }
+                break;
             case "invite_plain":
                 // 只发卡、不请求展开。用来把「胶囊画出来了没有」和「展开成不成功」分成两件事：
                 // 这两个问题之前一直混在一起看，导致把「没画出来」误判成「展开事件投错了」。

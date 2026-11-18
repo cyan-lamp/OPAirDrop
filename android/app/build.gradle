@@ -229,17 +229,20 @@ tasks.named('preBuild').configure {
     dependsOn stageKernelAssets
 }
 
-// ——— 这里原来是 LSPosed 入口类的编译期 API ———
+// ——— 现代 Xposed API：只借签名，不打包 ———
 //
-// 曾经有一个 `FluidModule`（`src/main/resources/META-INF/xposed/java_init.list` 点名），
-// 跑在 SystemUI 进程里钩住流体云插件，用来把卡片强行摊开。它已经整个删掉了：换来的
-// 摊开动作不值那个代价——通知中心里那张卡会缺席，点空白区域也收不回去。
+// `FluidModule` 跑在 SystemUI 进程里，钩 `OplusLiveAlertNotificationsRepository` 的
+// `access$entryToReminderType`，把 `remindType` 从 0 抬到 11，让流体云卡片自己展开
+// （来龙去脉写在那个类的注释里）。它 import 的 `io.github.libxposed.api.*` 由框架在目标
+// 进程里注入，所以这里是 `compileOnly`：真打进 APK 反而会和框架注入的那份打架。
 //
-// 现在这张卡只走公开 API（`Notification.ProgressStyle` + `setRequestPromotedOngoing`），
-// 不需要任何 `compileOnly` 存根，也不需要 stubApiJar 这个任务链。
+// 入口声明在 `src/main/resources/META-INF/xposed/` 下（`module.prop` / `java_init.list` /
+// `scope.list`），这是现代 API 的约定；旧版那套 `AndroidManifest` meta-data 已经不需要了。
+// 曾经那个同名的 `FluidModule` 是另一套做法（硬调 `onExpand`），代价是通知中心里那张卡
+// 缺席、点空白也收不回去，所以整个删掉过；现在这个是重写的，不是把旧的捡回来。
 
 dependencies {
-    // 空的不是遗漏：这个应用是「框架 Java + Rust 库」，没有 AndroidX、没有 Kotlin，没有任何
-    // 需要塞进 APK 或在运行时解析的依赖。曾经在这里的三条（LSPosed 模块 API、DexKit、
-    // Kotlin stdlib）属于那个已被裁掉的注入式设计。
+    // 只有这一条，而且不进包。剩下的都是「框架 Java + Rust 库」：没有 AndroidX、没有 Kotlin、
+    // 没有任何需要在运行时解析的东西。
+    compileOnly 'io.github.libxposed:api:102.0.0'
 }
