@@ -15,6 +15,7 @@ import android.util.Log;
  *
  * <pre>
  *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode invite_fresh
+ *   adb shell am start -n com.oshare.airdrop/.LiveProbeActivity --es mode invite_fresh
  *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode progress
  *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode send_done
  *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode send_fail
@@ -23,6 +24,14 @@ import android.util.Log;
  *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode recv_fail
  *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode drop
  * </pre>
+ *
+ * <p>两条入口做同一件事，用哪条看设备的脸色：ColorOS 把闲置的应用冻进
+ * {@code DEFER_BY_OPLUS / FROZEN} 名单之后，**连显式组件的广播也会被无限期挂起**
+ * （{@code dumpsys activity broadcasts} 里 {@code terminalCount=0}、
+ * {@code dispatchClockTime=1970-01-01}、{@code reason: mBroadcastConsumerDeferApply}），
+ * 而 {@code am broadcast} 照样回 {@code result=0}，看起来像是发出去了。这时换
+ * {@link LiveProbeActivity}：启动 Activity 一定会把进程解冻，它自己立刻 finish，
+ * 前台交还出去，再投卡。
  */
 public final class LiveProbe extends BroadcastReceiver {
 
@@ -31,9 +40,11 @@ public final class LiveProbe extends BroadcastReceiver {
     @Override
     public void onReceive(Context context, Intent intent) {
         String mode = intent.getStringExtra("mode");
-        if (mode == null) {
-            mode = "invite";
-        }
+        fire(context, mode == null ? "invite" : mode);
+    }
+
+    /** 两条入口共用的那一段。{@code mode} 非空。 */
+    static void fire(Context context, String mode) {
         Log.i(TAG, "probe " + mode + ", allowed=" + LiveCard.allowed(context));
         PendingIntent accept = open(context, 41);
         PendingIntent refuse = open(context, 42);

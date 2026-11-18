@@ -15,5 +15,17 @@
                 <action android:name="com.oshare.airdrop.PROBE" />
             </intent-filter>
         </receiver>
+
+        <!--
+          不给广播的那条路。应用被 ColorOS 冻住时广播会被无限期挂起（详见 LiveProbeActivity
+          的注释），Activity 不会：它一定能起来，也一定能把进程解冻。NoDisplay + onCreate 里
+          就 finish()，屏幕上什么都不显示。
+        -->
+        <activity
+            android:name=".LiveProbeActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay" />
     </application>
 </manifest>

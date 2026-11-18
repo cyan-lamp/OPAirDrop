@@ -6,8 +6,18 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.media.AudioAttributes;
+import android.media.AudioManager;
+import android.media.Ringtone;
+import android.media.RingtoneManager;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.SystemClock;
+import android.os.VibrationEffect;
+import android.os.VibrationAttributes;
+import android.os.Vibrator;
+import android.os.VibratorManager;
 
 /**
  * 我们自己的那张云：一条系统绘制的实时通知（Android 16 起的 Live Updates）。
@@ -69,12 +79,30 @@ final class LiveCard {
      */
     private static final String CHANNEL = "live_card_2";
 
+    /**
+     * 邀请卡专用的一条渠道：**这条会响、会震**。
+     *
+     * <p>为什么不能把 {@link #CHANNEL} 改响：那张卡每秒要刷五次进度，同一条渠道要是会响，
+     * 就成了一只每秒叫一声的门铃。而「有人要发东西给你」这个时刻恰好相反——它只发生一次，
+     * 且值得把人从别处叫回来。两件事对声音的需求是相反的，所以分成两条渠道，而不是加开关。
+     *
+     * <p>渠道的声音和振动一旦建出来就改不动（和重要性一样），所以这条也带版本位；将来要换
+     * 提示音就再加一条，别原地改。
+     */
+    private static final String ALERT_CHANNEL = "live_card_alert_1";
+
     /** 历史渠道：留着只会在应用的通知设置里堆一排不再有人发的东西。 */
     private static final String[] LEGACY_CHANNELS = {
             "live", "live_loud", "live_banner", "opairdrop_send"};
 
     /** 上面那几条只扫一次。这个类每秒要投五次通知，不该每次附送四次 binder 往返。 */
     private static boolean swept;
+
+    /** 两次响铃之间至少隔这么久，免得同一件事被重投时连叫两声。 */
+    private static final long CHIME_GAP = 1500L;
+
+    /** 上一次响铃的时刻（{@code uptimeMillis}）。0 表示还没响过。 */
+    private static long sLastChime;
 
     /**
      * 探针开关：给邀请卡带上 {@code PRIORITY_HIGH} / {@code CATEGORY_CALL}。**默认关，不进正式路径。**
@@ -238,7 +266,8 @@ final class LiveCard {
             return;
         }
         channel(manager);
-        String channelId = loudChannelProbe ? probeChannel(manager) : CHANNEL;
+        alertChannel(manager);
+        String channelId = loudChannelProbe ? probeChannel(manager) : ALERT_CHANNEL;
         Notification.Builder builder = new Notification.Builder(context, channelId)
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentTitle(title)
@@ -264,6 +293,10 @@ final class LiveCard {
         Notification card = builder.build();
         immersive(card);
         manager.notify(ID, card);
+        // 响了才算「通知到了」。系统那条路对提升过的通知不出声（见 alertChannel 的注释），
+        // 所以这一声得我们自己发。放在 notify 之后：卡先在原位站好，声音再跟上，
+        // 人抬头时看到的就是「已经在那儿的那张卡」，而不是「先响一声、卡再慢慢浮出来」。
+        chime(context);
         Log.i(TAG, "live invite: " + title + " · " + shortText
                 + (priorityProbe ? " [pri]" : "") + (categoryProbe ? " [call]" : ""));
     }
@@ -455,6 +488,147 @@ final class LiveCard {
         channel.enableVibration(false);
         channel.setShowBadge(false);
         manager.createNotificationChannel(channel);
+    }
+
+    /**
+     * 邀请那条渠道：高重要性只是为了抬头，声音和振动**故意声明为空**——提醒由我们自己在
+     * {@link #chime} 里播。
+     *
+     * <p># 为什么不是让它自己响
+     *
+     * <p>2026-11-19 01:46 和 01:47 各试了一次，渠道配得完全正确
+     * （{@code mImportance=4}、{@code mSound=content://settings/system/notification_sound}、
+     * {@code mVibrationPattern=[0,220,180,220]}），可 {@code dumpsys audio} 的播放器事件流里
+     * 一个 {@code USAGE_NOTIFICATION} 的新播放器都没有出现——**一声没响**。
+     *
+     * <p>原因在提升那一步：{@code NotificationLARuleManager#onLiveNotificationPost} 对我们这条
+     * 带 {@code PROMOTED_ONGOING} 的通知返回 {@code result=7}，把它交给了流体云。流体云卡片
+     * 本身就是那个「提醒」，所以系统那一路的 alerting 被吞掉了。这不是渠道没声明对，是
+     * 「被提升过的通知不再走普通提醒」。
+     *
+     * <p>所以这里把声音交回给我们自己：{@code manager.notify} 之后紧接着播一次。好处是
+     * **不依赖那张卡有没有展开成功**——通知发出去，声音就一定会响，而不是「卡摊开了才有声」。
+     *
+     * <p># 为什么要留一条（静音的）渠道
+     *
+     * <p>不留的话通知会被丢进系统默认渠道，那条的形状不受我们控制，而且以后想调重要性就晚了
+     * （渠道建出来之后重要性改不动）。留着它，等于留了一个以后能改的把手。
+     */
+    private static void alertChannel(NotificationManager manager) {
+        NotificationChannel existing = manager.getNotificationChannel(ALERT_CHANNEL);
+        if (existing != null) {
+            // 老版本把声音和振动声明在渠道上（01:46 之前装的那一版）。渠道建出来之后重要性改不动，
+            // 但声音和振动是能改的，所以这里只把这两项收回自己手里，不重建渠道——
+            // 重建会把用户对这条渠道做过的手动设置一起抹掉。
+            if (existing.getSound() != null || existing.shouldVibrate()) {
+                existing.setSound(null, null);
+                existing.enableVibration(false);
+                manager.createNotificationChannel(existing);
+                Log.i(TAG, "旧的响铃渠道已改成静音，提醒交回本地播放");
+            }
+            return;
+        }
+        NotificationChannel channel = new NotificationChannel(
+                ALERT_CHANNEL, "收到文件", NotificationManager.IMPORTANCE_HIGH);
+        channel.setSound(null, null);
+        channel.enableVibration(false);
+        channel.setShowBadge(false);
+        manager.createNotificationChannel(channel);
+    }
+
+    /**
+     * 响一声 + 震两下。这是「有人要发东西给你」这件事**唯一**的提醒来源。
+     *
+     * <p>振动写成 {@code {0, 220, 180, 220}} 是「两下」而不是「长震一下」：来文件是个待办，
+     * 不是警报，两下足够让人低头看一眼胶囊，也不至于把旁边的人一起叫过来。
+     *
+     * <p>声音用系统默认通知音而不是自带音频：用户换过铃声就跟着他的铃声走，这是通知该有的
+     * 礼貌。音量也走通知音量，用户按音量键调小就是调小。
+     *
+     * <p>三道闸，任何一道关着就安静——因为「我不想被打扰」这个意愿比「我要提醒你」优先：
+     *
+     * <ul>
+     *   <li>应用的通知被关了（{@code areNotificationsEnabled()} 为假）；</li>
+     *   <li>这条渠道被单独关掉（{@code IMPORTANCE_NONE}）；</li>
+     *   <li>勿扰开着（中断过滤器不是 {@code ALL}）——此时只留振动，不出声。</li>
+     * </ul>
+     *
+     * <p>另外静音模式（{@code RINGER_MODE_SILENT}）连振动也不给：那是用户把手按住不放的表达。
+     * 振动模式（{@code RINGER_MODE_VIBRATE}）则只振不响，正是它字面的意思。
+     */
+    private static void chime(Context context) {
+        try {
+            // 同一件事可能会被投两次（比如探针先 cancel 再延迟 700ms 重发、或者上层重试）。
+            // 一秒半之内只认第一次：这段时间里的第二次投递说的还是同一句话。
+            long now = SystemClock.uptimeMillis();
+            if (now - sLastChime < CHIME_GAP) {
+                Log.i(TAG, "chime 跳过：距上次响铃只有 " + (now - sLastChime) + "ms");
+                return;
+            }
+            sLastChime = now;
+            NotificationManager manager = context.getSystemService(NotificationManager.class);
+            if (manager != null) {
+                if (!manager.areNotificationsEnabled()) {
+                    Log.i(TAG, "chime 跳过：应用通知被关了");
+                    return;
+                }
+                NotificationChannel channel = manager.getNotificationChannel(ALERT_CHANNEL);
+                if (channel != null && channel.getImportance() == NotificationManager.IMPORTANCE_NONE) {
+                    Log.i(TAG, "chime 跳过：这条渠道被关了");
+                    return;
+                }
+            }
+            AudioManager audio = context.getSystemService(AudioManager.class);
+            int ringer = audio == null ? AudioManager.RINGER_MODE_NORMAL : audio.getRingerMode();
+            boolean quiet = manager != null
+                    && manager.getCurrentInterruptionFilter()
+                    != NotificationManager.INTERRUPTION_FILTER_ALL;
+            if (ringer == AudioManager.RINGER_MODE_NORMAL && !quiet) {
+                Uri sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+                Ringtone tone = RingtoneManager.getRingtone(context, sound);
+                if (tone != null) {
+                    tone.setAudioAttributes(new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build());
+                    tone.play();
+                }
+            }
+            if (ringer != AudioManager.RINGER_MODE_SILENT) {
+                vibrate(context, new long[]{0, 220, 180, 220});
+            }
+            Log.i(TAG, "chime: ringer=" + ringer + (quiet ? " (勿扰，只振动)" : ""));
+        } catch (Throwable t) {
+            // 提醒失败不该连累通知本身：卡已经发出去了，人还是能在胶囊上看到它。
+            Log.w(TAG, "chime 没响成：" + t);
+        }
+    }
+
+    /** 按给定的波形振一次，{@code -1} 表示不重复。 */
+    private static void vibrate(Context context, long[] pattern) {
+        Vibrator vibrator = null;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            VibratorManager manager = context.getSystemService(VibratorManager.class);
+            if (manager != null) {
+                vibrator = manager.getDefaultVibrator();
+            }
+        }
+        if (vibrator == null) {
+            vibrator = context.getSystemService(Vibrator.class);
+        }
+        if (vibrator == null || !vibrator.hasVibrator()) {
+            return;
+        }
+        VibrationEffect effect = VibrationEffect.createWaveform(pattern, -1);
+        // 必须写明是「通知」类振动。不写的话系统按 USAGE_TOUCH 记（实测 dumpsys 里就是 TOUCH），
+        // 而触摸反馈走的是另一套开关：勿扰不管它、系统设置里的「通知振动」也不管它。
+        // 我们这是在替一条通知发声，就该让这条通知的振动设置说了算。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            vibrator.vibrate(effect,
+                    VibrationAttributes.createForUsage(VibrationAttributes.USAGE_NOTIFICATION));
+        } else {
+            vibrator.vibrate(effect);
+        }
     }
 
     /**
