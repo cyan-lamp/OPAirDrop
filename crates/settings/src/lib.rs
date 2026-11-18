@@ -134,7 +134,9 @@ pub const CATALOG: &[Setting] = &[
         kind: Kind::Text { max_len: 200 },
         default: "",
         title: "AirDrop 名称",
-        summary: "对端在列表里看到的名字。留空则使用下面的机型。",
+        // 留空落到「系统设备名」——设置里那个设备名称，蓝牙广播的也是它。以前落到机型上，
+        // 于是对端看到的是一台叫「PJZ110」的机器，而本人手机上这台明明叫「书桌旁的手机」。
+        summary: "对端在列表里看到的名字。留空则使用系统设备名（蓝牙名称）。",
     },
     Setting {
         key: "device.model",
@@ -266,7 +268,11 @@ pub const CATALOG: &[Setting] = &[
     Setting {
         key: "log.level",
         kind: Kind::Choice(&["off", "error", "info", "debug"]),
-        default: "info",
+        // 默认 debug（2026-11-18 由 info 改来）：这一版还在追流体云与对端发现的时序，出问题时
+        // 手上第一份东西就是日志，默认 info 会让最要紧的那几行过程记录根本不落盘。代价是文件大
+        // 一些——日志按天分文件，且 log.level 就摆在设置页最下面，嫌吵的人自己调回 info 即可。
+        // 设置页那颗【还原】回到的就是这一档。
+        default: "debug",
         title: "日志级别",
         // 原文是「debug 会记录报文本身」，摘掉 log.preview_bytes 时一并改掉：报文收发全在
         // crates/http 与 crates/airdrop 里，两边都不往这份日志里写一个字，写了日志的只有

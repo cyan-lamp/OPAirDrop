@@ -14,11 +14,13 @@ import android.util.Log;
  * 出来。广播进来时应用还在后台，这才是真实场景——人在别的应用里，对面发来一张照片。
  *
  * <pre>
- *   adb shell am broadcast -a com.oshare.airdrop.PROBE --es mode invite
- *   adb shell am broadcast -a com.oshare.airdrop.PROBE --es mode invite_high
- *   adb shell am broadcast -a com.oshare.airdrop.PROBE --es mode invite_twice
- *   adb shell am broadcast -a com.oshare.airdrop.PROBE --es mode progress
- *   adb shell am broadcast -a com.oshare.airdrop.PROBE --es mode drop
+ *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode invite_fresh
+ *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode progress
+ *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode send_done
+ *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode send_fail
+ *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode recv_done
+ *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode recv_fail
+ *   adb shell am broadcast -n com.oshare.airdrop/.LiveProbe -a com.oshare.airdrop.PROBE --es mode drop
  * </pre>
  */
 public final class LiveProbe extends BroadcastReceiver {
@@ -35,39 +37,61 @@ public final class LiveProbe extends BroadcastReceiver {
         PendingIntent accept = open(context, 41);
         PendingIntent refuse = open(context, 42);
         switch (mode) {
-            case "invite_banner_fresh":
+            case "invite_fresh":
                 // 先把本应用的通知全清掉，排除「组内成员不抬头」这个可能。
                 ((android.app.NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE))
                         .cancelAll();
                 new android.os.Handler(context.getMainLooper()).postDelayed(
-                        () -> LiveCard.inviteBanner(context, "卷卷薯 想发给你文件",
-                                "1 个文件 · 2.4 MB", accept, refuse), 700);
-                break;
-            case "invite_banner":
-                LiveCard.inviteBanner(context, "卷卷薯 想发给你文件", "1 个文件 · 2.4 MB", accept, refuse);
+                        () -> invite(context, accept, refuse), 700);
                 break;
             case "invite_high":
+                invite(context, accept, refuse);
+                break;
+            case "invite_plain":
+                // 只发卡、不请求展开。用来把「胶囊画出来了没有」和「展开成不成功」分成两件事：
+                // 这两个问题之前一直混在一起看，导致把「没画出来」误判成「展开事件投错了」。
                 LiveCard.invite(context, "卷卷薯 想发给你文件", "1 个文件 · 2.4 MB", accept, refuse);
                 break;
             case "invite_twice":
-                LiveCard.invite(context, "卷卷薯 想发给你文件", "1 个文件 · 2.4 MB", accept, refuse);
+                invite(context, accept, refuse);
                 new android.os.Handler(context.getMainLooper()).postDelayed(
-                        () -> LiveCard.invite(context, "卷卷薯 想发给你文件",
-                                "1 个文件 · 2.4 MB · 刚刚", accept, refuse), 900);
+                        () -> invite(context, accept, refuse), 900);
                 break;
             case "oplus_tile":
                 probeOplusTile(context);
                 break;
             case "progress":
-                LiveCard.update(context, "正在接收", "45%", 45);
+                LiveCard.update(context, "正在接收", "45% · 1 个文件 · 2.1 MB / 4.8 MB", 45);
+                break;
+            case "send_done":
+                // 和 SendHost.finished 完全一致：成功只挂【完成】，没有【打开文件】。
+                LiveCard.finishWithActions(context, "发送完成", "2 个文件 · 4.8 MB", null);
+                break;
+            case "send_fail":
+                LiveCard.failedWithActions(context, "发送失败",
+                        "3% · 1 个文件 · 0.2 MB / 4.8 MB", 3, open(context, 44));
+                break;
+            case "recv_done":
+                LiveCard.finishWithActions(context, "接收完成", "2 个文件 · 4.8 MB",
+                        open(context, 45));
+                break;
+            case "recv_fail":
+                // 接收侧没有「重发」这个动作可做——传过来这件事取决于对面，所以只挂【完成】。
+                LiveCard.failedWithActions(context, "接收失败",
+                        "3% · 1 个文件 · 0.2 MB / 4.8 MB", 3, null);
                 break;
             case "drop":
                 LiveCard.drop(context);
                 break;
             default:
-                LiveCard.invite(context, "卷卷薯 想发给你文件", "1 个文件 · 2.4 MB", accept, refuse);
+                invite(context, accept, refuse);
                 break;
         }
+    }
+
+    /** 和 {@code ReceiveHost} 接到邀请时做的事一样：只发卡。展开交给系统。 */
+    private static void invite(Context context, PendingIntent accept, PendingIntent refuse) {
+        LiveCard.invite(context, "卷卷薯 想发给你文件", "1 个文件 · 2.4 MB", accept, refuse);
     }
 
     /**

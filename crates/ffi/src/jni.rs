@@ -966,6 +966,8 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_serveDecided(
             directory,
             settings_text,
             model,
+            // 这个入口没有那个参数，见 `Java_..._serveWatched`。
+            ptr::null_mut(),
             input,
             output,
             decide,
@@ -998,6 +1000,7 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_serveWatched(
     directory: jstring,
     settings_text: jstring,
     model: jstring,
+    system_name: jstring,
     input: jobject,
     output: jobject,
     decide: jobject,
@@ -1010,6 +1013,7 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_serveWatched(
             directory,
             settings_text,
             model,
+            system_name,
             input,
             output,
             decide,
@@ -1019,7 +1023,7 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_serveWatched(
 }
 
 /// The body of the two exports above. `landing` may be null, which means nobody is watching.
-// These eight are the Java signature. The exports above cannot pass a struct — JNI marshals
+// These nine are the Java signature. The exports above cannot pass a struct — JNI marshals
 // one argument per Java parameter — and this body reads each of them exactly once, so grouping
 // them here would add a struct whose only purpose is to be unpacked on the next line.
 #[allow(clippy::too_many_arguments)]
@@ -1028,6 +1032,7 @@ unsafe fn serve_for_java(
     directory: jstring,
     settings_text: jstring,
     model: jstring,
+    system_name: jstring,
     input: jobject,
     output: jobject,
     decide: jobject,
@@ -1065,6 +1070,17 @@ unsafe fn serve_for_java(
         None
     } else {
         match unsafe { read_string(env, model) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
+    };
+    // The phone's own name — what Settings calls this device, and what Bluetooth advertises.
+    // Null is the "caller has nothing to say" case, which falls back to the model.
+    // SAFETY: as above.
+    let system_name = if system_name.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, system_name) } {
             Some(text) => Some(text),
             None => return ptr::null_mut(),
         }
@@ -1119,6 +1135,9 @@ unsafe fn serve_for_java(
             settings_len,
             model_pointer,
             model_len,
+            // Borrowed rather than a pointer: it never leaves this frame, and `serve` wants a
+            // `&str` in the first place. `None` here is the older callers' case.
+            system_name.as_deref(),
             read_connection,
             write_connection,
             &mut connection as *mut Connection as *mut c_void,

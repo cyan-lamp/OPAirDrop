@@ -378,6 +378,11 @@ final class ReceiveHost {
             // 问在哪：只有流体云这一条。应用级的浮窗已经撤掉（2026-11-16 15:10）——它要么
             // 抢走前台、要么把胶囊挡住，为了"更醒目"付出的代价比收益大。
             Confirmation.Offer shown = Confirmation.parse(summary, decisionMs);
+            // 接到东西了，这张卡本该自己摊开：消息藏在胶囊里等于没送到。但摊开这件事
+            // 应用侧没有开关——原先靠 Xposed 模块进 SystemUI 调插件的 onExpand，代价是
+            // 通知中心里看不见这张卡、点空白区域收不回去。现在改由系统决定：这条通知带
+            // 高重要性渠道 + setOnlyAlertOnce(false)，会先抬头一次把人叫到；看不看得清
+            // 那两个按钮，交给用户点一下胶囊。
             cloud = LiveCard.allowed(context);
             if (cloud) {
                 LiveCard.invite(context, shown.title(), shown.body(),
@@ -454,12 +459,38 @@ final class ReceiveHost {
                 percent = total > 0 ? (int) Math.min(100L, done * 100L / total) : -1;
                 if (cloud) {
                     // 同一个 id，同一朵云：邀请那张卡在这里变成进度，不需要先撤再发。
-                    LiveCard.update(context, "正在接收", percent >= 0 ? percent + "%" : "准备中", percent);
+                    LiveCard.update(context, "正在接收", line(done, total), percent);
                 }
                 emit(newEvent("receiving", RECEIVING).put("progress", percent));
             } catch (JSONException impossible) {
                 Log.w(TAG, "receive progress unavailable", impossible);
             }
+        }
+
+        /**
+         * 卡片第二行：{@code 45% · 3 个文件 · 2.6 MiB / 5.8 MiB}。
+         *
+         * <p>和发送卡那句是同一个形状，因为人在这两件事上问的是同一个问题。三段各管一件事：
+         * 百分比是胶囊上那个数，件数说这一次是几份东西，字节数是「还剩多久」唯一能算的凭据
+         * ——2.6 MB 里的百分比看不出还剩多久。
+         *
+         * <p>缺哪一段就不写那一段，而不是写个占位：对端没声明总数时没有分母，与其编一个
+         * 「共 0 B」，不如只说「3 个文件」。三段都缺（刚接受，字节还没到）时说的是「准备中」。
+         */
+        private String line(long done, long total) {
+            List<String> parts = new ArrayList<>(3);
+            if (percent >= 0) {
+                parts.add(percent + "%");
+            }
+            int count = offered == null ? 0 : offered.length();
+            if (count > 0) {
+                parts.add(count + " 个文件");
+            }
+            if (total > 0) {
+                // 封顶到 total：对端可以多发，而一条写着「112%」的卡只会让人以为哪里坏了。
+                parts.add(Listener.bytes(Math.min(done, total)) + " / " + Listener.bytes(total));
+            }
+            return parts.isEmpty() ? "准备中" : String.join(" · ", parts);
         }
 
         /**
@@ -478,9 +509,15 @@ final class ReceiveHost {
             settled = true;
             if (cloud) {
                 // 收完不是结束：人还要去打开那份东西。所以这张卡不自己消失，留到人按「完成」。
+                // 第二行和发送完成那张说同一句话的形状：几份、多少字节。这里不写「100%」——
+                // 完成这件事由标题说，而百分比在一张已经画满的轨道旁边是同一个意思说两遍。
                 LiveCard.finishWithActions(context, "接收完成",
-                        published.entries().size() + " 份 · " + Listener.bytes(published.bytes()),
+                        published.entries().size() + " 个文件 · " + Listener.bytes(published.bytes()),
                         openAction(context, published));
+                // 收完也摊开：这张卡上「存到哪儿」和【打开文件】是收尾那一步真正的信息，
+                // 而它们只在摊开的那一面看得见。
+                // 摊开这件事已经不做了：应用侧没有这个开关，硬撬（Xposed 进 SystemUI）会让这张
+                // 卡在通知中心缺席、并且点空白区域收不回去。宁可是一颗点一下才展开的胶囊。
                 cloud = false;
             }
             try {
@@ -534,7 +571,10 @@ final class ReceiveHost {
          */
         void failed(String message) {
             if (cloud) {
-                LiveCard.failed(context, "接收失败", message, percent);
+                // 只挂【完成】，没有【重试】：重来一次要对面重新发，而对面那台手机不归我们叫醒。
+                // 轨道停在真走到的那个数上（{@link #percent}），不拉满——失败画成成功，是这里
+                // 最不能犯的错。
+                LiveCard.failedWithActions(context, "接收失败", message, percent, null);
                 cloud = false;
             }
             settle("failed", FAILED, message);

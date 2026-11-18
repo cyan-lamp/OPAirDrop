@@ -298,6 +298,10 @@ public final class Native {
      * @param decision asked once per offer; never null
      * @param landing told how many bytes have landed, and how many the offer declared; never
      *     null
+     * @param model what the system calls this hardware — shown to a peer as the model
+     * @param systemName what the system calls *this phone*: the device name in Settings, which
+     *     is also what Bluetooth advertises. Blank falls back to {@code model}, which is what a
+     *     peer used to be shown for an untouched installation.
      * @return the report frame described in the class comment
      * @throws IOException if a stream fails or a member cannot be written
      * @throws IllegalArgumentException if the settings cannot be read, or the directory is
@@ -307,6 +311,7 @@ public final class Native {
             String directory,
             String settings,
             String model,
+            String systemName,
             InputStream input,
             OutputStream output,
             Decision decision,

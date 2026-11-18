@@ -660,12 +660,15 @@ final class Listener {
     }
 
     /**
-     * The name a peer shows: {@code device.name}, then {@code device.model}, then the phone's
-     * own model.
+     * The name a peer shows: {@code device.name}, then the phone's own name.
      *
-     * <p>Both blank rows are the table's defaults and each means "use the next one down", which
-     * is the only answer that is never wrong for somebody who has not thought about it. An
-     * unreadable table falls back to the same place for the same reason.
+     * <p>The row is the person's answer to "what should the other phone call this one", so it
+     * wins outright. When it is blank the answer is the name the system itself uses — the one in
+     * Settings → About → Device name, which Bluetooth advertises too — and not the model. That
+     * was the old last step and it was the wrong one in the place it was most visible: an
+     * untouched installation introduced itself to an iPhone as "PJZ110" while its owner called
+     * the same phone something else everywhere else. {@link #systemName} still ends at the model
+     * when the system reports nothing, so the chain can never come back empty.
      *
      * <p>The chain has to match {@code settings::name} in Rust, and that is not a duplication
      * to be tidied away: this copy is what the certificate's CN and the SRV target are made
@@ -675,28 +678,52 @@ final class Listener {
      *
      * <p>Package-private because the feature page prints it: that row answers "what will a peer
      * read", and a second copy of the chain in a view class would not be a frozen twin but a
-     * third rule to keep in step. (It used to feed two rows there; the model row is gone.)
+     * third rule to keep in step.
      */
     String peerName() {
         SettingsScreen screen = settingsNow();
         String named = value(screen, "device.name");
-        return named.isEmpty() ? peerModel(screen) : named;
+        return named.isEmpty() ? systemName(context) : named;
     }
 
     /**
-     * The model a peer reads: {@code device.model}, then the phone's own.
+     * 系统给这台手机起的名字：设置里那个「设备名称」，蓝牙广播的也是它。
      *
-     * <p>Only ever appears in the {@code /Ask} answer — {@code /Discover} carries the name and
-     * the capability blob, nothing about the hardware — so this is the field a person sees on
-     * the other device after tapping their own.
+     * <p>从这里读而不是自己拼，是因为这件事只有一个答案——用户在「关于手机」里改了名字，蓝牙、
+     * 热点、以及这一行都跟着变，而 {@code Build} 里没有任何一个字段记得那个名字。
      *
-     * <p>Private: this used to have a package-private twin for the feature page's "model" row,
-     * which has been removed. The chain is still the second step of {@link #peerName}, so it
-     * keeps answering {@code /Ask} — it just no longer has a caller that prints it.
+     * <p>两条路，顺序不是随便定的：{@code Settings.Global.DEVICE_NAME} 是系统自己存的那个字符串，
+     * 读它不要权限，也是设置页显示的那个值；蓝牙适配器的名字是第二条，因为有些 ROM 只在蓝牙开着
+     * 的时候才把名字写进那张表。两条都拿不到才落到机型上——那正是这一版要改掉的旧行为，留它只是
+     * 因为「PJZ110」也好过一个空名字。
+     *
+     * <p>返回的串已经 trim 过；只有机型那一档可能为空（{@code Build.MODEL} 理论上是非空的，
+     * {@link #systemModel} 兜了一层）。
      */
-    private String peerModel(SettingsScreen screen) {
-        String model = value(screen, "device.model");
-        return model.isEmpty() ? systemModel() : model;
+    static String systemName(Context context) {
+        if (context != null) {
+            try {
+                String named = android.provider.Settings.Global.getString(
+                        context.getContentResolver(),
+                        android.provider.Settings.Global.DEVICE_NAME);
+                if (named != null && !named.trim().isEmpty()) {
+                    return named.trim();
+                }
+            } catch (Throwable unreadable) {
+                // 个别 ROM 把这张表锁着。读不到就往下走，这不是错误。
+            }
+            try {
+                android.bluetooth.BluetoothAdapter adapter =
+                        android.bluetooth.BluetoothAdapter.getDefaultAdapter();
+                String named = adapter == null ? null : adapter.getName();
+                if (named != null && !named.trim().isEmpty()) {
+                    return named.trim();
+                }
+            } catch (Throwable refused) {
+                // API 31 起 getName() 要 BLUETOOTH_CONNECT，没授权就是 SecurityException。
+            }
+        }
+        return systemModel();
     }
 
     /** What {@code Build} reports, which is the last step of both chains. */
@@ -790,7 +817,7 @@ final class Listener {
         ReceiveHost.Attempt attempt = ReceiveHost.open(context, peer);
         // 谁在看进度。每条连接一个，因为接收端一次只服务一个对端（见类注释「Why one
         // thread and not a pool」），所以进度条上最多只有一条连接的数字。
-        Meter meter = new Meter(context, attempt);
+        Meter meter = new Meter(attempt);
         // 库里按路径写文件，而公共目录（Pictures、Movies…）在 targetSdk 37 下只能走媒体库，
         // 所以先落到应用自己的暂存目录，收完再由 Publish 搬进公共目录并挂到媒体库上。
         // 暂存目录只属于这一次连接，finally 里无条件删掉。
@@ -803,6 +830,9 @@ final class Listener {
                     staged.getAbsolutePath(),
                     screen.stored(),
                     Build.MODEL,
+                    // 对端在 /Discover 里读到的名字。空着的时候由 native 自己拼出来的是机型，
+                    // 而这台手机在系统里叫什么只有这里知道，所以两个都交过去。
+                    systemName(context),
                     peer.getInputStream(),
                     peer.getOutputStream(),
                     summary -> {
@@ -865,12 +895,11 @@ final class Listener {
             // 暂存里的东西只有两种下场：搬进公共目录，或者被删掉。走到这里时两种都已经发生
             // 过了，剩下的是空目录和搬失败的那几份——留着它们只是让 app 的数据目录一直长大。
             Publish.discard(staged);
-            // 走到一半的连接：进度条还挂着「正在接收」，而它已经不会再动一分一毫了。收回去。
-            // 一次都没落地过字节的连接不会碰任何通知——这次握手失败或者这次探测，不该把
-            // 上一个传输留下的结果一起抹掉。
-            meter.abandon();
-            // 卡片那一侧同理，而且它还要从「还没结束的接收」那张表里退出去：一条握手失败的
+            // 卡片那一侧要收尾，而且它还要从「还没结束的接收」那张表里退出去：一条握手失败的
             // 连接从来没对外说过话，但它在表里占着一个位置，不收回来的话这张表只增不减。
+            //
+            // 这里原来还有一句 {@code meter.abandon()}，去撤一条普通通知上的进度条。那条
+            // 通知连同它一起没了（2026-11-19）：进度只画在流体云那张卡上，一处一句。
             attempt.abandon();
         }
     }
@@ -1108,12 +1137,12 @@ final class Listener {
     }
 
     /**
-     * 把库里报的字节数变成至多每秒五条的通知，并且知道自己屏幕上还有没有东西要收回去。
+     * 把库里报的字节数变成至多每秒五条的状态更新。
      *
      * <p># 为什么必须节流
      *
-     * <p>{@link Native.Landing#landed} 是按落地块调用的，一次传输就是成千上万次，而每一条
-     * 通知都是一次 binder 事务，全都发生在正在读字节的那条线程上——传输在等它。进度条每秒
+     * <p>{@link Native.Landing#landed} 是按落地块调用的，一次传输就是成千上万次，而每一次
+     * 更新都是一次 binder 事务，全都发生在正在读字节的那条线程上——传输在等它。进度每秒
      * 重画超过五次，人眼也读不出区别，所以这里选的是「够快」而不是「最快」。
      *
      * <p># 为什么收尾不在这里的回调里
@@ -1126,28 +1155,18 @@ final class Listener {
         /** 两次投递之间的最小间隔。 */
         private static final long INTERVAL_MS = 200;
 
-        private final Context context;
-
         /**
-         * 这一次接收的另一半：互传那张卡片。
+         * 这一次接收的落点：流体云那张卡（{@link ReceiveHost}）。
          *
-         * <p>进度要往两个地方走，因为这一刻人可能在看其中任何一个：本应用的通知（
-         * {@link ReceiveService}）和互传的原生弹窗与流体云卡片（{@link ReceiveHost}）。两者
-         * 不是二选一——卡片上画的时候通知也该在，人从哪儿看都该看见同一个数字。
+         * <p>只有它一处。这里原来还写着「本应用的通知和卡各一份」，那条通知已经撤掉
+         * （2026-11-19）：同一条传输在两个地方各画一遍，人看到的只会是两个不一样的数。
          */
         private final ReceiveHost.Attempt attempt;
 
         /** 上次投递的时刻（{@link System#nanoTime}）；0 表示一次都还没投递过。 */
         private long postedAt;
 
-        /** 屏幕上有没有一条属于这次连接的进度条。 */
-        private boolean showing;
-
-        /** 这次连接有没有结果。有结果之后就不再收尾。 */
-        private boolean settled;
-
-        Meter(Context context, ReceiveHost.Attempt attempt) {
-            this.context = context;
+        Meter(ReceiveHost.Attempt attempt) {
             this.attempt = attempt;
         }
 
@@ -1159,29 +1178,15 @@ final class Listener {
                 return;
             }
             postedAt = now;
-            showing = true;
-            // 进度只画在流体云那张卡上（{@code attempt.progress}）。普通通知不再画进度条：
+            // 进度只画在流体云那张卡上（{@code attempt.progress}）。普通通知不再画任何进度：
             // 同一条传输在两处同时走进度，一处是胶囊、一处是通知栏，人只会看见两个不一样的数。
             attempt.progress(done, total);
         }
 
-        /** 有结果了：把进度条换成那句话。 */
+        /** 有结果了。 */
         void finished(String text) {
-            settled = true;
             // 收完那句话由流体云的卡说（带【打开文件】【完成】）。这里不再另发一条普通通知，
             // 否则一次接收会在通知栏和胶囊里各留一条同样的话，而其中一条点不动。
-        }
-
-        /**
-         * 把属于这次连接的进度条收回去。
-         *
-         * <p>只收自己画过的那条。一次都没落地过字节的连接——握手失败的、设置读不出来的、
-         * 对端只是来探测一下的——不该把上一个传输留下的结果抹掉。
-         */
-        void abandon() {
-            if (showing && !settled) {
-                ReceiveService.abandon(context);
-            }
         }
     }
 

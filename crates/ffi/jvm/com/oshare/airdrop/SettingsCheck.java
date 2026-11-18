@@ -146,7 +146,7 @@ public final class SettingsCheck {
         check("revert leaves the page clean", !screen.dirty(), "still dirty");
 
         screen.reset("log.level");
-        check("reset uses the table's default", "info".equals(screen.setting("log.level").value()),
+        check("reset uses the table's default", "debug".equals(screen.setting("log.level").value()),
                 screen.setting("log.level").value());
     }
 

@@ -229,9 +229,17 @@ tasks.named('preBuild').configure {
     dependsOn stageKernelAssets
 }
 
+// ——— 这里原来是 LSPosed 入口类的编译期 API ———
+//
+// 曾经有一个 `FluidModule`（`src/main/resources/META-INF/xposed/java_init.list` 点名），
+// 跑在 SystemUI 进程里钩住流体云插件，用来把卡片强行摊开。它已经整个删掉了：换来的
+// 摊开动作不值那个代价——通知中心里那张卡会缺席，点空白区域也收不回去。
+//
+// 现在这张卡只走公开 API（`Notification.ProgressStyle` + `setRequestPromotedOngoing`），
+// 不需要任何 `compileOnly` 存根，也不需要 stubApiJar 这个任务链。
+
 dependencies {
-    // Empty on purpose. The app is plain framework Java plus the Rust library: no AndroidX,
-    // no Kotlin, nothing that has to travel in the APK or be resolved at runtime. The three
-    // entries that used to be here — the LSPosed module API, DexKit and the Kotlin stdlib —
-    // belonged to the injection-based design this app no longer has.
+    // 空的不是遗漏：这个应用是「框架 Java + Rust 库」，没有 AndroidX、没有 Kotlin，没有任何
+    // 需要塞进 APK 或在运行时解析的依赖。曾经在这里的三条（LSPosed 模块 API、DexKit、
+    // Kotlin stdlib）属于那个已被裁掉的注入式设计。
 }

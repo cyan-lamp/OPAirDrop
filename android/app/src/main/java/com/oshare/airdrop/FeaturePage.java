@@ -661,7 +661,8 @@ final class FeaturePage {
     /**
      * 设备显示：对端在列表里看到的名字。
      *
-     * <p>名字空着的时候对端读到的是机型（{@code Listener.peerName} 的兜底链，和 Rust 那边
+     * <p>名字空着的时候对端读到的是这台手机在系统里的名字（设置 → 关于手机 → 设备名称，
+     * 蓝牙广播的也是它；{@code Listener.systemName} 的兜底链，和 Rust 那边
      * {@code settings::name} 是同一条），副标题要把「此刻真正生效的那个值」写出来，否则空行
      * 会被读成「对端什么都看不到」。
      *
@@ -687,7 +688,7 @@ final class FeaturePage {
         // 单行用它会得到一对平角压在卡片圆角上。
         chrome.setRowAction(nameRow, true, Scheme.CORNERS_ALL,
                 () -> askSetting("device.name", "对端看到的名字",
-                        "留空则用设备型号", () -> {
+                        "留空则用系统设备名（蓝牙名称）", () -> {
                             if (nameDisplayValue != null) {
                                 nameDisplayValue.setText(nameLine());
                             }
@@ -695,13 +696,13 @@ final class FeaturePage {
         return card;
     }
 
-    /** 对端此刻会读到的名字；名字留空时注明它其实是机型。 */
+    /** 对端此刻会读到的名字；名字留空时注明它其实是系统设备名。 */
     private String nameLine() {
         String shown = listener.peerName();
         if (!storedText("device.name").isEmpty()) {
             return shown;
         }
-        return shown + "（名字留空，用的是设备型号）";
+        return shown + "（名字留空，用的是系统设备名）";
     }
 
     /** 一行存下来的原文（去空白）；表读不出来或没这一行就是空串。 */

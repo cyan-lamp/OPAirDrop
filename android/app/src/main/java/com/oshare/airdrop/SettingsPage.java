@@ -208,17 +208,23 @@ final class SettingsPage {
     }
 
     /**
-     * 诊断板块下面那两颗：丢掉日志设置的改动，或者把它写下去。
+     * 诊断板块底下那两颗：把级别掰回 debug，或者把当前的选择写下去。
      *
-     * <p>它们只管诊断板块里的东西，而诊断板块里现在**只剩一行** {@code log.level}——发现、
-     * 发送、接收、设备四块都搬到功能页去了，原来的 {@code log.preview_bytes}（报文长度）也摘了
-     * （没有读取方的滑杆）。所以「只管日志级别」在实现上不需要给 {@link SettingsScreen#save}
-     * 加一个键白名单：可见的、可改的本来就只有这一行，其余的写回去时值与加载时一字不差。
+     * <p>它们只管日志级别，而诊断板块里现在**只剩这一行**——发现、发送、接收、设备四块都搬到
+     * 功能页去了，原来的 {@code log.preview_bytes}（报文长度）也摘了（没有读取方的滑杆）。所以
+     * 「只管日志级别」在实现上不需要给 {@link SettingsScreen#save} 加一个键白名单：可见的、可改
+     * 的本来就只有这一行，其余的写回去时值与加载时一字不差。
      *
      * <p>写成白名单反而更危险：白名单里没有的键不会报错，它只是静静地不保存——将来谁把一行挪
      * 回这一页，就得先猜为什么改了没反应。
      *
-     * <p>保存成完要把 {@code log.level} 重新读一次（见 {@link #save}）：不重读的话，人把级别
+     * <p># 分工：还原只换选择，保存才写盘
+     *
+     * <p>这两颗按钮的语义是「选」与「存」。【还原】把选择挪回表里的默认档（现在是 {@code debug}），
+     * 但不落盘——能落盘的话，【保存】在它之后就没有可做的事了。原来那个「恢复默认值？」的悬浮窗
+     * 干的是同一件事（只改值、不保存），挪到这里之后少一次点击、也少一个只有一种答案的问句。
+     *
+     * <p>保存完要把 {@code log.level} 重新读一次（见 {@link #save}）：不重读的话，人把级别
      * 从 info 改成 debug、回到首页发一个文件，日志里那一档的细节一行都不会多——那个设置看着
      * 生效了，实际上要等下次启动。这是「保存按钮只管日志」这件事唯一必须自己多走的一步。
      */
@@ -226,25 +232,46 @@ final class SettingsPage {
         LinearLayout line = chrome.row();
 
         TextView revert = chrome.ghostButton("还原", view -> {
-            if (!screen.dirty()) {
-                chrome.say("没有改动");
+            Row row = logRow();
+            if (row == null) {
                 return;
             }
-            ask("放弃诊断的改动？", "回到上次保存的内容。", "放弃", () -> {
-                screen.revert();
-                attempted = false;
-                apply();
-                clearProblems();
-            });
+            String fallback = row.setting.defaultValue();
+            if (row.setting.value().equals(fallback)) {
+                chrome.say("已经是 " + fallback);
+                return;
+            }
+            screen.reset(row.setting.key());
+            apply();
+            if (attempted) {
+                showProblem(row);
+            }
+            chrome.say("已切回 " + fallback + "，按【保存】写入");
         });
         TextView save = chrome.mainButton("保存", view -> save());
+        // 和功能页驱动板块那一对一模一样的大小：蓝底按钮默认 padding 20/13、字 15sp，比灰底
+        // 那圈 16/11、14sp 大一号，并排时蓝的比灰的高出一截。钉成同一份。
+        save.setPadding(chrome.dp(16), chrome.dp(11), chrome.dp(16), chrome.dp(11));
+        save.setTextSize(14);
 
-        LinearLayout.LayoutParams revertLp =
-                chrome.mm(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
-        revertLp.rightMargin = chrome.dp(10);
-        line.addView(revert, revertLp);
-        line.addView(save, chrome.mm(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        LinearLayout.LayoutParams left = new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        line.addView(revert, left);
+        LinearLayout.LayoutParams right = new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        right.setMargins(chrome.dp(8), 0, 0, 0);
+        line.addView(save, right);
         return line;
+    }
+
+    /** 诊断板块里那一行 {@code log.*}。按表的键找，不按位置猜。 */
+    private Row logRow() {
+        for (Row row : rows.values()) {
+            if (row.setting.key().startsWith("log.")) {
+                return row;
+            }
+        }
+        return null;
     }
 
     /**
@@ -322,12 +349,6 @@ final class SettingsPage {
                 body.addView(hint);
             }
             body.addView(groupCard(section), chrome.margins(0, 16));
-            // 动作行紧跟在它管的那张卡后面，中间不再隔任何东西：按钮和它作用的东西之间不该隔着
-            // 一整块别的板块。原来那一行「日志写到哪」挪进了卡里（见 {@link #logNote}），所以
-            // 这里只剩两颗按钮。
-            if (logs(section)) {
-                body.addView(logActions(), chrome.margins(0, 6));
-            }
         }
 
         body.addView(chrome.sectionTitle("关于"), chrome.margins(4, 0));
@@ -377,11 +398,13 @@ final class SettingsPage {
             card.addView(rowView(setting), chrome.margins(first ? 0 : 16, 6));
             first = false;
         }
-        // 「日志写到哪」作为卡里最后一行挂着：它和上面两行说的是同一件事（这个级别记下来的东西
-        // 存在哪），而且它对不齐的问题只有长在卡里才彻底没有。分隔线照旧用整幅的那种。
+        // 「日志写到哪」和它底下那两颗按钮都长在卡里：它们和上面那一行说的是同一件事（这个
+        // 级别记下来的东西存在哪、要不要写下去），而卡外那两颗按钮上一版挂在页面栅格上，
+        // 起头和卡里的字对不齐——对齐交给布局，不靠谁去记一个数。
         if (logs(section)) {
             card.addView(chrome.divider(), chrome.fixedDivider(0, 0));
             card.addView(logNote(), chrome.margins(16, 0));
+            card.addView(logActions(), chrome.margins(14, 4));
         }
         return card;
     }
@@ -394,10 +417,9 @@ final class SettingsPage {
         LinearLayout box = chrome.column();
 
         TextView name = chrome.text(setting.title(), 15, true, S.text);
-        name.setOnLongClickListener(view -> {
-            askReset(row);
-            return true;
-        });
+        // 长按不再弹「恢复默认值？」：这一个板块里能改的只有日志级别一行，一行之上再挂一个
+        // 只有一种答案的对话框，等于让人先猜一下「恢复默认」和下面那颗【还原】有什么不同。
+        // 现在只有一种说法，就在卡底那两颗按钮上（见 {@link #logActions}）。
         box.addView(name);
 
         if (!setting.summary().isEmpty()) {
@@ -654,34 +676,6 @@ final class SettingsPage {
         }
         row.problem.setText(problem.substring(colon + 2));
         row.problem.setVisibility(View.VISIBLE);
-    }
-
-    /** 把一行放回表里的默认值，先说出那个值是什么。 */
-    private void askReset(Row row) {
-        ask(
-                "恢复「" + row.setting.title() + "」的默认值？",
-                "默认是 " + describe(row.setting) + "。",
-                "恢复",
-                () -> {
-                    screen.reset(row.setting.key());
-                    apply();
-                    showProblem(row);
-                });
-    }
-
-    /**
-     * 一个值在对话框里的说法。
-     *
-     * <p>数字的存储形式是它最不可读的一面：问「要不要恢复成 8589934592」是一个没人答得上来
-     * 的问题，所以默认值按输入框会显示的样子说出来。
-     */
-    private String describe(SettingsScreen.Setting setting) {
-        String value = setting.defaultValue();
-        String reading = setting.defaultReading();
-        if (setting.control() != SettingsScreen.Control.NUMBER) {
-            return value.isEmpty() ? "空" : value;
-        }
-        return reading.isEmpty() ? value : value + "（" + reading + "）";
     }
 
     private View aboutCard() {

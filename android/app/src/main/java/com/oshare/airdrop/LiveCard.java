@@ -3,8 +3,11 @@ package com.oshare.airdrop;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.Context;
+import android.content.Intent;
 import android.os.Build;
+import android.os.Bundle;
 
 /**
  * 我们自己的那张云：一条系统绘制的实时通知（Android 16 起的 Live Updates）。
@@ -30,37 +33,67 @@ import android.os.Build;
  *
  * <p>{@link NotificationManager#canPostPromotedNotifications()} 为假。那是系统层面的开关
  * （用户可以在设置里关掉某个应用的实时通知），调用方据此决定要不要换一套观感，而不是猜。
+ *
+ * <p># 展开是怎么发生的
+ *
+ * <p>两件事在这里被分开，过去它们被当成了一件：
+ *
+ * <p><b>抬头</b>（状态栏上那一下 banner）由渠道重要性和 {@code setOnlyAlertOnce} 决定，
+ * {@link #announce} 用 {@code setOnlyAlertOnce(false)} 投一次，系统就抬。这部分在应用侧就能做。
+ *
+ * <p><b>摊开</b>（胶囊长成那张带进度条和按钮的大卡）是系统的事，应用侧没有这个开关。
+ * 2026-11-18 之后这里不再试图去按它：原先那条路是发广播让 Xposed 模块进 SystemUI 调
+ * 插件 ViewModel 的 onExpand，看着能让卡片摊开，代价是**通知中心里那张卡不见了、点空白
+ * 区域收不回去**——因为它只在「展开」这一帧被摆好了姿态，系统其余的状态迁移没有跟着走。
+ * 一个能摊开但收不回去、还在通知中心缺席的卡，比一颗需要人点一下的胶囊更糟。
+ *
+ * <p>所以这里只投一张**规矩的**实时通知：{@code ProgressStyle} +
+ * {@code setRequestPromotedOngoing} + {@code setShortCriticalText}，全部是
+ * {@code android.jar} 里的公开 API。系统愿意提升就在状态栏那颗胶囊里，愿意展开它自己会展开；
+ * 用户点一下也能展开。**不再往 extras 里塞任何 OPPO 私有键**（见下面 markFluid 的历史）：
+ * 那些键不仅会被 SystemUI 重新计算后覆盖，其中 {@code remindType=13}（强提醒·始终）和
+ * 非空的 {@code fullScreenIntent} 还会把它钉在「始终提醒」的姿态上——这正是「点空白
+ * 区域不收缩」的直接原因。
  */
 final class LiveCard {
 
     private static final String TAG = "OPAirDrop";
 
-    /** 与接收确认分开的一条渠道：这一条不该响，也不该被「接收确认」的静音连带。 */
-    private static final String CHANNEL = "live";
+    /**
+     * 一张卡一条渠道，重要性高。
+     *
+     * <p>名字带版本号（{@code _2}）不是洁癖：渠道一旦被建出来，重要性就**改不动**了——同一个
+     * id 再调一次 {@code createNotificationChannel} 只会更新名字和描述，重要性取原来那个。
+     * 这台机器上 {@code live} 那条是低重要性建出来的（用来验证「胶囊不展开是不是因为重要性
+     * 太低」那一轮），沿用下去就永远抬不起头，所以换一条新的，并把旧的删掉。
+     */
+    private static final String CHANNEL = "live_card_2";
 
-    /** 同一个位置、高重要性的一条渠道，只为回答「胶囊不展开是不是因为重要性太低」。 */
-    private static final String CHANNEL_LOUD = "live_loud";
+    /** 历史渠道：留着只会在应用的通知设置里堆一排不再有人发的东西。 */
+    private static final String[] LEGACY_CHANNELS = {
+            "live", "live_loud", "live_banner", "opairdrop_send"};
+
+    /** 上面那几条只扫一次。这个类每秒要投五次通知，不该每次附送四次 binder 往返。 */
+    private static boolean swept;
 
     /** 一张卡一个 id：同时只有一个传输在走，第二个会覆盖第一个，这正是我们要的。 */
     private static final int ID = 0x0B00;
 
-    /** 抬头那一条用另一个 id：它和云里的卡是两条通知，不能互相覆盖。 */
-    private static final int PLAIN_ID = 0x0B10;
+    /** 卡上【完成】按下去的那条广播；一个 id 一处，免得两次传输抢同一个 PendingIntent。 */
+    private static final int DONE_REQUEST = 0x0B04;
 
-    /** 试验用的第三条：见 {@link #inviteBanner}。 */
-    private static final int BANNER_ID = 0x0B20;
-    private static final String CHANNEL_BANNER = "live_banner";
-
-    /** 最近一次画卡用的 Context。{@link #dropLater} 需要一个，而它没有参数可以拿。 */
-    private static Context lastContext;
-
-    /** 失败卡在胶囊上停多久：够读完一句话，又不至于一直占着那个位置（见 {@link #failed}）。 */
-    private static final long FAILED_MS = 8000;
-
-    /** 撤掉那张已完成卡片用的计时器（见 {@link #finishAndDismiss}）。 */
-    private static final android.os.Handler LATER =
-            new android.os.Handler(android.os.Looper.getMainLooper());
-
+    /**
+     * 曾经在这里的那四个常量已经删掉了：{@code ACTION_EXPAND}（请模块摊开卡片）、
+     * {@code KEY_OPTIONS}（{@code oplusLiveAlertOptions}）、{@code REMIND_STRONG_ALWAYS}（13）、
+     * {@code HOST_STATUS_BAR}（8）。
+     *
+     * <p>它们合起来做的事是「让这张通知看起来像系统自己的强提醒卡」。代价在 2026-11-18 显形：
+     * 通知中心里找不到这张卡、点空白区域收不回去。这两个症状不是三个独立的 bug，是同一次
+     * 越权的三个面——通知被摆成了系统卡的姿态，却没有系统卡的完整状态机。
+     *
+     * <p>只留公开 API：{@code ProgressStyle}、{@code setRequestPromotedOngoing}、
+     * {@code setShortCriticalText}。系统要提升就提升，不提升它至少是一条正常的进度通知。
+     */
     private LiveCard() {}
 
     /** 这张机器此刻允许我们发实时通知没有。 */
@@ -76,184 +109,28 @@ final class LiveCard {
     }
 
     /**
-     * 画一张在走的卡。
+     * 画一张在走的卡，**不打扰人**。
      *
      * @param percent 0–100；负数表示「不知道进度」，这时卡片画成不确定态而不是停在 0%
      */
     static void update(Context context, String title, String shortText, int percent) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.BAKLAVA) {
-            return;
-        }
-        NotificationManager manager = context.getSystemService(NotificationManager.class);
-        if (manager == null) {
-            return;
-        }
-        channel(manager, CHANNEL);
-        lastContext = context.getApplicationContext();
-
-        Notification.ProgressStyle style = new Notification.ProgressStyle()
-                // 形状跟着进度走：不设这个，系统画的是一段静态装饰而不是一条在走的轨道。
-                .setStyledByProgress(true)
-                .setProgressIndeterminate(percent < 0);
-        if (percent >= 0) {
-            style.setProgress(Math.min(100, percent));
-        }
-
-        Notification card = new Notification.Builder(context, CHANNEL)
-                .setSmallIcon(R.mipmap.ic_launcher)
-                .setContentTitle(title)
-                .setContentText(shortText)
-                // 胶囊里那一行字。系统只在有它的时候才把这张卡提升到状态栏那个位置。
-                .setShortCriticalText(shortText)
-                .setStyle(style)
-                .setOngoing(true)
-                .setOnlyAlertOnce(true)
-                .setShowWhen(false)
-                .setRequestPromotedOngoing(true)
-                .build();
-        manager.notify(ID, card);
-        Log.i(TAG, "live card: " + title + " · " + shortText + " · " + percent + "%");
+        post(context, title, shortText, percent, false, false, null, null);
     }
 
-    /** 收尾：进度拉满，短句换成结果，仍然挂着让系统放完那一段动画。 */
+    /**
+     * 同一张卡，但**把它抬起来一次**（系统的抬头，也就是展开后那张大卡）。
+     *
+     * <p>用在四个时机上：接到邀请、开始发送、发送结束、接收完成。这四处都是「此刻有事发生，
+     * 看一眼」，中间的进度不该跟着一起响——所以它是独立的一个入口，而不是 {@link #update}
+     * 的一个布尔参数：调用点写的是意图，不是标志位。
+     */
+    static void announce(Context context, String title, String shortText, int percent) {
+        post(context, title, shortText, percent, true, false, null, null);
+    }
+
+    /** 收尾：进度拉满，短句换成结果。 */
     static void finish(Context context, String title, String shortText) {
-        update(context, title, shortText, 100);
-    }
-
-    /**
-     * 收尾，并在片刻之后撤掉。
-     *
-     * <p>为什么要撤：这张卡是常驻（{@code ONGOING}）的，一张「已完成」的常驻卡会一直占着胶囊
-     * 那个位置——而那个位置是给人的，不是给历史的。留几秒是为了让完成那一下被看见。
-     */
-    static void finishAndDismiss(Context context, String title, String shortText, long afterMs) {
-        update(context, title, shortText, 100);
-        LATER.postDelayed(() -> drop(context), Math.max(1000, afterMs));
-    }
-
-    /**
-     * 一张收尾的失败卡：停在被切断的那个数上，写清为什么，八秒后自己下去。
-     *
-     * <p># 为什么不是 {@link #finishAndDismiss}
-     *
-     * <p>那条路把进度拉满。拉满的轨道在胶囊上就是「收完了」这个意思，而把失败画成成功是这里
-     * 最不能犯的错——2026-11-17 那次「点接收，通知自己关了」的另一半原因就在这儿：卡片按常规
-     * 收尾撤掉，屏幕上没有留下任何一句解释。所以这一张保留断开那一刻的 {@code percent}：
-     * 收到 4% 断的，轨道就停在 4%，人自己看得出断在中途。
-     *
-     * <p>{@code percent} 为负（一个字节都还没落地）时画的是 0%，不是不确定态：那个转圈的动画
-     * 说的是「正在动」，这条连接已经不会再动了。0% 恰好是最诚实的一句话——一个字节都没收到。
-     *
-     * <p># 为什么几句短话写得这么具体
-     *
-     * <p>读到这张卡的人不知道 socket 是什么。他要的不是 errno，是「刚才那一下为什么没成、
-     * 下回该改哪里」。所以调用方传进来的短句是一句能拿去改设置的话，而不是一句异常原文。
-     */
-    static void failed(Context context, String title, String shortText, int percent) {
-        update(context, title, shortText, Math.max(0, percent));
-        dropLater(FAILED_MS);
-    }
-
-    /**
-     * 一张「要不要收」的卡：同一个胶囊位置，展开后带两个按钮。
-     *
-     * <p>这一条测的是这件事：胶囊自己放不下按钮（它是一颗 chip），所以按钮只能出现在**展开
-     * 之后**。点胶囊究竟会就地展开成一张带按钮的大卡，还是只是把通知栏拉下来，决定了「接收/
-     * 拒绝」能不能一步点到——这是这个方案唯一的交互未知数，所以它必须先在真机上看一眼。
-     *
-     * @param accept 按「接受」时发的广播；调用方负责把它接到自己的决定上
-     * @param refuse 同上，按「拒绝」
-     */
-    static void invite(Context context, String title, String shortText,
-                       android.app.PendingIntent accept, android.app.PendingIntent refuse) {
-        // 高重要性，不是低：**提升成实时通知并不会让它自己出现**，会不会抬头由渠道重要性决定。
-        // 2026-11-16 实测：同一条提升通知，低重要性渠道只有一颗 chip；换成高重要性渠道后它
-        // 自动展开浮在别的应用之上（前提是应用的通知设置里「横幅」勾上，这一项不在本应用
-        // 的控制范围内）。
-        invite(context, CHANNEL_LOUD, title, shortText, accept, refuse);
-    }
-
-    /**
-     * 邀请做成一**条普通的高重要性通知**：不请求提升，于是它走系统的横幅。
-     *
-     * <p>2026-11-16 的分工是这样定下来的：流体云那颗胶囊**只有点了才展开**，而且页面上的小字
-     * 明写着「实时活动…不受通知设置影响」——应用的通知设置里那个「横幅」管的是普通通知。
-     * 既然两条路的开关是分开的，就让它们各做各擅长的事：**要人马上做决定的用横幅**（它自己
-     * 浮出来，视图归我们，按钮多高都行），**显示进度的用云**（胶囊里那颗，不打扰人）。
-     */
-    static void inviteBanner(Context context, String title, String shortText,
-                             android.app.PendingIntent accept, android.app.PendingIntent refuse) {
-        banner(context, title, shortText, accept, refuse, null);
-    }
-
-    /** 带自定义视图的那一版：按钮 64dp，约系统默认高度的 1.5 倍。 */
-    static void inviteBannerTall(Context context, String title, String shortText,
-                                 android.app.PendingIntent accept, android.app.PendingIntent refuse,
-                                 android.widget.RemoteViews view) {
-        banner(context, title, shortText, accept, refuse, view);
-    }
-
-    private static void banner(Context context, String title, String shortText,
-                               android.app.PendingIntent accept, android.app.PendingIntent refuse,
-                               android.widget.RemoteViews view) {
-        NotificationManager manager = context.getSystemService(NotificationManager.class);
-        if (manager == null) {
-            return;
-        }
-        channel(manager, CHANNEL_LOUD);
-        Notification.Builder builder = new Notification.Builder(context, CHANNEL_LOUD)
-                .setSmallIcon(R.mipmap.ic_launcher)
-                .setContentTitle(title)
-                .setContentText(shortText)
-                .setOngoing(true)
-                .setOnlyAlertOnce(true)
-                .setShowWhen(false)
-                .addAction(new Notification.Action.Builder(null, "拒绝", refuse).build())
-                .addAction(new Notification.Action.Builder(null, "接收", accept).build());
-        if (view != null) {
-            builder.setCustomContentView(view).setCustomHeadsUpContentView(view);
-        }
-        manager.notify(PLAIN_ID, builder.build());
-        Log.i(TAG, "banner invite" + (view == null ? "" : " (custom view)") + ": " + title
-                + " · " + shortText);
-    }
-
-    /** 撤掉横幅那一条。 */
-    static void dropBanner(Context context) {
-        NotificationManager manager = context.getSystemService(NotificationManager.class);
-        if (manager != null) {
-            manager.cancel(PLAIN_ID);
-        }
-    }
-
-    private static void invite(Context context, String channel, String title, String shortText,
-                               android.app.PendingIntent accept, android.app.PendingIntent refuse) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.BAKLAVA) {
-            return;
-        }
-        NotificationManager manager = context.getSystemService(NotificationManager.class);
-        if (manager == null) {
-            return;
-        }
-        channel(manager, channel);
-        Notification card = new Notification.Builder(context, channel)
-                .setSmallIcon(R.mipmap.ic_launcher)
-                .setContentTitle(title)
-                .setContentText(shortText)
-                .setShortCriticalText(shortText)
-                // 邀请阶段**不画进度条**：这时没有任何字节在走，一条轨道只会让人以为传输已经开始。
-                // 轨道从「点了接收」那一刻起才该出现（{@link #update} 会给这张卡换上 ProgressStyle）。
-                .setOngoing(true)
-                .setOnlyAlertOnce(true)
-                .setShowWhen(false)
-                .setRequestPromotedOngoing(true)
-                // 先「拒绝」后「接收」：加进来的顺序就是左右顺序，而主导动作该在右边——
-                // 这是拿手机的那只手够得最舒服的一侧，也是「接受」与「取消」惯常的排布。
-                .addAction(new Notification.Action.Builder(null, "拒绝", refuse).build())
-                .addAction(new Notification.Action.Builder(null, "接收", accept).build())
-                .build();
-        manager.notify(ID, card);
-        Log.i(TAG, "live invite (" + channel + "): " + title + " · " + shortText);
+        post(context, title, shortText, 100, true, true, null, null);
     }
 
     /**
@@ -267,7 +144,41 @@ final class LiveCard {
      *             那就只挂「完成」
      */
     static void finishWithActions(Context context, String title, String shortText,
-                                  android.app.PendingIntent open) {
+                                  PendingIntent open) {
+        post(context, title, shortText, 100, true, true, open, null);
+    }
+
+    /**
+     * 失败的那张卡：停在断开那一刻的百分比上，挂【重试】【完成】，**不自己消失**。
+     *
+     * <p># 为什么不像以前那样八秒后自己下去
+     *
+     * <p>失败是唯一一种「人不做点什么，这件事就永远没完成」的状态。一条自己消失的失败提示，
+     * 在通知栏里和「什么都没发生过」长得一模一样——2026-11-17 那次「流体云通知自己关了」就是
+     * 这么被读成「它自己拒的」。留着它，人至少知道自己手上还有一个可以按的按钮。
+     *
+     * <p># 为什么进度停在断开那一刻
+     *
+     * <p>拉满的轨道在胶囊上就是「收完了」这个意思，而把失败画成成功是这里最不能犯的错。
+     * 收到 4% 断的，轨道就停在 4%，人自己看得出断在中途。{@code percent} 为负（一个字节都还没
+     * 落地）时画 0% 而不是不确定态：那个转圈的动画说的是「正在动」，这条连接已经不会再动了。
+     *
+     * @param retry 按【重试】时去哪儿；{@code null} 表示这件事没法重来（比如接收侧），
+     *              那就只挂【完成】
+     */
+    static void failedWithActions(Context context, String title, String shortText, int percent,
+                                  PendingIntent retry) {
+        post(context, title, shortText, Math.max(0, percent), true, true, null, retry);
+    }
+
+    /**
+     * 一张「要不要收」的卡：同一个胶囊位置，展开后带两个按钮。
+     *
+     * @param accept 按「接受」时发的广播；调用方负责把它接到自己的决定上
+     * @param refuse 同上，按「拒绝」
+     */
+    static void invite(Context context, String title, String shortText,
+                       PendingIntent accept, PendingIntent refuse) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.BAKLAVA) {
             return;
         }
@@ -275,41 +186,76 @@ final class LiveCard {
         if (manager == null) {
             return;
         }
-        channel(manager, CHANNEL);
-        lastContext = context.getApplicationContext();
-
-        Notification.ProgressStyle style = new Notification.ProgressStyle()
-                .setStyledByProgress(true)
-                .setProgress(100);
-        Notification.Builder builder = new Notification.Builder(context, CHANNEL)
+        channel(manager);
+        Notification card = new Notification.Builder(context, CHANNEL)
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentTitle(title)
                 .setContentText(shortText)
                 .setShortCriticalText(shortText)
-                .setStyle(style)
+                // 邀请阶段**不画进度条**：这时没有任何字节在走，一条轨道只会让人以为传输已经开始。
+                // 轨道从「点了接收」那一刻起才该出现（{@link #update} 会给这张卡换上 ProgressStyle）。
                 .setOngoing(true)
-                .setOnlyAlertOnce(true)
+                // 邀请必须抬头：它问的是一个需要人在几秒内回答的问题。
+                .setOnlyAlertOnce(false)
                 .setShowWhen(false)
-                .setRequestPromotedOngoing(true);
-        if (open != null) {
-            builder.addAction(new Notification.Action.Builder(null, "打开文件", open).build());
-        }
-        builder.addAction(new Notification.Action.Builder(null, "完成",
-                android.app.PendingIntent.getBroadcast(context, 0x0B04,
-                        new android.content.Intent(context, CardDismiss.class),
-                        android.app.PendingIntent.FLAG_UPDATE_CURRENT
-                                | android.app.PendingIntent.FLAG_IMMUTABLE)).build());
-        manager.notify(ID, builder.build());
-        Log.i(TAG, "live done: " + title + " · " + shortText);
+                .setRequestPromotedOngoing(true)
+                // 先「拒绝」后「接收」：加进来的顺序就是左右顺序，而主导动作该在右边——
+                // 这是拿手机的那只手够得最舒服的一侧，也是「接受」与「取消」惯常的排布。
+                .addAction(new Notification.Action.Builder(null, "拒绝", refuse).build())
+                .addAction(new Notification.Action.Builder(null, "接收", accept).build())
+                .build();
+        immersive(card);
+        manager.notify(ID, card);
+        Log.i(TAG, "live invite: " + title + " · " + shortText);
     }
 
-    /** 过一会儿自己撤掉：用于「失败」这种看一眼就够、又不该一直占着位置的状态。 */
-    static void dropLater(long afterMs) {
-        Context context = lastContext;
-        if (context == null) {
-            return;
+    /**
+     * 请流体云把这张卡摊开成沉浸态——「展开」，不用钩子、不用私有 JSON。
+     *
+     * <p># 键从哪来的
+     *
+     * <p>SystemUI 的 {@code OplusLiveAlertNotificationsRepository#entryToLiveAlert} 在把一条通知
+     * 转成流体云卡时，会自己拼一份 {@code OplusLiveAlertNotificationOptions}，其中四个键
+     * <b>直接读通知 extras 的顶层</b>，不是读我们塞的那串私有 JSON：
+     *
+     * <pre>
+     * linkedHashMap.put("liveAlertService", bundle.getString("liveAlertService", ""));
+     * linkedHashMap.put("immersiveCardType", Integer.valueOf(bundle.getInt("immersiveCardType", -1)));
+     * linkedHashMap.put("requestLockScreenImmersive", Integer.valueOf(bundle.getInt("requestLockScreenImmersive", -1)));
+     * linkedHashMap.put("ignoreEntry", Integer.valueOf(bundle.getInt("ignoreEntry", 0)));
+     * </pre>
+     *
+     * <p>所以这是一个**应用侧可写的入口**：写普通 extra 就行，系统自己会把它搬进插件。
+     *
+     * <p># 为什么是 2
+     *
+     * <p>插件里两处都在读同一个键，两处都认 2：
+     *
+     * <ul>
+     *   <li>{@code livealert/notification/origin/b#b()} 拼「这张卡支持哪些尺寸」：
+     *       来源是通知（{@code ENTRY_NOTIFICATION}）时给 {@code VIEW_SIZE_SM} + {@code VIEW_SIZE_LG}，
+     *       再判 {@code immersiveCardType == 2} 就追加 {@code VIEW_SIZE_IMMERSIVE}。
+     *       不支持这个尺寸的卡，想展开也没有那一面可画。</li>
+     *   <li>{@code seedling/notification/j} 选「这一屏画哪个尺寸」：
+     *       {@code if (n.y() == 2) { format = n.E(VIEW_SIZE_IMMERSIVE); ... }}，
+     *       而 {@code n.y()} 就是取 map 里的 {@code immersiveCardType}，取不到给 0。</li>
+     * </ul>
+     *
+     * <p>两个条件合起来才是「摊开」。只写第二处会拿到一个不存在的面，只写第一处则永远不选它。
+     *
+     * <p># 为什么不是 {@code open.oppomobile.com} 上的公开文档
+     *
+     * <p>公开 API（{@code android.jar} API 37）里没有展开——{@code ProgressStyle}、
+     * {@code setRequestPromotedOngoing}、{@code setShortCriticalText} 之外一个都没有。
+     * 这个键也没写进文档，但它是**系统自己读的契约**，不是我们要去改的别人的状态：
+     * 传进去的是一个值，怎么画由系统决定，画不画得出来也不影响通知本身的合法性。
+     * 这和之前那套「改 SystemUI 里插件的 ViewModel」是两件事。
+     */
+    private static void immersive(Notification card) {
+        if (card.extras == null) {
+            card.extras = new Bundle();
         }
-        LATER.postDelayed(() -> drop(context), Math.max(1000, afterMs));
+        card.extras.putInt("immersiveCardType", 2);
     }
 
     /** 撤掉。传 {@code null} 之外什么都不需要。 */
@@ -320,15 +266,129 @@ final class LiveCard {
         }
     }
 
-    private static void channel(NotificationManager manager, String id) {
-        if (manager.getNotificationChannel(id) != null) {
+    /**
+     * 这里原来有一个 {@code expand(Context)}，往 {@code com.android.systemui} 发一条广播，
+     * 让 Xposed 模块进 SystemUI 调流体云插件的 onExpand。
+     *
+     * <p>它已经删了，连带 {@code FluidModule} 和整个 LSPosed 声明。理由是它换来的东西不值：
+     * 卡片确实会摊开一下，但**通知中心里那张卡同时消失了，点空白区域也收不回去**——
+     * 每次都需要用户去通知中心手动划掉。一个摊开了却收不回去的卡，不如一颗点一下就开的胶囊。
+     *
+     * <p>现在这张卡完全由系统管：{@code ProgressStyle} + {@code setRequestPromotedOngoing}
+     * 决定它是不是实时通知，展开与收起由用户点击和系统策略决定。应用侧没有、也不该有
+     * 这个开关——{@code android.jar} 里根本没有类似方法（{@code Notification.Builder} 上只有
+     * {@code setRequestPromotedOngoing} 和 {@code setShortCriticalText}）。
+     */
+
+    /** 卡上【完成】按下去的那条广播。两处（发送完成、接收完成）指向同一个动作。 */
+    private static PendingIntent done(Context context) {
+        return PendingIntent.getBroadcast(context, DONE_REQUEST,
+                new Intent(context, CardDismiss.class),
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+    }
+
+    /**
+     * 这里原来有一个 {@code markFluid(Context, Notification)}，往通知 extras 里塞
+     * {@code oplusLiveAlertOptions}（{@code remindType=13}、{@code showHostMap=[8]}），
+     * 并把 {@code fullScreenIntent} 指向【完成】那条广播。
+     *
+     * <p># 它为什么被删
+     *
+     * <p>那套写法的目标是把通知摆成「系统自己的强提醒卡」的姿态，好让它在桌面态就摊开。
+     * {@code dumpsys} 证明 JSON 确实进了 extras，可卡片的行为从此不再由系统统一管理：
+     *
+     * <ul>
+     *   <li>{@code remindType=13} 就是「强提醒 · 始终」——一个「始终提醒」的姿态，自然
+     *       不会因为用户点了空白区域而收敛。这是「点空白不收缩」的直接原因。</li>
+     *   <li>非空 {@code fullScreenIntent} 会让这条通知在系统眼里带「全屏意图」的语义
+     *       （{@code entryToReminderType} 只看它是否非空就返回 13），通知中心对它的归类
+     *       也随之改变——这是「通知中心里不显示流体云」的原因。</li>
+     *   <li>更要紧的是：{@code entryToLiveAlert} 最后会用 {@code entryToReminderType}
+     *       算出来的值**整个重写**这个 key，所以我们写进去的数在系统眼里本来就不是权威值。
+     *       一个既不被采纳、又会误导系统状态机的字段，留着只有坏处。</li>
+     * </ul>
+     *
+     * <p>现在这条路完全交给公开 API。如果系统不提升它，它就是一条带进度的常驻通知——
+     * 这是可以接受的降级，而不是需要靠私有键去撬的失败态。
+     */
+
+    /**
+     * 卡片本身的唯一出口。
+     *
+     * @param alert     这一次要不要抬头。抬头由渠道重要性 + {@code setOnlyAlertOnce} 共同决定，
+     *                  两者缺一不可：低重要性渠道上把 onlyAlertOnce 设成 false 也不抬。
+     * @param terminal  这张卡是不是「这件事已经结束」。终态必须挂【完成】——传输结束不是这件事的
+     *                  结束，人还要按一下才算收尾；而进度中的卡一颗按钮都不该有。
+     * @param open      【打开文件】的 intent，没有就不挂这颗按钮
+     * @param retry     【重试】的 intent，没有就不挂这颗按钮
+     */
+    private static void post(Context context, String title, String shortText, int percent,
+                             boolean alert, boolean terminal, PendingIntent open,
+                             PendingIntent retry) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.BAKLAVA) {
             return;
         }
-        boolean loud = CHANNEL_LOUD.equals(id);
-        NotificationChannel channel = new NotificationChannel(id,
-                loud ? "传输邀请" : "传输进度",
-                loud ? NotificationManager.IMPORTANCE_HIGH : NotificationManager.IMPORTANCE_LOW);
-        // 高重要性是为了抬头（heads-up），不是为了让手机响：邀请要人看见，不该吓人一跳。
+        NotificationManager manager = context.getSystemService(NotificationManager.class);
+        if (manager == null) {
+            return;
+        }
+        channel(manager);
+
+        Notification.ProgressStyle style = new Notification.ProgressStyle()
+                // 形状跟着进度走：不设这个，系统画的是一段静态装饰而不是一条在走的轨道。
+                .setStyledByProgress(true)
+                .setProgressIndeterminate(percent < 0);
+        if (percent >= 0) {
+            style.setProgress(Math.min(100, percent));
+        }
+
+        Notification.Builder builder = new Notification.Builder(context, CHANNEL)
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentTitle(title)
+                .setContentText(shortText)
+                // 胶囊里那一行字。系统只在有它的时候才把这张卡提升到状态栏那个位置。
+                .setShortCriticalText(shortText)
+                .setStyle(style)
+                .setOngoing(true)
+                // 这里就是「抬头」的开关：true 是安静地换一行字，false 是把卡抬起来。
+                .setOnlyAlertOnce(!alert)
+                .setShowWhen(false)
+                .setRequestPromotedOngoing(true);
+        // 顺序就是左右顺序：【打开文件】/【重试】说的是「接下来做什么」，排在左边；
+        // 【完成】是「这件事到此为止」，永远在最右。两者不会同时出现，所以最多两颗。
+        if (open != null) {
+            builder.addAction(new Notification.Action.Builder(null, "打开文件", open).build());
+        }
+        if (retry != null) {
+            builder.addAction(new Notification.Action.Builder(null, "重试", retry).build());
+        }
+        // 终态必须有【完成】——哪怕没有别的按钮。没有它，一张停在 3% 的失败卡就只能等系统回收，
+        // 而人拿不到「我已经知道了」这个动作。
+        if (terminal) {
+            builder.addAction(new Notification.Action.Builder(null, "完成", done(context)).build());
+        }
+        Notification card = builder.build();
+        manager.notify(ID, card);
+        Log.i(TAG, "live card: " + title + " · " + shortText + " · " + percent + "%"
+                + (alert ? " (heads-up)" : ""));
+    }
+
+    /** 这条渠道，第一次用到时建；顺手把历史上那几条删掉。 */
+    private static void channel(NotificationManager manager) {
+        if (!swept) {
+            swept = true;
+            for (String legacy : LEGACY_CHANNELS) {
+                if (manager.getNotificationChannel(legacy) != null) {
+                    manager.deleteNotificationChannel(legacy);
+                }
+            }
+        }
+        if (manager.getNotificationChannel(CHANNEL) != null) {
+            return;
+        }
+        NotificationChannel channel = new NotificationChannel(
+                CHANNEL, "传输进度", NotificationManager.IMPORTANCE_HIGH);
+        // 高重要性是为了抬头，不是为了让手机响：这四件事要人看见，不该吓人一跳。
         channel.setSound(null, null);
         channel.enableVibration(false);
         channel.setShowBadge(false);

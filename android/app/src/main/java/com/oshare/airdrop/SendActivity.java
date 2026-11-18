@@ -240,9 +240,16 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     private final Map<String, TextView> nameViews = new LinkedHashMap<>();
     /** hash → 对方在 AirDrop 里设的真名。发现阶段拿不到，/Discover 应答到达后填入。 */
     private final Map<String, String> realNames = new LinkedHashMap<>();
-    /** 已经查过/正在查名字的稳定地址。hash 每次广播都变，只有地址能认出「还是那一台」。 */
-    private final java.util.Set<String> probed = java.util.Collections.synchronizedSet(
-            new java.util.HashSet<>());
+    /**
+     * 上一次替哪台设备问过名字。键是稳定地址，值是那一刻。
+     *
+     * <p>一次问不到不该永远不问：对面锁屏、正忙、AirDrop 刚切走时握手都会失败，而它可能十几
+     * 秒后就好了。以前这里是「一个地址一次，进程内不再重试」——结果是那格子的名字要等到重新
+     * 进面板（新一次会话、空表）才可能补上，中间一直写着占位。
+     */
+    private final Map<String, Long> probed = new LinkedHashMap<>();
+    /** 同一台设备两次问名字至少隔这么久。问一次要连 TLS，问得太勤纯耗电。 */
+    private static final long NAME_RETRY_MS = 15_000;
 
     /** 正在滑出。防止连按两次返回键跑两遍动画。 */
     private boolean closing;
@@ -253,6 +260,15 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * <p>只有从首页点进来才走它：系统分享面板那条路进来时文件已经在 intent 里，没有可选的。
      */
     private static final int PICK_FILES = 0x5E4D;
+
+    /**
+     * 这张页面是被流体云上那颗【重试】叫起来的。
+     *
+     * <p>不是 {@code ACTION_SEND} 的另一种写法：那一条带着文件，这一条什么也不带——要发的东西
+     * 上一次就定了，{@link SendHost#retry} 手上就有。带上文件反而会变成第二次解析、第二份缓存
+     * 副本，而人按那颗按钮要的只是「再发一遍刚才那个」。
+     */
+    static final String ACTION_RETRY = "com.oshare.airdrop.action.RETRY";
 
     /** 选择器已经弹出去了。它回来之前再点一次不该叠出第二个。 */
     private boolean picking;
@@ -349,7 +365,16 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         SendHost.register(cardCancel);
 
         Intent source = getIntent();
-        if (shared(source)) {
+        if (ACTION_RETRY.equals(source.getAction())) {
+            // 卡上那记【重试】。把它当成一次性的：动作改掉，屏幕转一下、主题换一下都不会
+            // 让这一页重放一遍发送。
+            source.setAction(null);
+            // 重来的动作多半还在（同一个进程里）；不在（进程被杀过）就退回选文件——
+            // 人按那颗按钮要的是「再发一次」，不是看一块空面板。
+            if (!SendHost.retry()) {
+                requestFiles();
+            }
+        } else if (shared(source)) {
             new Thread(() -> intake(source), "opairdrop-intake").start();
         } else {
             // 空手来的（首页「发送文件」）：先把文件选出来，再谈发给谁。
@@ -367,6 +392,14 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        if (ACTION_RETRY.equals(intent.getAction())) {
+            setIntent(intent);
+            intent.setAction(null);
+            if (!SendHost.retry()) {
+                requestFiles();
+            }
+            return;
+        }
         if (!shared(intent)) {
             return;
         }
@@ -1053,16 +1086,72 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             renderStage();
         }
 
-        // 缓存没有名字的设备，后台问一次 /Discover。按稳定地址去重：hash 与 UUID 每次广播
-        // 都变，用它们当键会让同一台设备每两秒重查一遍。问不到的地址也记进去，进程内不再
-        // 重试——对面锁屏时反复握手只会白耗电，下次打开页面再试。
+        // 名字可能在这一轮才到（型号、缓存、刚问回来的真名），而设备集合没变——那种情况下
+        // 不重建整屏，只把那一行字换掉。占位「iPhone」变成「张三的 iPhone」就是这条路。
+        for (Peers.Peer peer : usable) {
+            setLabel(nameViews.get(peer.name), label(peer));
+        }
+
+        // 缓存里没有名字的设备，后台问一次 /Discover。按稳定地址去重：hash 与 UUID 每次广播
+        // 都变，用它们当键会让同一台设备每秒重查一遍。问不到的地址留个时刻，隔
+        // {@link #NAME_RETRY_MS} 再试——问一次要连 TLS，但一直不试就等于这格子永远没名字。
+        long now = System.currentTimeMillis();
         for (Peers.Peer peer : usable) {
             String key = PeerNames.key(peer);
-            if (key == null || PeerNames.get(peer) != null || !probed.add(key)) {
+            if (key == null || PeerNames.get(peer) != null || realNames.containsKey(peer.name)) {
                 continue;
             }
+            Long tried = probed.get(key);
+            if (tried != null && now - tried < NAME_RETRY_MS) {
+                continue;
+            }
+            probed.put(key, now);
             probeName(peer);
         }
+    }
+
+    /**
+     * 一台设备在界面上叫什么。
+     *
+     * <p>三道来源，一道比一道准：本次会话问到的真名 → 上次按稳定地址存下的真名 → 占位。
+     *
+     * <p>**占位从来不是实例名**。以前直接画 {@code peer.name}，而 iPhone 的实例名是一串每
+     * 分钟换一次的 hash：打开发送面板先看见乱码，一两秒后它自己变成真名。那一下闪动既没有
+     * 信息，也让人以为列表出错了。现在占位用型号（{@link Peers.Peer#kind()}）——「一台
+     * iPhone」说得对，而且它和真名的差别只是前缀，换上去时宽度不会突然翻倍。
+     */
+    private String label(Peers.Peer peer) {
+        String known = realNames.get(peer.name);
+        if (known == null) {
+            known = PeerNames.get(peer);
+        }
+        return known == null ? peer.kind() : known;
+    }
+
+    /**
+     * 换掉格子上那行名字，换的时候淡一下。
+     *
+     * <p>淡进而不是直接跳：占位变真名是这一屏上唯一会发生的一次字变，跳变看着像掉帧。
+     * 180 毫秒足够看出「它刚刚认出了对方」，又不至于让人等。
+     */
+    private static void setLabel(TextView view, String wanted) {
+        if (view == null || wanted == null || wanted.contentEquals(view.getText())) {
+            return;
+        }
+        view.setText(wanted);
+        view.animate().cancel();
+        view.setAlpha(0.3f);
+        view.animate().alpha(1f).setDuration(180).start();
+    }
+
+    /** 表里现在这一台。设备可能被清掉又重新加回来，那时地址、端口都该用新的。 */
+    private Peers.Peer current(String name) {
+        for (Peers.Peer peer : found) {
+            if (peer.name.equals(name)) {
+                return peer;
+            }
+        }
+        return null;
     }
 
     private static java.util.Set<String> namesOf(List<Peers.Peer> peers) {
@@ -1085,12 +1174,8 @@ public final class SendActivity extends Activity implements Peers.Watcher {
 
         TextView name = new TextView(this);
         // 真名两条来源：本次会话里 /Discover 刚问到的，或上次存下的（按稳定地址查）。
-        // 后者让同一台设备下次一出现就显示名字，不必等预查询跑完。
-        String knownName = realNames.get(peer.name);
-        if (knownName == null) {
-            knownName = PeerNames.get(peer);
-        }
-        name.setText(knownName == null ? peer.name : knownName);
+        // 都没有就写型号——不写实例名，理由见 {@link #label}。
+        name.setText(label(peer));
         name.setTextSize(12.5f);
         name.setTextColor(S.text);
         name.setGravity(Gravity.CENTER);
@@ -1122,12 +1207,16 @@ public final class SendActivity extends Activity implements Peers.Watcher {
 
         // 一次只跑一个传输，所以「正在传」时点任何一台都当作取消：那时页面上没有第二件事
         // 可以开始，而人点下去的意思只可能是「停下」。
+        //
+        // 点的时候回表里取一次这一台：对端可能已经被清掉又加回来了（一次广播空白就够了），
+        // 而这个格子抓着的是旧对象，地址端口都可能是上一轮的。
         cell.setOnClickListener(view -> {
             if (sending) {
                 cancelSend();
-            } else {
-                send(peer);
+                return;
             }
+            Peers.Peer live = current(peer.name);
+            send(live != null ? live : peer);
         });
         return cell;
     }
@@ -1225,10 +1314,13 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         Log.i(TAG, "send to " + peer.name + " — " + peer.address + ":" + peer.port
                 + " host=" + peer.host + ", " + files.size() + " file(s)");
         status(peer, "正在连接…");
-        SendNotice.waiting(this, peer.name, "正在连接…");
-        // 也从这一刻起卡片接手这块屏幕（它接手时会来一条 {@code send_card}，那条通知据此
-        // 让位）。两边的数字取自下面同一个进度回调，不各算一遍。
-        SendHost.begin(sendSession, peer.name, files.size() + " 个文件");
+        // 失败时卡上那颗【重试】要落回这里。把「再发一遍」记成动作本身，而不是记一对参数：
+        // 这一次要发的东西全在 {@link #files} 里、发去哪全在这个 peer 上，写第二份就是第二个
+        // 会过期的副本。
+        SendHost.remember(() -> send(peer));
+        // 也从这一刻起卡片接手这块屏幕。两边的数字取自下面同一个进度回调，不各算一遍。
+        // 标题上的名字用 {@link #label}：这里多半还只有「iPhone」，握手那一步会把它换成真名。
+        SendHost.begin(sendSession, label(peer), files.size() + " 个文件");
 
         List<String> paths = new ArrayList<>();
         for (File file : files) {
@@ -1253,8 +1345,6 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     progressOf.remove(peer.name);
                     redrawProgress(peer.name);
                     status(peer, "已发送 · " + size(report.bytes));
-                    SendNotice.finished(this, "已发送到 " + peer.name,
-                            files.size() + " 个文件 · " + size(report.bytes));
                     // 终态。卡片只在 SUCCESS 上放成功的动画，所以这个码不能换成别的。
                     SendHost.finished(sendSession, peer.name, SendHost.SUCCESS,
                             files.size() + " 个文件 · " + size(report.bytes));
@@ -1285,22 +1375,11 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                         // 原文（"Connection reset" 之类）只进日志：页面那行是给站在两台手机
                         // 中间的人看的，他要知道的是「还得再试一次」，不是异常类名。
                         : "连接被中断";
-                String title = stopped ? "已取消发送"
-                        : refused || timedOut ? "没有发出去"
-                        : impostor ? "对方身份不符"
-                        : "发送失败";
-                // 页面上那行只有几个字（磁贴很窄），通知栏里可以说完：谁、为什么、去改
-                // 哪里。这句是给「手机在别人手里」那一刻写的，所以只点名设置和屏幕。
-                String detail = refused
-                        ? peer.name + " 现在不收文件 · 把 iPhone 的隔空投送改成「所有人（10 分钟）」并保持亮屏"
-                        : impostor
-                        ? message + " · 已中止，没有发出任何内容。对方的证书若是刚换过，重新搜索一次设备再试"
-                        : timedOut
-                        ? peer.name + (moving[0]
-                                ? " 不再回应 · 保持亮屏、别切走隔空投送，再点一次设备重试"
-                                : " 没有接受 · 弹窗出现后十五秒内点「接受」；"
-                                        + "没有弹窗就把隔空投送改成「所有人（10 分钟）」并保持亮屏")
-                        : message + " · 保持两台设备都亮屏、隔空投送不切走，再点一次设备重试";
+                // 「谁、为什么、去改哪里」这句是给「手机在别人手里」那一刻写的，所以只点名
+                // 设置和屏幕。名字那一截留到主线程再拼：真名是握手时问回来的，而这里是发送
+                // 线程——在这一侧读 realNames 会和一个正在写的 UI 线程撞上，而且读到的多半
+                // 还是发送开始前那个占位。标题不在这里写：那一句由 {@link SendHost#label}
+                // 按状态码给，两处各写一份就会有两套说法。
                 runOnUiThread(() -> {
                     sending = false;
                     live = null;
@@ -1309,7 +1388,17 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     progressOf.remove(peer.name);
                     redrawProgress(peer.name);
                     status(peer, message);
-                    SendNotice.finished(this, title, detail);
+                    String who = label(peer);
+                    String detail = refused
+                            ? who + " 现在不收文件 · 把 iPhone 的隔空投送改成「所有人（10 分钟）」并保持亮屏"
+                            : impostor
+                            ? message + " · 已中止，没有发出任何内容。对方的证书若是刚换过，重新搜索一次设备再试"
+                            : timedOut
+                            ? who + (moving[0]
+                                    ? " 不再回应 · 保持亮屏、别切走隔空投送，再点一次设备重试"
+                                    : " 没有接受 · 弹窗出现后十五秒内点「接受」；"
+                                            + "没有弹窗就把隔空投送改成「所有人（10 分钟）」并保持亮屏")
+                            : message + " · 保持两台设备都亮屏、隔空投送不切走，再点一次设备重试";
                     // 各有各的码：人按了取消是 1009，对面不收是 1008，等不到回答是 1010，
                     // 其余（含「对方身份不符」「连接被中断」）都是失败。卡片按这个码选动画
                     // 和那行字，不读上面那几个布尔——词表只有这一份。
@@ -1393,13 +1482,11 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                                 case Native.Progress.READY -> {
                                     Log.i(TAG, "phase ready (handshake done, asking)");
                                     status(peer, "已连接，正在请求发送…");
-                                    SendNotice.waiting(SendActivity.this, peer.name, "已连接，正在请求发送…");
                                     SendHost.waiting(sendSession, peer.name, "已连接，正在请求发送…");
                                 }
                                 case Native.Progress.WAITING -> {
                                     Log.i(TAG, "phase waiting (the person has been asked)");
                                     status(peer, "等待对方接受…");
-                                    SendNotice.waiting(SendActivity.this, peer.name, "等待对方接受…");
                                     SendHost.waiting(sendSession, peer.name, "等待对方接受…");
                                 }
                                 case Native.Progress.SENDING -> {
@@ -1408,16 +1495,10 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                                     redrawProgress(peer.name);
                                     String count = "发送中 " + (total == 0 ? 0 : sent * 100 / total) + "%";
                                     status(peer, count);
-                                    // 页面上那行字和通知栏那句是同一句。通知里的人没在看页面，
-                                    // 所以多给一个「走到哪了」的分数：2.6 MB 里的百分比看不出还剩多久。
-                                    SendNotice.progress(SendActivity.this, peer.name,
-                                            total == 0 ? -1f : (float) sent / total,
-                                            total == 0 ? count : count + " · " + size(sent) + " / " + size(total));
                                     // 卡片上的百分比走胶囊，第二行给的是字节数：同一句「45%」在
                                     // 两个地方各写一遍，晚一帧就是两个数。
                                     // 胶囊标题用真名（/Discover 带回的那个），不是 hash。
-                                    String cardName = realNames.getOrDefault(peer.name, peer.name);
-                                    SendHost.progress(sendSession, cardName,
+                                    SendHost.progress(sendSession, label(peer),
                                             total == 0 ? -1 : (int) (sent * 100 / total),
                                             files.size() + " 个文件" + (total == 0 ? ""
                                                     : " · " + size(sent) + " / " + size(total)));
@@ -1602,11 +1683,11 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     }
 
     /**
-     * /Discover 应答带回了对方自己起的名字：把格子下方那行 hash 换掉。
+     * /Discover 应答带回了对方自己起的名字：把格子上那行占位换掉。
      *
-     * <p>真名在发现阶段拿不到（iPhone 广播的 mDNS 实例名是加密的 hash），只有连上、问过
-     * /Discover 才知道。所以这里允许改变已经画出来的视图，也把真名记进 {@link #realNames}：
-     * 重建（重扫、换主题）之后那一行仍要是真名，不能退回去显示 hash。
+     * <p>真名在发现阶段拿不到（iPhone 广播的 mDNS 实例名是每分钟换一次的 hash），只有连上、
+     * 问过 /Discover 才知道。所以这里允许改变已经画出来的视图，也把真名记进 {@link #realNames}：
+     * 重建（重扫、换主题）之后那一行仍要是真名，不能退回去显示占位。
      */
     private void showRealName(Peers.Peer peer, String real) {
         if (real == null || real.trim().isEmpty()) {
@@ -1614,10 +1695,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         }
         realNames.put(peer.name, real);
         PeerNames.put(peer, real);
-        TextView label = nameViews.get(peer.name);
-        if (label != null) {
-            label.setText(real);
-        }
+        setLabel(nameViews.get(peer.name), label(peer));
         Log.i(TAG, "peer name from /Discover: " + peer.name + " -> " + real);
     }
 

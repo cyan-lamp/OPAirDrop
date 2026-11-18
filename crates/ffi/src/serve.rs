@@ -21,11 +21,14 @@
 //!
 //! # Why the answers come from the settings and not from the caller
 //!
-//! The name in the `/Discover` and `/Ask` answers is `device.name`, with the model as the
-//! fallback the table already promises, and the model in the `/Ask` answer is `device.model`
-//! falling back in turn to what the caller passes. Passing them as another argument would mean
-//! two answers to one question — the row on the settings screen, and whatever the caller
-//! decided to pass — and the screen would be the one that lost.
+//! The name in the `/Discover` and `/Ask` answers is `device.name`; blank falls back to what the
+//! operating system calls this phone (`system_name`), and a caller with nothing to say about that
+//! falls back to the model, which is the chain the table promises. The model in the `/Ask` answer
+//! is `device.model`, falling back in turn to what the caller passes. Passing either as another
+//! argument would mean two answers to one question — the row on the settings screen, and whatever
+//! the caller decided to pass — and the screen would be the one that lost. `system_name` is not
+//! that argument: it is not a setting and cannot be, because it is the phone's name in the
+//! system's own settings, and nothing in this library can read it.
 //!
 //! The model used to be only an argument, on the grounds that it is the one thing here the
 //! operating system knows and a row for it would invite a person to rename their phone. It is
@@ -350,6 +353,9 @@ pub unsafe extern "C" fn opairdrop_serve(
             settings_len,
             model,
             model_len,
+            // 这个入口没有那个参数：它的原型早于「系统设备名」，而加参数会改掉一个已经
+            // 有人在用的 C 原型（见 `opairdrop_serve_watched` 为什么另开一个出口）。
+            None,
             read,
             write,
             context,
@@ -399,6 +405,8 @@ pub unsafe extern "C" fn opairdrop_serve_decided(
             settings_len,
             model,
             model_len,
+            // 同 `opairdrop_serve`：原型不动，参数缺省。
+            None,
             read,
             write,
             context,
@@ -430,6 +438,11 @@ pub unsafe extern "C" fn opairdrop_serve_decided(
 ///
 /// As [`opairdrop_serve_decided`], plus: `progress` must be a valid function pointer whose
 /// `progress_context` stays valid for the duration of the call.
+///
+/// `system_name` (and its length) is what the operating system calls this phone — the name the
+/// person gave it in Settings, which is also the name Bluetooth advertises — or null for
+/// nothing. It is here rather than on the two older exports because those are frozen prototypes
+/// with callers already built against them; this one is the entry the app uses.
 #[no_mangle]
 pub unsafe extern "C" fn opairdrop_serve_watched(
     directory: *const u8,
@@ -438,6 +451,8 @@ pub unsafe extern "C" fn opairdrop_serve_watched(
     settings_len: usize,
     model: *const u8,
     model_len: usize,
+    system_name: *const u8,
+    system_name_len: usize,
     read: ReadCallback,
     write: WriteCallback,
     context: *mut c_void,
@@ -447,6 +462,17 @@ pub unsafe extern "C" fn opairdrop_serve_watched(
     progress_context: *mut c_void,
     report: *mut OpairdropBuffer,
 ) -> i32 {
+    // SAFETY: `system_name` is null or points at `system_name_len` readable bytes, per the
+    // contract. Null is taken before `from_raw_parts`, which requires non-null even for an
+    // empty slice.
+    let system_name = if system_name.is_null() {
+        None
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(system_name, system_name_len) };
+        // A name that is not UTF-8 is not a reason to refuse a transfer — the peer would only
+        // be shown a replacement-character version of it — so it is dropped instead.
+        std::str::from_utf8(bytes).ok()
+    };
     // SAFETY: as above, plus the second callback pair the caller promises.
     unsafe {
         serve(
@@ -456,6 +482,7 @@ pub unsafe extern "C" fn opairdrop_serve_watched(
             settings_len,
             model,
             model_len,
+            system_name,
             read,
             write,
             context,
@@ -477,7 +504,9 @@ pub unsafe extern "C" fn opairdrop_serve_watched(
 /// `directory` is where an upload's members are written; it is created if it does not
 /// exist. `settings` is the stored settings text — `key=value` per line — or null for the
 /// table's defaults. `model` is what the operating system calls this hardware, or null for
-/// nothing.
+/// nothing. `system_name` is what the operating system calls *this phone* — the name its owner
+/// gave it, which is also what Bluetooth advertises — or `None` when the caller has nothing to
+/// say, in which case a blank `device.name` falls through to the model as it always did.
 ///
 /// `report` receives a [`Report`] frame on success, or the failure's message as UTF-8 on
 /// failure — the status says which. It must be zero-initialized and released with
@@ -501,6 +530,7 @@ pub(crate) unsafe fn serve(
     settings_len: usize,
     model: *const u8,
     model_len: usize,
+    system_name: Option<&str>,
     read: ReadCallback,
     write: WriteCallback,
     context: *mut c_void,
@@ -558,7 +588,7 @@ pub(crate) unsafe fn serve(
     };
 
     let mut server = Server::new(Store {
-        name: settings::name(&values, model),
+        name: settings::name(&values, system_name.unwrap_or_default(), model),
         model: settings::model(&values, model),
         directory: PathBuf::from(directory),
         limits: settings::limits(&values),
@@ -757,11 +787,15 @@ mod tests {
 
     /// Like [`serve_decided`], but through the export that also reports progress. Returns
     /// the status, the report frame, the answers, and what the hook was told, in order.
+    ///
+    /// `system_name` is what the phone is called; the empty string is the "caller has nothing
+    /// to say" case, which is what every other helper here passes.
     #[allow(clippy::type_complexity)]
     fn serve_watched(
         directory: &str,
         settings: &str,
         model: &str,
+        system_name: &str,
         requests: Vec<u8>,
         accept: bool,
     ) -> (i32, Vec<u8>, Vec<u8>, Vec<(u64, u64)>) {
@@ -782,6 +816,8 @@ mod tests {
                 settings.len(),
                 model.as_ptr(),
                 model.len(),
+                system_name.as_ptr(),
+                system_name.len(),
                 read_wire,
                 write_wire,
                 &mut wire as *mut Wire as *mut c_void,
@@ -1022,6 +1058,39 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_name_is_the_phone_s_own_name_and_not_its_model() {
+        let root = scratch("system-name");
+        // The case this exists for: an untouched installation used to introduce itself to an
+        // iPhone as "OPPO PJZ110" while Settings called the same phone "书桌旁的手机". The
+        // model row is deliberately unset, so anything reading it here would show the fallback.
+        let (code, _, answers, _) = serve_watched(
+            root.to_str().expect("UTF-8"),
+            "",
+            "OPPO PJZ110",
+            "书桌旁的手机",
+            post("/Discover", "application/x-apple-binary-plist", &[]),
+            true,
+        );
+
+        assert_eq!(code, status::OK);
+        let answer = DiscoverAnswer::parse(body_of(&answers)).expect("the answer is a plist");
+        assert_eq!(answer.computer_name, "书桌旁的手机");
+
+        // …and the row still wins over it, because the row is what the person typed for this.
+        let (code, _, answers, _) = serve_watched(
+            root.to_str().expect("UTF-8"),
+            "device.name=书房里的手机\n",
+            "OPPO PJZ110",
+            "书桌旁的手机",
+            post("/Discover", "application/x-apple-binary-plist", &[]),
+            true,
+        );
+        assert_eq!(code, status::OK);
+        let answer = DiscoverAnswer::parse(body_of(&answers)).expect("the answer is a plist");
+        assert_eq!(answer.computer_name, "书房里的手机");
+    }
+
+    #[test]
     fn an_upload_lands_and_its_names_come_back_in_the_report() {
         let root = scratch("upload");
         let payload = vec![7u8; 4096];
@@ -1055,6 +1124,7 @@ mod tests {
             root.to_str().expect("UTF-8"),
             "",
             "OPPO PJZ110",
+            "",
             post("/Upload", "application/x-cpio", &body),
             true,
         );

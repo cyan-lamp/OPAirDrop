@@ -237,16 +237,30 @@ pub(crate) fn response_limit(values: &Values) -> usize {
     }
 }
 
-/// The name to answer a peer with: `device.name`, or the model when that is blank.
+/// The name to answer a peer with: `device.name`, then the system's own name for the phone,
+/// then [`model`].
 ///
-/// The fallback goes through [`model`] rather than straight to the caller's argument, so a
-/// person who has set a model but not a name is called by the model they chose. Two answers to
-/// one question — the row, and whatever this function decided — is the drift this file exists
-/// to prevent.
-pub(crate) fn name(values: &Values, system: &str) -> String {
+/// `system_name` is what the system calls this device — the string in Settings → About → Device
+/// name, which is also what Bluetooth advertises. It comes from Java (`Settings.Global.DEVICE_NAME`
+/// first, then the adapter's name) because it is not derivable here: nothing in the build knows
+/// what its owner renamed the phone to.
+///
+/// It used to fall straight through to the model, and that made a phone called "书桌旁的手机"
+/// announce itself as "PJZ110" to every peer — the `/Discover` answer is the only name an iPhone
+/// ever draws, so the model was the wrong answer in the one place it was most visible.
+///
+/// The last step still goes through [`model`] rather than to `system_model` directly, so a person
+/// who has set a model but not a name is called by the model they chose. Two answers to one
+/// question — the row, and whatever this function decided — is the drift this file exists to
+/// prevent. A blank `system_name` (a caller built before this argument existed, or a system that
+/// reports nothing) is treated as "not set" and falls through to the same place it always did.
+pub(crate) fn name(values: &Values, system_name: &str, system_model: &str) -> String {
     match trimmed(values, DEVICE_NAME) {
         Some(entered) => entered.to_string(),
-        None => model(values, system),
+        None => match system_name.trim() {
+            "" => model(values, system_model),
+            named => named.to_string(),
+        },
     }
 }
 
@@ -467,22 +481,29 @@ mod tests {
     }
 
     #[test]
-    fn a_blank_name_falls_back_through_the_model_row_to_the_system_one() {
+    fn a_blank_name_falls_back_to_the_system_name_then_through_the_model_row() {
         let mut values = Values::new();
-        // Nothing set: the caller's own model is the answer, which is what an untouched
-        // installation has always shown a peer.
-        assert_eq!(name(&values, "pjz110"), "pjz110");
+        // Nothing set and no system name: the caller's own model is the answer, which is what a
+        // caller built before this argument existed still gets.
+        assert_eq!(name(&values, "", "pjz110"), "pjz110");
         assert_eq!(model(&values, "pjz110"), "pjz110");
 
-        // Model set, name not: both answers become the model, because a peer that draws the
-        // name and the model in the same panel should not see two different devices.
+        // A system name is the whole point of the argument: an untouched installation is called
+        // what the phone is called everywhere else, not what the hardware is called.
+        assert_eq!(name(&values, "书桌旁的手机", "pjz110"), "书桌旁的手机");
+
+        // Model set, name not, no system name: both answers become the model, because a peer
+        // that draws the name and the model in the same panel should not see two devices.
         values.set(DEVICE_MODEL, "iPhone 18").expect("a text row");
         assert_eq!(model(&values, "pjz110"), "iPhone 18");
-        assert_eq!(name(&values, "pjz110"), "iPhone 18");
+        assert_eq!(name(&values, "", "pjz110"), "iPhone 18");
+        // With a system name the row still loses to it: the phone's own name outranks the
+        // hardware, and the model row only ever answers the model question.
+        assert_eq!(name(&values, "书桌旁的手机", "pjz110"), "书桌旁的手机");
 
         // Name set: it wins the name answer, and the model answer keeps its own row.
         values.set(DEVICE_NAME, "书桌旁的手机").expect("a text row");
-        assert_eq!(name(&values, "pjz110"), "书桌旁的手机");
+        assert_eq!(name(&values, "另一个名字", "pjz110"), "书桌旁的手机");
         assert_eq!(model(&values, "pjz110"), "iPhone 18");
     }
 
@@ -493,10 +514,16 @@ mod tests {
         // nothing but spaces has to fall back like an empty one rather than answer with them.
         values.set(DEVICE_NAME, "   ").expect("spaces are text");
         values.set(DEVICE_MODEL, "  ").expect("spaces are text");
-        assert_eq!(name(&values, "pjz110"), "pjz110");
+        assert_eq!(name(&values, "", "pjz110"), "pjz110");
         assert_eq!(model(&values, "pjz110"), "pjz110");
 
         values.set(DEVICE_NAME, "  书房  ").expect("a text row");
-        assert_eq!(name(&values, "pjz110"), "书房");
+        assert_eq!(name(&values, "", "pjz110"), "书房");
+
+        // A system name arrives from another process, so it can be blank or padded too; both
+        // are "not set" rather than a device called " ".
+        values.set(DEVICE_NAME, "").expect("clearing is allowed");
+        assert_eq!(name(&values, "   ", "pjz110"), "pjz110");
+        assert_eq!(name(&values, "  书房  ", "pjz110"), "书房");
     }
 }

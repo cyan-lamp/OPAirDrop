@@ -192,8 +192,11 @@ public final class RoundTrip {
         byte[] frame;
         ByteArrayInputStream in = new ByteArrayInputStream(requests.toByteArray());
         try {
-            frame = Native.serveWatched(inbox.toString(), "", "Pixel Test", in, answers,
-                    summary -> true, (done, total) -> seen.add(new long[] {done, total}));
+            // "Pixel Test" twice: this check is about the report frame, and passing the same
+            // string for the model and the phone's own name keeps the name fallback out of it.
+            frame = Native.serveWatched(inbox.toString(), "", "Pixel Test", "Pixel Test", in,
+                    answers, summary -> true,
+                    (done, total) -> seen.add(new long[] {done, total}));
         } finally {
             in.close();
         }

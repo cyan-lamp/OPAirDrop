@@ -69,7 +69,7 @@ final class Peers {
     private static final String SUFFIX = "._airdrop._tcp.local";
 
     /**
-     * 多久重问一次。对端掉线时 ARP/AWDL 都不会通知，只能靠反复问。
+     * 手上有可连的对端时，多久重问一次。对端掉线时 ARP/AWDL 都不会通知，只能靠反复问。
      *
      * <p>1 秒（原 2 秒）：抓包确认 iPhone 是应答查询的（查询后 0.5–0.8 秒回），所以问得勤一点，
      * 打开 AirDrop 后发现自己快一倍。耗电代价很小——一条 40 字节的组播，每秒一次。
@@ -77,20 +77,97 @@ final class Peers {
     private static final long ASK_EVERY_MS = 1000;
 
     /**
-     * 一台上一次见到后多久算消失——iOS 关 AirDrop 不发 goodbye，全靠这个超时发现。
+     * 一台可连的都没有时，多久重问一次。
      *
-     * <p>抓包量过 iPhone 在线时的应答节奏：间隔 0.5–2.7 秒（它按自己节奏广播，和我们的查询频率
-     * 无关）；关掉 AirDrop 后完全不应答。取 3.5 秒——按用户要求把消失压到最快，代价是只比实测
-     * 的最大应答间隔 2.7 秒多 0.8 秒，偶尔丢一两条应答就可能把还开着的设备误删、闪一下。
-     *
-     * <p>历史上 30 秒太慢、8 秒仍出现过异常长的应答空白被误删；3.5 秒是明确接受这个误删风险的
-     * 选择。若真机上出现设备闪烁，把这里调回 6 秒即可。
+     * <p>这一档专为「一开就看见」：手上空的，最坏情况是「它刚开、我刚问过」，白等一整秒。300
+     * 毫秒把这段空白压到感觉不出来。代价是空列表期间每秒三条约 40 字节的组播——只有在面板开着
+     * 且什么都没找到时才是这个节奏，一旦有人立刻退回一秒。
      */
-    private static final long EXPIRE_MS = 3_500;
+    private static final long ASK_EAGER_MS = 300;
+
+    /**
+     * 一台上一包之后多久算消失——**兜底值**，不是主判据。
+     *
+     * <p># 快速消失靠 goodbye，不靠这个数
+     *
+     * <p>iOS 关掉 AirDrop 时会发 TTL=0 的记录（见 {@link #absorb} 的 {@code gone} 分支），
+     * 那一刻设备就该立刻从列表里消失。这个常数只负责「对方一声不响地没了」——拔电、走出
+     * AWDL 范围、崩溃。那种情况本来就无从考究时间点，宁可慢一点也不能误删。
+     *
+     * <p># 为什么从 2.5 秒放宽到 6 秒
+     *
+     * <p>2.5 秒是拍的，真机把它否掉了。08:00 那一轮抓到的是这个：
+     * <pre>
+     * dropped e9bed2a41703 after 2567 ms of silence (threshold 2500, rhythm 1320 ms)
+     * 1 connectable — e9bed2a41703          ← 一秒后同一台又回来了
+     * dropped e9bed2a41703 after 1379 ms of silence (threshold 1200, rhythm 528 ms)
+     * </pre>
+     * 设备一直在，是我们删了又加。原因是 mDNS 的重复应答抑制：同一份记录不会答得太勤，所以
+     * 一台**活着的** iPhone 合法地安静过 2.6 秒。而 50 秒的采样里（{@code probe:} 那些行）
+     * 健康时的安静最多 752 毫秒——两者相差三倍，说明 2.5 秒正好落在「健康」和「真走了」之间
+     * 那条模糊带里，谁划在那都会闪。
+     *
+     * <p>6 秒是「比健康时长出一个数量级」的位置：健康时安静不到 1 秒，6 秒还没声音就真的
+     * 不是抑制了。慢的这 3.5 秒只影响「对方一声不响地消失」这种本来就没有时间点的情况。
+     */
+    private static final long EXPIRE_MS = 6_000;
+
+    /**
+     * 量节奏时，短于这个的间隔不采样。
+     *
+     * <p>同一轮应答常被拆成 PTR/SRV/TXT 几个包，前后只差几毫秒；把它当「它的说话周期」记下来
+     * 只是噪音。200 毫秒以下的一律看作同一次说话。
+     */
+    private static final long QUIET_MIN_MS = 200;
+
+    /**
+     * 节奏的平滑系数：新的间隔占多少。
+     *
+     * <p>0.3 大约是「记住最近三四帧」。取 1 会被一次丢包带到沟里，取 0.05 又跟不上真实变化。
+     */
+    private static final double RHYTHM_ALPHA = 0.3;
+
+    /**
+     * 量节奏时，长于这个的间隔不采样。
+     *
+     * <p>超过四秒的空白不是它的节奏，是它真的安静过（或者我们自己的查询丢了）。算进平均值只
+     * 会让这个数失去意义。
+     */
+    private static final long RHYTHM_CEIL_MS = 4_000;
+
+    /**
+     * 攒够几个间隔就写一行统计。
+     *
+     * <p>这一行答的是一个靠猜猜不出来的问题：**对端到底隔多久说一次话**。08:05 那一轮的答案
+     * 是「答，约每秒一次，从不在问」（{@code q=0 a=5} 每 5 秒），健康时最长安静 752 毫秒。
+     * 阈值就是据此定的，见 {@link #EXPIRE_MS}。
+     */
+    private static final int RHYTHM_SAMPLES = 10;
+
+    /**
+     * 诊断态：先不删任何对端，每 {@link #DIAG_EVERY_MS} 打一行问答节奏。
+     *
+     * <p>**临时开关，调好阈值就关掉。** 开着是因为阈值必须用真机上的分布来定，而一删就换一个
+     * 新 {@code Peer}、统计归零——被闪烁打断的样本永远攒不够十次，看到的全是半截数据。
+     */
+    private static final boolean DIAG = false;
+
+    /** 诊断态下的「永不删」，只为把分布采样完整。 */
+    private static final long DIAG_HOLD_MS = 30_000;
+
+    /** 诊断态下多久打一行。5 秒 = 一屏日志里能看出节奏，又不至于淹掉别的行。 */
+    private static final long DIAG_EVERY_MS = 5_000;
 
     /** 一台对端。字段可变，因为它是被几条记录先后填满的。 */
     static final class Peer {
-        /** 实例名，去掉 {@link #SUFFIX}，也就是对端自己起的名字。 */
+        /**
+         * 实例名，去掉 {@link #SUFFIX}。
+         *
+         * <p>**这不是给人看的名字**。iPhone 广播的实例名是一串每分钟换一次的不透明 hash，把它
+         * 画到界面上就是乱码——早先发送面板正是这么做的，于是先看见一串十六进制，一两秒后它才
+         * 变成真名。真名要连上之后问 {@code /Discover} 才有，缓存见 {@link PeerNames}；在那之前
+         * 用 {@link #kind()} 顶上。这个字段还剩两个用处：做 {@code peers} 表的键，以及进日志。
+         */
         final String name;
         /** SRV 指向的主机名，同时用作 {@code Host} 头。 */
         String host = "";
@@ -119,8 +196,59 @@ final class Peers {
          * （见 {@code Identity.clientContext}），但发送日志里会记一行。
          */
         String fingerprint = "";
-        /** 最后一次见到它的时刻，{@link System#currentTimeMillis()}。 */
+        /**
+         * 最后一次听到它的时刻，{@link System#currentTimeMillis()}。
+         *
+         * <p>语义是「关于它的任何一条记录到了」，不是「它的字段变了」。这两者以前混在一起：
+         * 地址那条记录只在地址变得「更好」时才刷新这个时刻，于是同一台设备反复答同一个地址时，
+         * 它明明在应答，却被算成沉默——{@link #expire} 于是把它删掉。
+         */
         long seenAt;
+
+        /**
+         * 最后一次「从这个地址收到任意一个包」的时刻。
+         *
+         * <p>和 {@link #seenAt} 的差别是「答了」与「还在说话」：iPhone 在分享页里会**主动**不停地
+         * 问 {@code _airdrop._tcp.local}，那些查询包里一条记录都没有，{@link #absorb} 看不见它们，
+         * 于是以前它明明在链路上喊着，我们却按沉默算，两秒半就把它删了——这正是「关了 AirDrop
+         * 之后反复闪」和「开着却偶尔消失」同一处病根的两种表现。
+         */
+        long heardFrom;
+
+        /**
+         * 实测出来的「它多久说一次话」，毫秒。0 表示还没测出来。
+         *
+         * <p>**只用于日志，不参与判定。** 这个数曾经是过期阈值的依据，真机把它否掉了：所有
+         * 对端的节奏都是「我们问一次它答一次」，约每秒一帧，用它算出来的阈值必然比健康沉默更
+         * 短，于是列表闪。留着是因为它是「对端到底是什么行为」的唯一实测记录——{@link #EXPIRE_MS}
+         * 那 6 秒就是从它旁边那组数推出来的。
+         */
+        long period;
+
+        /** 量到过的间隔里最小、最大的那个，只为日志里那一行统计。0 表示还没量过。 */
+        long gapMin;
+        long gapMax;
+
+        /** 已经量了几个间隔。 */
+        int gaps;
+
+        /**
+         * 最后一次「它主动问了一句」的时刻；{@code questions} 是问到几包。
+         *
+         * <p>查询包和应答包是**两种不同的信号**，这里是它们的分界线：应答受 mDNS 的重复抑制
+         * 约束（同一份记录不会答得太勤），所以一台活着的设备可以合法地安静两三秒；而「问」是
+         * 它自己在发起，没有抑制，节奏稳得多——iPhone 在分享页里就一直问。
+         *
+         * <p>所以「它走了没有」这件事要分开判：问答两条流，哪条都不该拿另一条的节奏去套。
+         */
+        long askedAt;
+        int questions;
+
+        /** 收到几包应答（含记录的那些）。只为日志里那一行统计。 */
+        int replies;
+
+        /** 「它凑齐地址和端口」这一刻是否已经记过日志。见 {@link #absorb}。 */
+        boolean reported;
 
         Peer(String name) {
             this.name = name;
@@ -129,6 +257,37 @@ final class Peers {
         /** 能不能连：地址和端口都有了才算。 */
         boolean connectable() {
             return port > 0 && !address.isEmpty();
+        }
+
+        /**
+         * 还不知道真名时，这台设备该叫什么。
+         *
+         * <p>取 TXT 里的型号而不是 {@link #name}：型号是「它是什么」，实例名是「它这一次叫
+         * 什么」——后者对人多半没有意义，对 iPhone 则是一串每分钟换一次的 hash。
+         *
+         * <p>回落到「附近设备」而不是空着：一个没有名字的格子看着像坏了。
+         */
+        String kind() {
+            String model = this.model == null ? "" : this.model.trim();
+            if (model.startsWith("iPhone")) {
+                return "iPhone";
+            }
+            if (model.startsWith("iPad")) {
+                return "iPad";
+            }
+            if (model.startsWith("iPod")) {
+                return "iPod";
+            }
+            if (model.startsWith("Watch")) {
+                return "Apple Watch";
+            }
+            if (model.startsWith("Mac")) {
+                return "Mac";
+            }
+            if (model.startsWith("Android")) {
+                return "Android";
+            }
+            return "附近设备";
         }
     }
 
@@ -145,8 +304,16 @@ final class Peers {
     private final Map<String, Peer> peers = new LinkedHashMap<>();
 
     private volatile boolean running;
+    /**
+     * 上一包把表改到了没有。浏览线程自己写自己读；{@link #receive} 置位，{@link #loop} 清位。
+     */
+    private boolean dirty;
     /** 上一次记日志时那一串「谁在、在哪」。 */
     private volatile String lastSeen;
+    /** 上一次打诊断行是什么时候，只给 {@link #DIAG} 用。 */
+    private long lastDigest;
+    /** 这一次浏览是什么时候开始的，用来量「对端多久出现在列表里」。 */
+    private long startedAt;
     private Thread thread;
     private MulticastSocket socket;
     private WifiManager.MulticastLock lock;
@@ -195,6 +362,24 @@ final class Peers {
         }
     }
 
+    /**
+     * 现在有几台能连的。
+     *
+     * <p>查询节奏按它分档，见 {@link #ASK_EAGER_MS}。数「能连」而不是数「听过」：只到了一条
+     * SRV、地址还没回来的那些还上不了列表，人在屏幕上看到的仍然是空的，那时问得勤才有意义。
+     */
+    private int ready() {
+        synchronized (peers) {
+            int ready = 0;
+            for (Peer peer : peers.values()) {
+                if (peer.connectable()) {
+                    ready++;
+                }
+            }
+            return ready;
+        }
+    }
+
     private void loop() {
         String problem = null;
         try {
@@ -206,12 +391,14 @@ final class Peers {
             // 先把「此刻还没有对端」记一笔。下面只在收到包时才 announce，缺了这一句，
             // 一台身边什么都没有的手机，在日志里和「根本没开始问」长得一模一样。
             publish(null);
+            startedAt = System.currentTimeMillis();
             while (running) {
                 long now = System.currentTimeMillis();
                 if (now >= nextAsk) {
                     send(query);
                     asked++;
-                    nextAsk = now + ASK_EVERY_MS;
+                    // 一台能连的都没有时问得勤一些：那是人正盯着空列表等它出现的时刻。
+                    nextAsk = now + (ready() == 0 ? ASK_EAGER_MS : ASK_EVERY_MS);
                     // 问了半分钟仍然一包未收。这和「答了但记录凑不齐」是两回事：后者会走
                     // announce 的 partial records 分支，前者连一个字节都没回来，通常意味着
                     // 组播没出得去这块网卡，或者对端不在这条链路上。
@@ -219,8 +406,24 @@ final class Peers {
                         Log.w(TAG, "browse: " + asked + " queries sent, nothing came back");
                     }
                 }
+                dirty = false;
                 if (receive()) {
                     heard++;
+                }
+                // 过期检查放在这里，而不是只放在收包超时里。
+                //
+                // 5353 上从来不是只有我们在说话：打印机、投屏、别人的 AirPlay 一直在广播。
+                // 只要它们来得比 250 毫秒密，socket.receive() 就一直不超时，挂在超时上的
+                // 过期检查就一次都不会跑——关掉 AirDrop 的那台于是永远挂着，要重进面板才消失。
+                // 这是「关了还显示」的真正原因，和 EXPIRE_MS 是几秒无关。
+                if (expire() > 0) {
+                    dirty = true;
+                }
+                if (DIAG && now - lastDigest >= DIAG_EVERY_MS) {
+                    lastDigest = now;
+                    digest();
+                }
+                if (dirty) {
                     publish(null);
                 }
             }
@@ -256,8 +459,8 @@ final class Peers {
         socket = new MulticastSocket(null);
         socket.setReuseAddress(true);
         // 250ms 而不是 1s：一次响应常被拆成 PTR/SRV/TXT 几个包，收包越勤，一台设备凑齐
-        // connectable（地址+端口）越快，开 AirDrop 后显示得越及时。expire 也挂在收包超时上，
-        // 这个间隔同时决定关掉后多久被清掉的上限——250ms 让 6s 阈值真正精确到 6s。
+        // connectable（地址+端口）越快，开 AirDrop 后显示得越及时。这一档同时是过期检查的
+        // 节奏——每轮循环都查一次 expire()，所以 2.5 秒的阈值真正精确到 2.5 秒。
         socket.setSoTimeout(250);
         // 绑 IPv4 通配的 socket 收不到 ff02::fb，绑 IPv6 通配的又发不出 224.0.0.251：
         // 地址族要跟着上面选的组走，而不是跟着习惯走。
@@ -357,25 +560,102 @@ final class Peers {
         }
     }
 
-    /** 收一个报文，并在有变化时返回 true。 */
+    /**
+     * 收一个报文。
+     *
+     * @return 收到了一包（不管里面有没有我们认得的东西）。表有没有被改到另记在 {@link #dirty}
+     *         上——两者必须分开：别的服务的广播会不停地把「收到」置真，而它一次也不该引起重画。
+     */
     private boolean receive() {
         byte[] buffer = new byte[1500];
         DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
         try {
             socket.receive(packet);
         } catch (java.net.SocketTimeoutException idle) {
-            return expire() > 0;
+            // 超时不再是过期检查的唯一入口，见 {@link #loop}。
+            return false;
         } catch (Exception closed) {
             return false;
         }
         byte[] data = new byte[packet.getLength()];
         System.arraycopy(packet.getData(), packet.getOffset(), data, 0, data.length);
+        // 先认人，再看包里写了什么。
+        //
+        // 顺序很重要：iPhone 在分享页里不停地问 _airdrop._tcp.local，那些查询包里一条记录都
+        // 没有，mdnsRecords 返回空，absorb 什么也不会做——可这一包本身恰恰是「它还在」最硬的
+        // 证据。以前只在解析出记录时才算「听到了」，于是它明明在链路上喊着，我们却按沉默算。
+        //
+        // 空包 = 它在问，非空 = 它在答。这两种节奏不一样，过期判据也不一样，见 {@link #heard}。
+        boolean question;
         try {
             String lines = new String(Native.mdnsRecords(data), java.nio.charset.StandardCharsets.UTF_8);
-            return absorb(lines);
+            question = lines.trim().isEmpty();
+            if (absorb(lines)) {
+                dirty = true;
+            }
         } catch (Exception notForUs) {
             // 5353 上还有别的服务在广播：打印机、投屏、别人的 AirPlay。不是错误。
-            return false;
+            question = true;
+        }
+        heard(packet.getAddress(), question);
+        return true;
+    }
+
+    /**
+     * 某一台在说话——按源地址认人，顺手量一下它的节奏。
+     *
+     * <p># 为什么按地址认，不按包里写的名字
+     *
+     * <p>查询包里没有名字。要把它归到某一台设备头上，唯一的线索就是「这一包从谁的地址发
+     * 过来」，而 {@link Peer#address} 正是我们知道的那个地址。
+     *
+     * <p># 为什么顺手量节奏
+     *
+     * <p>{@link #EXPIRE_MS} 原来是个常数，可「沉默多久算走」本来就该跟着对方的说话频率走：
+     * iPhone 在分享页里约每秒问一次，退出分享页就彻底安静。量出来的节奏让阈值自动贴合——它
+     * 话多，阈值就短，关掉 AirDrop 后消失得快；它话少，阈值就跟着放宽，不会把一台只是答得慢
+     * 的设备误删。见 {@link #timeout}。
+     *
+     * <p>实例名每分钟换一次（Apple 的隐私设计），换一次就是一条新记录、一个新 {@code Peer}，
+     * 量到的节奏也跟着从头开始——这没关系：新实例建出来一两秒内就会收到它下一帧查询，节奏很
+     * 快就能重新量到，而那段时间用的 {@link #EXPIRE_MS} 兜底并不比原来差。
+     */
+    private void heard(InetAddress source, boolean question) {
+        if (source == null) {
+            return;
+        }
+        String from = bare(source.getHostAddress());
+        long now = System.currentTimeMillis();
+        synchronized (peers) {
+            for (Peer peer : peers.values()) {
+                // 地址还没到（只收到 SRV）的这台认不出来，它会走 absorb 里 seenAt 那条路。
+                if (peer.address.isEmpty() || !bare(peer.address).equals(from)) {
+                    continue;
+                }
+                if (question) {
+                    peer.questions++;
+                    peer.askedAt = now;
+                } else {
+                    peer.replies++;
+                }
+                long gap = peer.heardFrom == 0 ? 0 : now - peer.heardFrom;
+                peer.heardFrom = now;
+                // 太短：同一次说话被拆成了几个包。太长：它中间真的安静过，那不叫节奏。
+                if (gap < QUIET_MIN_MS || gap > RHYTHM_CEIL_MS) {
+                    continue;
+                }
+                peer.period = peer.period <= 0
+                        ? gap
+                        : Math.round(peer.period * (1 - RHYTHM_ALPHA) + gap * RHYTHM_ALPHA);
+                peer.gapMin = peer.gapMin == 0 ? gap : Math.min(peer.gapMin, gap);
+                peer.gapMax = Math.max(peer.gapMax, gap);
+                if (++peer.gaps == RHYTHM_SAMPLES) {
+                    // 一行统计，答的是「它到底隔多久说一次话」——EXPIRE_FLOOR_MS 的依据。
+                    trace("rhythm: " + peer.name + " speaks every " + peer.period + " ms ("
+                            + peer.gaps + " gaps, " + peer.gapMin + "–" + peer.gapMax + " ms, q="
+                            + peer.questions + " a=" + peer.replies + ")");
+                }
+            }
         }
     }
 
@@ -410,12 +690,16 @@ final class Peers {
                         String instance = field[1].endsWith(SUFFIX)
                                 ? field[1].substring(0, field[1].length() - SUFFIX.length())
                                 : field[1];
-                        if (peers.remove(instance) != null) {
-                            changed = true;
-                        }
+                        boolean removed = peers.remove(instance) != null;
                         // 有些实现把 goodbye 挂在主机名上（A/AAAA 的 TTL=0），不是实例名。
                         // 那种记录带 service suffix 时上面已覆盖；这里再按主机名兜一次。
                         if (peers.values().removeIf(peer -> field[1].equals(peer.host))) {
+                            removed = true;
+                        }
+                        if (removed) {
+                            // 这一行是「快」的来源：有 goodbye 就不必等计时器，消失是即时的。
+                            // 真机上要确认它到底会不会来——不来，才只能退回阈值。
+                            trace("goodbye " + field[1] + " — removed now, without waiting for the timer");
                             changed = true;
                         }
                     }
@@ -423,7 +707,7 @@ final class Peers {
                         Peer peer = peer(field[1]);
                         peer.host = field[2];
                         peer.port = parseInt(field[3]);
-                        peer.seenAt = System.currentTimeMillis();
+                        touch(peer);
                         changed = true;
                     }
                     case "addr" -> {
@@ -434,10 +718,17 @@ final class Peers {
                         // 地址行属于主机名，回填给所有指向这台主机的实例。
                         for (Peer peer : peers.values()) {
                             if (peer.host.equals(field[1])) {
+                                // 先记「听到了」，再看地址有没有变——两件事。
+                                //
+                                // 以前这一句在 if 里面，于是同一台设备反复答同一个地址时，
+                                // 它答得再勤也算沉默：地址没「变好」，时刻就不刷新。
+                                // 这不是理论问题——应答本来就是重复的，所以正确实现的
+                                // responder 永远刷新不了它，{@link #expire} 于是把一台明明
+                                // 在应答的设备删掉，过一秒又被下一条 SRV 加回来。
+                                touch(peer);
                                 String address = field[2];
                                 if (betterAddress(address, peer.address)) {
                                     peer.address = address;
-                                    peer.seenAt = System.currentTimeMillis();
                                     changed = true;
                                 }
                             }
@@ -448,14 +739,31 @@ final class Peers {
                         // 其余键（flags 等）这一侧不读，`browse.rs` 也只报了这三个。
                         // 指纹那一项的键名是 `h`——对端就是这么发的，见 `Responder.java`。
                         if ("model".equals(field[2])) {
-                            peer(field[1]).model = field[3];
+                            Peer peer = peer(field[1]);
+                            touch(peer);
+                            peer.model = field[3];
                             changed = true;
                         } else if ("h".equals(field[2])) {
-                            peer(field[1]).fingerprint = field[3].trim();
+                            Peer peer = peer(field[1]);
+                            touch(peer);
+                            peer.fingerprint = field[3].trim();
                             changed = true;
                         }
                     }
                     default -> { }
+                }
+            }
+            // 一台设备凑齐「地址 + 端口」的那一刻记一笔。
+            //
+            // 这是人眼在列表里看见它的时刻，也是「对方一开 AirDrop，我们多久显示」唯一的可测
+            // 证据。没有这一行，这件事只能靠感觉形容（「有时候要等一会儿」），也就没法回答
+            // 「还能不能再快」。
+            long now = System.currentTimeMillis();
+            for (Peer peer : peers.values()) {
+                if (peer.connectable() && !peer.reported) {
+                    peer.reported = true;
+                    trace("ready " + peer.name + "@" + peer.address + ":" + peer.port
+                            + " after " + (now - startedAt) + " ms of browsing");
                 }
             }
         }
@@ -521,22 +829,116 @@ final class Peers {
         Peer peer = peers.get(name);
         if (peer == null) {
             peer = new Peer(name);
-            peer.seenAt = System.currentTimeMillis();
+            touch(peer);
             peer.scope = nicIndex;
             peers.put(name, peer);
         }
         return peer;
     }
 
-    /** 丢掉太久没再出现的对端，返回丢掉的个数。 */
+    /**
+     * 记一笔「关于它的记录到了」。
+     *
+     * <p>**只刷 {@link Peer#seenAt}，不碰 {@link Peer#heardFrom}**：后者是「收到过几个包」的
+     * 计时器，由 {@link #receive} 那一侧独占。这里也刷的话，间隔永远是 0（absorb 先跑，heard
+     * 后跑，瞬间就被填成当前时刻），节奏量不出来——真机上第一次跑就是 `gaps=0`，一行样本都
+     * 没攒到。两个时刻记的是两件事，就该由两条路径各自维护。
+     */
+    private static void touch(Peer peer) {
+        peer.seenAt = System.currentTimeMillis();
+    }
+
+    /**
+     * 丢掉太久没再出现的对端，返回丢掉的个数。
+     *
+     * <p>每轮循环都调一次（收包 250 毫秒超时，所以大约每 250 毫秒一次），不只在收包超时时调
+     * ——理由见 {@link #loop}，那是「关了还显示」的根因。
+     */
     private int expire() {
-        long cutoff = System.currentTimeMillis() - EXPIRE_MS;
-        int before;
+        long now = System.currentTimeMillis();
         synchronized (peers) {
-            before = peers.size();
-            peers.values().removeIf(peer -> peer.seenAt < cutoff);
+            int before = peers.size();
+            // 「还在」的证据有两个来源：它答了（seenAt，记录解析出来了），或者它只是在说话
+            // （heardFrom，查询包）。后者以前根本不算数，于是一台明明在链路上不停发查询的
+            // iPhone，会因为「没答出我们能解析的记录」被删掉——手机就在手边、AirDrop 开着，
+            // 列表里却是空的，过一秒它又被下一帧查询带回列表。这就是「闪烁」。
+            peers.values().removeIf(peer -> {
+                long silence = now - lastHeard(peer);
+                long threshold = timeout();
+                if (silence < threshold) {
+                    return false;
+                }
+                // 删掉的那一刻必须写清楚：谁、沉默多久、按什么阈值、节奏是多少。只看到「列表
+                // 空了」是调不动阈值的——而这条路径的每个数都只能用真机上的行为来定。
+                trace("dropped " + peer.name + "@" + peer.address + " after " + silence
+                        + " ms of silence (threshold " + threshold + ", rhythm " + peer.period + " ms)");
+                return true;
+            });
+            // 一台设备只有一个当前实例，但实例名每分钟换一次（Apple 的隐私设计）。
+            //
+            // 以前旧的靠「再也收不到它的 SRV」自然过期；现在 {@link #heard} 按地址续命，
+            // 旧名字会被新名字的包一起喂活，于是在列表里出现一模一样的两格——这正是「先看见
+            // 一个名字、一瞬间又变成另一个」的另一半真相。地址没变、名字换了，收掉旧的。
+            List<Peer> alive = new ArrayList<>(peers.values());
+            for (Peer older : alive) {
+                if (older.address.isEmpty()) {
+                    continue;
+                }
+                for (Peer newer : alive) {
+                    if (newer == older || !bare(newer.address).equals(bare(older.address))) {
+                        continue;
+                    }
+                    if (newer.seenAt > older.seenAt) {
+                        peers.remove(older.name);
+                        trace("retired " + older.name + " — same address as " + newer.name);
+                        break;
+                    }
+                }
+            }
+            return before - peers.size();
         }
-        return before - peers.size();
+    }
+
+    /** 最后一次「有证据说明它还在」的时刻：答了记录，或者发了任意一包。 */
+    private static long lastHeard(Peer peer) {
+        return Math.max(peer.seenAt, peer.heardFrom);
+    }
+
+    /**
+     * 诊断：把这台的问答节奏原样打出来。
+     *
+     * <p>要回答的是三个数：它多久说一次话（gaps 的平均/最小/最大）、那些话里几包是问、几包
+     * 是答、现在安静了多久。阈值只能从这三样推出来——「沉默多久算它走了」的正确答案是「比它
+     * 活着时的最长沉默再宽一点」，不是任何一个人能凭直觉拍出来的常数。真机上量到的第一个样本
+     * 就已经推翻了原先的 2.5 秒：一台活着的 iPhone 合法地安静过 2.6 秒。
+     */
+    private void digest() {
+        long now = System.currentTimeMillis();
+        for (Peer peer : snapshot()) {
+            if (peer.questions + peer.replies == 0) {
+                continue;
+            }
+            trace("probe: " + peer.name + "@" + peer.address
+                    + " q=" + peer.questions + " a=" + peer.replies
+                    + " gaps=" + peer.gaps + " avg=" + peer.period
+                    + " min=" + peer.gapMin + " max=" + peer.gapMax
+                    + " quiet=" + (now - lastHeard(peer)) + " ms");
+        }
+    }
+
+    /**
+     * 这台设备沉默多久算走了。
+     *
+     * <p>只有一个答案，因为在这里只能有一个：真机上量到的健康沉默（最长 752 毫秒）和一次被
+     * 误删的 2.6 秒之间，没有可靠的界线再细分。「按每台设备自己的节奏算」这条路走过又回来了
+     * ——测下来所有对端的节奏都是「我们问一次它答一次」，约每秒一帧，跟着它算只会得到一个更小
+     * 的阈值，也就是更会闪。
+     *
+     * <p>真正的「快」在别处：{@link #absorb} 的 {@code gone} 分支。对方主动告别时立刻消失，
+     * 这个常数只管「一声不响地没了」——拔电、走出范围、崩溃，那本来就没有准确时间点。
+     */
+    private long timeout() {
+        return DIAG ? DIAG_HOLD_MS : EXPIRE_MS;
     }
 
     private static int parseInt(String text) {
