@@ -250,7 +250,7 @@ final class LiveCard {
     }
 
     /**
-     * 失败的那张卡：停在断开那一刻的百分比上，挂【重试】【完成】，**不自己消失**。
+     * 失败的那张卡：停在断开那一刻的百分比上，挂【重试】【取消】，**不自己消失**。
      *
      * <p># 为什么不像以前那样八秒后自己下去
      *
@@ -431,7 +431,7 @@ final class LiveCard {
      *
      * @param alert     这一次要不要抬头。抬头由渠道重要性 + {@code setOnlyAlertOnce} 共同决定，
      *                  两者缺一不可：低重要性渠道上把 onlyAlertOnce 设成 false 也不抬。
-     * @param terminal  这张卡是不是「这件事已经结束」。终态必须挂【完成】——传输结束不是这件事的
+     * @param terminal  这张卡是不是「这件事已经结束」。终态必须挂一颗收尾按钮——传输结束不是这件事的
      *                  结束，人还要按一下才算收尾；而进度中的卡一颗按钮都不该有。
      * @param open      【打开文件】/【打开链接】的 intent，没有就不挂这颗按钮
      * @param openLabel {@code open} 那颗按钮写什么。收的是文件就是「打开文件」，收的是一条链接
@@ -479,10 +479,17 @@ final class LiveCard {
         if (retry != null) {
             builder.addAction(new Notification.Action.Builder(null, "重试", retry).build());
         }
-        // 终态必须有【完成】——哪怕没有别的按钮。没有它，一张停在 3% 的失败卡就只能等系统回收，
-        // 而人拿不到「我已经知道了」这个动作。
+        // 终态必须有这颗收尾按钮——哪怕没有别的按钮。没有它，一张停在 3% 的失败卡就只能等系统
+        // 回收，而人拿不到「我已经知道了」这个动作。
+        //
+        // 它叫什么取决于旁边站着谁，而不是取决于这里只有一处调用点：
+        // · 旁边是【重试】时叫【取消】。「要不要再来一次」是一对答案，是 / 否；写成【完成】
+        //   等于替人把这件事盖了章，可人当下只是不想重试，并没有承认什么已经完成。
+        // · 旁边是【打开文件】/【打开链接】、或者旁边空着时叫【完成】。那两处问的是
+        //   「现在打开吗」，答一句「完了」才顺；而【取消】在那儿会让人以为要把收到的文件退回去。
         if (terminal) {
-            builder.addAction(new Notification.Action.Builder(null, "完成", done(context)).build());
+            String label = retry != null ? "取消" : "完成";
+            builder.addAction(new Notification.Action.Builder(null, label, done(context)).build());
         }
         Notification card = builder.build();
         manager.notify(ID, card);
