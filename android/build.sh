@@ -16,7 +16,7 @@ root=$(cd "$here/.." && pwd)
 
 cargo_bin=${CARGO_BIN:-$HOME/.cargo/bin/cargo}
 java_home=${JAVA_HOME:-/d/Downloads/project/tools/jdk-17.0.20.1+1}
-gradle_bin=${GRADLE_BIN:-/d/Downloads/project/tools/gradle-8.13/bin/gradle}
+gradle_bin=${GRADLE_BIN:-/d/Downloads/project/tools/gradle-9.6.0/bin/gradle}
 task=${1:-assembleDebug}
 
 echo "== rust: aarch64-linux-android =="
