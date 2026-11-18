@@ -34,6 +34,7 @@
 # problem that lives above them.
 #
 # Usage: awdl-stack.sh start | boot [name] | stop | status | link | share | exclusive
+#        | watch | guard
 #   start      full sequence; idempotent while the boot id matches
 #   boot       the same sequence, for the app to run on itself (no `am
 #              force-stop`, daemon started at the end, receipt written to
@@ -44,6 +45,9 @@
 #   link       step 4 only (the drivers are already in place)
 #   share      give the radio back to Wi-Fi without touching the link
 #   exclusive  take it away again (the default state after `start`)
+#   watch      start the freeze guard if it is not running (idempotent, returns
+#              at once); this is what the app calls when listening is turned on
+#   guard      the guard loop itself; started by `watch`/`boot`, not typed
 #
 # `start` and `boot` differ in exactly two places, and both come from who the
 # caller is. `start` is typed by an operator with a shell: it begins with
@@ -1213,6 +1217,32 @@ UNFROZEN_GROUP=$FREEZE_ROOT/system
 GUARD_PID=$STATE/guard.pid
 GUARD_LOG=$STATE/guard.log
 
+# The two things the guard reads to decide whether it still has a job.
+#
+# `receive.manual` is the person's intent, and the app keeps it in its own
+# SharedPreferences file -- root reads the XML directly rather than asking the app,
+# because the app may be exactly the frozen thing this loop exists for, and a
+# question put to a parked process is not answered. The foreground marker is a file
+# `MainActivity` creates in `onResume` and deletes in `onPause`: of everything in
+# this system, existence is the cheapest thing that cannot lie, and it is what tells
+# the loop it can skip a tick without guessing.
+PREF_FILE=/data/data/$APP/shared_prefs/opairdrop.xml
+FRONT_FLAG=/data/data/$APP/files/foreground
+
+# Is the person still asking to receive?
+#
+# Read with the shell's own `read` rather than `grep`: at twenty seconds a tick the
+# fork would cost more than the answer, and the file is four lines of XML.
+listening() {
+    [ -r "$PREF_FILE" ] || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            *'name="receive.manual" value="true"'*) return 0 ;;
+        esac
+    done < "$PREF_FILE"
+    return 1
+}
+
 # Move every pid of the app out of the frozen subtree, and say how many moved.
 keep_unfrozen() {
     moved=0
@@ -1282,13 +1312,64 @@ start_guard() {
     return 1
 }
 
+# The loop itself.
+#
+# Its lifetime is the person's intent, not the stack's. While `receive.manual` is
+# true the app has to stay schedulable -- that is the whole function -- and when it
+# goes false there is nothing left worth a wake-up, so the loop ends and the phone
+# gets its idle back. The three minutes of patience before it ends are deliberate:
+# the tile is a one-second switch, and the documented way to use this is to turn it
+# off, look at the iPhone, turn it back on. A guard that left on the first `false`
+# would reopen the hole it was written to close, and would do it silently.
+#
+# The cadence is two seconds for the first minute, twenty after. Two is not a
+# re-assertion rate: the move is sticky (measured -- one `echo <pid> >
+# cgroup.procs` and then five minutes with not a single HANS line for the uid,
+# utime advancing all the while), so what the loop actually watches for is the app
+# being *replaced* by a new pid: systemui rebinding the tile, an update, a
+# `force-stop` and relaunch. Twenty seconds is still well inside the time it takes
+# a person to walk to the other phone and conclude this one is missing.
 cmd_guard() {
     [ "$(id -u)" = 0 ] || die 'must run as root'
     echo $$ > "$GUARD_PID"
+    born=$(date +%s)
+    quiet=
     while :; do
-        keep_unfrozen
-        sleep 2
+        now=$(date +%s)
+        if listening; then
+            quiet=
+            # A foreground app is out of the freezer's reach anyway; skipping here
+            # saves a `cat` of /proc per pid for an answer already known. Skipping
+            # only this tick, never the loop: "in front now" says nothing about the
+            # next tick, and whoever presses home does not come back to warn us.
+            [ -e "$FRONT_FLAG" ] || keep_unfrozen
+        else
+            [ -n "$quiet" ] || quiet=$now
+            if [ $((now - quiet)) -ge 180 ]; then
+                say "GUARD_EXIT receive.manual has been off for $((now - quiet)) s"
+                break
+            fi
+        fi
+        if [ $((now - born)) -lt 60 ]; then sleep 2; else sleep 20; fi
     done
+    # Only if the file still names us: a newer guard may have claimed it while this
+    # one was on its way out, and deleting its pid would leave an orphan nobody can
+    # stop.
+    [ "$(cat "$GUARD_PID" 2>/dev/null)" = "$$" ] && rm -f "$GUARD_PID"
+    return 0
+}
+
+# `guard`, as the app asks for it: start the loop if it is not already there.
+#
+# A second verb because the loop and the request for it are different things. The
+# app calls this the moment the person turns listening on, and `boot` is the wrong
+# trigger for that: building the stack and wanting to receive are two separate
+# presses, in either order. The common one is boot first, tile second -- and a
+# guard started by `boot` would read `receive.manual` false, wait out its three
+# minutes and leave before the person ever reached the tile.
+cmd_watch() {
+    [ "$(id -u)" = 0 ] || die 'must run as root'
+    start_guard
 }
 
 # Where the answer goes: the app's own directory, next to `radio-share` and
@@ -1710,8 +1791,9 @@ case "${1:-status}" in
     exclusive) cmd_exclusive ;;
     status) cmd_status ;;
     guard) cmd_guard ;;
+    watch) cmd_watch ;;
     *)
-        echo 'Usage: awdl-stack.sh start|boot|stop|link|share|exclusive|status|guard'
+        echo 'Usage: awdl-stack.sh start|boot|stop|link|share|exclusive|status|guard|watch'
         exit 2
         ;;
 esac

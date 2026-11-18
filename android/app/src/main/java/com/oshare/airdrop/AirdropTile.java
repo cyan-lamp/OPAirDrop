@@ -50,7 +50,21 @@ public final class AirdropTile extends TileService {
     @Override
     public void onClick() {
         super.onClick();
-        if (ReceiveService.listening(this)) {
+        // 三种状态，三个动作。分开写是因为它们的「再点一次」含义不同：
+        //
+        //   关着                    → 开
+        //   开着但服务没起来        → 再开一次（这是唯一能做的重试）
+        //   开着、在听、但链路不在  → 去功能页（这里不建链，见下面的注释）
+        boolean wanted = ReceiveService.listening(this);
+        if (wanted && ReceiveService.running()) {
+            if (!StackKeeper.linked()) {
+                // 开着，8770 在听，蓝牙也在喊——但没有 awdltun0 就没有一条 mDNS 广播发得出去，
+                // 对面手机上什么都不会出现。这里**不**偷偷 insmod：那要关二十五秒 Wi-Fi，
+                // 中途被打断还会把 Wi-Fi 弄丢（理由见 StackKeeper 的类注释）。所以把人送到
+                // 唯一能建链的那一页去。
+                openFeature();
+                return;
+            }
             ReceiveService.setManual(this, false);
             ReceiveService.apply(this);
         } else {
@@ -58,6 +72,10 @@ public final class AirdropTile extends TileService {
             // 一个开关只该有一个含义（见 2026-11-16 15:10 那条：别人的十分钟窗口正是"又收不到
             // 了"的来源）。
             ReceiveService.enable(this, 0);
+            // 再敲一次门，用绑定而不是 startForegroundService：应用在后台时后者会被系统
+            // 「接受但不执行」（真机上量到过 app=null、startForegroundCount=0），于是开关
+            // 亮着、8770 没人听，直到把应用切到前台。理由与实测见 ReceiveService#poke。
+            ReceiveService.poke(this);
             if (!Notices.ready(this)) {
                 // 磁贴是个 Service，弹不出权限框。缺任何一条，刚打开的这个接收端都是哑的：
                 // 没有通知，「有人要发东西给你」一个字也送不出去；没有蓝牙广播，对端连这台
@@ -69,6 +87,24 @@ public final class AirdropTile extends TileService {
             }
         }
         render();
+    }
+
+    /**
+     * 把功能页摆到人面前。
+     *
+     * <p>用 {@link MainActivity#EXTRA_FEATURE} 而不是「打开应用」：应用首页说的是「怎么收」，
+     * 功能页说的是「怎么把链路建起来」，而此刻他缺的正是后者。
+     */
+    private void openFeature() {
+        Intent open = new Intent(this, MainActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                .putExtra(MainActivity.EXTRA_FEATURE, true);
+        try {
+            startActivityAndCollapse(PendingIntent.getActivity(this, 0, open,
+                    PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));
+        } catch (RuntimeException refused) {
+            Log.w(TAG, "磁贴拉不起功能页：" + refused);
+        }
     }
 
     /**
@@ -118,16 +154,25 @@ public final class AirdropTile extends TileService {
         if (tile == null) {
             return;
         }
-        boolean on = ReceiveService.listening(this);
-        if (on && !StackKeeper.linked()) {
-            // 开着，但内核层没在：接收端确实在听，可是没有 awdltun0 就没有一条 mDNS 广播
-            // 发得出去，对面手机上什么都不会出现。「亮着 = 能被发现」在这台机器上曾经是
-            // 假的，而假的绿灯比红灯难查得多——所以这里不再点绿灯。
+        // 绿灯要同时满足三件事：他想要收（{@code receive.manual}）、进程真的在听（服务在跑）、
+        // 对面真的看得见（{@code awdltun0} 在）。少任何一条，这一格都不该是绿的——假的绿灯
+        // 比红灯难查得多。
+        boolean wanted = ReceiveService.listening(this);
+        boolean live = wanted && ReceiveService.running();
+        if (wanted && !live) {
+            // 开关拨上去了，服务却没起来。磁贴从后台叫 startForegroundService 会被系统拒
+            // （Android 12 起），而人此刻已经在 iPhone 上找设备了。这一格必须说这件事，
+            // 而且点它有救：下一次点击会再叫一次。
+            tile.setState(Tile.STATE_UNAVAILABLE);
+            tile.setSubtitle("监听没起来，点一下重试");
+        } else if (live && !StackKeeper.linked()) {
+            // 在听，但没有 awdltun0：mDNS 没有网卡可发。「亮着 = 能被发现」在这台机器上曾经
+            // 是假的，所以这里不点绿灯；点它会去功能页，那里才有建链按钮。
             tile.setState(Tile.STATE_UNAVAILABLE);
             String trouble = StackKeeper.note();
-            tile.setSubtitle(trouble.isEmpty() ? "AWDL 链路未建立" : trouble);
+            tile.setSubtitle(trouble.isEmpty() ? "链路未建立，点这里建链" : trouble);
         } else {
-            tile.setState(on ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
+            tile.setState(live ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
             tile.setSubtitle(null);
         }
         tile.setLabel(getString(R.string.tile_airdrop));

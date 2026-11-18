@@ -206,7 +206,31 @@ public final class DriverSetup {
      * {@code status}) can be driven by the page without a second copy of this plumbing.
      */
     public static Result run(String arguments, Context context) {
-        String command = command(PAYLOAD, dir(context).getAbsolutePath(), arguments);
+        return exec(command(PAYLOAD, dir(context).getAbsolutePath(), arguments), context);
+    }
+
+    /**
+     * Starts the freeze guard, and nothing else.
+     *
+     * <p>Deliberately not {@link #run}: this is called every time the person turns listening on,
+     * and that method's preamble checks a 38 MB payload against its manifest first. The guard
+     * needs exactly one file -- the script -- and if the script is not there then the stack was
+     * never built, which is a state the guard has nothing to say about (the tile already refuses
+     * to go green without a link). Skipping the check also means a stale payload cannot make
+     * turning listening on slow; the next {@code boot} is what refreshes it.
+     */
+    public static Result watch(Context context) {
+        return exec("exec sh " + PAYLOAD + "/awdl-stack.sh watch", context);
+    }
+
+    /**
+     * Runs one shell line through {@code su} and collects what it said.
+     *
+     * <p>Split out of {@link #run} so that {@link #watch} can hand in a command without the
+     * payload check; everything else about the call -- the reader thread, the deadline, the
+     * refusal to kill a script that outlived it -- is the same for both.
+     */
+    private static Result exec(String command, Context context) {
         List<String> lines = new ArrayList<>();
         Process process;
         try {
@@ -261,7 +285,14 @@ public final class DriverSetup {
                     StackState.read(context.getFilesDir()),
                     "脚本 " + TIMEOUT_SECONDS + " 秒仍在运行");
         }
-        overran = null;
+        // Only if it is ours. This line used to clear the field unconditionally, which was
+        // harmless while `run` had one caller; with `watch` on the same path it is not: a guard
+        // start finishing while a timed-out `boot` still owns the handle would drop it, and then
+        // `running()` answers "yes" for as long as the app lives -- greying out both buttons on
+        // the feature page with nothing running.
+        if (overran == process) {
+            overran = null;
+        }
         int code = process.exitValue();
         drain(output, lines);
         return new Result(code, lines, StackState.read(context.getFilesDir()), "");

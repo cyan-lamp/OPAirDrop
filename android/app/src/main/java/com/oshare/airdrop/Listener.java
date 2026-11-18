@@ -243,6 +243,34 @@ final class Listener {
     private Responder announcer;
 
     /**
+     * 这一次生命周期里已经有人去造 {@link Responder} 了。
+     *
+     * <p>{@link #announcer} 非 null 不足以回答这个问题：从「决定要造」到「把它放进去」之间隔着
+     * {@code ServiceId.loadOrCreate} 的读文件与 {@link Responder} 的构造，那几毫秒里
+     * {@link #beginAnnouncing} 可以被第二个人叫到。2026-11-18 真机上量到过，两条线程各造了一个：
+     *
+     * <pre>
+     *   19:38:52.680  27364  ble: starting
+     *   19:38:52.681  27362  ble: starting
+     *   19:38:52.682  27367  announcing 7f5ed39dbd10 at air.local:8770 on awdltun0
+     *   19:38:52.683  27370  announcing 7f5ed39dbd10 at air.local:8770 on awdltun0
+     * </pre>
+     *
+     * <p>那两条线程是 {@code start()} 里的 {@link #beginAnnouncing} 和 {@link StackKeeper} 那侧
+     * 链路一就绪就打来的 {@link #retryAnnouncing}——真机上链路通常比磁贴早，所以这一撞是常规
+     * 路径而不是边角。后果不是多几行日志：{@link #announcer} 只装得下一个，先造的那个成了孤儿，
+     * 它的 socket 与两条线程没人收，{@link #endAnnouncing} 也永远不会停它。于是「关」之后仍有人
+     * 每三秒公告一次——对端看见一台点了却没人接的设备。
+     *
+     * <p>用一位独立的标志而不是让 {@link #announcer} 早点非 null：那个人造到一半就抛异常时，
+     * 留一个空的 {@link #announcer} 会让 {@link #retryAnnouncing} 以为「有对象了，重启它」，
+     * 而重启一个构造失败的对象救不回任何东西。
+     *
+     * <p>Guarded by {@link #lock}；{@link #endAnnouncing} 里落回 false，下一次启动是新的一次。
+     */
+    private boolean begun;
+
+    /**
      * 这一次启动用的身份，留着是为了能把广播重新开一次。
      *
      * <p>{@link #beginAnnouncing} 只在 {@code start()} 里跑一次，那一次很可能撞上「链路还
@@ -584,21 +612,41 @@ final class Listener {
      * break the pin every sender has already read.
      */
     private void beginAnnouncing(Identity identity) {
-        ServiceId service = ServiceId.loadOrCreate(context.getFilesDir());
-        Responder announcing = new Responder(
-                context,
-                service.current,
-                service.stale,
-                Responder.hostNameFor(identity.computerName()),
-                identity.certHash(),
-                PORT,
-                Responder.DEFAULT_INTERFACE,
-                this::tell);
-        asideProblem = "";
+        // 一道闸，先占位再干活。理由见 {@link #begun}：先造后发的话，两条线程会各造一个，
+        // 而只有一个能被停掉。
         synchronized (lock) {
-            announcer = announcing;
+            if (begun) {
+                return;
+            }
+            begun = true;
         }
-        announcing.start();
+        try {
+            ServiceId service = ServiceId.loadOrCreate(context.getFilesDir());
+            Responder announcing = new Responder(
+                    context,
+                    service.current,
+                    service.stale,
+                    Responder.hostNameFor(identity.computerName()),
+                    identity.certHash(),
+                    PORT,
+                    Responder.DEFAULT_INTERFACE,
+                    this::tell);
+            asideProblem = "";
+            synchronized (lock) {
+                announcer = announcing;
+            }
+            announcing.start();
+        } catch (RuntimeException refused) {
+            // 造不出来就把位子还回去，{@link #retryAnnouncing} 才还有下一次机会——它那一段
+            // 「上一次连 Responder 都没造出来」说的正是这里。占着位子不放会让链路随后就绪
+            // 时也只是安静地看着，而人对面看到的是一台不存在的设备。
+            synchronized (lock) {
+                begun = false;
+            }
+            asideProblem = "广播未起：" + refused;
+            Log.w(TAG, "announcer could not be created", refused);
+            return;
+        }
         // 第二层公告：蓝牙。iPhone 的隔空投送先听这二十字节，听见了才把 AWDL 上的服务叫起来，
         // 之后才轮得到上面那条 mDNS 记录被读到。少这一层时，「查询发得完全正确、每两秒一次、
         // 却谁都不答」正是它会表现成的样子——对端在每一层都在，只是没人听 8770。
@@ -658,9 +706,9 @@ final class Listener {
      * 后才建好。那之后有两条路，旧代码两条都没有：等下一次 {@code start()}（要人去关再开一次
      * 开关），或者就这么听着 8770 而谁也找不到。
      *
-     * <p>两道闸，与 {@code reannounce} 同一个理由：接收端没在跑就不叫（广播「我在这儿、来发
-     * 给我」而 8770 没在听，是比看不见更坏的一种存在），已经在跑也不叫（那是每八秒一次的
-     * 空转，见 {@link StackKeeper#TICK_MS}）。
+     * <p>一道闸，与 {@code reannounce} 同一个理由：接收端没在跑就不叫——广播「我在这儿、来发
+     * 给我」而 8770 没在听，是比看不见更坏的一种存在。已经在跑的那一半不再直接返回：mDNS 与
+     * 蓝牙是「这台机器可以被发现」的两层，只坏一层时这一句才有事可做（见下面的注释）。
      *
      * <p>{@link Responder#start()} 允许这样被叫第二次：它在失败路径上会把 opener 清掉，那时候
      * 再叫一次就是真的重新 bind 一次（看 {@code Responder#open} 里的注释，那里写的就是这个
@@ -685,6 +733,16 @@ final class Listener {
             return;
         }
         if (announcing.running()) {
+            // mDNS 在，蓝牙不在。这是「磁贴关掉再打开」之后真机上落到的那条缝：Responder 被
+            // stop 之后再 start 是一次全新的 bind，成功了；而 BLE 那一次 advertise 落在 stop
+            // 的尾巴上（{@code ble stopped: idle} 之后紧接着的一次 start），r0 侧没有重新注册，
+            // 于是 iPhone 的分享面板永远等不到那二十字节——mDNS 发得再对也没人听。
+            //
+            // {@code announceOverBluetooth} 幂等（Rust 侧对已在广播的回答是 already started），
+            // 所以这里可以每 tick 叫一次；真失败时也只是再记一句，不会有多余的广播。
+            if (!announced) {
+                announceOverBluetooth();
+            }
             return;
         }
         announcing.start();
@@ -696,6 +754,8 @@ final class Listener {
         synchronized (lock) {
             announcing = announcer;
             announcer = null;
+            // 下一次 start 是新的一次「谁去公告」，{@link #begun} 得跟着这条生命周期一起回来。
+            begun = false;
         }
         if (announcing != null) {
             announcing.stop();

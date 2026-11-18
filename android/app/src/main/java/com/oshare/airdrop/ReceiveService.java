@@ -5,8 +5,11 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.ServiceConnection;
+import android.os.Binder;
 import android.os.IBinder;
 
 /**
@@ -68,6 +71,27 @@ public final class ReceiveService extends Service {
      */
     private static volatile boolean shown;
 
+    /**
+     * 这个进程里真的有接收端在跑。
+     *
+     * <p>与 {@link #listening} 是两件事，而磁贴需要后者：{@code receive.manual} 是人的**意愿**，
+     * 它写进去之后服务可能根本没起来——磁贴从后台调 {@code startForegroundService} 会被系统拒
+     * （Android 12 起），而人点完就在 iPhone 上找设备了。只看意愿的开关于是会亮一颗假绿灯，
+     * 那比红灯难查得多：红色会让人再点一次，绿色只会让人以为是自己手机的问题。
+     *
+     * <p>写在 {@link #onStartCommand} 挂了通知之后、{@link #onDestroy} 开头落回去，于是它答的是
+     * 「现在有没有人在 8770 上听」，而不是「上一次成没成」。
+     */
+    private static volatile boolean running;
+
+    /** 服务此刻在不在跑。给磁贴与看护共用的活判据。 */
+    static boolean running() {
+        return running;
+    }
+
+    /** {@link #onBind} 交出去的那张空位。没有方法，也没有状态：它只证明「实例建出来了」。 */
+    private static final IBinder SEAT = new Binder();
+
     /** 人手动开了接收端没有。 */
     static boolean manual(Context context) {
         return context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
@@ -90,7 +114,43 @@ public final class ReceiveService extends Service {
         long until = minutes <= 0 ? 0 : System.currentTimeMillis() + minutes * 60_000L;
         context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
                 .edit().putBoolean(MANUAL, true).putLong(UNTIL, until).apply();
+        // 先叫看护者，再起服务：这一段之后本进程就要开始收包了，而 HANS 什么时候来冻它不由
+        // 我们决定。见 armGuard。
+        armGuard(context);
         apply(context);
+    }
+
+    /**
+     * 把内核层那个看护者叫起来。只在「人决定要收」这一刻叫一次。
+     *
+     * <p>看护者是 {@code awdl-stack.sh} 里那段循环，把本进程从冻结的 cgroup 子树挪到
+     * {@code /sys/fs/cgroup/system}，见那个文件 GUARD 那一段。这里只负责让它的寿命等于
+     * {@link #MANUAL} 的寿命：开监听时它在，关掉三分钟后它自己走。
+     *
+     * <p>为什么不在 {@code boot} 那里了事：建链和想收是两次按键，最常见的顺序是先建链、
+     * 后开磁贴。由 {@code boot} 顺手拉起的看护者在那时读到的是 `receive.manual=false`，
+     * 人还没走到磁贴它就已经走了——那正是它需要防的那件事。
+     *
+     * <p>另一条线程：{@code su} 这一跳是几十到几百毫秒，而磁贴那一下是按秒算的。失败不断言
+     * 任何事——没有 root 的机器上收包本来就只是应用层的事，链路有没有建由 {@link StackKeeper}
+     * 在通知栏上如实说。
+     */
+    private static void armGuard(Context context) {
+        Context app = context.getApplicationContext();
+        new Thread(() -> {
+            DriverSetup.Result result = DriverSetup.watch(app);
+            int code = result.code();
+            if (code != 0) {
+                // 不是 subtitle()：那一句在没有 problem 的时候会退回读 stack-state 的回执，
+                // 于是「脚本里没有 watch 这个子命令」会被写成「已就绪：AWDL 在 wonder0 上…」，
+                // 一句真话回答了一个没人问的问题。这里要的是脚本自己最后说的那一行。
+                String why = result.problem();
+                if (why.isEmpty() && !result.lines().isEmpty()) {
+                    why = result.lines().get(result.lines().size() - 1);
+                }
+                Log.w(TAG, "看护者没能起来：code=" + code + (why.isEmpty() ? "" : " " + why));
+            }
+        }, "opairdrop-guard").start();
     }
 
     /** 剩下的毫秒数；0 表示一直开；负数表示已经过期。 */
@@ -144,11 +204,172 @@ public final class ReceiveService extends Service {
     }
 
     private static void stop(Context context) {
+        // 先松手再停。反过来的话，stopService 拆掉了实例，可那条绑定线还拉着
+        // 「还有人在要它」，系统会把它重新建起来——磁贴关了、8770 又亮着，
+        // 而人以为它关了。见 release()。
+        release(context);
         try {
             context.stopService(new Intent(context, ReceiveService.class));
         } catch (RuntimeException ignored) {
             // 已经不在跑了。
         }
+    }
+
+    /**
+     * 用一次绑定把服务叫醒：不给它「后台启动」这一个理由拒绝的机会。
+     *
+     * <p># 它补的是哪一条
+     *
+     * <p>2026-11-18 真机上量到的那条：应用在后台（桌面或最近任务里，进程还在但在缓存组）
+     * 时从磁贴点「开」，{@code receive.manual} 写成了 true，磁贴也亮着，而
+     * {@code dumpsys activity services com.oshare.airdrop} 里是这么写的——
+     *
+     * <pre>
+     *   ServiceRecord{… com.oshare.airdrop/.ReceiveService}
+     *     app=null                       ← 没有 attach 到任何进程
+     *     startRequested=true
+     *     code:SYSTEM_ALLOW_LISTED       ← 系统说了「允许」
+     *     startForegroundCount=0         ← 但一次 startForeground 都没发生过
+     * </pre>
+     *
+     * <p>也就是：{@code startForegroundService} 被**接受**了，却没有被执行。onStartCommand
+     * 从来没有被调用过，于是 8770 没人听、mDNS 与蓝牙都没发、iPhone 的分享面板里干干净净。
+     * 人这时看到的是一格亮着的磁贴，而唯一的出路是把应用切到前台——那一刻挂起的启动才被兑现。
+     * 这就是「关了再开就收不到，必须打开 App」这条报告的机制。
+     *
+     * <p># 为什么绑定能过去
+     *
+     * <p>{@code startForegroundService} 与 {@code bindService} 在 AMS 里走的是两条路：前者
+     * 带着「后台启动前台服务」的全套审查（那个 ALLOW_LISTED 就是审查的结论），后者只有一个
+     * 条件——调用方（此刻正被系统点着的那块磁贴）活着。绑定到自己的服务时，AMS 直接把这个
+     * service 实例建出来（{@code bringUpServiceLocked}），挂起的启动也随之兑现。
+     *
+     * <p># 这条线要留着，不能连上就解绑
+     *
+     * <p>第一版是「连上就解绑」，理由是这次绑定要的只是「把实例建出来」。真机上量到的是另一种
+     * 结局：解绑 30 毫秒后系统把它拆了——
+     *
+     * <pre>
+     *   19:34:59.214  ble: starting
+     *   19:34:59.215  announcing 7f5ed39dbd10 at air.local:8770 on awdltun0
+     *   19:34:59.244  ble stopped: idle          ← 29 毫秒
+     * </pre>
+     *
+     * <p>因为拆与不拆取决于「还有没有人要它」。这次 startForegroundService 正是那个被接受但
+     * 没被兑现的请求（见上面的 dumpsys），它不构成一个理由；真正让实例站着的是这条绑定。
+     * 解绑等于把刚敲开的门又关上，磁贴亮着、8770 又没人听了。
+     *
+     * <p>所以这条线一直持到「关」：{@link #release} 在 {@link #stop} 里被调用，那一刻两个理由
+     * 一起拿走。这中间它不花任何东西——绑定在自己的服务上，没有可见的副作用。
+     *
+     * <p>失败只记一行：没有这一次，磁贴仍然是磁贴，只是又回到那条「必须打开 App」的路上。
+     */
+    static void poke(Context context) {
+        Context app = context.getApplicationContext();
+        Intent intent = new Intent(app, ReceiveService.class);
+        ServiceConnection fresh = new ServiceConnection() {
+            @Override
+            public void onServiceConnected(ComponentName name, IBinder service) {
+                // 什么也不做。这一次绑定的全部用处已经在 AMS 里兑现了：实例建出来了。
+                //
+                // 这里**不能**解绑。真机上量到过：解绑的 30 毫秒后系统把服务拆了
+                // （onDestroy → `ble stopped: idle`），因为拆与不拆取决于「还有没有人要它」，
+                // 而这次 startForegroundService 正是那个没被兑现的请求（见上面的 dumpsys）。
+                // 解绑等于把刚敲开的门又关上，磁贴亮着、8770 又没人听了。
+            }
+
+            @Override
+            public void onServiceDisconnected(ComponentName name) {
+                // 服务被系统收走了（或者我们自己停的）。下一次「开」会重新 poke。
+                forget(this);
+            }
+        };
+        synchronized (ReceiveService.class) {
+            if (bond != null) {
+                // 已经绑着了。第二次 bind 会在 AMS 里多出一条连接记录，而它换不回任何东西。
+                return;
+            }
+            try {
+                if (app.bindService(intent, fresh, Context.BIND_AUTO_CREATE)) {
+                    bond = fresh;
+                }
+            } catch (RuntimeException refused) {
+                Log.w(TAG, "绑定接收服务没成：" + refused);
+            }
+        }
+    }
+
+    /**
+     * 松手：把 {@link #poke} 那次绑定解掉。
+     *
+     * <p>必须在 {@link #stop} 之前——「关」这个动作要同时拿走两个理由，缺一个服务都还在：
+     * 一个是 {@code stopService}，另一个就是这条绑定的线。只解绑不停服务，服务会因为
+     * startRequested 还在而活着；只停服务不解绑，它会被这条线拉着不放。
+     */
+    private static void release(Context context) {
+        ServiceConnection held;
+        synchronized (ReceiveService.class) {
+            held = bond;
+            bond = null;
+        }
+        if (held == null) {
+            return;
+        }
+        try {
+            context.getApplicationContext().unbindService(held);
+        } catch (RuntimeException ignored) {
+            // 系统已经先解了（进程被杀过，或者服务被收走时自动断的）。
+        }
+    }
+
+    private static void forget(ServiceConnection which) {
+        synchronized (ReceiveService.class) {
+            if (bond == which) {
+                bond = null;
+            }
+        }
+    }
+
+    /**
+     * {@link #poke} 那条线。非 null 就代表「我们还绑着它」。
+     *
+     * <p>它是这个类里唯一一处「因为有人在要它，所以服务必须活着」的状态，所以 {@link #stop}
+     * 要把它清掉——否则关掉之后再点开、再关，服务永远停不下来。
+     */
+    private static ServiceConnection bond;
+
+    /**
+     * 服务被创建时对齐一次，不等 {@code onStartCommand}。
+     *
+     * <p>两条路能把它创建出来：{@code startForegroundService}（磁贴与功能页那条），以及
+     * {@code bindService}（见 {@link #poke}）。后者创建的实例不带「五秒内必须 startForeground」
+     * 那个期限，但这里仍然立刻把通知挂上：服务在跑的每一毫秒都该有那条「正在接收」，而
+     * 「进来时就已经该收」这件事与「怎么进来的」无关。
+     *
+     * <p>{@link #up} 幂等，所以 {@code onStartCommand} 随后再来一次也只是重复同一组赋值。
+     */
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        if (listening(this)) {
+            up();
+        }
+    }
+
+    /**
+     * 进入「在收」：挂上身份，起接收端，开始看链路。
+     *
+     * <p>抽出来是因为有两个入口（{@link #onCreate} 与 {@link #onStartCommand}），而它们要做的
+     * 是同一件事。写在两处就会有两种说法，迟早会分家。
+     */
+    private void up() {
+        startForeground(NOTIFICATION, notification(this));
+        shown = true;
+        running = true;
+        Listener.of(this).start();
+        // 应用层到这里就齐了。内核层（模块、awdld、awdltun0）这里**不建**：建它要关二十五秒
+        // Wi-Fi，只有功能页那个按钮该做这件事。看护者只负责在它不在时如实说，理由见 StackKeeper。
+        StackKeeper.watch(this);
     }
 
     @Override
@@ -166,15 +387,11 @@ public final class ReceiveService extends Service {
             startForeground(NOTIFICATION, notification(this));
             stopForeground(STOP_FOREGROUND_REMOVE);
             shown = false;
+            running = false;
             stopSelf();
             return START_NOT_STICKY;
         }
-        startForeground(NOTIFICATION, notification(this));
-        shown = true;
-        Listener.of(this).start();
-        // 应用层到这里就齐了；内核层（模块、awdld、awdltun0）由它去对齐，理由见 StackKeeper：
-        // 磁贴只碰得到这一层，而这正是「从磁贴开、不打开应用」时 iPhone 看不见这台机器的原因。
-        StackKeeper.watch(this);
+        up();
         // 限时开着的，到点自己收摊：那个期限是我们自己的承诺，不该等某个观察者来兑现。
         long left = remaining(this);
         if (left != 0) {
@@ -194,11 +411,13 @@ public final class ReceiveService extends Service {
 
     @Override
     public void onDestroy() {
+        // 第一句就落回去：从这一刻起 8770 正在关，磁贴不该再亮。下面两步都是「还能收到」的
+        // 最后一段，而人看见的是磁贴那一格。
+        running = false;
         // 顺序是有讲究的：先叫看护者停手，再关广播，最后把这个进程的前台身份收掉。
         //
-        // unwatch 只置一个标志（理由见 StackKeeper#unwatch）：它此刻可能正卡在那二十五秒的
-        // 驱动交换里，而把做到一半的交换砍掉是这台机器上唯一能把 Wi-Fi 弄丢的操作。所以「停」
-        // 是「这一轮跑完别看」的意思，它自己会退。
+        // unwatch 只置一个标志（理由见 StackKeeper#unwatch）：它那条线程除了枚举网卡什么都不做，
+        // 一眼就能退出，所以「停」是「下一眼别看」的意思。
         StackKeeper.unwatch();
         Listener.of(this).stop();
         shown = false;
@@ -207,7 +426,10 @@ public final class ReceiveService extends Service {
 
     @Override
     public IBinder onBind(Intent intent) {
-        return null;
+        // 这张空位只有一个用途：让 {@link #poke} 那次绑定走得通。绑定在这里不是「对外提供
+        // 服务」，而是唯一一条能把服务实例从后台拉起来的窄门（理由见 poke）。返回 null 会让
+        // 系统把这次绑定当成失败，门就白敲了。
+        return SEAT;
     }
 
     /**

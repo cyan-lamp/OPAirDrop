@@ -23,6 +23,7 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.io.File;
 import java.io.IOException;
 
 /**
@@ -78,6 +79,25 @@ public final class MainActivity extends Activity {
      * 不再弹的那些权限可以被直接落到设置页，而没有它就只能弹框，不能把人扔进设置。
      */
     static final String EXTRA_PERMISSIONS = "ask_permissions";
+
+    /**
+     * 从磁贴进来，而且落点要是功能页。
+     *
+     * <p>磁贴只控制应用层的监听，它不建内核栈——建栈要关二十五秒 Wi-Fi，那只有功能页那个按钮
+     * 该做（理由见 {@code StackKeeper} 的类注释）。于是「开着监听，但 {@code awdltun0} 不在」
+     * 这一种状态需要一个去处：人点磁贴，就把人送到唯一能解决它的那一页，而不是让他对着一个
+     * 亮着却谁也看不见的开关猜。
+     */
+    static final String EXTRA_FEATURE = "open_feature";
+
+    /**
+     * 「应用在前台」的标记文件名。
+     *
+     * <p>放在 {@code files/} 下，root 侧那个解冻看护者只 {@code stat} 它一下：存在就是在
+     * 前台，不必打开、不必解析。名字与 {@code awdl-stack.sh} 里的 {@code FOREGROUND_FLAG}
+     * 是同一个词。
+     */
+    static final String FOREGROUND_FLAG = "foreground";
 
     private Listener listener;
     /** 当前这套配色。深色与浅色各一张表，见 {@link Scheme}。 */
@@ -270,6 +290,10 @@ public final class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        // 人在看着这台手机，而 ColorOS 的 HANS 只在应用退到后台、长时间没有 binder 事件时才
+        // 停它。把这件事写成一个文件，是为了让 root 侧那个解冻看护能在人不需要它的时候退出：
+        // 它每两秒写一次 cgroup.procs，那不是「看着手机」时该有的开销。
+        markForeground(true);
         // 从系统设置回来时，互传的范围可能已经变了，而设置文件也可能被改过——重新对齐一次
         // 比追着问哪一处变了便宜。重复调用只对齐、不重复注册观察者，见 ReceiveService.follow。
         ReceiveService.follow(this);
@@ -278,6 +302,41 @@ public final class MainActivity extends Activity {
         // 道闸（没在跑、已经发出去），所以每次进来都调是安全的。
         Listener.of(this).reannounce();
         refresh();
+    }
+
+    @Override
+    protected void onPause() {
+        // 在 super 之前落回去：从这一刻起这台手机不再被人看着，而看护者要开始工作。宁可让
+        // 它早一轮醒来，也不要让它晚一轮——晚的那一轮里，iPhone 的分享面板正好是空的。
+        markForeground(false);
+        super.onPause();
+    }
+
+    /**
+     * 「应用此刻在前台」这件事落到一个文件上，给 root 侧的看护者读。
+     *
+     * <p>为什么是文件而不是别的东西：看护者是 {@code awdl-stack.sh} 里一个每两秒转一圈的
+     * root shell，它读不了 SharedPreferences（那要反序列化 XML，而且应用自己有进程内缓存），
+     * 为一句话开一条 binder 或一个 socket 又太重。文件的存在性是最便宜、也最难说谎的判据。
+     *
+     * <p>写不进去不是错误路径：看护者读不到这个文件时按「不在前台」算，也就是多救一次。那一边
+     * 的错误方向必须偏保守——少救一次是「设备看不见」，多救一次只是几毫秒 CPU。
+     */
+    private void markForeground(boolean front) {
+        File flag = new File(getFilesDir(), FOREGROUND_FLAG);
+        if (front) {
+            try {
+                if (!flag.exists()) {
+                    //noinspection ResultOfMethodCallIgnored
+                    flag.createNewFile();
+                }
+            } catch (IOException tooBusy) {
+                android.util.Log.w("OPAirDrop", "前台标记写不进去：" + tooBusy);
+            }
+            return;
+        }
+        //noinspection ResultOfMethodCallIgnored
+        flag.delete();
     }
 
     /**
@@ -403,7 +462,14 @@ public final class MainActivity extends Activity {
             return insets;
         });
 
-        selectTab(0, false);
+        // 落点。磁贴带 EXTRA_FEATURE 来的时候直接停在功能页：那是唯一能建链的地方，而链路
+        // 不在正是他被送过来的原因。只对这一次生效，理由与 EXTRA_PERMISSIONS 相同。
+        Intent opening = getIntent();
+        boolean feature = opening != null && opening.getBooleanExtra(EXTRA_FEATURE, false);
+        if (feature) {
+            opening.removeExtra(EXTRA_FEATURE);
+        }
+        selectTab(feature ? 1 : 0, false);
         return root;
     }
 
