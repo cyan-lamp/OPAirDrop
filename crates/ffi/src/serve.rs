@@ -370,7 +370,7 @@ pub unsafe extern "C" fn opairdrop_serve(
 ///
 /// The offer is read first and then shown to `decide`, because a prompt that names nothing
 /// is a prompt nobody can answer: the endpoint reads the offer, hands over a one-line
-/// summary, and answers `/Ask` with `200` or `503` according to the reply. A `decide` that
+/// summary, and answers `/Ask` with `200` or `401` according to the reply. A `decide` that
 /// returns zero, or a callback that fails, is a refusal — the safe direction, since the
 /// alternative is accepting what a person never saw.
 ///
@@ -856,8 +856,13 @@ mod tests {
 
         assert_eq!(code, status::OK, "a refusal is an answer, not a failure");
         assert!(
-            String::from_utf8_lossy(&answers).starts_with("HTTP/1.1 503"),
+            String::from_utf8_lossy(&answers).starts_with("HTTP/1.1 401"),
             "the peer is told, in the one place it is still listening"
+        );
+        // And told the truth about the connection: the refusal ends it.
+        assert!(
+            String::from_utf8_lossy(&answers).contains("Connection: close"),
+            "a refusing answer closes"
         );
         assert_eq!(
             summary, "Ada 的 iPhone\t1\t7\t0\ta.pdf\u{1f}7",

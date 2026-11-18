@@ -180,7 +180,7 @@ final class Confirmation {
             what.append(links).append(" 个链接");
         }
         // 「当作拒绝」和结果页那句「已放弃」是两句话说了两件事。人没看见这条邀请、或者看见了
-        // 还没来得及伸手，都不等于他拒绝了——发送端拿到的是同一个 503，但屏幕上说什么由这里
+        // 还没来得及伸手，都不等于他拒绝了——发送端拿到的是同一个 401，但屏幕上说什么由这里
         // 决定。到点之后那张卡写的是「已放弃」，所以在还没到点的时候就得是同一句话。
         return new Offer(sender, what + (bytes > 0 ? " · " + size(bytes) : "")
                 + "，" + seconds(timeoutMs) + " 秒内没人应答就放弃。", entries(field, 4), links);
@@ -262,7 +262,7 @@ final class Confirmation {
             // 通知发不出去（渠道被禁用、系统拒收）：没有人会被问，所以不能收。
             //
             // 这一行是必须的，不是顺手加的：走这条路的结果是「每一次传输都被拒收」，
-            // 而对端只会看到 503，本机什么也不显示。没有它，故障现场只剩一个「怎么发
+            // 而对端只会看到 401，本机什么也不显示。没有它，故障现场只剩一个「怎么发
             // 都发不过来」的抱怨。
             Log.w(TAG, "confirm " + session + " could not be shown: " + unavailable, unavailable);
             return false;

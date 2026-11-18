@@ -649,17 +649,29 @@ fn frame(sent: &Sent) -> Vec<u8> {
 
 /// Turns a client error into a status and a message.
 ///
-/// A `503` on `/Ask` is the one answer that means *the person on the other end said no*, or
-/// rather that there is no person to ask: it is what a phone set to "contacts only" tells an
-/// anonymous sender, and it arrives instead of a prompt. Everything else is a transport
-/// failure and is reported as one.
+/// Any non-`200` on `/Ask` is the same event to us: *the person on the other end said no*,
+/// or there is no person to ask — a phone set to "contacts only" answers this way to an
+/// anonymous sender, instead of showing a prompt. ASK-1 says exactly this: only `200` is an
+/// acceptance, and everything else is a decline or a failure.
+///
+/// The code is no longer part of the test. It used to be `status: 503` only, on the theory
+/// that `503` was *the* refusal code; the spec's own example is `403`; and an iPhone that
+/// declined a transfer on 2026-11-18 answered `401 [Connection: keep-alive,
+/// Content-Length: 0]` — a code neither the spec nor either guess named. Matching the path
+/// and not the number is the version that survives a peer choosing a different code, and
+/// the head now travels with the error so the next surprise lands in the log instead of
+/// costing another round of guessing.
 fn describe_error(error: ClientError) -> Failure {
     match &error {
-        ClientError::Refused {
-            path, status: 503, ..
-        } if *path == PATH_ASK => {
-            Failure::new(status::REFUSED, "the peer is not accepting files")
-        }
+        ClientError::Refused { path, .. } if *path == PATH_ASK => Failure::new(
+            status::REFUSED,
+            // The whole rendering, not just the phrase: the status code and the answer's
+            // headers are what a person cannot get from anywhere else. The screen says
+            // "对方暂时不收文件" and nothing about codes (see `SendActivity`), so this string
+            // is log-only — and a log that drops the one number that differs between a
+            // decline and an auth failure costs a whole round of guessing.
+            format!("the peer is not accepting files — {error}"),
+        ),
         _ => Failure::transport(error),
     }
 }

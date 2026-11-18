@@ -1369,7 +1369,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                 // 上那一下「接受」；走了一半才超时，是对面不再读这条连接了。
                 boolean timedOut = failed instanceof SocketTimeoutException;
                 String message = stopped ? "已取消"
-                        : refused ? "对方暂时不收文件"
+                        : refused ? "对方拒绝"
                         : impostor ? "对方身份不符"
                         : timedOut ? (moving[0] ? "对方不再回应" : "对方没有接受")
                         // 原文（"Connection reset" 之类）只进日志：页面那行是给站在两台手机
@@ -1389,8 +1389,12 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     redrawProgress(peer.name);
                     status(peer, message);
                     String who = label(peer);
+                    // 「拒绝」和「不收」在这里是同一件事的两个可能：`/Ask` 上只有非 200 这一个
+                    // 事实，人和设置给不出区别。所以标题写人做的那件事（拒绝），副行再给另一种
+                    // 可能（对面根本没看见询问）——只写「不收文件」会把一次明确的拒绝说成状态。
                     String detail = refused
-                            ? who + " 现在不收文件 · 把 iPhone 的隔空投送改成「所有人（10 分钟）」并保持亮屏"
+                            ? who + " 拒绝了这次发送 · 若对方并没有看到询问，把 iPhone 的隔空投送"
+                                    + "改成「所有人（10 分钟）」并保持亮屏"
                             : impostor
                             ? message + " · 已中止，没有发出任何内容。对方的证书若是刚换过，重新搜索一次设备再试"
                             : timedOut

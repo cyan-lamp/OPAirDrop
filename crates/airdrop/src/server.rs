@@ -76,17 +76,24 @@ pub trait Receiver {
     /// only when [`Receiver::answers_ask_early`] is `false`: a receiver that answers before
     /// reading the offer has not seen what it would be refusing.
     ///
-    /// `false` answers `503` and ends the connection. The peer is told in the one place it
+    /// `false` answers `401` and ends the connection. The peer is told in the one place it
     /// is still listening, so a sender can render "declined" rather than "the connection
     /// broke" — which is the difference between a person saying no and a bug. Answering
     /// `200` and then dropping the upload would leave the other phone waiting on a prompt
     /// that was already refused here.
     ///
-    /// The status is a measurement we have not taken: no capture in this repository shows
-    /// what an iPhone sends when a transfer is declined on the other side. `503` is the
-    /// code OpenDrop answers, and `Client` reports any non-`200` as
-    /// [`crate::client::Error::Refused`] with the status attached, so the day a device says
-    /// otherwise the number is one line here rather than a redesign.
+    /// `401 Unauthorized` is not the spec's example — ASK-2 says "SHOULD respond with a
+    /// non-200 status such as `403` and close the connection, so the sender doesn't wait
+    /// out its own timeout" — it is what an iPhone actually sends when its owner taps
+    /// decline. Both earlier codes were measured against a real one and both failed:
+    ///
+    /// * `503` reads as *temporarily unavailable*: the phone kept its prompt on
+    ///   "waiting" until its own ASK-2a timeout, longer than 15 s.
+    /// * `403` reads as *this exchange failed*: the phone reopened a TLS connection
+    ///   0.4 s later and asked again, so the person answered twice.
+    ///
+    /// A sender that treats every non-`200` as a refusal (ASK-1) is unaffected either
+    /// way; the difference only shows up on peers that read the code.
     fn accept(&mut self, _offer: &Ask) -> bool {
         true
     }
@@ -269,7 +276,10 @@ impl<R: Receiver> Server<R> {
             let keep = if request.method() != "POST" {
                 // `405` and close: the body of a request we refuse is still in the stream,
                 // and framing it as the next head is how a refusal becomes a parse error.
-                send(output, &Response::new(405))?;
+                // The head says `close` because that is what happens next — a refusal that
+                // declares `keep-alive` invites the peer to wait for an answer on a
+                // connection this loop is about to drop.
+                send(output, &Response::new(405).with_keep_alive(false))?;
                 false
             } else {
                 match request.path() {
@@ -277,7 +287,7 @@ impl<R: Receiver> Server<R> {
                     PATH_ASK => self.ask(&request, input, output, &mut offer)?,
                     PATH_UPLOAD => self.upload(&request, input, output, offer.as_ref())?,
                     _ => {
-                        send(output, &Response::new(404))?;
+                        send(output, &Response::new(404).with_keep_alive(false))?;
                         false
                     }
                 }
@@ -367,7 +377,8 @@ impl<R: Receiver> Server<R> {
             Err(error) => {
                 // A `400` here is our own parser refusing a body the peer considers valid,
                 // and the peer is still waiting for an answer, so it can still be told.
-                send(output, &Response::new(400))?;
+                // The error below ends the connection, so the head says `close`.
+                send(output, &Response::new(400).with_keep_alive(false))?;
                 return Err(Error::Protocol(error));
             }
         };
@@ -376,7 +387,40 @@ impl<R: Receiver> Server<R> {
         // possible and useful. `ask` is skipped rather than called and ignored, so a
         // receiver that prompts cannot be made to prompt twice.
         if !self.receiver.accept(&parsed) {
-            send(output, &Response::new(503))?;
+            // `401`, because that is what an iPhone sends when a person declines.
+            //
+            // Not a guess and not from the spec: 2026-11-18, an iPhone was asked for a
+            // file from this phone and its owner tapped decline, and this client recorded
+            // the answer it gave —
+            //
+            // ```text
+            // /Ask answered 401 [Connection: keep-alive, Content-Length: 0]: (no body)
+            // ```
+            //
+            // That is the whole decline: status, two headers, no body. Apple's receiver
+            // says "not this time" with `401 Unauthorized`, which reads like an auth
+            // failure and is not one — it is the person's answer, expressed in the one
+            // vocabulary the protocol has for answers.
+            //
+            // What the two earlier codes cost, both measured on the same phone:
+            //
+            // * `503 Service Unavailable` — chosen as "what OpenDrop answers". It carries
+            //   "temporarily, try again later", and the sender did exactly that: its share
+            //   sheet stayed on *waiting* until its own ASK-2a timeout expired (> 15 s)
+            //   instead of showing the refusal that had already happened.
+            // * `403 Forbidden` — the spec's example for a decline (ASK-2), and still
+            //   wrong for an Apple sender: the phone treated it as a failed exchange and
+            //   **retried**, opening a fresh TLS connection 0.4 s later and sending the
+            //   same offer again, so the person was asked twice and the first phone kept
+            //   spinning. `401` is the difference between "your request is not allowed"
+            //   and "the person said no".
+            //
+            // `close` in the head, although the iPhone's own decline says `keep-alive`:
+            // this loop is about to end, and a head that declares the opposite of what
+            // happens next invites the sender to wait on a socket that is already gone.
+            // Nothing follows a decline, so closing is the honest framing of a finished
+            // conversation.
+            send(output, &Response::new(401).with_keep_alive(false))?;
             return Ok(false);
         }
         let answer = self.receiver.ask(Some(&parsed));
@@ -396,8 +440,9 @@ impl<R: Receiver> Server<R> {
         let content_type = request.header("content-type").unwrap_or("");
         if !is_archive_type(content_type) {
             // `406`, before `100 Continue`: saying "carry on" and then refusing the body
-            // makes the peer send an archive nobody will read.
-            send(output, &Response::new(406))?;
+            // makes the peer send an archive nobody will read. `close`, because the body is
+            // still in the stream and this loop returns.
+            send(output, &Response::new(406).with_keep_alive(false))?;
             return Ok(false);
         }
         if request.expects_continue() {
@@ -599,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn a_declined_offer_is_answered_503_and_never_answered_200() {
+    fn a_declined_offer_is_answered_401_close_and_never_answered_200() {
         let files = [Item::new("a.pdf").with_size(7)];
         let body = crate::ask_request(&Sender::new("Mac", "MacBookPro18,3", "id"), &id(), &files, &[]);
         let (receiver, output) = run(
@@ -611,7 +656,16 @@ mod tests {
             &post(PATH_ASK, "", &body),
         );
 
-        assert_eq!(statuses(&output), [503]);
+        assert_eq!(statuses(&output), [401]);
+        // The head has to agree with what happens next: this refusal is the last thing on
+        // the connection, so it may not declare `keep-alive`. A sender that believes the
+        // header waits for a second answer on a socket that is already gone.
+        let head = String::from_utf8_lossy(&output);
+        assert!(
+            head.contains("Connection: close"),
+            "a refusing answer closes: {head}"
+        );
+        assert!(!head.contains("keep-alive"), "and says so: {head}");
         // The offer was still read: refusing is something done to a known transfer, and a
         // receiver that refuses without looking cannot say what it refused.
         assert_eq!(receiver.offers.len(), 1);

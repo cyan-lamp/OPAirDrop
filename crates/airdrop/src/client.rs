@@ -149,11 +149,7 @@ impl<S: Read + Write> Client<S> {
             .map_err(Error::Io)?;
         let answer = self.read_answer()?;
         if !answer.ok() {
-            return Err(Error::Refused {
-                path: PATH_DISCOVER,
-                status: answer.status(),
-                body: answer.body().to_vec(),
-            });
+            return Err(refused(PATH_DISCOVER, &answer));
         }
         DiscoverAnswer::parse(answer.body()).map_err(Error::Protocol)
     }
@@ -182,11 +178,7 @@ impl<S: Read + Write> Client<S> {
             .map_err(Error::Io)?;
         let answer = self.read_answer()?;
         if !answer.ok() {
-            return Err(Error::Refused {
-                path: PATH_ASK,
-                status: answer.status(),
-                body: answer.body().to_vec(),
-            });
+            return Err(refused(PATH_ASK, &answer));
         }
         AskAnswer::parse(answer.body()).map_err(Error::Protocol)
     }
@@ -237,11 +229,7 @@ impl<S: Read + Write> Client<S> {
 
         let answer = self.read_answer()?;
         if !answer.ok() {
-            return Err(Error::Refused {
-                path: PATH_UPLOAD,
-                status: answer.status(),
-                body: answer.body().to_vec(),
-            });
+            return Err(refused(PATH_UPLOAD, &answer));
         }
         if !answer.body().is_empty() {
             // UP-5. The status said the archive was taken; the body says otherwise, and the
@@ -402,9 +390,18 @@ pub enum Error {
     ///
     /// The body is kept because it is where a peer puts its reason, and a refusal without
     /// one is a number.
+    ///
+    /// `head` keeps the rest of the answer — the headers, in arrival order, as the peer wrote
+    /// them — because the number is the *least* informative part of a decline. `Connection`
+    /// says whether the peer expected the socket to survive the refusal, and a peer that
+    /// answers a decline with `close` and one that answers `keep-alive` are making two
+    /// different statements about what happens next. 2026-11-18: an iPhone declined our
+    /// offer with a code we could not read out of any log, and the only place it existed was
+    /// this head, which was being thrown away.
     Refused {
         path: &'static str,
         status: u16,
+        head: String,
         body: Vec<u8>,
     },
     /// An upload answered `200` and then said something anyway.
@@ -426,8 +423,15 @@ impl std::fmt::Display for Error {
             Error::Refused {
                 path,
                 status,
+                head,
                 body,
-            } => write!(f, "{path} answered {status}: {}", describe(body)),
+            } => {
+                write!(f, "{path} answered {status}")?;
+                if !head.is_empty() {
+                    write!(f, " [{head}]")?;
+                }
+                write!(f, ": {}", describe(body))
+            }
             Error::Reported { status, body } => write!(
                 f,
                 "upload answered {status} with {} bytes, which UP-5 defines as a failure: {}",
@@ -451,6 +455,29 @@ impl std::error::Error for Error {
             Error::Refused { .. } | Error::Reported { .. } => None,
             Error::Closed { .. } => None,
         }
+    }
+}
+
+/// Builds a refusal that carries the whole answer, not only its status.
+///
+/// The head is rendered here rather than at the log site because this is the last place
+/// that has it: [`Response`] is consumed by the next request on the connection, and a
+/// refusal is the one answer whose *shape* is worth keeping — a peer that declines with
+/// `Connection: close` and one that declines with `Connection: keep-alive` are telling the
+/// sender two different things about what it may do next.
+fn refused(path: &'static str, answer: &Response) -> Error {
+    let head = answer
+        .headers()
+        .entries()
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Error::Refused {
+        path,
+        status: answer.status(),
+        head,
+        body: answer.body().to_vec(),
     }
 }
 
@@ -872,14 +899,52 @@ mod tests {
             .ask(&sender(), &id(), &[Item::new("a")], &[])
             .expect_err("refuses");
         match &error {
-            Error::Refused { path, status, body } => {
+            Error::Refused {
+                path,
+                status,
+                head,
+                body,
+            } => {
                 assert_eq!(*path, PATH_ASK);
                 assert_eq!(*status, 400);
                 assert_eq!(body, b"bad offer");
+                // The answer's shape travels with the refusal: a decline that says `close`
+                // and one that says `keep-alive` are different statements, and the only
+                // place either survives is here.
+                assert!(head.to_lowercase().contains("content-length"), "{head}");
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert!(error.to_string().contains("bad offer"), "{error}");
+        assert!(
+            error.to_string().to_lowercase().contains("content-length"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_declined_offer_says_how_the_peer_wanted_the_connection_to_end() {
+        // That one word is the difference between "the peer is finished with this socket" and
+        // "the peer thinks the exchange failed but the socket is still good", and the sender
+        // cannot choose its own next step without reading it rather than assuming it. The
+        // iPhone that declined on 2026-11-18 answered `401` with `keep-alive` and then said
+        // nothing more; `close` is the other framing a peer may choose, and it has to work.
+        let script = closed_answer(401, Vec::new());
+        let mut client = Client::new(Wire::answering(script), "air");
+        let error = client
+            .ask(&sender(), &id(), &[Item::new("a")], &[])
+            .expect_err("refuses");
+        match &error {
+            Error::Refused { status, head, .. } => {
+                assert_eq!(*status, 401);
+                assert!(
+                    head.to_lowercase().contains("connection: close"),
+                    "{head}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(client.is_closed(), "a peer that said close closed it");
     }
 
     #[test]

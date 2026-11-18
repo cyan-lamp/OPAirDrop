@@ -398,7 +398,7 @@ final class ReceiveHost {
             // `unanswered`；那句话在这里是假的，真相是"没有人被告知"。
             //
             // 所以这一条不是优化，是把假话改成真话：没有出口就当场说不，让对面几百毫秒内
-            // 拿到 503，而不是等它自己超时。
+            // 拿到 401，而不是等它自己超时。
             if (!cloud && !Notices.allowed(context) && !Listener.of(context).watched()) {
                 Log.w(TAG, "invitation " + session
                         + " dropped: no surface at all (notifications off, nothing on screen)");
@@ -417,7 +417,7 @@ final class ReceiveHost {
                     cloud = false;
                 }
             }
-            // 「人说了不行」和「一直没人理」对发送端是同一个 503，对人却是两句不同的话。
+            // 「人说了不行」和「一直没人理」对发送端是同一个 401，对人却是两句不同的话。
             // 这一行把两者分开，也把耗时写下来——超时这个数只有在拒绝之后才看得见，
             // 而人看到的是一张很久之前就弹出来的卡片。
             Log.i(TAG, "invitation " + session
@@ -432,7 +432,7 @@ final class ReceiveHost {
                 // 拒绝的话必须说清是谁拒的。过去两种情况共用「已拒绝」，于是超时被读成
                 // 「我没点它，它自己拒的」——那不是人看错，是我们没写明白。
                 // `expired` 是标题表里本来就有的一个相位（「邀请已过期」），只是从来没有
-                // 人发过它：状态码两边都是 1004（对发送端都是同一个 503），区别只在标题。
+                // 人发过它：状态码两边都是 1004（对发送端都是同一个 401），区别只在标题。
                 end(answered ? "rejected" : "expired", REJECTED, answered
                         ? "已拒绝"
                         : (decisionMs / 1000) + " 秒内没人应答，已放弃");

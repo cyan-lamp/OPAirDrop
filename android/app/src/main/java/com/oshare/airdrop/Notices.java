@@ -25,7 +25,7 @@ import java.util.function.Predicate;
  * <p>**通知（{@code POST_NOTIFICATIONS}）** 管「有人在发东西给你」这句话送不送得到人眼前。关着
  * 的时候 {@link android.app.NotificationManager#notify} 既不抛异常也不返回值，它只是把通知丢掉。
  * 于是「没申请过这条权限」的表现不是崩溃，是**整个应用安静地什么反应都没有**：iPhone 点发送，
- * 本机不出任何提示，三十秒后对面收到 503。2026-11-16 的现场就是这样——{@code dumpsys package}
+ * 本机不出任何提示，三十秒后对面收到 401。2026-11-16 的现场就是这样——{@code dumpsys package}
  * 里 {@code POST_NOTIFICATIONS: granted=false}，{@code dumpsys notification} 里
  * {@code AppSettings: com.oshare.airdrop importance=NONE}。而代码里全仓只有蓝牙那条权限有申请点，
  * 通知这条从来没有。

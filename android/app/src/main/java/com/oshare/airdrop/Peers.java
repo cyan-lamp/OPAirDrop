@@ -86,15 +86,20 @@ final class Peers {
     private static final long ASK_EAGER_MS = 300;
 
     /**
-     * 一台上一包之后多久算消失——**兜底值**，不是主判据。
+     * 一台上一包之后多久算消失——**凑不齐地址端口时的兜底值**，不是唯一判据。
      *
-     * <p># 快速消失靠 goodbye，不靠这个数
+     * <p># 「快速消失靠 goodbye」这个说法被真机推翻了
      *
-     * <p>iOS 关掉 AirDrop 时会发 TTL=0 的记录（见 {@link #absorb} 的 {@code gone} 分支），
-     * 那一刻设备就该立刻从列表里消失。这个常数只负责「对方一声不响地没了」——拔电、走出
-     * AWDL 范围、崩溃。那种情况本来就无从考究时间点，宁可慢一点也不能误删。
+     * <p>这里原来写着「iOS 关掉 AirDrop 时会发 TTL=0 的记录」，于是这一档只当兜底，
+     * 6 秒也心安理得。2026-11-18 21:10 的真机把前提否掉了：iPhone 关掉 AirDrop 之后
+     * **一包都没再发**，{@link #absorb} 的 {@code gone} 分支一次都没走到，日志里只有
+     * {@code after 6065 ms of silence (threshold 6000)}。也就是说对它而言，
+     * 这个常数就是全部——六秒的延迟直接落在人眼里。能连的那一档因此有了自己的
+     * {@link #CONNECTABLE_MS}。
      *
-     * <p># 为什么从 2.5 秒放宽到 6 秒
+     * <p>goodbye 那条路仍然在，仍然比任何计时器都快；只是不能指望它一定会来。
+     *
+     * <p># 为什么整体从 2.5 秒放宽到 6 秒，以及后来为什么又能分开
      *
      * <p>2.5 秒是拍的，真机把它否掉了。08:00 那一轮抓到的是这个：
      * <pre>
@@ -109,8 +114,43 @@ final class Peers {
      *
      * <p>6 秒是「比健康时长出一个数量级」的位置：健康时安静不到 1 秒，6 秒还没声音就真的
      * 不是抑制了。慢的这 3.5 秒只影响「对方一声不响地消失」这种本来就没有时间点的情况。
+     *
+     * <p>**2026-11-18 起这一档只留给「还不完整」的对端**：能连的那一档有自己的、短得多的
+     * {@link #CONNECTABLE_MS}。上面那两次闪烁都发生在没有可连对端、查询提到 300 毫秒一次的
+     * 时候，这个条件现在被写进了判断里，而不是靠一个对所有人生效的大数来回避。
      */
     private static final long EXPIRE_MS = 6_000;
+
+    /**
+     * 一台**能连**的对端上一包之后多久算消失。
+     *
+     * <p># 为什么能连的那一档可以短到 2.2 秒
+     *
+     * <p>因为「能连」这个条件本身就把节奏钉住了：只要列表里有一台能连的，{@link #ASK_EVERY_MS}
+     * 就是 1 秒一次，而对端是**一问一答**的。21:10 那一轮实测（{@code browse: rhythm}）：
+     * 10 个间隔 568–1400 毫秒、平均 1052，同一窗口里 {@code q=0 a=14} —— 它一包都没问过，
+     * 十四个应答全是我们问出来的。所以对一台能连的对端，**沉默满两个查询周期**就不是抑制，
+     * 是它真的不答了。
+     *
+     * <p># 为什么 2.5 秒那一版当年会闪
+     *
+     * <p>{@link #EXPIRE_MS} 里记着两次闪烁，1280 和 2500 两档都试过。那两次都发生在
+     * {@code ready() == 0} 的那段——手上没有能连的对端，查询降到 {@link #ASK_EAGER_MS}
+     * 的 300 毫秒一次，而 Apple 对「同一个问题问得太勤」是会**压掉应答**的（mDNS 的重复应答
+     * 抑制）。于是活着的设备合法地安静了两秒半，被删掉，一秒后又回来。
+     *
+     * <p>结论不是「阈值不能小于 6 秒」，是「阈值不能拿 300 毫秒那一档的节奏去定」。这一档
+     * 只对能连的对端生效，而它们一定处在 1 秒那一档，所以 2.2 秒 = 两个整周期、两条都没等到。
+     *
+     * <p># 换来了什么
+     *
+     * <p>2026-11-18 21:10：iPhone 关掉 AirDrop 的那一刻是 21:10:31.86（最后一包），我们
+     * 21:10:37.93 才删，日志写的是 {@code after 6065 ms of silence (threshold 6000)} —— 它
+     * 根本**不发** goodbye（{@code gone} 那条路一次都没走到），全靠这个兜底。iPhone 那边
+     * 两秒就能看见我们消失，我们这边六秒才看见它消失，差别全在这一个数上。改完之后是两秒出头，
+     * 与对端同一量级。
+     */
+    private static final long CONNECTABLE_MS = 2_200;
 
     /**
      * 量节奏时，短于这个的间隔不采样。
@@ -157,6 +197,22 @@ final class Peers {
 
     /** 诊断态下多久打一行。5 秒 = 一屏日志里能看出节奏，又不至于淹掉别的行。 */
     private static final long DIAG_EVERY_MS = 5_000;
+
+    /**
+     * 把 5353 上收到的每一包**原样**打进日志：源地址、长度、解析行，外加整包的十六进制。
+     *
+     * <p>为什么不复用 {@link #DIAG}：那个开关会把 {@link #expire} 改成「永不删」，而这一轮要
+     * 量的正是「多久删」——两个目的在同一次运行里互斥。
+     *
+     * <p>为什么要有十六进制：{@link Native#mdnsRecords} 只交出它认得的那几种记录（srv / addr /
+     * txt / gone），而「iPhone 关掉 AirDrop 时到底发了什么」这个问题的答案很可能落在它**不认**
+     * 的东西上——收起一个服务的 goodbye 是 TTL=0，可 TTL 从来不在这几行里；一条只带 flags 的
+     * 空应答、一次 probe、一次冲突改名的 announce，解析行里全都看不见。抓包工具没有（这台机器
+     * 上没有 tcpdump，也没有 root 之外的注入手段），那就让唯一握着 socket 的人把字节抄下来。
+     *
+     * <p>**临时开关，取完证就关。** 每包一行十六进制，开着的时候日志是不好看的。
+     */
+    private static final boolean WIRE = false;
 
     /** 一台对端。字段可变，因为它是被几条记录先后填满的。 */
     static final class Peer {
@@ -319,6 +375,39 @@ final class Peers {
     private WifiManager.MulticastLock lock;
     /** 组播是从哪块网卡进来的，同时也是连对端时该从哪块出去。0 表示系统默认。 */
     private volatile int nicIndex;
+
+    /**
+     * 现在绑在哪块网卡上，名字；没有走系统默认路由时为 {@code null}。
+     *
+     * <p>只在 {@link #rebind} 里读，答案不同结论就不同：本来就在 {@code awdltun0} 上，它一消失
+     * 就只能**等**——换到旁边任何一块都是换到一条 iPhone 不在的路上；本来在 Wi-Fi 或
+     * {@code wonder0} 上，{@code awdltun0} 一出现就该**搬**过去。
+     */
+    private volatile String bound;
+
+    /**
+     * 还在不在原来那块网卡上——每 {@link #REBIND_CHECK_MS} 核一次。
+     *
+     * <p>2026-11-18 抓包时撞上的真实现场：把这台的 AirDrop 关掉再打开，`awdltun0` 被拆了
+     * 重建，index 变了，而 socket 绑的还是旧那块。于是 {@code send} 静默失败（异常被下面的
+     * 「一次发不出去就等下一轮」吞掉）、{@code receive} 一直超时——**一个字的日志都没有**，
+     * 列表停在上一次的内容上再也不动，直到人退出这一页再进来。浏览线程本身是活的，只是聋了。
+     */
+    private int sendFails;
+
+    /** 下一次核网卡的时间。 */
+    private long nextRebind;
+
+    /**
+     * 每隔多久核一次网卡。
+     *
+     * <p>1 秒：AirDrop 开关是人的动作，列表在两秒内跟上就够了；再密就是白烧电。这一条不负责
+     * 「对端走了多久算走」（那是 {@link #expire} 的事），只负责「我是不是还在听」。
+     */
+    private static final long REBIND_CHECK_MS = 1_000;
+
+    /** 连续几次发不出去就认定这块 socket 已经不属于这条链路。 */
+    private static final int REBIND_FAILS = 3;
     /** 这一次浏览问的是哪个组。地址族跟着网卡走，见 {@link #open()}。 */
     private volatile InetAddress group;
 
@@ -419,6 +508,13 @@ final class Peers {
                 if (expire() > 0) {
                     dirty = true;
                 }
+                // 还在不在原来那块网卡上。AirDrop 一开一关就把 awdltun0 换了一个，而 socket
+                // 不会自己跟过去——它只是安静地不再收发。检查放在过期检查之后：先按「没有新
+                // 记录」把该走的走掉，再换网卡重新问，两步互不遮挡。
+                if (now >= nextRebind) {
+                    nextRebind = now + REBIND_CHECK_MS;
+                    rebind();
+                }
                 if (DIAG && now - lastDigest >= DIAG_EVERY_MS) {
                     lastDigest = now;
                     digest();
@@ -468,8 +564,11 @@ final class Peers {
                 InetAddress.getByName(v6 ? "::" : "0.0.0.0"), PORT));
         if (nic != null) {
             socket.setNetworkInterface(nic);
-            nicIndex = nic.getIndex();
         }
+        // 0 = 系统默认。写成 0 而不是留着上一次的值：网卡真的没了的时候，下一条有效网卡
+        // 一定与它不同，{@link #rebind} 就会把我们搬过去。
+        nicIndex = nic == null ? 0 : nic.getIndex();
+        bound = nic == null ? null : nic.getName();
         try {
             socket.setTimeToLive(255);
         } catch (Exception ignored) {
@@ -502,12 +601,25 @@ final class Peers {
      * 路由器的 Mac，不是手机。
      */
     private NetworkInterface link() {
+        return link(true);
+    }
+
+    /**
+     * 同上，但可以拒绝兜底。
+     *
+     * <p>{@code fallback=false} 时只认 AWDL 那两块，没有就返回 {@code null}——把「这条路不在」
+     * 当成一个正当答案交给调用方，而不是硬塞一块能开却不通的网卡。
+     */
+    private NetworkInterface link(boolean fallback) {
         try {
             for (String name : new String[]{AWDL, AWDL_RADIO}) {
-                NetworkInterface nic = NetworkInterface.getByName(name);
-                if (nic != null && nic.isUp()) {
+                NetworkInterface nic = named(name);
+                if (nic != null) {
                     return nic;
                 }
+            }
+            if (!fallback) {
+                return null;
             }
             for (NetworkInterface candidate : Collections.list(NetworkInterface.getNetworkInterfaces())) {
                 String name = candidate.getName();
@@ -521,9 +633,65 @@ final class Peers {
         return null;
     }
 
-    /** 记下本机地址，用来把自己从对端列表里认出来。 */
-    private void collectOwnAddresses() {
+    /** 按名字取一块正在用的网卡；不存在或者没起来都算没有。 */
+    private static NetworkInterface named(String name) {
         try {
+            NetworkInterface nic = NetworkInterface.getByName(name);
+            return nic != null && nic.isUp() ? nic : null;
+        } catch (Exception gone) {
+            return null;
+        }
+    }
+
+    /**
+     * 网卡换了就把 socket 搬到新那块上。
+     *
+     * <p>两种触发，说的都是同一件事——**这个 socket 已经不在听了**，而不是「我在听，只是没人
+     * 说话」。后者归 {@link #expire}，前者归这里；混在一处就会把「对端走了」误判成「我聋了」。
+     *
+     * <p>搬完不清空表：对端的地址是它自己的，换条链路也还成立；真正过期的会由 {@link #expire}
+     * 按沉默时长走掉。清空反而会让列表闪一下再回来。
+     */
+    private void rebind() {
+        // 分两档，因为「该搬去哪」和「该不该等」是同一个问题的两面。
+        //
+        // 2026-11-18 21:57 实测的现场：杀掉 awdld，awdltun0 没了。那时按「换一块能用的」
+        // 来理解这件事，就会搬到 wonder0 上——它也在 AWDL 名单里，所以兜底那一条拦不住它。
+        // 搬过去之后每 250 毫秒发一次查询、每次 sendto 都 ENETUNREACH（那条路没有 IPv6 默认
+        // 路由），攒够三次又不通，再触发一次 rebind，再开一次 socket：一分钟里把自己开关了
+        // 几十遍，而 iPhone 根本不在那条路上。
+        //
+        // 所以绑在 awdltun0 上时就只认 awdltun0，它没了就原地等（链路回来时 index 一定是新的，
+        // 下一次检查自然会搬过去——实测 1.3 秒）；绑在别处时才贪心，见到 awdltun0 就搬。
+        NetworkInterface nic = AWDL.equals(bound) ? named(AWDL) : link(true);
+        if (nic == null && AWDL.equals(bound)) {
+            // 不是 socket 哑了，是整条链路不在。sendFails 一起归零：留着它只会在链路回来时
+            // 白白多触发一次重开。
+            sendFails = 0;
+            return;
+        }
+        int index = nic == null ? 0 : nic.getIndex();
+        boolean moved = index != nicIndex;
+        boolean deaf = sendFails >= REBIND_FAILS;
+        if (!moved && !deaf) {
+            return;
+        }
+        trace("rebinding: " + (moved
+                ? "link moved to " + nic.getName() + " (" + nicIndex + " → " + index + ")"
+                : sendFails + " sends in a row went nowhere"));
+        sendFails = 0;
+        close();
+        try {
+            open();
+        } catch (Exception failed) {
+            // 搬不过去就下一轮再试。线程活着比起一个干净的失败更重要：这一页还开着，
+            // 人随时会把 AirDrop 再打开一次。
+            trace("rebind failed: " + failed);
+        }
+    }
+
+    /** 记下本机地址，用来把自己从对端列表里认出来。 */
+    private void collectOwnAddresses() {        try {
             for (NetworkInterface nic : Collections.list(NetworkInterface.getNetworkInterfaces())) {
                 for (InetAddress address : Collections.list(nic.getInetAddresses())) {
                     own.add(bare(address.getHostAddress()));
@@ -553,10 +721,12 @@ final class Peers {
 
     private void send(byte[] query) {
         try {
-            DatagramPacket packet = new DatagramPacket(query, query.length, group, PORT);
-            socket.send(packet);
+            socket.send(new DatagramPacket(query, query.length, group, PORT));
+            sendFails = 0;
         } catch (Exception ignored) {
             // 一次发不出去就等下一轮：组播本来就不保证送达，把一次失败当失败会误报。
+            // 但连着几次就不是运气了——见 {@link #sendFails} 与 {@link #rebind}。
+            sendFails++;
         }
     }
 
@@ -587,8 +757,9 @@ final class Peers {
         //
         // 空包 = 它在问，非空 = 它在答。这两种节奏不一样，过期判据也不一样，见 {@link #heard}。
         boolean question;
+        String lines = "";
         try {
-            String lines = new String(Native.mdnsRecords(data), java.nio.charset.StandardCharsets.UTF_8);
+            lines = new String(Native.mdnsRecords(data), java.nio.charset.StandardCharsets.UTF_8);
             question = lines.trim().isEmpty();
             if (absorb(lines)) {
                 dirty = true;
@@ -596,9 +767,29 @@ final class Peers {
         } catch (Exception notForUs) {
             // 5353 上还有别的服务在广播：打印机、投屏、别人的 AirPlay。不是错误。
             question = true;
+            lines = "";
+        }
+        if (WIRE) {
+            wire(packet.getAddress(), data, question, lines);
         }
         heard(packet.getAddress(), question);
         return true;
+    }
+
+    /** 十六进制表。手工查表只因为 `String.format("%02x")` 在热路径上要造 1500 个字符串。 */
+    private static final char[] HEX = "0123456789abcdef".toCharArray();
+
+    /** {@link #WIRE} 的那一行：谁、多大、是问是答、解析出来的行、整包字节。 */
+    private static void wire(InetAddress from, byte[] data, boolean question, String lines) {
+        StringBuilder hex = new StringBuilder(data.length * 2);
+        for (byte b : data) {
+            hex.append(HEX[(b >> 4) & 0x0f]).append(HEX[b & 0x0f]);
+        }
+        String rows = lines.trim().replace('\n', '|');
+        trace("rx " + data.length + "B " + (question ? "Q" : "A") + " from "
+                + (from == null ? "?" : bare(from.getHostAddress()))
+                + (rows.isEmpty() ? "" : " :: " + rows)
+                + " :: " + hex);
     }
 
     /**
@@ -864,7 +1055,7 @@ final class Peers {
             // 列表里却是空的，过一秒它又被下一帧查询带回列表。这就是「闪烁」。
             peers.values().removeIf(peer -> {
                 long silence = now - lastHeard(peer);
-                long threshold = timeout();
+                long threshold = timeout(peer);
                 if (silence < threshold) {
                     return false;
                 }
@@ -929,16 +1120,22 @@ final class Peers {
     /**
      * 这台设备沉默多久算走了。
      *
-     * <p>只有一个答案，因为在这里只能有一个：真机上量到的健康沉默（最长 752 毫秒）和一次被
-     * 误删的 2.6 秒之间，没有可靠的界线再细分。「按每台设备自己的节奏算」这条路走过又回来了
-     * ——测下来所有对端的节奏都是「我们问一次它答一次」，约每秒一帧，跟着它算只会得到一个更小
-     * 的阈值，也就是更会闪。
+     * <p>两档，分界线是「能连」：能连的那一档知道我们正以 1 秒一次的节奏问它，所以它沉默
+     * 两个周期就是答案（见 {@link #CONNECTABLE_MS}）；凑不齐地址端口的那些还在
+     * {@link #ASK_EAGER_MS} 的 300 毫秒档上，那时 Apple 会压应答，只能退回 {@link #EXPIRE_MS}。
      *
-     * <p>真正的「快」在别处：{@link #absorb} 的 {@code gone} 分支。对方主动告别时立刻消失，
-     * 这个常数只管「一声不响地没了」——拔电、走出范围、崩溃，那本来就没有准确时间点。
+     * <p>「按每台设备自己的节奏算」这条路走过又回来了——量下来所有对端的节奏都是「我们问一次
+     * 它答一次」，跟着它算只会得到一个更小的阈值，也就是更会闪。要说清的不是它多快说话，是
+     * **我们多快问了一次而它没答**。
+     *
+     * <p>真正的「快」仍然在别处：{@link #absorb} 的 {@code gone} 分支。只是 2026-11-18 的
+     * 真机证明 iPhone 关 AirDrop 时并不发那个告别，所以这一档不能只当兜底。
      */
-    private long timeout() {
-        return DIAG ? DIAG_HOLD_MS : EXPIRE_MS;
+    private long timeout(Peer peer) {
+        if (DIAG) {
+            return DIAG_HOLD_MS;
+        }
+        return peer.connectable() ? CONNECTABLE_MS : EXPIRE_MS;
     }
 
     private static int parseInt(String text) {

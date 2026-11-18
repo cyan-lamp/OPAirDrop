@@ -40,13 +40,21 @@ pub fn reason(status: u16) -> &'static str {
         100 => "Continue",
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         406 => "Not Acceptable",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         // Peers read the code, not the phrase; anything else gets a plausible word so
         // the status line stays syntactically valid.
+        //
+        // `403` is listed rather than left to the fallback even though a correct peer
+        // ignores the phrase: it is the code this endpoint sends when a person declines a
+        // transfer, and `403 Error` on the one answer that decides whether a phone says
+        // "declined" or "declined, but something looked wrong" is not worth saving a line.
         _ if status < 400 => "OK",
         _ => "Error",
     }
@@ -342,14 +350,16 @@ mod tests {
         assert_eq!(reason(100), "Continue");
         assert_eq!(reason(200), "OK");
         assert_eq!(reason(400), "Bad Request");
+        assert_eq!(reason(403), "Forbidden");
         assert_eq!(reason(404), "Not Found");
         assert_eq!(reason(405), "Method Not Allowed");
         assert_eq!(reason(406), "Not Acceptable");
         assert_eq!(reason(413), "Payload Too Large");
         assert_eq!(reason(500), "Internal Server Error");
+        assert_eq!(reason(503), "Service Unavailable");
         // Unknown codes stay syntactically valid.
         assert_eq!(reason(201), "OK");
-        assert_eq!(reason(503), "Error");
+        assert_eq!(reason(418), "Error");
     }
 
     #[test]

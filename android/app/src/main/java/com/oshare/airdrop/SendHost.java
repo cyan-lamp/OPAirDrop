@@ -277,7 +277,9 @@ final class SendHost {
     static String label(int status) {
         switch (status) {
             case SUCCESS: return "发送完成";
-            case REFUSED: return "对方没有接收";
+            // 与 {@link SendActivity} 那行同词：1008 是 `/Ask` 被拒，人在对面手机上点了拒绝，
+            // 「没有接收」读起来像「还没收到」，把已经发生的事说成了还没发生。
+            case REFUSED: return "对方拒绝";
             case CANCELLED: return "已取消";
             case TIMEOUT: return "发送超时";
             case 1013: return "对方空间不足";
