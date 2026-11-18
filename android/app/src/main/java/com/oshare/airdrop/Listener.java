@@ -243,6 +243,18 @@ final class Listener {
     private Responder announcer;
 
     /**
+     * 这一次启动用的身份，留着是为了能把广播重新开一次。
+     *
+     * <p>{@link #beginAnnouncing} 只在 {@code start()} 里跑一次，那一次很可能撞上「链路还
+     * 没建好」——磁贴刚点开时正是如此（见 {@link StackKeeper}）。链路随后建好，广播却已经
+     * 放弃了，除了人再拨一次开关没有第二个机会。
+     *
+     * <p>用存下来的这一份而不是重新读：证书是这次启动的证书，广播里的名字和它必须一致
+     * （见 {@link #beginAnnouncing}）。重开广播不是新的一次启动，重新读文件反而会让两边分家。
+     */
+    private volatile Identity identity;
+
+    /**
      * Why there is no announcer, when there is none for a reason worth saying.
      *
      * <p>Separate from {@link Responder#aside()} because it is written before the announcer
@@ -425,6 +437,7 @@ final class Listener {
             // The name inside it is the name a peer reads, so the certificate and the
             // announcement say the same thing — see the class comment.
             identity = new IdentityStore(context.getFilesDir()).loadOrCreate(peerName());
+            this.identity = identity;
         } catch (IOException | GeneralSecurityException failed) {
             // No certificate means no listener at all, and that is stricter than the rule for
             // the announcer below. An unfindable receiver still accepts from anything that
@@ -634,6 +647,47 @@ final class Listener {
             }
         }
         announceOverBluetooth();
+    }
+
+    /**
+     * 链路刚建好之后，把广播再起一次。幂等，可以从任何线程调用。
+     *
+     * <p>{@link #reannounce} 补的是「蓝牙那一下敲早了」，这一位补的是另一条、也是 2026-11-18
+     * 真机上量到的那条：接收端起来的时候 AWDL 链路还不存在，{@link Responder#bind()} 抛
+     * {@code 没有网卡 awdltun0}，{@code aside()} 从此一直写着「广播未起」——而链路在二十五秒
+     * 后才建好。那之后有两条路，旧代码两条都没有：等下一次 {@code start()}（要人去关再开一次
+     * 开关），或者就这么听着 8770 而谁也找不到。
+     *
+     * <p>两道闸，与 {@code reannounce} 同一个理由：接收端没在跑就不叫（广播「我在这儿、来发
+     * 给我」而 8770 没在听，是比看不见更坏的一种存在），已经在跑也不叫（那是每八秒一次的
+     * 空转，见 {@link StackKeeper#TICK_MS}）。
+     *
+     * <p>{@link Responder#start()} 允许这样被叫第二次：它在失败路径上会把 opener 清掉，那时候
+     * 再叫一次就是真的重新 bind 一次（看 {@code Responder#open} 里的注释，那里写的就是这个
+     * 场景）。
+     */
+    void retryAnnouncing() {
+        Responder announcing;
+        Identity who;
+        synchronized (lock) {
+            if (worker == null || stopping) {
+                return;
+            }
+            announcing = announcer;
+            who = identity;
+        }
+        if (announcing == null) {
+            // 上一次连 Responder 都没造出来（读 service-id 就失败了）。身份在手就再试一次，
+            // 那会重走一遍读文件与起蓝牙广播。
+            if (who != null) {
+                beginAnnouncing(who);
+            }
+            return;
+        }
+        if (announcing.running()) {
+            return;
+        }
+        announcing.start();
     }
 
     /** Takes the instance back and closes the announcer's socket. Safe to call when there is none. */

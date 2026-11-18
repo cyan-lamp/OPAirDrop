@@ -58,6 +58,16 @@ public final class ReceiveService extends Service {
     private static final android.os.Handler CLOSER =
             new android.os.Handler(android.os.Looper.getMainLooper());
 
+    /**
+     * 这条通知现在挂在通知栏上。
+     *
+     * <p>{@link StackKeeper} 会从它自己的线程上要求改那句话，而改的办法是
+     * {@link NotificationManager#notify}——那条通知不存在的时候发它是「凭空造一条」，所以要有
+     * 一位记着 {@link #startForeground} 有没有真的发生过。它在 {@link #onDestroy} 里落回去，
+     * 于是停止之后再来的更新什么也不做。
+     */
+    private static volatile boolean shown;
+
     /** 人手动开了接收端没有。 */
     static boolean manual(Context context) {
         return context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
@@ -153,13 +163,18 @@ public final class ReceiveService extends Service {
             // 异常——整个进程被杀。真机上量到过一次：从外面拉起服务时恰好不满足条件，应用
             // 直接消失，日志里只剩 TUN_READY 之后的空白。所以先挂上再摘掉，那几十毫秒的
             // 通知一闪是这个 API 的入场费，不是可以省掉的。
-            startForeground(NOTIFICATION, notification());
+            startForeground(NOTIFICATION, notification(this));
             stopForeground(STOP_FOREGROUND_REMOVE);
+            shown = false;
             stopSelf();
             return START_NOT_STICKY;
         }
-        startForeground(NOTIFICATION, notification());
+        startForeground(NOTIFICATION, notification(this));
+        shown = true;
         Listener.of(this).start();
+        // 应用层到这里就齐了；内核层（模块、awdld、awdltun0）由它去对齐，理由见 StackKeeper：
+        // 磁贴只碰得到这一层，而这正是「从磁贴开、不打开应用」时 iPhone 看不见这台机器的原因。
+        StackKeeper.watch(this);
         // 限时开着的，到点自己收摊：那个期限是我们自己的承诺，不该等某个观察者来兑现。
         long left = remaining(this);
         if (left != 0) {
@@ -179,7 +194,14 @@ public final class ReceiveService extends Service {
 
     @Override
     public void onDestroy() {
+        // 顺序是有讲究的：先叫看护者停手，再关广播，最后把这个进程的前台身份收掉。
+        //
+        // unwatch 只置一个标志（理由见 StackKeeper#unwatch）：它此刻可能正卡在那二十五秒的
+        // 驱动交换里，而把做到一半的交换砍掉是这台机器上唯一能把 Wi-Fi 弄丢的操作。所以「停」
+        // 是「这一轮跑完别看」的意思，它自己会退。
+        StackKeeper.unwatch();
         Listener.of(this).stop();
+        shown = false;
         super.onDestroy();
     }
 
@@ -188,17 +210,45 @@ public final class ReceiveService extends Service {
         return null;
     }
 
-    private Notification notification() {
-        NotificationManager manager = getSystemService(NotificationManager.class);
+    /**
+     * 重画通知上那句话，不改变这条通知在不在。
+     *
+     * <p>唯一的调用方是 {@link StackKeeper}：它会在自己那条线程上发现「链路没了，正在重建」
+     * 或者「建不起来，因为××」，而这两种情况人只有可能在通知栏上看到——应用没打开（这本来
+     * 就是磁贴那条路径的前提）。
+     *
+     * <p>{@link #shown} 是那道闸：{@code notify} 对一条不存在的通知是「凭空造一条」，会让
+     * 一个已经停掉的接收端在通知栏上留一条假的「正在接收」。所以这里不判断该不该收，只判断
+     * 这条通知此刻在不在栏上。
+     */
+    static void refresh(Context context) {
+        if (!shown) {
+            return;
+        }
+        NotificationManager manager = context.getSystemService(NotificationManager.class);
+        if (manager == null) {
+            return;
+        }
+        manager.notify(NOTIFICATION, notification(context.getApplicationContext()));
+    }
+
+    /**
+     * 造这条通知。
+     *
+     * <p>静态的，因为它有第二个调用方 {@link #refresh}——那一位手里只有一个 {@code Context}，
+     * 没有 Service 实例，而这正是它存在的前提（服务在跑的时候才有通知要改）。
+     */
+    private static Notification notification(Context context) {
+        NotificationManager manager = context.getSystemService(NotificationManager.class);
         if (manager != null) {
             ensureChannel(manager);
         }
 
-        return new Notification.Builder(this, CHANNEL)
+        return new Notification.Builder(context, CHANNEL)
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentTitle("正在接收")
                 .setContentText(line())
-                .setContentIntent(open(this))
+                .setContentIntent(open(context))
                 .setOngoing(true)
                 .build();
     }
@@ -228,10 +278,19 @@ public final class ReceiveService extends Service {
         manager.createNotificationChannel(channel);
     }
 
-    /** 通知上那句话：窗口开着就说还剩多久，否则说跟着互传。 */
-    private String line() {
-        // 这句话只说我们自己的事：磁贴开着，接收端就在跑。以前它要跟着互传的措辞走
-        // （「所有人（10 分钟）」），那是别人的窗口，已经不再决定我们收不收。
-        return "正在监听 " + Listener.PORT + " · 附近设备可发现";
+    /**
+     * 通知上那句话：一切正常就说端口，链路有问题就说那件事。
+     *
+     * <p>这句话只说我们自己的事：磁贴开着，接收端就在跑。以前它要跟着互传的措辞走
+     * （「所有人（10 分钟）」），那是别人的窗口，已经不再决定我们收不收。
+     *
+     * <p>「正在监听 8770 · 附近设备可发现」在链路没建起来时是**假的**：8770 确实在听，但
+     * iPhone 的分享面板里什么都没有，而人看着这句话只会去对面手机上找问题。所以
+     * {@link StackKeeper#note()} 不空的时候它顶掉这一整句——那是唯一能解释「开着却看不见」
+     * 的地方，而这条路径上应用根本没打开，通知栏就是唯一的屏幕。
+     */
+    private static String line() {
+        String trouble = StackKeeper.note();
+        return trouble.isEmpty() ? "正在监听 " + Listener.PORT + " · 附近设备可发现" : trouble;
     }
 }

@@ -1,6 +1,8 @@
 package com.oshare.airdrop;
 
 import android.app.PendingIntent;
+import android.content.ComponentName;
+import android.content.Context;
 import android.content.Intent;
 import android.graphics.drawable.Icon;
 import android.service.quicksettings.Tile;
@@ -23,6 +25,17 @@ import android.service.quicksettings.TileService;
  * <p>系统在展开通知栏时绑定这个服务，所以进程被杀之后磁贴照样点得动。点了之后走的是
  * {@link ReceiveService#setManual} + {@link ReceiveService#apply}：写凭据、起前台服务。
  * 磁贴的点击会带来一个短暂的允许窗口，这正是「应用在后台也能开始接收」需要的那一下。
+ *
+ * <p># 那个「第三种」是另一回事
+ *
+ * <p>开关仍然只有两个位置。但「开」之后还有一件事不归磁贴管：内核层（模块、{@code awdld}、
+ * {@code awdltun0}）得在，否则 mDNS 连网卡都找不着，对面手机上什么都不会出现。这一段由
+ * {@link StackKeeper} 去对齐，而它给出的结论必须有人显示——否则「开着」与「开着但谁也看不见」
+ * 在屏幕上长得一模一样，那正是 2026-11-18 16:56 那次的现象。
+ *
+ * <p>所以磁贴多了【不可用】这一格，说的是链路的事，不是开关的事：开关还在开的位置，接收端
+ * 也还在听，只是这台机器此刻报不出名字。第二次点它仍然是「关」——一个开关只该有一个含义，
+ * 状态另开一格去讲。
  */
 public final class AirdropTile extends TileService {
 
@@ -79,6 +92,26 @@ public final class AirdropTile extends TileService {
         }
     }
 
+    /**
+     * 请系统把这格磁贴重画一次。
+     *
+     * <p>从 {@link StackKeeper} 那条线程上调：链路的有无不是人点的，磁贴自己不会知道，而它
+     * 又只有被绑定的时候才画得出东西——{@code getQsTile()} 在没有实例时是 {@code null}。
+     *
+     * <p>{@link TileService#requestListeningState} 正是为这件事存在的：系统会（在下拉面板可见
+     * 时）回调 {@link #onStartListening}，于是 {@link #render()} 读到的是**刚问过**的结论。
+     * 面板没展开的时候这一次是空的，而那时也没有人在看这格图标。
+     */
+    static void refresh(Context context) {
+        try {
+            requestListeningState(context, new ComponentName(context, AirdropTile.class));
+        } catch (RuntimeException refused) {
+            // 个别 ROM 在这一步会拒。链路状态本身是对的，只是这格图标要等到人下拉通知栏
+            // 那一刻才更新——比让一次刷新把看护线程崩掉好。
+            Log.w(TAG, "磁贴没能重画：" + refused);
+        }
+    }
+
     /** 磁贴的样子只反映一件事：现在收不收。 */
     private void render() {
         Tile tile = getQsTile();
@@ -86,7 +119,17 @@ public final class AirdropTile extends TileService {
             return;
         }
         boolean on = ReceiveService.listening(this);
-        tile.setState(on ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
+        if (on && !StackKeeper.linked()) {
+            // 开着，但内核层没在：接收端确实在听，可是没有 awdltun0 就没有一条 mDNS 广播
+            // 发得出去，对面手机上什么都不会出现。「亮着 = 能被发现」在这台机器上曾经是
+            // 假的，而假的绿灯比红灯难查得多——所以这里不再点绿灯。
+            tile.setState(Tile.STATE_UNAVAILABLE);
+            String trouble = StackKeeper.note();
+            tile.setSubtitle(trouble.isEmpty() ? "AWDL 链路未建立" : trouble);
+        } else {
+            tile.setState(on ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
+            tile.setSubtitle(null);
+        }
         tile.setLabel(getString(R.string.tile_airdrop));
         // 用应用自己的图标（蓝色圆点 + 两道环），取的是**裁剪过视口**的那一份
         // （{@code tile_airdrop.xml}：同一组路径，viewport 收到 48 并让图形顶格画）。
