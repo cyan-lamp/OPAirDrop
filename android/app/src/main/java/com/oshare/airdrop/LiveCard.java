@@ -8,8 +8,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
-import android.media.Ringtone;
-import android.media.RingtoneManager;
+import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -103,6 +102,9 @@ final class LiveCard {
 
     /** 上一次响铃的时刻（{@code uptimeMillis}）。0 表示还没响过。 */
     private static long sLastChime;
+
+    /** 正在播的那个播放器。留着它是为了下一条来时能把上一声掐掉，别两路声音叠着响。 */
+    private static MediaPlayer sChimePlayer;
 
     /**
      * 探针开关：给邀请卡带上 {@code PRIORITY_HIGH} / {@code CATEGORY_CALL}。**默认关，不进正式路径。**
@@ -542,8 +544,14 @@ final class LiveCard {
      * <p>振动写成 {@code {0, 220, 180, 220}} 是「两下」而不是「长震一下」：来文件是个待办，
      * 不是警报，两下足够让人低头看一眼胶囊，也不至于把旁边的人一起叫过来。
      *
-     * <p>声音用系统默认通知音而不是自带音频：用户换过铃声就跟着他的铃声走，这是通知该有的
-     * 礼貌。音量也走通知音量，用户按音量键调小就是调小。
+     * <p>声音用自带的一段合成音频（{@code R.raw.chime_dong}，两下 120~230Hz 的鼓点），
+     * 不是系统默认通知音。换来的是：节奏固定、和下面那两下振动对得上点。代价是不跟着用户的
+     * 铃声走——所以音量仍然走通知音量，静音模式、振动模式、勿扰的语义一个都不少，
+     * 只换音色，不换礼仪。
+     *
+     * <p>为什么不用渠道挂一个自定义铃声：{@code NotificationChannel#setSound} 只认
+     * {@code content://} / {@code file://}，{@code android.resource://} 交给系统会静默失效，
+     * 得先把 raw 里的音频导出成文件再喂 URI，绕这一圈没有收益。
      *
      * <p>三道闸，任何一道关着就安静——因为「我不想被打扰」这个意愿比「我要提醒你」优先：
      *
@@ -584,15 +592,7 @@ final class LiveCard {
                     && manager.getCurrentInterruptionFilter()
                     != NotificationManager.INTERRUPTION_FILTER_ALL;
             if (ringer == AudioManager.RINGER_MODE_NORMAL && !quiet) {
-                Uri sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
-                Ringtone tone = RingtoneManager.getRingtone(context, sound);
-                if (tone != null) {
-                    tone.setAudioAttributes(new AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                            .build());
-                    tone.play();
-                }
+                playChimeSound(context);
             }
             if (ringer != AudioManager.RINGER_MODE_SILENT) {
                 vibrate(context, new long[]{0, 220, 180, 220});
@@ -601,6 +601,70 @@ final class LiveCard {
         } catch (Throwable t) {
             // 提醒失败不该连累通知本身：卡已经发出去了，人还是能在胶囊上看到它。
             Log.w(TAG, "chime 没响成：" + t);
+        }
+    }
+
+    /**
+     * 播一遍「咚~咚~」。
+     *
+     * <p>用 {@link MediaPlayer} 而不是 {@code Ringtone}：raw 资源没有 URI，{@code Ringtone}
+     * 拿不到它。{@code MediaPlayer.create} 会同步准备好，直接 {@code start} 就行。
+     *
+     * <p>静态留着上一次的实例是必须的：上一条还没播完又来一条时，{@code release()} 掉旧的
+     * 再建新的，否则会有两路音频叠着响，听起来像回声。而 {@code create} 的实例不会自己回收，
+     * 不主动放就会一直占着一个解码器。
+     *
+     * <p>{@code USAGE_NOTIFICATION} + {@code CONTENT_TYPE_SONIFICATION}：这两个决定了它走
+     * 通知音量、被静音模式掐掉、在勿扰里走「允许通知」这条规则——和系统通知音同等待遇。
+     * 换音色不该顺手换掉这些。
+     */
+    private static void playChimeSound(Context context) {
+        try {
+            stopChimeSound();
+            // 不能图省事用 MediaPlayer.create()：它在返回之前就已经 prepare 了，
+            // 之后调 setAudioAttributes 会被底层忽略，实测 attributes 落成 USAGE_UNKNOWN，
+            // 声音于是走 STREAM_MUSIC——媒体音量、静音模式管不着它，等于把上面那三道闸全废了。
+            // 所以老老实实「先设属性、再给数据源、最后 prepare」。
+            MediaPlayer player = new MediaPlayer();
+            player.setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build());
+            player.setDataSource(context,
+                    Uri.parse("android.resource://" + context.getPackageName()
+                            + "/" + R.raw.chime_dong));
+            player.setOnCompletionListener(mp -> {
+                mp.release();
+                if (sChimePlayer == mp) {
+                    sChimePlayer = null;
+                }
+            });
+            player.prepare();
+            sChimePlayer = player;
+            player.start();
+        } catch (Throwable t) {
+            Log.w(TAG, "chime 播放失败：" + t);
+        }
+    }
+
+    /** 掐掉上一次还没播完的那一声，没有就什么都不做。 */
+    private static void stopChimeSound() {
+        MediaPlayer old = sChimePlayer;
+        sChimePlayer = null;
+        if (old == null) {
+            return;
+        }
+        try {
+            if (old.isPlaying()) {
+                old.stop();
+            }
+        } catch (Throwable ignored) {
+            // 已经 release 过或者状态不对，都无所谓——反正下一个还要重建。
+        }
+        try {
+            old.release();
+        } catch (Throwable ignored) {
+            // 同上。
         }
     }
 

@@ -29,9 +29,12 @@ public final class LiveProbeActivity extends Activity {
         super.onCreate(state);
         String mode = getIntent().getStringExtra("mode");
         final String chosen = mode == null ? "invite_fresh" : mode;
+        // 默认 300 ms 只是让前台真的落回去；invite_fresh 自己还会再等 700 ms。
+        // 传 --ei delay 4000 就是「等应用彻底退到后台再投」，用来复现真实场景：
+        // 人待在别的应用里，对面发来一张照片。
+        int delay = getIntent().getIntExtra("delay", 300);
         finish();
-        // 300 ms 只是让前台真的落回去；invite_fresh 自己还会再等 700 ms。
         new Handler(Looper.getMainLooper()).postDelayed(
-                () -> LiveProbe.fire(this, chosen), 300);
+                () -> LiveProbe.fire(this, chosen), Math.max(0, delay));
     }
 }
