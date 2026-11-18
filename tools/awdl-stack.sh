@@ -1047,6 +1047,12 @@ cmd_stop() {
     # un-throttled. `freezer_restore` is a no-op when `boot` never had to set
     # it, which is the case for a `start`/`stop` pair that never shared a link.
     freezer_restore || true
+    # Same principle, one layer up: `stop` means the phone goes back to the
+    # user, and a root loop that writes `cgroup.procs` every 2 s is not part of
+    # "back to the user". The app keeps whatever freezer policy the ROM wants
+    # for it -- which is the whole reason this guard exists, and also the whole
+    # reason it must not outlive the link.
+    stop_guard || true
     # The app's request file is deliberately left alone. It is the user's
     # preference and not state of this run, so `stop` restoring Wi-Fi above is
     # the end of the teardown, not a silent edit of what the switch will be next
@@ -1163,6 +1169,128 @@ start_daemon() {
     return 1
 }
 
+# ---------------------------------------------------------------------------
+# Keeping the app schedulable
+#
+# The freezer above is AOSP's, and on this ROM it is not the one that decides.
+# ColorOS ships a second one -- HANS, `oplus_sys_hans` driven over netlink by
+# the `oplus.hans` userspace daemon -- and it parks every third-party app that
+# is not on screen. Measured on this phone 2026-11-18 17:57:
+#
+#   17:57:45.598  unfreeze uid: 10456 reason: W_AsyncBinder
+#   17:57:45.599  F exit(), F stay=83
+#   17:57:48.602  F enter(), M stay=3
+#   17:57:48.603  freeze uid: 10456 scene: LcdOn
+#
+# Three seconds of running per external event, and `F stay=3` is the whole of
+# it. The app read utime/stime 47/18 from /proc/<pid>/stat and was still 47/18
+# twelve seconds later, while `awdld` on the same phone went 94/196 -> 97/205 in
+# the same window. An app parked like that cannot announce -- the mDNS ticker is
+# a timer, so nothing external ever wakes it -- and cannot answer on 8770. A
+# cold `boot` measured 289 s wall against the 25 s this script needs, because
+# the work had finished long before the app was given a slice to read it.
+#
+# It is a cgroup, and only the app is inside it: the app sits at
+# `/apps/uid_10456/pid_N`, this script and `awdld` both sit at `0::/` because
+# `su` starts them there, and `cgroup.freeze` lives on the app's subtree. So the
+# fix is not to negotiate with the vendor -- the deviceidle whitelist, the
+# standby bucket, `cached_apps_freezer` and a foreground service with an ongoing
+# notification are all already in place and none of them touches HANS -- it is
+# to move the app into a subtree nobody freezes. `/sys/fs/cgroup/system` is a
+# leaf of the same hierarchy, so memory and io accounting stay in the unified
+# tree, and it carries no freeze of its own.
+#
+# Measured after the move: 51/23 -> 54/28 over 24 s, and not one HANS line for
+# the uid in the following five minutes.
+#
+# A loop rather than a one-shot because the app is replaced (systemui rebinds
+# the tile, `am force-stop`, an update) and because AMS re-files a process whose
+# importance changes. Re-asserting costs one `cat` of /proc/<pid>/cgroup per pid
+# every two seconds, and nothing at all when the app is already where it should
+# be.
+FREEZE_ROOT=/sys/fs/cgroup
+UNFROZEN_GROUP=$FREEZE_ROOT/system
+GUARD_PID=$STATE/guard.pid
+GUARD_LOG=$STATE/guard.log
+
+# Move every pid of the app out of the frozen subtree, and say how many moved.
+keep_unfrozen() {
+    moved=0
+    for p in $(pidof "$APP" 2>/dev/null); do
+        where=$(sed -n 's/^0:://p' "/proc/$p/cgroup" 2>/dev/null)
+        case "$where" in
+            /apps/*)
+                echo "$p" > "$UNFROZEN_GROUP/cgroup.procs" 2>/dev/null && moved=$((moved + 1))
+                ;;
+        esac
+    done
+    [ "$moved" -gt 0 ] && echo "UNFROZEN pids=$moved at $(date +%H:%M:%S)"
+    return 0
+}
+
+stop_guard() {
+    guard_alive || { rm -f "$GUARD_PID"; return 0; }
+    kill "$(cat "$GUARD_PID")" 2>/dev/null
+    say 'GUARD_STOPPED'
+    rm -f "$GUARD_PID"
+}
+
+# Is the pid in the file still our loop?
+#
+# `$STATE` lives in /data/local/tmp and survives a reboot, a pid does not: after
+# one, the number belongs to whatever the kernel handed it to next, and both
+# `kill` and "already running" would act on a stranger. The cmdline is the only
+# thing that distinguishes a reused pid from the process we left behind.
+guard_alive() {
+    pid=$(cat "$GUARD_PID" 2>/dev/null)
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'awdl-stack\.sh guard'
+}
+
+# Idempotent: a second `boot` in the same session keeps the guard it has and
+# only re-asserts the one position that may have changed since.
+start_guard() {
+    if guard_alive; then
+        say "GUARD_ALREADY pid=$(cat "$GUARD_PID")"
+        keep_unfrozen
+        return 0
+    fi
+    launcher=
+    command -v setsid >/dev/null 2>&1 && launcher=setsid
+    # Re-exec this file rather than inline the loop: `setsid` needs a program to
+    # start, and a guard that dies with the `su -c` that launched it would stop
+    # watching exactly when the app stops being talked to.
+    #
+    # The pid is *not* taken from `$!`. With `setsid` in front, `$!` is the
+    # parent that may fork and exit at once, and a pid file pointing at a
+    # wrapper is a pid file that cannot be stopped -- `cmd_guard` writes its own
+    # `$$` instead, which is true whatever the launcher does.
+    rm -f "$GUARD_LOG" "$GUARD_PID"
+    $launcher sh "$0" guard > "$GUARD_LOG" 2>&1 &
+    n=0
+    while [ "$n" -lt 20 ]; do
+        guard_alive && break
+        sleep 0.1
+        n=$((n + 1))
+    done
+    if guard_alive; then
+        say "GUARD_STARTED pid=$(cat "$GUARD_PID") $(tail -n 1 "$GUARD_LOG" 2>/dev/null)"
+        return 0
+    fi
+    say 'the guard did not stay up; the app will be frozen between events'
+    return 1
+}
+
+cmd_guard() {
+    [ "$(id -u)" = 0 ] || die 'must run as root'
+    echo $$ > "$GUARD_PID"
+    while :; do
+        keep_unfrozen
+        sleep 2
+    done
+}
+
 # Where the answer goes: the app's own directory, next to `radio-share` and
 # `radio-state`, because that is the one place this process and the app already
 # agree on.
@@ -1231,6 +1359,16 @@ boot_receipt() {
 cmd_boot() {
     [ "$(id -u)" = 0 ] || die 'must run as root'
     BOOT_NAME=${2:-}
+    # First thing, before the branch and before any driver work.
+    #
+    # The caller is the app, and on this ROM the caller is parked. Measured: a
+    # cold `boot` took 289 s of wall time for 25 s of work, because the script
+    # finished and then the app sat frozen, unable to read a pipe that already
+    # had EOF on it, until something unrelated gave it a HANS window. Starting
+    # the guard at the end would fix the *next* boot and leave every cold one --
+    # the exact case this is for -- as slow as it was. It goes here so the
+    # caller is schedulable for the whole call, not once it is over.
+    start_guard || true
 
     if same_boot "$STATE/stack-boot"; then
         # Already swapped in this boot. Same rule as `start`: from here on a
@@ -1571,8 +1709,9 @@ case "${1:-status}" in
     share) cmd_share ;;
     exclusive) cmd_exclusive ;;
     status) cmd_status ;;
+    guard) cmd_guard ;;
     *)
-        echo 'Usage: awdl-stack.sh start|boot|stop|link|share|exclusive|status'
+        echo 'Usage: awdl-stack.sh start|boot|stop|link|share|exclusive|status|guard'
         exit 2
         ;;
 esac

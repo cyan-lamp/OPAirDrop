@@ -58,8 +58,24 @@ public final class DriverSetup {
     private static final String PAYLOAD = "/data/local/tmp/opairdrop";
     /** The manifest staged next to the modules; see {@code stageKernelAssets} in build.gradle. */
     private static final String MANIFEST = "SHA256SUMS";
-    /** Every `insmod` and the daemon start together take about 25 s on a cold phone. */
-    private static final int TIMEOUT_SECONDS = 180;
+    /**
+     * How long {@code boot} is given before the app stops waiting for an answer.
+     *
+     * <p>Five minutes, against the 25 s the script needs, because the number is not a schedule —
+     * it is the point past which a caller that is still blocked is being lied to. The measured
+     * 289 s cold boot this used to hide is now the script's problem, not the caller's: it came
+     * from the app being parked by the ROM's freezer for the whole run, and {@code boot} now
+     * moves it out of the frozen cgroup before it starts working.
+     */
+    private static final int TIMEOUT_SECONDS = 300;
+
+    /**
+     * {@link #run}'s answer when the script is still going.
+     *
+     * <p>Not an exit status: nothing exited. It exists so that a caller can tell "the script
+     * failed" from "the script has not finished", which need opposite responses from the tile.
+     */
+    public static final int STILL_RUNNING = -2;
 
     /**
      * Whether a bring-up is in flight, for two callers that would otherwise race.
@@ -72,6 +88,17 @@ public final class DriverSetup {
      * both land here rather than on the script.
      */
     private static final AtomicBoolean RUNNING = new AtomicBoolean();
+
+    /**
+     * The run that outlived its deadline, if any.
+     *
+     * <p>Only {@link #running()} reads it, and only to answer the question the flag alone cannot:
+     * a timeout keeps {@link #RUNNING} up so that the next tap cannot stack a second {@code boot}
+     * on a half-finished driver swap — but if that swap then finishes on its own, nothing is left
+     * to lower the flag, and the page would say "还在装驱动" until the app restarted. This is the
+     * handle that lets it notice.
+     */
+    private static volatile Process overran;
 
     private DriverSetup() {}
 
@@ -123,7 +150,7 @@ public final class DriverSetup {
     /**
      * Brings the stack up: unpack, copy, run {@code boot}, read the receipt.
      *
-     * <p>Blocking, and it must not be called on the main thread — it waits up to three minutes
+     * <p>Blocking, and it must not be called on the main thread — it waits up to five minutes
      * for the phone. Only one runs at a time; see {@link #RUNNING}.
      */
     public static Result boot(Context context, String name) {
@@ -131,23 +158,45 @@ public final class DriverSetup {
             return new Result(-1, new ArrayList<>(), StackState.read(context.getFilesDir()),
                     "正在装驱动，这一次要先跑完");
         }
+        boolean answered = false;
         try {
             File local = dir(context);
             try {
                 unpack(context, local);
             } catch (IOException e) {
+                answered = true;
                 return new Result(-1, new ArrayList<>(), StackState.read(context.getFilesDir()),
                         "解包失败：" + e.getMessage());
             }
-            return run("boot " + quote(name), context);
+            Result result = run("boot " + quote(name), context);
+            // A run that is still going is not a run that finished. Clearing the flag here would
+            // let the next tile tap start a second `boot` on a driver swap that is half done,
+            // which is the one interleaving that leaves the phone without a Wi-Fi driver. The
+            // flag stays up until a later `boot` finds the swap finished and takes the
+            // idempotent path -- that call answers, and clears it.
+            answered = result.code() != STILL_RUNNING;
+            return result;
         } finally {
-            RUNNING.set(false);
+            if (answered) {
+                RUNNING.set(false);
+            }
         }
     }
 
     /** Whether a bring-up is in flight. The page uses it to draw the run it did not start. */
     public static boolean running() {
-        return RUNNING.get();
+        if (!RUNNING.get()) {
+            return false;
+        }
+        Process late = overran;
+        if (late != null && !late.isAlive()) {
+            // 超时的那一轮其实已经结束了。放开闸门，让下一次 boot 走幂等那条路：
+            // 它读的是脚本自己写的回执，比这里的任何猜测都准。
+            overran = null;
+            RUNNING.set(false);
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -159,7 +208,6 @@ public final class DriverSetup {
     public static Result run(String arguments, Context context) {
         String command = command(PAYLOAD, dir(context).getAbsolutePath(), arguments);
         List<String> lines = new ArrayList<>();
-        int code;
         Process process;
         try {
             process = new ProcessBuilder("su", "-c", command).redirectErrorStream(true).start();
@@ -167,32 +215,76 @@ public final class DriverSetup {
             return new Result(-1, lines, StackState.read(context.getFilesDir()),
                     "没有 root：找不到 su（" + noSu.getMessage() + "）");
         }
-        try {
-            StringBuilder output = new StringBuilder();
+        StringBuilder output = new StringBuilder();
+        // Read on a thread of its own, and let `waitFor` own the clock.
+        //
+        // What used to be here read the pipe to EOF *before* calling `waitFor`, so the timeout
+        // could only ever be reached by a script that had already exited: a hung boot was both
+        // unbounded and silent. The deadline is time spent by the script, so it has to be
+        // enforced by something that is not blocked on the script's output.
+        Thread reader = new Thread(() -> {
+            byte[] buffer = new byte[4096];
             try (InputStream in = process.getInputStream()) {
-                byte[] buffer = new byte[4096];
                 int n;
                 while ((n = in.read(buffer)) > 0) {
-                    output.append(new String(buffer, 0, n, StandardCharsets.UTF_8));
+                    synchronized (output) {
+                        output.append(new String(buffer, 0, n, StandardCharsets.UTF_8));
+                    }
                 }
+            } catch (IOException closed) {
+                // Losing the pipe says nothing that the exit status will not also say.
             }
-            if (!process.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                process.destroy();
-                return new Result(-1, lines, StackState.read(context.getFilesDir()),
-                        "脚本 " + TIMEOUT_SECONDS + " 秒没有结束");
-            }
-            code = process.exitValue();
-            for (String line : output.toString().split("\n")) {
-                if (!line.trim().isEmpty()) {
-                    lines.add(line.trim());
-                }
-            }
-        } catch (IOException | InterruptedException e) {
+        }, "stack-output");
+        reader.setDaemon(true);
+        reader.start();
+        boolean finished;
+        try {
+            finished = process.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
             process.destroy();
             return new Result(-1, lines, StackState.read(context.getFilesDir()),
-                    "调用 su 失败：" + e.getMessage());
+                    "调用 su 被中断");
         }
+        if (!finished) {
+            // Deliberately not `destroy()`. `su` does not forward the signal to the shell it
+            // started, so killing the wrapper would leave the driver swap half done and still
+            // running as root -- the one outcome worse than waiting. The script publishes its
+            // own receipt when it is done, so the honest answer is "not yet" and the app's next
+            // tick reads the real one.
+            if (RUNNING.get()) {
+                // So that {@link #running()} can tell "the caller gave up waiting" from "the
+                // script is still working": this reference is the only thing that knows.
+                overran = process;
+            }
+            return new Result(STILL_RUNNING, drain(output, lines),
+                    StackState.read(context.getFilesDir()),
+                    "脚本 " + TIMEOUT_SECONDS + " 秒仍在运行");
+        }
+        overran = null;
+        int code = process.exitValue();
+        drain(output, lines);
         return new Result(code, lines, StackState.read(context.getFilesDir()), "");
+    }
+
+    /**
+     * Appends what the reader thread has produced so far.
+     *
+     * <p>Guarded because it is called while that thread may still be running -- that is the whole
+     * point of the timeout path. Whatever arrived late is not lost: it is appended to a buffer
+     * nobody reads again, which is cheaper than a lock held across a blocking read.
+     */
+    private static List<String> drain(StringBuilder output, List<String> lines) {
+        String text;
+        synchronized (output) {
+            text = output.toString();
+        }
+        for (String line : text.split("\n")) {
+            if (!line.trim().isEmpty()) {
+                lines.add(line.trim());
+            }
+        }
+        return lines;
     }
 
     /**
