@@ -79,7 +79,10 @@ final class Tuning {
      * 一行**计数**设置（条数、层数、条流数），取不到或不是整数就用 {@code fallback}。
      *
      * <p>和 {@link #ms} 是同一段代码，只是名字不同。分开命名不是为了绕开复用，是因为
-     * 「毫秒」这个词出现在 {@code client.streams} 旁边会读成一个时间——而它是一个条数。
+     * 「毫秒」这个词出现在一个「条数」旁边会读成一个时间。眼下没有调用者——唯一的计数项
+     * `client.streams` 已在 2026-11-20 删掉（测过不提速，Plan.md §3.3.1）。留着的理由是：
+     * 将来复测多流、或者再加任何一个「条数」设置时，读它该用这个名字，而不是去用
+     * {@link #ms}。
      */
     static long count(SettingsScreen screen, String key, long fallback) {
         return ms(screen, key, fallback);
