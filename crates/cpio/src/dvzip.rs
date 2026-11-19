@@ -169,6 +169,16 @@ pub struct Decoder<R: Read> {
     decoded: Vec<u8>,
     /// Blocks accepted before the refusal, so "the second block" can be said out loud.
     blocks: u32,
+    /// Empty blocks skipped so far.
+    ///
+    /// Not part of [`Decoder::blocks`]: they carry nothing, and counting them as blocks
+    /// would make the diagnostic say three when the sender framed two.
+    empty: u32,
+    /// How many empty blocks have been skipped since the last real one.
+    ///
+    /// Reset by every block with a payload. An endless run of zeros is not a body we can
+    /// wait out, so it gets a ceiling; see [`MAX_EMPTY_RUN`].
+    run: u32,
 }
 
 /// How much of the body [`Decoder::head`] keeps. Two block headers, one 64-byte block,
@@ -177,6 +187,15 @@ const HEAD_DUMP: usize = 96;
 
 /// How much of the first block's inflate output [`Decoder::decoded`] keeps.
 const DECODED_DUMP: usize = 64;
+
+/// How many empty blocks in a row are still treated as "the sender paused".
+///
+/// An empty block is four zero bytes and says nothing; one of them between two real
+/// blocks is a sender flushing its buffer before it is full, and skipping it is exactly
+/// equivalent to those four bytes not being there. See [`Decoder::next_block`] for why
+/// this is not an error at all. A thousand in a row is four kilobytes of zeros and no
+/// sender does that, which makes it the right place to stop waiting and complain.
+const MAX_EMPTY_RUN: u32 = 1024;
 
 /// Bytes as space-separated hex, or `-` when there are none.
 fn hex_of(bytes: &[u8]) -> String {
@@ -205,6 +224,8 @@ impl<R: Read> Decoder<R> {
             head: Vec::new(),
             decoded: Vec::new(),
             blocks: 0,
+            empty: 0,
+            run: 0,
         }
     }
 
@@ -223,82 +244,132 @@ impl<R: Read> Decoder<R> {
     /// time is paid at most once per transfer.
     fn diagnosis(&self) -> String {
         let mut out = format!("{} block(s) were read first", self.blocks);
+        if self.empty > 0 {
+            out.push_str(&format!(", {} empty block(s) skipped", self.empty));
+        }
         out.push_str(&format!("; the body began 0x{}", hex_of(&self.head)));
         out.push_str(&format!("; block one decoded to 0x{}", hex_of(&self.decoded)));
         out
     }
 
     /// Loads the next block into `self.block`; `false` at a clean end of body.
+    ///
+    /// # An empty block is not an error
+    ///
+    /// The length field *is* the framing (DVZ-1), and a zero length carries no payload at
+    /// all. Skipping it is therefore exactly equivalent to those four bytes not being in
+    /// the body: nothing is inflated, nothing is produced, nothing takes a place. This
+    /// used to be an "implausible length" refusal, and that refusal threw away a transfer
+    /// whose framing was perfect — all the person on the phone saw was the archive could
+    /// not be read.
+    ///
+    /// 2026-11-19 21:40:08 is the case in full. The body was, byte for byte:
+    ///
+    /// ```text
+    /// 00 00 00 55  78 9c …    85 bytes, inflating to a cpio "070701" header
+    /// 00 01 db 0e  78 9c …    121614 bytes, inflating to exactly 128 KiB
+    /// 00 00 00 00             an empty block
+    /// ```
+    ///
+    /// The arithmetic settles the question of blame: 4 + 85 + 4 + 121614 = 121707, and
+    /// 121707 is the offset the refusal named. We were on a perfect block boundary and
+    /// had read every byte of two valid blocks, so the only wrong judgement in the chain
+    /// was ours about the last four bytes. The sender flushes when its buffer is empty;
+    /// that is a zero-length block, and the format has no way to say "nothing" otherwise.
+    ///
+    /// [`MAX_EMPTY_RUN`] keeps "skip it" from turning into "wait forever" on a body that
+    /// degenerates into zeros.
     fn next_block(&mut self) -> io::Result<bool> {
-        let at = self.offset;
-        let mut header = [0u8; 4];
-        let mut got = 0;
-        while got < 4 {
-            match self.inner.read(&mut header[got..]) {
-                Ok(0) if got == 0 => {
-                    self.done = true;
-                    return Ok(false);
+        loop {
+            let at = self.offset;
+            let mut header = [0u8; 4];
+            let mut got = 0;
+            while got < 4 {
+                match self.inner.read(&mut header[got..]) {
+                    Ok(0) if got == 0 => {
+                        self.done = true;
+                        return Ok(false);
+                    }
+                    Ok(0) => {
+                        self.keep(&header[..got]);
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "DVZip block header truncated",
+                        ));
+                    }
+                    Ok(n) => got += n,
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
                 }
-                Ok(0) => {
-                    self.keep(&header[..got]);
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "DVZip block header truncated"));
-                }
-                Ok(n) => got += n,
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
             }
-        }
-        self.offset += 4;
-        self.keep(&header);
-        let raw = u32::from_be_bytes(header);
-        let length = (raw & LENGTH_MASK) as usize;
-        if length == 0 || length > MAX_BLOCK {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "implausible DVZip block length {length} (header 0x{raw:08x} at offset {at}); {}",
-                    self.diagnosis()
-                ),
-            ));
-        }
-
-        let mut payload = vec![0u8; length];
-        let mut filled = 0;
-        while filled < length {
-            let read = match self.inner.read(&mut payload[filled..]) {
-                Ok(n) => n,
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            };
-            if read == 0 {
-                self.keep(&payload[..filled]);
+            self.offset += 4;
+            self.keep(&header);
+            let raw = u32::from_be_bytes(header);
+            let length = (raw & LENGTH_MASK) as usize;
+            if length == 0 {
+                self.empty += 1;
+                self.run += 1;
+                if self.run > MAX_EMPTY_RUN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "DVZip body has no end: {} empty blocks in a row at offset {at}; {}",
+                            self.run,
+                            self.diagnosis()
+                        ),
+                    ));
+                }
+                continue;
+            }
+            self.run = 0;
+            if length > MAX_BLOCK {
                 return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
+                    io::ErrorKind::InvalidData,
                     format!(
-                        "DVZip block truncated at {filled} of {length}; {}",
+                        "implausible DVZip block length {length} (header 0x{raw:08x} at offset {at}); {}",
                         self.diagnosis()
                     ),
                 ));
             }
-            filled += read;
-        }
-        self.offset += length as u64;
-        self.keep(&payload);
 
-        self.block = if raw & STORED != 0 {
-            payload
-        } else {
-            inflate(&payload)?
-        };
-        // Only the first block: the question this answers is about where the body
-        // started, and block two onwards would push the first out of the log line.
-        if self.decoded.is_empty() {
-            let take = DECODED_DUMP.min(self.block.len());
-            self.decoded.extend_from_slice(&self.block[..take]);
+            let mut payload = vec![0u8; length];
+            let mut filled = 0;
+            while filled < length {
+                let read = match self.inner.read(&mut payload[filled..]) {
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                };
+                if read == 0 {
+                    self.keep(&payload[..filled]);
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "DVZip block truncated at {filled} of {length}; {}",
+                            self.diagnosis()
+                        ),
+                    ));
+                }
+                filled += read;
+            }
+            self.offset += length as u64;
+            self.keep(&payload);
+
+            self.block = if raw & STORED != 0 {
+                payload
+            } else {
+                inflate(&payload)?
+            };
+            // Only the first block: the question this answers is about where the body
+            // started, and block two onwards would push the first out of the log line.
+            if self.decoded.is_empty() {
+                let take = DECODED_DUMP.min(self.block.len());
+                self.decoded.extend_from_slice(&self.block[..take]);
+            }
+            self.blocks += 1;
+            self.position = 0;
+            return Ok(true);
         }
-        self.blocks += 1;
-        self.position = 0;
-        Ok(true)
     }
 }
 
@@ -460,27 +531,75 @@ mod tests {
 
     #[test]
     fn a_refused_header_reports_what_came_before_it() {
-        // A four-byte stored block followed by four zero bytes. The refusal is about the
-        // second header, but the bytes that matter are the first block's: without them a
-        // log line cannot tell a sender that framed an 111-byte block from a reader that
+        // A four-byte stored block followed by a length over the cap. The refusal is about
+        // the second header, but the bytes that matter are the first block's: without them
+        // a log line cannot tell a sender that framed an 111-byte block from a reader that
         // started at the wrong offset. 2026-11-19 20:57:55 was exactly that question.
+        //
+        // The second header used to be four zero bytes, which is no longer a refusal --
+        // 2026-11-19 21:40:08 reclassified an empty block as legal, see `next_block`.
         let mut body = Vec::new();
         body.extend_from_slice(&(0x8000_0000u32 | 4).to_be_bytes());
         body.extend_from_slice(b"abcd");
-        body.extend_from_slice(&[0u8; 4]);
+        body.extend_from_slice(&(MAX_BLOCK as u32 + 1).to_be_bytes());
 
         let err = Decoder::new(&body[..]).read_to_end(&mut Vec::new()).unwrap_err();
         let text = err.to_string();
         assert!(text.contains("at offset 8"), "{text}");
         assert!(text.contains("1 block(s) were read first"), "{text}");
         assert!(
-            text.contains("the body began 0x80 00 00 04 61 62 63 64 00 00 00 00"),
+            text.contains("the body began 0x80 00 00 04 61 62 63 64 00 10 00 01"),
             "the body so far should be in the message: {text}"
         );
         assert!(
             text.contains("block one decoded to 0x61 62 63 64"),
             "the first block's content should be in the message: {text}"
         );
+    }
+
+    #[test]
+    fn an_empty_block_between_two_real_ones_is_skipped() {
+        // Byte for byte the body that failed at 2026-11-19 21:40:08: two framed blocks and
+        // four zeros the sender emitted when it flushed an empty buffer. The arithmetic
+        // proves we were at a correct boundary -- 4 + 85 + 4 + 121614 = 121707, the offset
+        // the old code refused -- so only the empty block stands between this and a
+        // complete decode.
+        let first = b"070701 the start of a cpio header";
+        let second = noise(13, 128 * 1024);
+        let mut body = Vec::new();
+        body.extend_from_slice(&(0x8000_0000u32 | first.len() as u32).to_be_bytes());
+        body.extend_from_slice(first);
+        body.extend_from_slice(&[0u8; 4]);
+        body.extend_from_slice(&(0x8000_0000u32 | second.len() as u32).to_be_bytes());
+        body.extend_from_slice(&second);
+
+        let mut decoded = Vec::new();
+        Decoder::new(&body[..])
+            .read_to_end(&mut decoded)
+            .expect("an empty block carries nothing and must not fail the body");
+        let mut expected = Vec::from(&first[..]);
+        expected.extend_from_slice(&second);
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn a_body_of_zeros_does_not_hang() {
+        let body = vec![0u8; 4 * (MAX_EMPTY_RUN as usize + 1)];
+        let err = Decoder::new(&body[..]).read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("has no end"), "{err}");
+    }
+
+    #[test]
+    fn a_trailing_empty_block_ends_the_body_cleanly() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(0x8000_0000u32 | 3).to_be_bytes());
+        body.extend_from_slice(b"abc");
+        body.extend_from_slice(&[0u8; 4]);
+
+        let mut decoded = Vec::new();
+        Decoder::new(&body[..]).read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, b"abc");
     }
 
     #[test]
