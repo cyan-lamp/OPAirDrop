@@ -1524,12 +1524,16 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         }
 
         new Thread(() -> {
-            // 字节有没有真的开始走。失败时用来分辨「对面没点接受」和「走到一半对面不
-            // 读了」——这两件事在异常里长得一样（都是一个超时或一个 reset），在人那边
-            // 却是两句不同的话。写在数组里是因为它由进度回调填、由 catch 读。
-            boolean[] moving = {false};
+            // 这一趟走到哪儿了。写在对象里是因为它由进度回调填、由 catch 读。
+            //
+            // 两件事必须分开记：{@code moving} 是「对面已经点了接受」（进度相位进了 SENDING），
+            // 它决定超时那句该说「没有接受」还是「不再回应」；{@code bytes} 是「有多少字节真的
+            // 写进了那条 socket」，它决定中断那句该不该怪环境。前者推不出后者——刚进 SENDING
+            // 相位时可能一个字节都还没写出去；后者也推不出前者，因为 setSoTimeout 那一下
+            // 看的就是相位。
+            Flight flight = new Flight();
             try {
-                byte[] frame = transfer(peer, paths, moving);
+                byte[] frame = transfer(peer, paths, flight);
                 Report report = Report.parse(
                         new String(frame, java.nio.charset.StandardCharsets.UTF_8));
                 runOnUiThread(() -> {
@@ -1572,7 +1576,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                 String message = stopped ? "已取消"
                         : refused ? "对方拒绝"
                         : impostor ? "对方身份不符"
-                        : timedOut ? (moving[0] ? "对方不再回应" : "对方没有接受")
+                        : timedOut ? (flight.moving ? "对方不再回应" : "对方没有接受")
                         // 原文（"Connection reset" 之类）只进日志：页面那行是给站在两台手机
                         // 中间的人看的，他要知道的是「还得再试一次」，不是异常类名。
                         : "连接被中断";
@@ -1603,11 +1607,24 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                             : impostor
                             ? message + " · 已中止，没有发出任何内容。对方的证书若是刚换过，重新搜索一次设备再试"
                             : timedOut
-                            ? who + (moving[0]
+                            ? who + (flight.moving
                                     ? " 不再回应 · 保持亮屏、别切走隔空投送，再点一次设备重试"
                                     : " 没有接受 · 弹窗出现后十五秒内点「接受」；"
                                             + "没有弹窗就把隔空投送改成「所有人（10 分钟）」并保持亮屏")
-                            : message + " · 保持两台设备都亮屏、隔空投送不切走，再点一次设备重试";
+                            // 走过字节的中断和零字节的中断，人要做的不是同一件事，所以这里
+                            // 按「有没有真的发出去过」分流，和接收侧 {@code Listener.because}
+                            // 是同一套判据、同一个道理（那边是「有没有真的收下来」）。
+                            //
+                            // 那句「保持两台设备都亮屏、隔空投送不切走」是给**故障**写的：连
+                            // 都没连上、一个字节都没动，最可能就是环境。已经在流字节的连接断
+                            // 在中途，多半是对面在手机上按了停、或者那台手机把屏幕关了——
+                            // 这时候劝人再去调环境，等于替对面那次「停」编一个不存在的理由。
+                            // 所以只说发生了什么：发了多少、没发完。**刻意不点名是谁停的**，
+                            // 从我们这侧看，「对面取消」和「对面断网」长得一模一样。
+                            : flight.bytes > 0
+                                    ? "传输在中途被中断，已发出 " + size(flight.bytes) + "，没有发完"
+                                    : message + " · 保持两台设备都亮屏、隔空投送不切走，"
+                                            + "再点一次设备重试";
                     // 各有各的码：人按了取消是 1009，对面不收是 1008，等不到回答是 1010，
                     // 其余（含「对方身份不符」「连接被中断」）都是失败。卡片按这个码选动画
                     // 和那行字，不读上面那几个布尔——词表只有这一份。
@@ -1622,7 +1639,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         }, "opairdrop-send").start();
     }
 
-    private byte[] transfer(Peers.Peer peer, List<String> paths, boolean[] moving) throws Exception {
+    private byte[] transfer(Peers.Peer peer, List<String> paths, Flight flight) throws Exception {
         // 人可能在连上之前就把这一趟取消了（卡片上的【取消发送】从「准备中」就在）。这时
         // 还去建连接，是拿几秒钟的握手换一次立刻作废——对面手机上会白弹一次邀请。
         if (cancelling) {
@@ -1683,13 +1700,18 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                             // ——人要先在对面手机上点接受，档案才可能开始落地。两个等待
                             // 该给的耐心不一样：弹窗十五秒内就该有结果，点了接受之后不设
                             // 上限会让人以为卡住。
-                            moving[0] = true;
+                            flight.moving = true;
                             try {
                                 held[0].setSoTimeout(uploadReadMs);
                             } catch (Exception noTimeout) {
                                 Log.w(TAG, "cannot lengthen the read timeout for the archive",
                                         noTimeout);
                             }
+                        }
+                        // 只往后两个相位记字节数：等待相位送进来的 0 会把已经走过的量抹掉，
+                        // 而这两个相位是单调的，后来的值不会比先前小。
+                        if (phase == Native.Progress.SENDING || phase == Native.Progress.DONE) {
+                            flight.bytes = sent;
                         }
                         runOnUiThread(() -> {
                             switch (phase) {
@@ -2567,6 +2589,22 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             // 读不出来就用默认：这一项不是必填，而挡住发送是比默认值更坏的答案。
             return null;
         }
+    }
+
+    /**
+     * 这一趟发送走到了哪儿。
+     *
+     * <p>只回答两个问题，而它们在失败时说的不是同一件事：{@link #moving}——对面点了接受没有；
+     * {@link #bytes}——有多少字节真的写进了那条 socket。传输线程里那个进度回调填，同一个线程
+     * 的 catch 读，所以不需要锁，{@code volatile} 只是为了让「跨了 runOnUiThread 之后再读」
+     * 这件事在读的人眼里是显然的。
+     */
+    private static final class Flight {
+        /** 进度相位进过 SENDING：对面已经在手机上点了接受。 */
+        volatile boolean moving;
+
+        /** 已经写出去的字节数。{@link Native.Progress#SENDING} 之前恒为 0。 */
+        volatile long bytes;
     }
 
     private static final class Report {

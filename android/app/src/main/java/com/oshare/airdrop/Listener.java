@@ -3,8 +3,11 @@ package com.oshare.airdrop;
 import android.content.Context;
 import android.os.Build;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FilterInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -947,7 +950,9 @@ final class Listener {
                     // 对端在 /Discover 里读到的名字。空着的时候由 native 自己拼出来的是机型，
                     // 而这台手机在系统里叫什么只有这里知道，所以两个都交过去。
                     systemName(context),
-                    peer.getInputStream(),
+                    // 包一层只为记下「它什么时候开口、第一句是什么」。见 {@link Spoken}：它不改
+                    // 字节、不改时机，只是把读到的抄一份。
+                    new Spoken(peer.getInputStream(), where(peer), System.currentTimeMillis()),
                     peer.getOutputStream(),
                     summary -> {
                         // The one moment a serving thread can tell a request from a body: the
@@ -1009,6 +1014,23 @@ final class Listener {
             // 真正需要人看一眼的失败（设置读不出来、目录写不进去、连接被系统掐断）仍然上线。
             if (routine(refused)) {
                 Log.i(TAG, "connection from " + where(peer) + " ended: " + describe(refused));
+                return;
+            }
+            // 没人回答过的连接断了，同样不上报。
+            //
+            // 这一支是为 2026-11-19 15:18 抓到的那一条加的：邀请挂了 30 秒没人应答，是我们
+            // 自己把这次邀请判成 expired、自己把连接收掉的，内核于是回 ECONNABORTED——它从
+            // 上面 {@link #routine} 里漏了出来（abort 本来就不该算「对端走掉」），一路走到
+            // {@code because(…, 0)}，得到「连接被系统切断，检查后台限网」。网络一点问题都没有，
+            // 只是没人点那一下。卡片那一层恰好侥幸没事（{@code Attempt.failed} 有 {@code if
+            // (cloud)} 把关，没人回答就没有 cloud），但页面那行是红的，还劝人去查路由器。
+            //
+            // 判据用「有没有人回答过」而不是「有没有字节落地」：这一支的字节数必然是 0，
+            // 落地量分不出「一直没人理」和「人点了、三秒后才断」。11-17 那次后台限网不受影响
+            // ——那次人**点了**接收，只是 socket 早就死了，answered 为真，仍按失败上报。
+            if (!attempt.answered()) {
+                Log.i(TAG, "connection from " + where(peer) + " ended unanswered: "
+                        + describe(refused));
                 return;
             }
             String because = because(refused, meter.bytes());
@@ -1289,6 +1311,91 @@ final class Listener {
     /** How long something took, in whole milliseconds, for a log line. */
     private static long millis(long startedAt) {
         return (System.nanoTime() - startedAt) / 1_000_000L;
+    }
+
+    /**
+     * 一条连接上「对端开口说了什么、隔了多久」，只记一次。
+     *
+     * <p># 为什么要在流上加这一层
+     *
+     * <p>库是阻塞地读请求的：读不到就一声不响。于是日志里只剩一行「握手成功」和很久之后的一行
+     * {@code offer}，中间那段空白有两种完全相反的解释——对端没开口，或者我们没读——而两者在
+     * 现有日志里长得一模一样。2026-11-19 15:35:03 那次就是这样：握手 289 毫秒完成，之后二十三秒
+     * 什么都没有，然后第二次握手、立刻来 {@code offer}。要修这条路，先得知道第一个字节是什么
+     * 时候到的、第一行说的是 {@code /Discover} 还是 {@code /Ask}。
+     *
+     * <p># 只看，不碰
+     *
+     * <p>读到的字节原样往后传，只是顺手抄一份：不改长度、不改时机、不提前读。一旦它开始参与，
+     * 它就不再是证据，而是另一个可能出错的地方。
+     */
+    private static final class Spoken extends FilterInputStream {
+        /** 一行请求最多留这么长，够看到方法、路径和版本。 */
+        private static final int CAP = 120;
+
+        private final String who;
+        /** 握手完成、交给库的那一刻。等的是「它什么时候开口」，不是「它什么时候连上来」。 */
+        private final long readyAt;
+
+        private final ByteArrayOutputStream head = new ByteArrayOutputStream(CAP);
+
+        /** 已经说过那一行了。一条连接只说第一次，后续是请求体。 */
+        private boolean said;
+
+        Spoken(InputStream raw, String who, long readyAt) {
+            super(raw);
+            this.who = who;
+            this.readyAt = readyAt;
+        }
+
+        /** 单字节读那条路要用的一个格子，省掉每字节一次分配。 */
+        private final byte[] single = new byte[1];
+
+        @Override
+        public int read() throws IOException {
+            int one = super.read();
+            if (one >= 0) {
+                single[0] = (byte) one;
+                keep(single, 0, 1);
+            }
+            return one;
+        }
+
+        @Override
+        public int read(byte[] into, int offset, int length) throws IOException {
+            int got = super.read(into, offset, length);
+            if (got > 0) {
+                keep(into, offset, got);
+            }
+            return got;
+        }
+
+        private void keep(byte[] from, int offset, int length) {
+            int room = CAP - head.size();
+            if (room > 0) {
+                head.write(from, offset, Math.min(length, room));
+                tell();
+            }
+        }
+
+        /** 攒到一整行（或者攒满）就说一句；{@code \r} 与 {@code \n} 都算行尾。 */
+        private void tell() {
+            if (said) {
+                return;
+            }
+            byte[] seen = head.toByteArray();
+            int end = 0;
+            while (end < seen.length && seen[end] != '\r' && seen[end] != '\n') {
+                end++;
+            }
+            if (end == seen.length && seen.length < CAP) {
+                return;
+            }
+            said = true;
+            Log.i(Listener.TAG, "first line from " + who + " after "
+                    + (System.currentTimeMillis() - readyAt) + " ms: "
+                    + new String(seen, 0, end, java.nio.charset.StandardCharsets.UTF_8));
+        }
     }
 
     /**

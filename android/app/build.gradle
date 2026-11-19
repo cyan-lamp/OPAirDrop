@@ -89,9 +89,9 @@ android {
     }
 
     buildFeatures {
-        // Off by default since AGP 8, and the debug-only probe in `src/debug` is gated on
-        // `BuildConfig.DEBUG` — MainActivity and SendActivity both ask it whether to expose
-        // that probe. Without this the two call sites do not compile.
+        // Off by default since AGP 8, and `SendActivity.preview()` is gated on
+        // `BuildConfig.DEBUG` — it asks it whether to honour the fake-device layout hook.
+        // Without this that call site does not compile.
         buildConfig true
     }
 

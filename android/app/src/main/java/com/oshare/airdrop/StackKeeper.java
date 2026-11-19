@@ -52,6 +52,19 @@ final class StackKeeper {
     /** 多久看一眼。八秒是一次蓝牙广播的间隔量级，比它更勤只是在问同一个问题。 */
     private static final long TICK_MS = 8_000L;
 
+    /**
+     * 链路**不在**的时候多久看一眼。
+     *
+     * <p>这一段和上一段不是同一种时间：链路在的时候这里什么都没得做（补广播那句话幂等，问的
+     * 是同一件事），而链路不在的那一段，人正站在功能页上等 {@code boot} 跑完——那次要二十五秒
+     * 以上。八秒的间隔意味着建链刚成功还要再白等最多八秒，人才在 iPhone 上看见这台机器；
+     * 而这里问一次只是一次网卡枚举，代价是一行 {@code getByName}。
+     *
+     * <p>不更勤（比如五百毫秒）：再快也不会让链路早出现一毫秒，只会让日志和 CPU 都多一串没人
+     * 读的问句。
+     */
+    private static final long ABSENT_TICK_MS = 1_500L;
+
     /** 看护线程。同一时刻只有一个；{@link #wanted} 是它该不该继续。 */
     private static volatile Thread worker;
     private static volatile boolean wanted;
@@ -153,7 +166,9 @@ final class StackKeeper {
                     break;
                 }
                 try {
-                    Thread.sleep(TICK_MS);
+                    // 链路不在的时候问得勤一些，理由见 {@link #ABSENT_TICK_MS}：那一段是人正
+                    // 等着的一段，而这里问一次只是一次网卡枚举。
+                    Thread.sleep(linked ? TICK_MS : ABSENT_TICK_MS);
                 } catch (InterruptedException stop) {
                     // 没人该中断这条线程（见 unwatch），真被中断了也只是提前看一眼 wanted。
                     Thread.currentThread().interrupt();

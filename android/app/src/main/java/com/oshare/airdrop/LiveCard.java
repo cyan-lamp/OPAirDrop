@@ -126,44 +126,19 @@ final class LiveCard {
     /** 正在播的那个播放器。留着它是为了下一条来时能把上一声掐掉，别两路声音叠着响。 */
     private static MediaPlayer sChimePlayer;
 
-    /**
-     * 探针开关：给邀请卡带上 {@code PRIORITY_HIGH} / {@code CATEGORY_CALL}。**默认关，不进正式路径。**
+    /*
+     * 曾经在这里的三个探针开关已经删掉了：priorityProbe（PRIORITY_HIGH）、
+     * categoryProbe（CATEGORY_CALL）、loudChannelProbe（换一条会响的渠道）。
      *
-     * <p>问的是一个很具体的问题：{@code OplusLiveAlertNotificationsRepository.addLiveAlert} 那条
-     * 运行日志里 {@code remindType=0}，而 {@code entryToReminderType} 算出 0 的唯一入口是
-     * {@code makeUnLoggableAndUnFluidConditionDecision} 判了「别打断」。在这个判断里，
-     * AOSP 的 {@code isImportanceHighEnough} 是这么写的：
+     * 它们试的是同一件事的三个变量：能不能让系统自己把这张卡当成「值得打断人」的提醒
+     * ——OplusLiveAlertNotificationsRepository.addLiveAlert 的 remindType 一直是 0，而 0 的
+     * 唯一入口是 makeUnLoggableAndUnFluidConditionDecision 判了「别打断」。前两个对应 AOSP
+     * isImportanceHighEnough 的第二条分支；第三个是赌 ranking importance 本身——渠道声明的是
+     * IMPORTANCE_HIGH，但 setSound(null) + enableVibration(false) 让系统把它压到 3。
      *
-     * <pre>
-     *   importance &gt;= IMPORTANCE_HIGH
-     *       || (importance &gt;= IMPORTANCE_DEFAULT &amp;&amp; isHighPriority(entry))
-     * </pre>
-     *
-     * <p>我们的渠道声明的是 {@code IMPORTANCE_HIGH}，但 {@code setSound(null)} +
-     * {@code enableVibration(false)} 让系统把 ranking importance 压到了 3，第一条不成立。
-     * 于是只剩第二条：{@code Notification.getPriority()} 为 HIGH/MAX。这条分支就是来
-     * 试那个的——**如果它成立，就完全不用动渠道、不用让手机响**。
+     * **三个都没能让 remindType 从 0 动起来。** 结论留在这里是为了别再试第四遍：这条路上没有
+     * 应用侧能扳的开关，声音只能自己发（见 chime）。
      */
-    static boolean priorityProbe;
-
-    /** 同上，试 {@code CATEGORY_CALL}：通话类通知在打断决策里另有一条放行分支。 */
-    static boolean categoryProbe;
-
-    /**
-     * 探针开关：换一条**带默认提示音和振动**的高重要性渠道投这张卡。
-     *
-     * <p>这是最后一个官方变量。前面两条（{@code PRIORITY_HIGH}、{@code CATEGORY_CALL}）都没能让
-     * {@code remindType} 从 0 动起来，说明拦截不在 {@code isHighPriority} 那条分支上。剩下最可能的
-     * 就是 ranking importance 本身：渠道声明的是 {@code IMPORTANCE_HIGH}，但 {@code dumpsys} 里
-     * 这条通知的 {@code importance=3}，因为我们把声音和振动都关了。
-     *
-     * <p>换句话说：**要让系统认定「这条值得打断人」，这个机型上恐怕就得让它响一声。** 这个开关
-     * 就是来确认那句话的。它建的渠道只在探针里用，测完可以删掉。
-     */
-    static boolean loudChannelProbe;
-
-    /** 探针专用的那条渠道。别和正式渠道混：它的存在本身就是"会响"。 */
-    private static final String PROBE_CHANNEL = "live_card_probe";
 
     /** 一张卡一个 id：同时只有一个传输在走，第二个会覆盖第一个，这正是我们要的。 */
     private static final int ID = 0x0B00;
@@ -337,8 +312,7 @@ final class LiveCard {
         }
         channel(manager);
         alertChannel(manager);
-        String channelId = loudChannelProbe ? probeChannel(manager) : ALERT_CHANNEL;
-        Notification.Builder builder = new Notification.Builder(context, channelId)
+        Notification.Builder builder = new Notification.Builder(context, ALERT_CHANNEL)
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentTitle(title)
                 .setContentText(shortText)
@@ -354,12 +328,6 @@ final class LiveCard {
                 // 这是拿手机的那只手够得最舒服的一侧，也是「接受」与「取消」惯常的排布。
                 .addAction(new Notification.Action.Builder(null, "拒绝", refuse).build())
                 .addAction(new Notification.Action.Builder(null, "接收", accept).build());
-        if (priorityProbe) {
-            builder.setPriority(Notification.PRIORITY_HIGH);
-        }
-        if (categoryProbe) {
-            builder.setCategory(Notification.CATEGORY_CALL);
-        }
         Notification card = builder.build();
         immersive(card);
         manager.notify(ID, card);
@@ -367,8 +335,7 @@ final class LiveCard {
         // 所以这一声得我们自己发。放在 notify 之后：卡先在原位站好，声音再跟上，
         // 人抬头时看到的就是「已经在那儿的那张卡」，而不是「先响一声、卡再慢慢浮出来」。
         chime(context);
-        Log.i(TAG, "live invite: " + title + " · " + shortText
-                + (priorityProbe ? " [pri]" : "") + (categoryProbe ? " [call]" : ""));
+        Log.i(TAG, "live invite: " + title + " · " + shortText);
     }
 
     /**
@@ -816,22 +783,5 @@ final class LiveCard {
         } else {
             vibrator.vibrate(effect);
         }
-    }
-
-    /**
-     * 探针渠道：同一条声明，但**留着默认提示音和振动**。
-     *
-     * <p>和 {@link #channel} 的唯一差别就是没调 {@code setSound(null)} 与
-     * {@code enableVibration(false)}。分开建而不是改原来那条，是因为渠道的重要性建出来就
-     * 改不动了（见 {@link #CHANNEL} 的注释）。
-     */
-    private static String probeChannel(NotificationManager manager) {
-        if (manager.getNotificationChannel(PROBE_CHANNEL) == null) {
-            NotificationChannel channel = new NotificationChannel(
-                    PROBE_CHANNEL, "探针·会响", NotificationManager.IMPORTANCE_HIGH);
-            channel.setShowBadge(false);
-            manager.createNotificationChannel(channel);
-        }
-        return PROBE_CHANNEL;
     }
 }

@@ -149,8 +149,51 @@ final class Peers {
      * 根本**不发** goodbye（{@code gone} 那条路一次都没走到），全靠这个兜底。iPhone 那边
      * 两秒就能看见我们消失，我们这边六秒才看见它消失，差别全在这一个数上。改完之后是两秒出头，
      * 与对端同一量级。
+     *
+     * <p># 但 2.2 秒是个死数，2026-11-19 又被真机否掉了
+     *
+     * <p>那天抓到的是一台**一直在说话**的 iPhone 被反复删掉：
+     * <pre>
+     * browse: rhythm: 40631c50dba3 speaks every 1166 ms (10 gaps, 879–1638 ms, q=0 a=12)
+     * browse: dropped 40631c50dba3@… after 2254 ms of silence (threshold 2200, rhythm 1030 ms)
+     * browse: dropped 3fa87792be9a@… after 2354 ms of silence (threshold 2200, rhythm 1059 ms)
+     * </pre>
+     * 上面的前提——「2.2 秒 = 两个整周期、两条都没等到」——只在间隔**恰好**是 1.0 秒时成立。
+     * 实测的间隔是 879–1638 毫秒：只要丢一包，两段一起就是 2.2–3.3 秒，于是一次丢包就够删掉
+     * 一台活着的设备。量出来的 {@code rhythm} 明明就在日志里，判定却一眼都没看它。
+     *
+     * <p>所以现在这一档是**下限**，真正的阈值由实测节奏给（见 {@link #timeout}）：至少容得下
+     * 「丢一包」，也就是两段最长的间隔再留一点余量。代价是对端真的关掉时晚 1.5 秒才消失——
+     * 换掉的是一台一直在说话的设备每秒消失一次。
      */
     private static final long CONNECTABLE_MS = 2_200;
+
+    /**
+     * 能连的对端，在「丢两包要多久」之上再留多少毫秒。
+     *
+     * <p>两段最长间隔是丢一包的理论上限，余量留给取整、平滑和收到包的时间戳粒度。
+     *
+     * <p># 为什么从 500 抬到 800
+     *
+     * <p>2026-11-19 15:57 的真机，一台节奏稳定的 iPhone 被删掉了，而且只差 119 毫秒：
+     * <pre>
+     * browse: rhythm: 3fa87792be9a speaks every 1021 ms (10 gaps, 464–1054 ms, q=0 a=11)
+     * browse: dropped 3fa87792be9a@… after 2727 ms of silence (threshold 2608, gaps 29, max 1054)
+     * </pre>
+     * 同一窗口 19 个间隔用了 22 秒，平均 1.16 秒——它一直在说话，最后**连着静了近三包**。
+     * 500 的余量只够「两段都落在高端」，不够真实链路上偶尔多丢一包。800 让最坏 1054 的情形
+     * 放宽到 2908，覆盖那次 2727 还留 181 毫秒；而它仍然远小于 {@link #EXPIRE_MS} 的 6 秒，
+     * 所以「真走了」和「凑不齐记录」两档不会混在一起。
+     */
+    private static final long CONNECTABLE_SLACK_MS = 800;
+
+    /**
+     * 攒够几个间隔，才敢用它们去放宽阈值。
+     *
+     * <p>少于这个数时量到的可能只有两帧「正好一样快」的样本，也可能一帧都没有（新实例）。
+     * 那种时候用 {@link #CONNECTABLE_MS} 兜底——它本身就是从几千帧真机数据里挑出来的位置。
+     */
+    private static final int CONNECTABLE_GAPS = 3;
 
     /**
      * 量节奏时，短于这个的间隔不采样。
@@ -274,10 +317,10 @@ final class Peers {
         /**
          * 实测出来的「它多久说一次话」，毫秒。0 表示还没测出来。
          *
-         * <p>**只用于日志，不参与判定。** 这个数曾经是过期阈值的依据，真机把它否掉了：所有
-         * 对端的节奏都是「我们问一次它答一次」，约每秒一帧，用它算出来的阈值必然比健康沉默更
-         * 短，于是列表闪。留着是因为它是「对端到底是什么行为」的唯一实测记录——{@link #EXPIRE_MS}
-         * 那 6 秒就是从它旁边那组数推出来的。
+         * <p>**平滑值，用来读，不用来判。** 判定要的是「最坏情况下它安静多久」，那是
+         * {@link #gapMax}，不是平均值：一台每秒说一次、偶尔隔 1.6 秒的设备，平均值看着很健康，
+         * 丢一包就安静三秒。所以 {@link #timeout} 拿 {@code gapMax} 算，这里只留给日志和
+         * {@code probe:} 那一行——「对端到底是什么行为」的唯一实测记录。
          */
         long period;
 
@@ -1032,6 +1075,10 @@ final class Peers {
                     default -> { }
                 }
             }
+            // 换实例名的那个新对端，先把地址从旧的上面接过来，再往下判「能不能连」。
+            // 顺序压在这里而不是循环开头：同一条报文里常常带着新实例的 SRV 和旧实例的 goodbye，
+            // 先把这一轮读完，接过来的地址才不会立刻被下一行抹掉。
+            changed |= inherit();
             // 一台设备凑齐「地址 + 端口」的那一刻记一笔。
             //
             // 这是人眼在列表里看见它的时刻，也是「对方一开 AirDrop，我们多久显示」唯一的可测
@@ -1045,6 +1092,62 @@ final class Peers {
                     trace("ready " + peer.name + "@" + peer.address + ":" + peer.port
                             + " after " + (now - startedAt) + " ms of browsing");
                 }
+            }
+        }
+        return changed;
+    }
+
+    /**
+     * 让还没拿到地址的新实例，从同一台主机的旧实例那里把地址接过来。
+     *
+     * <p># 为什么必须有这一步
+     *
+     * <p>iPhone 的实例名每分钟换一次（Apple 的隐私设计），换的时候它先发新实例的 SRV，再撤掉旧的。
+     * 而「能连」要求地址和端口都在，<b>地址挂在主机名上、要等另一条 addr 记录</b>——于是换名字的
+     * 那一段里，表里同时躺着：一个还在沉默的旧实例，和一个只有端口没有地址的新实例。旧实例被
+     * {@link #expire} 判死删掉，新实例又还上不了列表，{@code ready() == 0}。人看到的就是
+     * 「设备自己消失了，过几秒又回来」——而它从头到尾都是同一台手机，地址一次都没变。
+     *
+     * <p>2026-11-19 15:57 的日志正是这一刻：{@code dropped … after 2727 ms} 之后紧跟一行
+     * {@code nothing connectable yet (1 instance(s) with partial records)}——被删的是旧名字，
+     * 留下的那一个就是新名字，它缺的只是地址。
+     *
+     * <p># 凭什么敢把地址抄过去
+     *
+     * <p>SRV 里的主机名（{@code xxx.local}）属于机器，不属于实例。同一个主机名下的所有实例，
+     * 地址就是同一个，所以这不是猜，是读出来的结论。抄的只有地址和指纹——节奏统计不抄：那是
+     * 旧实例的样本，新实例自己会重新量。
+     *
+     * <p># 交完就把旧的删掉
+     *
+     * <p>留着等 {@link #expire} 的 {@code retired} 那一圈再删，表里会有最多 250 毫秒同时躺着
+     * 两个同地址的实例，而 {@link #announce} 与界面的重画都按实例名去重——那 250 毫秒里屏上是
+     * 两格一模一样的设备。既然地址已经交接完，旧的这一格就没有存在理由了。
+     *
+     * @return 表有没有被改动过（交给了谁、或者删掉了谁）
+     */
+    private boolean inherit() {
+        boolean changed = false;
+        // 先在快照上找、再写回 peer，避免边遍历边改表。
+        List<Peer> all = new ArrayList<>(peers.values());
+        for (Peer peer : all) {
+            if (!peer.address.isEmpty() || peer.host.isEmpty()) {
+                continue;
+            }
+            for (Peer other : all) {
+                if (other == peer || !peer.host.equals(other.host) || other.address.isEmpty()) {
+                    continue;
+                }
+                peer.address = other.address;
+                peer.scope = other.scope;
+                if (peer.fingerprint.isEmpty()) {
+                    peer.fingerprint = other.fingerprint;
+                }
+                trace("inherited " + peer.address + " for " + peer.name + " from " + other.name
+                        + " — same host, so it is the same device under a new instance name");
+                peers.remove(other.name);
+                changed = true;
+                break;
             }
         }
         return changed;
@@ -1148,10 +1251,13 @@ final class Peers {
                 if (silence < threshold) {
                     return false;
                 }
-                // 删掉的那一刻必须写清楚：谁、沉默多久、按什么阈值、节奏是多少。只看到「列表
-                // 空了」是调不动阈值的——而这条路径的每个数都只能用真机上的行为来定。
+                // 删掉的那一刻必须写清楚：谁、沉默多久、按什么阈值、节奏是多少、样本几个。
+                // 只看到「列表空了」是调不动阈值的——而这条路径的每个数都只能用真机上的行为来定。
+                // 后两个数（gaps / max）是阈值里唯一可变的那个来源，不写下来就分不清「按 2.2 秒
+                // 兜底删的」和「按实测的丢包宽度删的」。
                 trace("dropped " + peer.name + "@" + peer.address + " after " + silence
-                        + " ms of silence (threshold " + threshold + ", rhythm " + peer.period + " ms)");
+                        + " ms of silence (threshold " + threshold + ", rhythm " + peer.period
+                        + " ms, gaps " + peer.gaps + ", max " + peer.gapMax + " ms)");
                 return true;
             });
             // 一台设备只有一个当前实例，但实例名每分钟换一次（Apple 的隐私设计）。
@@ -1209,13 +1315,20 @@ final class Peers {
     /**
      * 这台设备沉默多久算走了。
      *
-     * <p>两档，分界线是「能连」：能连的那一档知道我们正以 1 秒一次的节奏问它，所以它沉默
-     * 两个周期就是答案（见 {@link #CONNECTABLE_MS}）；凑不齐地址端口的那些还在
-     * {@link #ASK_EAGER_MS} 的 300 毫秒档上，那时 Apple 会压应答，只能退回 {@link #EXPIRE_MS}。
+     * <p>两档，分界线是「能连」：能连的那一档知道我们正以 1 秒一次的节奏问它（见
+     * {@link #CONNECTABLE_MS}）；凑不齐地址端口的那些还在 {@link #ASK_EAGER_MS} 的 300 毫秒档上，
+     * 那时 Apple 会压应答，只能退回 {@link #EXPIRE_MS}。
      *
-     * <p>「按每台设备自己的节奏算」这条路走过又回来了——量下来所有对端的节奏都是「我们问一次
-     * 它答一次」，跟着它算只会得到一个更小的阈值，也就是更会闪。要说清的不是它多快说话，是
-     * **我们多快问了一次而它没答**。
+     * <p># 为什么这里现在看节奏，而 2026-11-18 那一次不看
+     *
+     * <p>那一次「按每台设备自己的节奏算」被否掉，否的是**平均值**：{@code period} 是所有间隔的
+     * 平滑，一台每秒一帧的设备它就是 1 秒，两倍才 2 秒——比健康时最长的沉默还短，跟着它算只会
+     * 更会闪。那个结论没错，错在把「平均」当成了「最坏」。
+     *
+     * <p>要判的是「它是不是丢了一包」，那么最坏情况是**连续两段都落在抖动的高端**，上限是
+     * {@code 2 × gapMax}（{@link #CONNECTABLE_GAPS} 挡着样本太少的情况）。2026-11-19 的现场就是
+     * 这个数：间隔 879–1638，丢一包安静 2.2–3.3 秒，而死阈值是 2.2 秒——一半的丢包都会删掉一台
+     * 活着的设备。这段仍然在说「我们问了一次而它没答」，只是把「没答」算成两段而不是一段。
      *
      * <p>真正的「快」仍然在别处：{@link #absorb} 的 {@code gone} 分支。只是 2026-11-18 的
      * 真机证明 iPhone 关 AirDrop 时并不发那个告别，所以这一档不能只当兜底。
@@ -1224,7 +1337,24 @@ final class Peers {
         if (DIAG) {
             return DIAG_HOLD_MS;
         }
-        return peer.connectable() ? CONNECTABLE_MS : EXPIRE_MS;
+        if (!peer.connectable()) {
+            return EXPIRE_MS;
+        }
+        // 量到的节奏只往上放宽，不往下收：CONNECTABLE_MS 是真机样本给出的下限。
+        return Math.max(CONNECTABLE_MS, lost(peer) + CONNECTABLE_SLACK_MS);
+    }
+
+    /**
+     * 它丢一包的时候会安静多久，毫秒；样本不够时返回 0（也就是不必放宽）。
+     *
+     * <p>取 {@link Peer#gapMax} 而不是 {@link Peer#period}：同一个窗口里，平均回答的是「它通常
+     * 多快说话」，最大值才回答「它最慢能拖到多久」，而丢包这件事只跟后者有关。
+     */
+    private static long lost(Peer peer) {
+        if (peer.gaps < CONNECTABLE_GAPS || peer.gapMax <= 0) {
+            return 0;
+        }
+        return 2 * peer.gapMax;
     }
 
     private static int parseInt(String text) {

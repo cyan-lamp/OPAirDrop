@@ -223,9 +223,6 @@ final class ReceiveHost {
      *
      * <p>三条链接也只有一颗按钮：这里只交第一条。一次点击开出三个标签页不是"都打开"，是把人
      * 丢进三个他自己没选过的页面。
-     *
-     * <p>可见性放到包内，是为了让 {@code LiveProbe} 那张探针卡用的就是这一条真实路径——
-     * 探针里另写一份的话，它证明的是探针自己，不是这张卡。
      */
     static android.app.PendingIntent openLink(Context context, List<String> urls) {
         android.content.Intent open = new android.content.Intent(context, OpenLink.class)
@@ -396,6 +393,17 @@ final class ReceiveHost {
         }
 
         /**
+         * 有没有人回答过这次邀请。见 {@link #answered}。
+         *
+         * <p>{@link Listener} 用它分辨「这条连接怎么断的」值不值得说：没人回答过的连接断了，
+         * 是这次邀请自己过期（或者人根本没被告知），不是一次失败——尤其不能把邀请超时自己
+         * 收掉连接时的 {@code ECONNABORTED} 说成「连接被系统切断，检查后台限网」。
+         */
+        boolean answered() {
+            return answered;
+        }
+
+        /**
          * 有人要发东西过来：说出去，然后等人回答。
          *
          * <p>会阻塞调用线程，和 {@link Confirmation#ask} 一样，因为调用它的那条线程本来就
@@ -453,7 +461,7 @@ final class ReceiveHost {
                         Confirmation.decision(context, session, true),
                         Confirmation.decision(context, session, false));
             }
-            // 三条出口都不通的时候，别让对面等满三十秒。
+            // 三条出口都不通的时候，别让对面等满六十秒。
             //
             // 出口只有三条：胶囊（cloud）、普通通知（Confirmation.ask）、以及正开着的界面。
             // 前两条都要 POST_NOTIFICATIONS 这条运行时权限，而新装的应用默认是关的——
@@ -505,7 +513,7 @@ final class ReceiveHost {
                 //
                 // 界面晚到一步时会按最后那一帧重放（{@link #snapshot}），而这条连接马上就要
                 // 去读 /Upload 了。中间这一段如果不说话，重放出来的就是那张已经答过的邀请——
-                // 于是同一个问题被问第二遍，这一次没人会答，三十秒后屏幕上出现「已拒绝」。
+                // 于是同一个问题被问第二遍，这一次没人会答，六十秒后屏幕上出现「已拒绝」。
                 // 人在那一刻的感觉就是「我没点拒绝，它自己拒的」。
                 //
                 // 说的是实话：人说了收，接下来就是收。字节还没到，所以没有百分比。
