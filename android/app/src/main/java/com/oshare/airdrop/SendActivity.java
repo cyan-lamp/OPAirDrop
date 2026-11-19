@@ -357,6 +357,15 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     private volatile String sendSession = "";
 
     /**
+     * 这一页的视图已经没了，但传输可能还在跑。
+     *
+     * <p>它决定两件事：{@link #onDestroy} 要不要把 {@link #cardCancel} 从 {@link SendHost} 上
+     * 摘下来（有传输在跑就还不能摘），以及发送线程收尾时要不要摘。写在最后一个收尾点上而不是
+     * 在 {@code onDestroy} 里延时——传输可能还要跑几分钟，一个恒为真的布尔比一条定时器诚实。
+     */
+    private volatile boolean pageGone;
+
+    /**
      * 卡片上那个「取消」落回这里。
      *
      * <p>先比 {@link #sendSession} 再比 {@link #sending}：卡片可能停在一张上一次留下的
@@ -570,14 +579,26 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      *
      * <p>只记「页面不在了」，不停传输：{@link SendSession} 把「页面」和「字节」分成两个布尔，
      * 正是为了这一刻——人把应用划掉时，传输该继续跑完，云也该继续在。
+     *
+     * <p># 取消的落点要不要一起撤
+     *
+     * <p>**只看有没有传输在跑**。这里原来无条件 {@code unregister}，注释说「页面销毁之后按下去
+     * 只会调到一个已经没有传输可停的对象上」——那句话是错的：{@link #live} 和 {@link #cancelling}
+     * 是这一页的字段，页面对象本身还活着（发送线程正握着它），socket 也还开着。撤掉注册的结果
+     * 不是「按了没用」，而是**卡片上那颗【取消发送】变成一颗彻底不响的按钮**——而人把面板划走
+     * 正是为了去看别的，那时能按的只剩卡片。
+     *
+     * <p>没有传输在跑时照旧撤掉：{@code SendHost.canceller} 是静态的，不撤就等于把一个已经
+     * 销毁的页面永久留在那里。有传输在跑时留着，等这一趟自己收尾再撤——见发送线程里那两处
+     * {@code pageGone} 的判断。
      */
     @Override
     protected void onDestroy() {
         SendSession.closed();
-        // 取消的落点没了：{@link #cardCancel} 停的是这一页握着的那条 socket，页面销毁之后
-        // 按下去只会调到一个已经没有传输可停的对象上。让它自己承认「这次我管不了」，卡片
-        // 会把按钮收回去，而不是按了没反应。
-        SendHost.unregister(cardCancel);
+        pageGone = true;
+        if (!sending) {
+            SendHost.unregister(cardCancel);
+        }
         super.onDestroy();
     }
 
@@ -1365,18 +1386,50 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * <p>关 socket 而不是发信号：传输线程此刻多半停在 {@code read} 上等对端回话，唯一能把它
      * 叫醒的只有「这条连接没了」。异常会在发送线程里抛出，走和失败同一条收尾路径，只是说法
      * 不同——{@link #cancelling} 记着这次是谁做的决定。
+     *
+     * <p># 三件容易写漏的事
+     *
+     * <p>**一、{@code cancelling} 要先置，哪怕没有连接可关。** 原来这里是
+     * {@code if (live == null) return;} 打头，等于「还没连上时点取消什么也不算」。从点下那台
+     * 设备到第一条连接建立，中间要过一次 DNS/SRP 查询、一次 TCP、一次 TLS 握手——2–5 秒。
+     * 这个窗口里人点了取消：{@code cancelling} 没置、socket 没有、{@code sending} 还是 true，
+     * 于是屏幕上没有反应，人也发不出第二次（{@link #send} 开头就被 {@code sending} 挡回去）。
+     * 现在先把话记下，传输线程走到下一个检查点（{@link #transfer} 开头、{@link #open} 建完、
+     * {@code /Ask} 换连接）就会自己中止。
+     *
+     * <p>**二、close 不能在主线程做。** 这个方法是视图点击进来的，也就是主线程；而
+     * {@code live} 是 {@code SSLSocket}，它的 {@code close()} 会先写一个 TLS {@code close_notify}
+     * ——一次真实的网络写。{@link HangUp#now} 把它挪到后台线程，并且用 {@code SO_LINGER(0)}
+     * 让它发的是 RST 而不是 FIN：对面 iPhone 该看到「这次传被中止了」，而不是「传完了」。
+     *
+     * <p>**三、{@code live} 在换连接的空档里指的还是上一条。** {@code /Discover} 那条答完就
+     * 作废，{@code second} 会先关掉它再新建一条。若取消正好落在这一瞬，关掉的是一个已经关掉的
+     * socket，新那条却照常建起来继续传。兜底还是上面那句 {@code cancelling}：{@link #open} 建完
+     * 连接会再看一眼它。
      */
     private void cancelSend() {
-        Socket open = live;
-        if (open == null) {
+        if (!sending) {
             return;
         }
         cancelling = true;
         Log.i(TAG, "send cancelled by the person");
-        try {
-            open.close();
-        } catch (Exception alreadyGone) {
-            Log.w(TAG, "cancel: socket was already closed", alreadyGone);
+        HangUp.now(live);
+    }
+
+    /**
+     * 一趟发送结束后的收尾：三个「正在跑」的标记一起放回空闲。
+     *
+     * <p>两个收尾点（成功、失败）原来各写一遍这三行。分开写的问题不是重复，而是**两处都少了
+     * 同一件事**：页面在发送途中被划走时，{@link #onDestroy} 特意没有摘掉 {@link #cardCancel}
+     * （摘了卡片上那颗【取消发送】就成了一颗不响的按钮），于是这件事必须由「传输真的结束」
+     * 这一刻来做，否则 {@link SendHost} 会一直握着一个已销毁的页面。
+     */
+    private void settle() {
+        sending = false;
+        live = null;
+        cancelling = false;
+        if (pageGone) {
+            SendHost.unregister(cardCancel);
         }
     }
 
@@ -1448,6 +1501,11 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         // 还是上一次那个，卡片上的取消会越过 cardCancel 里「是不是这一次」的判断。
         sendSession = UUID.randomUUID().toString();
         sending = true;
+        // 上一次按过取消、而那一次又没能走到收尾（线程卡在握手、页面被系统收回），
+        // {@code cancelling} 就会留着 true。不在这里清掉，这一趟刚起跑就会在
+        // {@link #open} 里被自己判成「人已经取消了」——一次无辜的秒失败，而且看起来
+        // 像「点发送完全没反应」。
+        cancelling = false;
         SendSession.began();
         Log.i(TAG, "send to " + peer.name + " — " + peer.address + ":" + peer.port
                 + " host=" + peer.host + ", " + files.size() + " file(s)");
@@ -1475,9 +1533,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                 Report report = Report.parse(
                         new String(frame, java.nio.charset.StandardCharsets.UTF_8));
                 runOnUiThread(() -> {
-                    sending = false;
-                    live = null;
-                    cancelling = false;
+                    settle();
                     SendSession.ended();
                     // 环褪回未开始：留着满圈会读成「还在跑」，而它已经跑完了。
                     progressOf.remove(peer.name);
@@ -1488,10 +1544,17 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                             files.size() + " 个文件 · " + size(report.bytes));
                 });
             } catch (Exception failed) {
-                Log.w(TAG, "send failed: " + peer.name, failed);
                 // 先把这个决定记下来：下面那段 lambda 里 cancelling 会被清掉，那时再问就
                 // 只会得到 false，标题永远是「发送失败」。
                 boolean stopped = cancelling;
+                if (stopped) {
+                    // 人按下的停不是故障。这条走 I 而不是 W：日志是要拿去读的，一个 W 会把
+                    // 「他说不要了」读成一次事故。异常名照留——它是「确实断在这条 socket 上」
+                    // 的证据（HangUp 关掉之后，这里必然是 Socket is closed）。
+                    Log.i(TAG, "send stopped: " + peer.name + " — " + failed);
+                } else {
+                    Log.w(TAG, "send failed: " + peer.name, failed);
+                }
                 // 对端说「不收」是这条链上唯一一种不算故障的失败：连接通了、TLS 握手成了、
                 // /Discover 回了 200、连名字都拿到了，缺的只有那台手机上的一档设置。所以
                 // 它有自己的说法——英文那一句（"… is not accepting files"）留给日志，页面
@@ -1519,9 +1582,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                 // 还是发送开始前那个占位。标题不在这里写：那一句由 {@link SendHost#label}
                 // 按状态码给，两处各写一份就会有两套说法。
                 runOnUiThread(() -> {
-                    sending = false;
-                    live = null;
-                    cancelling = false;
+                    settle();
                     SendSession.ended();
                     progressOf.remove(peer.name);
                     redrawProgress(peer.name);
@@ -1531,7 +1592,13 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     // 并列摆着，让一句已经确定的话听起来像猜测——401 是 iPhone 自己回的，
                     // 它就是在问过之后被拒的。要改设置、要亮屏那类指导在页面底部的说明卡里，
                     // 那里才是一份「对方没出现该去动哪里」的清单。
-                    String detail = refused
+                    //
+                    // 取消这一支不进卡片（{@link SendHost#finished} 直接撤卡），这里留着只因为
+                    // 它是这段分支的完整一张表：漏了它，下面那个兜底会把「再点一次设备重试」
+                    // 塞给一个刚刚说了不要的人——2026-11-19 15:07 那一版就是这么错的。
+                    String detail = stopped
+                            ? who + " 按下取消，这一趟没有发完"
+                            : refused
                             ? who + " 拒绝了这次发送"
                             : impostor
                             ? message + " · 已中止，没有发出任何内容。对方的证书若是刚换过，重新搜索一次设备再试"
@@ -1556,6 +1623,11 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     }
 
     private byte[] transfer(Peers.Peer peer, List<String> paths, boolean[] moving) throws Exception {
+        // 人可能在连上之前就把这一趟取消了（卡片上的【取消发送】从「准备中」就在）。这时
+        // 还去建连接，是拿几秒钟的握手换一次立刻作废——对面手机上会白弹一次邀请。
+        if (cancelling) {
+            throw new IOException("cancelled before connecting");
+        }
         // 每次投送都重读一次表，和接收端一样：改完设置不必重启应用，下一次点设备就是新值。
         SettingsScreen tuned = Tuning.read(this);
         int connectMs = (int) Tuning.ms(tuned, "client.connect_timeout_ms", CONNECT_TIMEOUT_MS);
@@ -1702,6 +1774,12 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         try {
             SSLSocket tls = connectTls(peer, live);
             live = tls;
+            // 握手这一段可能有好几百毫秒，人在那期间点了取消的话，{@link #cancelSend} 能关到的
+            // 只有裸 socket（它当时还不知道 TLS 那一层）。这里再看一眼：真取消了就抛出去，
+            // 由下面那个 catch 把刚建成的这条关掉，别让传输白跑一趟 /Discover。
+            if (cancelling) {
+                throw new IOException("cancelled during the connection");
+            }
             return tls;
         } catch (IOException failed) {
             closeQuietly(live);

@@ -1011,7 +1011,7 @@ final class Listener {
                 Log.i(TAG, "connection from " + where(peer) + " ended: " + describe(refused));
                 return;
             }
-            String because = because(refused);
+            String because = because(refused, meter.bytes());
             Log.w(TAG, "receive from " + where(peer) + " failed: " + describe(refused));
             setState("接收失败：" + because, true);
             // 页面、卡片、日志说的是同一句话，但页面可能是关着的——而人刚刚是从胶囊上点的
@@ -1132,9 +1132,11 @@ final class Listener {
      * {@code SocketException} 在这一层已经把 reset、broken pipe、closed 全都收进了同一个类，
      * 而这三句是 libcore 的固定译文、Android 每个版本都这么写。
      *
-     * <p>为什么不把 ECONNABORTED 归成「对端走掉」：这两个 errno 的方向相反。reset 是**对面**
-     * 发了 RST（分享面板关了），abort 是**我们自己**的内核把 fd 收了（后台限网、VPN 掉了、
-     * 息屏断网）。前者不该打扰人，后者恰恰是这台机器出了问题——而它偏偏长得最像前者。
+     * <p>为什么不把 ECONNABORTED 归成「对端走掉」：两个 errno 的方向不一样。reset 一定是
+     * **对面**发了 RST（分享面板关了）；abort 是本机这条连接被中止——后台限网、VPN 掉了、
+     * 息屏断网，或者，如 2026-11-19 实测的那样，**对端在 AWDL 这条隧道上收手**，我们这边的
+     * 内核跟着把 fd 收了。前者不该打扰人，后者要看情况，所以它单独判一次，具体说法见
+     * {@link #because(Throwable, long)}。
      */
     private static boolean aborted(Throwable socket) {
         String message = socket.getMessage();
@@ -1237,10 +1239,36 @@ final class Listener {
      *
      * <p>只有 ECONNABORTED 需要翻译。其余非例行的失败（目录写不进去、设置读不出来）原文
      * 本来就带着人能看懂的那半句，比如文件名和路径。
+     *
+     * <p># ECONNABORTED 要看「断了之前走过字节没有」
+     *
+     * <p>这个 errno 原来是**一律**翻成「检查后台限网」的，依据是 2026-11-17 那次：ColorOS 的
+     * nwpower 在应用离开前台时掐掉 socket，那时确实一个字节都没走。
+     *
+     * <p>2026-11-19 14:55 的实测推翻了「一律」：iPhone 发一个 15.5 MB 的视频过来，传到 2.3 MB
+     * 时那边按了取消，我们这一侧抛的是
+     *
+     * <pre>
+     * 14:55:18.287 W/OPAirDrop: receive from fe80::704d:92ff:fe08:dd2%awdltun0 failed:
+     *                            Software caused connection abort
+     * </pre>
+     *
+     * <p>——同一个 errno，意思却相反：这次是**对面**停的。按原来那句话去查后台限网，人会在
+     * 一个没有问题的设置上打转。
+     *
+     * <p>所以判据换成「有没有字节真的落地」：{@code /Upload} 一个字节都没开始就走完的连接，
+     * 只可能是本机这边先没了（限网、息屏、接口掉了）；走了几兆才断的，是传到一半被停下——
+     * 而这一次是谁停的，从我们这一侧分不出来（对面取消、和对面手机息屏断网，留下的都是这一句），
+     * 所以那句话不点名，只说发生了什么、丢了多少。
+     *
+     * @param landed 断之前已经落地的字节数
      */
-    private static String because(Throwable failed) {
+    private static String because(Throwable failed, long landed) {
         for (Throwable cause = failed; cause != null; cause = cause.getCause()) {
             if (aborted(cause)) {
+                if (landed > 0) {
+                    return "传输在中途被中断，已收到 " + bytes(landed) + "，没有存下";
+                }
                 // 把可行动的那一步一起说出来。措辞与首屏那条提示条、设置页同一个说法对齐
                 // （见 Notices.gap 的「后台被限网」），否则人会以为是两件事。
                 return "连接被系统切断，检查后台限网";
@@ -1293,12 +1321,25 @@ final class Listener {
         /** 上次投递的时刻（{@link System#nanoTime}）；0 表示一次都还没投递过。 */
         private long postedAt;
 
+        /**
+         * 最后一次报上来的已落地字节数。
+         *
+         * <p>只为了分辨一件事：这条连接断的时候，**有没有一个字节真的走过**。零字节断开是
+         * 「对面还没开始/本机还没来得及开始」，走了几兆才断开是「传到一半被停下」——这两种
+         * 在人那边要做的事完全不同，而异常本身只有一个 errno。
+         *
+         * <p>写在节流判断之前而不是之后：被节流掉的那几次恰恰是最后几次，漏记的话，一个在
+         * 两百毫秒内断掉的传输会被读成「一个字节都没走」。
+         */
+        private volatile long done;
+
         Meter(ReceiveHost.Attempt attempt) {
             this.attempt = attempt;
         }
 
         @Override
         public void landed(long done, long total) {
+            this.done = done;
             long now = System.nanoTime();
             // 第一条立刻投出去：否则前两百毫秒里一个小文件已经收完了，人什么都没看见。
             if (postedAt != 0 && now - postedAt < INTERVAL_MS * 1_000_000L) {
@@ -1308,6 +1349,11 @@ final class Listener {
             // 进度只画在流体云那张卡上（{@code attempt.progress}）。普通通知不再画任何进度：
             // 同一条传输在两处同时走进度，一处是胶囊、一处是通知栏，人只会看见两个不一样的数。
             attempt.progress(done, total);
+        }
+
+        /** 有没有字节真的落地过。见 {@link #done}。 */
+        long bytes() {
+            return done;
         }
 
         /** 有结果了。 */

@@ -211,9 +211,9 @@ final class LiveCard {
      *
      * <p># 为什么进度卡该有这颗按钮
      *
-     * <p>发送侧一直有取消（{@link SendActivity} 的界面按钮），接收侧没有：点了「接收」之后，
-     * 人唯一能做的就是把手机放下等它传完。一个几百兆的视频传到一半、发现传错了设备，或者
-     * 对面那台手机就在手上要先说句话——这时卡片上没有任何出口，人只能去杀进程或者拔网络。
+     * <p>点了「接收」之后，人唯一能做的就是把手机放下等它传完。一个几百兆的视频传到一半、
+     * 发现传错了设备，或者对面那台手机就在手上要先说句话——那时卡片上没有任何出口，人只能
+     * 去杀进程或者拔网络。
      *
      * <p># 为什么它只在进度中出现，不在邀请中出现
      *
@@ -231,7 +231,27 @@ final class LiveCard {
      */
     static void updateWithCancel(Context context, String title, String shortText, int percent,
                                  PendingIntent cancel) {
-        post(context, title, shortText, percent, false, false, null, null, null, "取消接收", cancel);
+        updateWithStop(context, title, shortText, percent, "取消接收", cancel);
+    }
+
+    /**
+     * 进度卡上那颗「这件事还没结束，要不要停」的按钮，名字由调用方给。
+     *
+     * <p># 为什么名字是参数
+     *
+     * <p>同一颗按钮在两个方向上说的不是一件事：接收时停的是「我不收了」，发送时停的是
+     * 「我发出去的这份不算了」。写成两个方法名只会让 {@code post} 的那两个重载各挂一次，
+     * 而这颗按钮的位置、时机、按下去之后的收尾三者完全相同——不同的只有一个词。
+     *
+     * <p>写错这个词的代价是实打实的：在两台手机中间看这张卡的人，靠这一行判断「我现在停的
+     * 是收还是发」。收发同时进行（一边收一边给第三台发）时，这是唯一能分辨的地方。
+     *
+     * @param label 按钮上那个词，例如「取消接收」「取消发送」
+     * @param stop  按下去要做的事；{@code null} 时这颗按钮不挂
+     */
+    static void updateWithStop(Context context, String title, String shortText, int percent,
+                               String label, PendingIntent stop) {
+        post(context, title, shortText, percent, false, false, null, null, null, label, stop);
     }
 
     /**
@@ -476,9 +496,9 @@ final class LiveCard {
     /**
      * 同上，多一颗「进行中才能按」的按钮。
      *
-     * <p>它是重载而不是把 {@code stop} 加进上面那个签名：上面那六处调用点里有五处永远没有这颗
-     * 按钮，为了一个只有接收进度用得到的参数，让它们各写一遍 {@code null}，读代码的人会以为
-     * 那五个 {@code null} 各自有含义。
+     * <p>它是重载而不是把 {@code stop} 加进上面那个签名：上面那六处调用点里没有一处需要这颗
+     * 按钮，为了它让它们各写一遍 {@code null}，读代码的人会以为那六个 {@code null} 各自有
+     * 含义。
      *
      * @param stopLabel 那颗按钮写什么；{@code stop} 为 {@code null} 时不看
      * @param stop      进行中的那颗按钮，没有就不挂
@@ -524,9 +544,9 @@ final class LiveCard {
         if (retry != null) {
             builder.addAction(new Notification.Action.Builder(null, "重试", retry).build());
         }
-        // 进行中那颗（目前只有【取消接收】）。它和上面两颗不会同时出现：一颗说的是「这件事
-        // 还没结束，要不要停」，上面两颗说的是「这件事已经结束了，接下来做什么」。同一张卡上
-        // 同时问这两个问题，读的人只会以为这是一次已经失败的传输。
+        // 进行中那颗（【取消接收】/【取消发送】，名字由调用方给）。它和上面两颗不会同时出现：
+        // 一颗说的是「这件事还没结束，要不要停」，上面两颗说的是「这件事已经结束了，接下来做
+        // 什么」。同一张卡上同时问这两个问题，读的人只会以为这是一次已经失败的传输。
         if (stop != null) {
             builder.addAction(new Notification.Action.Builder(null,
                     stopLabel == null ? "取消接收" : stopLabel, stop).build());

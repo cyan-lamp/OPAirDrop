@@ -155,6 +155,12 @@
             android:name=".CardDismiss"
             android:exported="false" />
 
+        <!-- 发送那张卡上【取消发送】的落点。同样不导出：一条能被别的应用伪造的「取消」，
+             等于让外面决定我们哪一次传输作废。 -->
+        <receiver
+            android:name=".SendCancel"
+            android:exported="false" />
+
         <!-- Reachable only from the settings page, so not exported: there is nothing a
              settings page does that another app should be able to trigger. -->
         <activity

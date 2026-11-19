@@ -792,61 +792,15 @@ final class ReceiveHost {
         }
 
         /**
-         * 把这条连接掐掉。**必须不在调用者线程上做**。
+         * 把这条连接掐掉。**必须不在调用者线程上做**——{@link HangUp#now} 负责这条约束，
+         * 连同「为什么必须发 RST 而不是好好说再见」「那条读字节的线程怎么办」都在它那里。
          *
-         * <p># 为什么不能就地 close
-         *
-         * <p>按【取消接收】的那一下走的是广播：{@link DecisionReceiver} 在**主线程**上被唤起，
-         * 于是这个方法也在主线程上跑。而 {@code peer} 是 {@code SSLSocket}，它的
-         * {@code close()} 不是把描述符一扔了事——它会先写一个 TLS {@code close_notify} 收尾，
-         * 也就是一次真实的写网络。2026-11-19 14:12 那一版就是这么崩的：
-         *
-         * <pre>
-         * NetworkOnMainThreadException
-         *   at ReceiveHost$Attempt.cancel(ReceiveHost.java:791)
-         *   at DecisionReceiver.onReceive(DecisionReceiver.java:32)
-         * </pre>
-         *
-         * <p>崩的是整个进程，卡片和传输一起没了。一次「我不想收了」换来一次崩溃，比没有这颗
-         * 按钮更糟。
-         *
-         * <p># 为什么是 RST 而不是好好地说再见
-         *
-         * <p>取消这个动作，在线的另一端只该有一种读法：**这次传输被中止了**。而正常的
-         * {@code close()} 在收包缓冲里还压着没读完的字节时，内核发的本来就是 RST——见
-         * {@link Listener#hangUp} 里那段实测。这里索性把这件事说明白：先把
-         * {@code SO_LINGER(0)} 设上，再关，RST 立刻出去，不等发送缓冲排空。
-         *
-         * <p>这和对面是 iPhone 时的行为是同一个信号：2026-11-19 那次实测，我们在 iPhone 上
-         * 中途取消，它回的正是 RST。现在反过来，我们也是回它一个 RST。
-         *
-         * <p># 那条读字节的线程怎么办
-         *
-         * <p>它不用叫醒，也不该被指望能叫醒：另一个线程 {@code close()} 一个正在 {@code read}
-         * 里阻塞的 socket，并不保证唤醒那次 read（Linux 上 fd 的引用还在 syscall 手里）。能
-         * 指望的是两件事，而这两件事在传输中本来就成立——{@link Listener#serve} 给 socket 设了
-         * SoTimeout 兜底，且对面此刻正在不停发字节，read 每收一块就返回一次；下一次 read 撞上
-         * 一个已关闭的 socket，立刻抛 {@code SocketException: Socket closed}。
-         *
-         * <p>单开一条线程而不是丢进公共线程池：这件事只做一次、做完就死，占一个池位没有意义，
-         * 而取消是人在急的时候按的——不值得排在别人后面。
+         * <p>这里只留一件本地的事：{@code peer} 此刻可能还是握手前的裸 socket，也可能是
+         * TLS 那一层。两种都行——{@code setSoLinger} 与 {@code close} 在两边都成立，而取消
+         * 只有一条路可走：把这条连接弄没。
          */
         private void abort() {
-            Thread cutting = new Thread(() -> {
-                try {
-                    // 先设，再关：反过来的话 close 已经开始走 TLS 收尾，就晚了。
-                    peer.setSoLinger(true, 0);
-                } catch (IOException alreadyGone) {
-                    // 描述符早就没了。照样往下走，close 幂等。
-                }
-                try {
-                    peer.close();
-                } catch (IOException alreadyGone) {
-                    // 已经断了：那条线程自己会走到收尾，并把这句「已取消」说出去。
-                }
-            }, "airdrop-receive-abort");
-            cutting.setDaemon(true);
-            cutting.start();
+            HangUp.now(peer);
         }
 
         /** 把最后那条再说一遍。界面晚到的时候用。 */
