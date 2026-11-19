@@ -75,6 +75,16 @@ final class Tuning {
         return ms(read(context), key, fallback);
     }
 
+    /**
+     * 一行**计数**设置（条数、层数、条流数），取不到或不是整数就用 {@code fallback}。
+     *
+     * <p>和 {@link #ms} 是同一段代码，只是名字不同。分开命名不是为了绕开复用，是因为
+     * 「毫秒」这个词出现在 {@code client.streams} 旁边会读成一个时间——而它是一个条数。
+     */
+    static long count(SettingsScreen screen, String key, long fallback) {
+        return ms(screen, key, fallback);
+    }
+
     /** 同上，从应用私有目录读。 */
     static long ms(File directory, String key, long fallback) {
         return ms(read(directory), key, fallback);

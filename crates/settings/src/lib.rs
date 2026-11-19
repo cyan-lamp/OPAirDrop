@@ -244,6 +244,17 @@ pub const CATALOG: &[Setting] = &[
         summary: "档案已经在发，等的是对面手机上那个人点「接受」。他犹豫多久都合法，所以它比上面那行长得多。",
     },
     Setting {
+        key: "client.streams",
+        kind: Kind::Number {
+            min: 1,
+            max: 6,
+            unit: Unit::Plain,
+        },
+        default: "1",
+        title: "并行连接数",
+        summary: "把要发的文件分成几组、同时投送。iPhone 一条连接只答一个请求，所以每一组都是一趟完整的投递，对面手机上会为每一趟各问一次「接受」。1 就是老样子。",
+    },
+    Setting {
         key: "http.response_limit",
         kind: Kind::Number {
             min: 4 * 1024,

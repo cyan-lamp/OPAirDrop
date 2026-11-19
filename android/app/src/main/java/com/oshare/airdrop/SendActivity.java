@@ -47,11 +47,20 @@ import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.security.GeneralSecurityException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.concurrent.atomic.AtomicReference;
 
 import javax.net.ssl.SSLSocket;
 
@@ -310,13 +319,24 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     private boolean picking;
 
     /**
-     * 正在跑的那条连接。
+     * 正在跑的那几条连接。
      *
-     * <p>取消发送只有一条路：把这个 socket 关掉，正在读/写的线程立刻抛出来。协议里没有
+     * <p>取消发送只有一条路：把这些 socket 关掉，正在读/写的线程立刻抛出来。协议里没有
      * 「收手」这种说法——对面已经在收字节，唯一的停法就是断线。所以这个字段不是为了优雅，
      * 是为了让人点了取消之后真的停。
+     *
+     * <p># 为什么是集合而不是一个 {@code volatile Socket}
+     *
+     * <p>它原来是单数，因为一次投送只有一条连接活着（{@code /Discover} 那条答完就作废，
+     * {@code /Ask} 换新的那条接手）。多流并行之后同时有 N 条在跑，只关掉最后登记的那一条
+     * 等于关掉其中一条、剩下 N−1 条照传——取消看着点了却没停，而这种半停最坏：屏幕说
+     * 「已取消」，对面手机上还在收。
+     *
+     * <p>用 {@link Collections#synchronizedSet} 而不是 {@code CopyOnWriteArraySet}：写（建连、
+     * 换连接）只发生在发送线程里，读（取消）只在人点那一下，两者都极少，但这个集合要在遍历
+     * 时不被并发写打乱——取消是一次快照之后逐个关，不持锁关 socket。
      */
-    private volatile Socket live;
+    private final Set<Socket> live = Collections.synchronizedSet(new LinkedHashSet<>());
 
     /** 这一次停是用户点的，不是出故障。catch 里靠它决定说「已取消」还是说原因。 */
     private volatile boolean cancelling;
@@ -1402,10 +1422,13 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * ——一次真实的网络写。{@link HangUp#now} 把它挪到后台线程，并且用 {@code SO_LINGER(0)}
      * 让它发的是 RST 而不是 FIN：对面 iPhone 该看到「这次传被中止了」，而不是「传完了」。
      *
-     * <p>**三、{@code live} 在换连接的空档里指的还是上一条。** {@code /Discover} 那条答完就
-     * 作废，{@code second} 会先关掉它再新建一条。若取消正好落在这一瞬，关掉的是一个已经关掉的
-     * socket，新那条却照常建起来继续传。兜底还是上面那句 {@code cancelling}：{@link #open} 建完
+     * <p>**三、换连接的空档里，集合里两条都在。** {@code /Discover} 那条答完就作废，
+     * {@code second} 会先关掉它再新建一条，于是有那么一瞬 {@link #live} 里装着新旧两条。
+     * 这不是缺陷而是冗余：多余的那条关掉也没事（{@link HangUp#now} 对已经关掉的 socket
+     * 是幂等的），少装一条才是缺陷。兜底仍然是上面那句 {@code cancelling}：{@link #open} 建完
      * 连接会再看一眼它。
+     *
+     * <p>**四、多流并行之后要关的是全部。** 见 {@link #live} 的类注释。
      */
     private void cancelSend() {
         if (!sending) {
@@ -1413,7 +1436,24 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         }
         cancelling = true;
         Log.i(TAG, "send cancelled by the person");
-        HangUp.now(live);
+        hangUpAll();
+    }
+
+    /**
+     * 把当前登记着的连接全部掐掉。
+     *
+     * <p>先取快照再逐个关：{@link HangUp#now} 会另起线程去写网络，若在遍历里边关边让别人
+     * 往里登记，会撞上 {@link java.util.ConcurrentModificationException}——而这条路径上抛异常
+     * 的后果是「点了取消没反应」。
+     */
+    private void hangUpAll() {
+        Socket[] all;
+        synchronized (live) {
+            all = live.toArray(new Socket[0]);
+        }
+        for (Socket one : all) {
+            HangUp.now(one);
+        }
     }
 
     /**
@@ -1426,7 +1466,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      */
     private void settle() {
         sending = false;
-        live = null;
+        live.clear();
         cancelling = false;
         if (pageGone) {
             SendHost.unregister(cardCancel);
@@ -1523,29 +1563,34 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             paths.add(file.getAbsolutePath());
         }
 
+        // 每次投送都重读一次表，和接收端一样：改完设置不必重启应用，下一次点设备就是新值。
+        // 读在起线程之前，是因为「开几条流」这一件事必须在动手之前定下来，而建连超时那三个
+        // 数字要发给每一条流——分开读会读到表的两份副本，N 条流用 N 套超时。
+        SettingsScreen tuned = Tuning.read(this);
+        List<List<String>> lanes = share(files, streamCount(tuned, files.size()));
+        Log.i(TAG, "send uses " + lanes.size() + " lane(s) for " + paths.size() + " file(s)");
+
         new Thread(() -> {
             // 这一趟走到哪儿了。写在对象里是因为它由进度回调填、由 catch 读。
             //
             // 两件事必须分开记：{@code moving} 是「对面已经点了接受」（进度相位进了 SENDING），
             // 它决定超时那句该说「没有接受」还是「不再回应」；{@code bytes} 是「有多少字节真的
-            // 写进了那条 socket」，它决定中断那句该不该怪环境。前者推不出后者——刚进 SENDING
+            // 写进了那几条 socket」，它决定中断那句该不该怪环境。前者推不出后者——刚进 SENDING
             // 相位时可能一个字节都还没写出去；后者也推不出前者，因为 setSoTimeout 那一下
             // 看的就是相位。
-            Flight flight = new Flight();
+            Flight flight = new Flight(lanes.size());
             try {
-                byte[] frame = transfer(peer, paths, flight);
-                Report report = Report.parse(
-                        new String(frame, java.nio.charset.StandardCharsets.UTF_8));
+                long moved = sendLanes(peer, lanes, flight, tuned);
                 runOnUiThread(() -> {
                     settle();
                     SendSession.ended();
                     // 环褪回未开始：留着满圈会读成「还在跑」，而它已经跑完了。
                     progressOf.remove(peer.name);
                     redrawProgress(peer.name);
-                    status(peer, "已发送 · " + size(report.bytes));
+                    status(peer, "已发送 · " + size(moved));
                     // 终态。卡片只在 SUCCESS 上放成功的动画，所以这个码不能换成别的。
                     SendHost.finished(sendSession, peer.name, SendHost.SUCCESS,
-                            files.size() + " 个文件 · " + size(report.bytes));
+                            files.size() + " 个文件 · " + size(moved));
                 });
             } catch (Exception failed) {
                 // 先把这个决定记下来：下面那段 lambda 里 cancelling 会被清掉，那时再问就
@@ -1576,7 +1621,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                 String message = stopped ? "已取消"
                         : refused ? "对方拒绝"
                         : impostor ? "对方身份不符"
-                        : timedOut ? (flight.moving ? "对方不再回应" : "对方没有接受")
+                        : timedOut ? (flight.moving.get() ? "对方不再回应" : "对方没有接受")
                         // 原文（"Connection reset" 之类）只进日志：页面那行是给站在两台手机
                         // 中间的人看的，他要知道的是「还得再试一次」，不是异常类名。
                         : "连接被中断";
@@ -1607,7 +1652,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                             : impostor
                             ? message + " · 已中止，没有发出任何内容。对方的证书若是刚换过，重新搜索一次设备再试"
                             : timedOut
-                            ? who + (flight.moving
+                            ? who + (flight.moving.get()
                                     ? " 不再回应 · 保持亮屏、别切走隔空投送，再点一次设备重试"
                                     : " 没有接受 · 弹窗出现后十五秒内点「接受」；"
                                             + "没有弹窗就把隔空投送改成「所有人（10 分钟）」并保持亮屏")
@@ -1621,8 +1666,9 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                             // 这时候劝人再去调环境，等于替对面那次「停」编一个不存在的理由。
                             // 所以只说发生了什么：发了多少、没发完。**刻意不点名是谁停的**，
                             // 从我们这侧看，「对面取消」和「对面断网」长得一模一样。
-                            : flight.bytes > 0
-                                    ? "传输在中途被中断，已发出 " + size(flight.bytes) + "，没有发完"
+                            : flight.sentBytes() > 0
+                                    ? "传输在中途被中断，已发出 " + size(flight.sentBytes())
+                                            + "，没有发完"
                                     : message + " · 保持两台设备都亮屏、隔空投送不切走，"
                                             + "再点一次设备重试";
                     // 各有各的码：人按了取消是 1009，对面不收是 1008，等不到回答是 1010，
@@ -1639,23 +1685,28 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         }, "opairdrop-send").start();
     }
 
-    private byte[] transfer(Peers.Peer peer, List<String> paths, Flight flight) throws Exception {
+    /**
+     * 一条流：一趟完整的「发现、请求、发档案」，两条连接。
+     *
+     * @param paths 这一条流要送的**那几份**文件——不是全部。分给谁由 {@link #share} 定
+     * @param flight 各条流共用的那块记账板；{@code lane} 是这一条在里面占的格子
+     * @param lane 这是第几条流，用自己的格子，不碰别人的
+     */
+    private byte[] transfer(Peers.Peer peer, List<String> paths, Flight flight, int lane,
+                            SettingsScreen tuned) throws Exception {
         // 人可能在连上之前就把这一趟取消了（卡片上的【取消发送】从「准备中」就在）。这时
         // 还去建连接，是拿几秒钟的握手换一次立刻作废——对面手机上会白弹一次邀请。
-        if (cancelling) {
+        // 另一条流先倒下时同理：{@code abort} 一置，剩下的流不该再让对面多弹一次窗。
+        if (cancelling || flight.abort.get()) {
             throw new IOException("cancelled before connecting");
         }
-        // 每次投送都重读一次表，和接收端一样：改完设置不必重启应用，下一次点设备就是新值。
-        SettingsScreen tuned = Tuning.read(this);
         int connectMs = (int) Tuning.ms(tuned, "client.connect_timeout_ms", CONNECT_TIMEOUT_MS);
         int readMs = (int) Tuning.ms(tuned, "client.read_timeout_ms", READ_TIMEOUT_MS);
         int uploadReadMs =
                 (int) Tuning.ms(tuned, "client.upload_read_timeout_ms", UPLOAD_READ_TIMEOUT_MS);
-        // 上一次记日志时的十分位。只用来去重，跨传输复用没有意义，所以是局部变量。
-        int[] quarter = {-1};
 
         // 第一条：/Discover 走这里，答完就作废。
-        SSLSocket[] held = {open(peer, connectMs, readMs)};
+        SSLSocket[] held = {open(peer, connectMs, readMs, flight)};
 
         // 第二条：/Ask 和 /Upload 走这里。谁来换、什么时候换由 Rust 定——它在 /Discover
         // 与 /Ask 之间调一次 {@code connect}——这里只负责「再连一次」这件事本身。
@@ -1664,14 +1715,15 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         // socket 还开着，于是写进同一条连接的 /Ask 换回来的不是 401、不是 reset、不是关闭，
         // 是什么都没有。本仓为此白等了整整一个读超时，界面停在「正在请求发送…」。
         Native.Link second = () -> {
-            if (cancelling) {
+            if (cancelling || flight.abort.get()) {
                 // 人已经点了取消。再连一条只会让取消慢一步，所以让传输就地从这里失败。
                 throw new IOException("cancelled before the second connection");
             }
-            Log.i(TAG, "second connection for /Ask");
+            Log.i(TAG, "lane " + lane + ": second connection for /Ask");
             closeQuietly(held[0]);
+            live.remove(held[0]);
             held[0] = null;
-            SSLSocket next = open(peer, connectMs, readMs);
+            SSLSocket next = open(peer, connectMs, readMs, flight);
             held[0] = next;
             return next;
         };
@@ -1700,7 +1752,13 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                             // ——人要先在对面手机上点接受，档案才可能开始落地。两个等待
                             // 该给的耐心不一样：弹窗十五秒内就该有结果，点了接受之后不设
                             // 上限会让人以为卡住。
-                            flight.moving = true;
+                            //
+                            // 这一句必须**每条流各做一次**，不能拿 {@code moving} 当门闩：
+                            // 那是四块格子共用的一面旗，只让第一条流改自己那条 socket 的话，
+                            // 另外三条会拿着 15 秒的短超时去等接受，然后准时炸掉整趟发送。
+                            // 2026-11-19 23:29 就是这么死的（lane 1 在 15.005 s 报 Read timed out）。
+                            // 超时是每条连接各自一份的，改的也是这条流自己的 {@code held[0]}。
+                            flight.moving.set(true);
                             try {
                                 held[0].setSoTimeout(uploadReadMs);
                             } catch (Exception noTimeout) {
@@ -1709,47 +1767,68 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                             }
                         }
                         // 只往后两个相位记字节数：等待相位送进来的 0 会把已经走过的量抹掉，
-                        // 而这两个相位是单调的，后来的值不会比先前小。
+                        // 而这两个相位是单调的，后来的值不会比先前小。各流记各流的格子，
+                        // 分母用整件事的总字节（{@code totalBytes}，从点发送那一刻就定死了），
+                        // 所以后面几条流陆续起跑时百分比不会往回跳。
                         if (phase == Native.Progress.SENDING || phase == Native.Progress.DONE) {
-                            flight.bytes = sent;
+                            flight.sent.set(lane, sent);
                         }
+                        // DONE 每条流各来一次，只有最后一条该让界面说「等待确认」。
+                        boolean last = phase == Native.Progress.DONE
+                                && flight.finished.incrementAndGet() >= flight.lanes;
+                        long done = flight.sentBytes();
+                        long whole = totalBytes;
                         runOnUiThread(() -> {
                             switch (phase) {
                                 case Native.Progress.READY -> {
-                                    Log.i(TAG, "phase ready (handshake done, asking)");
+                                    // 几条流各自握手，但界面只有一行字。已经有别的流在发字节了，
+                                    // 就不能把「发送中 45%」退回「正在请求发送…」。
+                                    if (flight.moving.get()) {
+                                        return;
+                                    }
+                                    Log.i(TAG, "lane " + lane + ": ready (handshake done, asking)");
                                     status(peer, "已连接，正在请求发送…");
                                     SendHost.waiting(sendSession, peer.name, "已连接，正在请求发送…");
                                 }
                                 case Native.Progress.WAITING -> {
-                                    Log.i(TAG, "phase waiting (the person has been asked)");
+                                    if (flight.moving.get()) {
+                                        return;
+                                    }
+                                    Log.i(TAG, "lane " + lane + ": waiting (the person has been asked)");
                                     status(peer, "等待对方接受…");
                                     SendHost.waiting(sendSession, peer.name, "等待对方接受…");
                                 }
                                 case Native.Progress.SENDING -> {
                                     progressOf.put(peer.name,
-                                            total == 0 ? 0f : Math.min(1f, (float) sent / total));
+                                            whole == 0 ? 0f : Math.min(1f, (float) done / whole));
                                     redrawProgress(peer.name);
-                                    String count = "发送中 " + (total == 0 ? 0 : sent * 100 / total) + "%";
+                                    String count = "发送中 " + (whole == 0 ? 0 : done * 100 / whole) + "%";
                                     status(peer, count);
                                     // 卡片上的百分比走胶囊，第二行给的是字节数：同一句「45%」在
                                     // 两个地方各写一遍，晚一帧就是两个数。
                                     // 胶囊标题用真名（/Discover 带回的那个），不是 hash。
                                     SendHost.progress(sendSession, label(peer),
-                                            total == 0 ? -1 : (int) (sent * 100 / total),
-                                            files.size() + " 个文件" + (total == 0 ? ""
-                                                    : " · " + size(sent) + " / " + size(total)));
+                                            whole == 0 ? -1 : (int) (done * 100 / whole),
+                                            files.size() + " 个文件" + (whole == 0 ? ""
+                                                    : " · " + size(done) + " / " + size(whole)));
                                     // 回调每秒来几十上百次。只在一成、两成……这些整点上留痕，
-                                    // 否则一个 200 MB 的文件能把整段日志冲掉。
-                                    int step = total == 0 ? -1 : (int) (sent * 10 / total);
-                                    if (step != quarter[0]) {
-                                        quarter[0] = step;
-                                        Log.i(TAG, "phase sending " + (total == 0 ? "?"
-                                                : sent * 100 / total + "%") + " (" + sent
-                                                + "/" + total + " bytes)");
+                                    // 否则一个 200 MB 的文件能把整段日志冲掉。这条十分位是
+                                    // **整件事**的，不是某条流的：多流并行的加速度就要靠它读，
+                                    // 按流各记一份会得到 N 条分辨率很低的曲线。
+                                    int step = whole == 0 ? -1 : (int) (done * 10 / whole);
+                                    if (step != flight.decile.getAndSet(step)) {
+                                        Log.i(TAG, "phase sending "
+                                                + (whole == 0 ? "?" : done * 100 / whole + "%")
+                                                + " (" + done + "/" + whole + " bytes, lane "
+                                                + lane + " at " + sent + ")");
                                     }
                                 }
                                 case Native.Progress.DONE -> {
-                                    Log.i(TAG, "phase done (all bytes written, waiting for the report)");
+                                    if (!last) {
+                                        return;
+                                    }
+                                    Log.i(TAG, "lane " + lane + ": done (all bytes written, "
+                                            + "waiting for the reports)");
                                     progressOf.put(peer.name, 1f);
                                     redrawProgress(peer.name);
                                     status(peer, "已发送，等待确认…");
@@ -1764,14 +1843,127 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             // 关最后那一条。中途换过连接的话，前一条已经在 second 里关掉了——那条连接上
             // 已经答过一个请求，留着它没有任何用处。
             closeQuietly(held[0]);
+            live.remove(held[0]);
             held[0] = null;
         }
     }
 
     /**
+     * 这一次要开几条流。
+     *
+     * <p>上限由文件和设置一起给：一条流只能承载**整个文件**——{@code /Ask} 报的是一份份
+     * 带类型、带图标的条目，{@code /Upload} 送的是它们的 DVZip，两者都没有「某个文件的第 N
+     * 段」这种说法。所以一个文件分不给两条流，文件数就是硬上限。**一个文件的多流并行不存在**，
+     * 这不是偷懒，是协议的形状。
+     */
+    private static int streamCount(SettingsScreen tuned, int files) {
+        long want = Tuning.count(tuned, "client.streams", 1);
+        return (int) Math.max(1, Math.min(want, files));
+    }
+
+    /**
+     * 把文件摊成最多 {@code streams} 组，让各组的字节数尽量接近。
+     *
+     * <p>大文件先摆、每次放进当时最空的那一组。不是「按数量均分」：一份 500 MB 的视频配上
+     * 九个 2 MB 的照片，按数量分会得到「视频 + 一张照片」和「八张照片」两组，两者差两个数量
+     * 级，并行的意义当场归零——快的那组早就在等慢的那组了。
+     *
+     * <p>组内保持人选的原始顺序，只是为了让日志和对面那份清单读起来还是原来那个顺序。
+     */
+    private static List<List<String>> share(List<File> files, int streams) {
+        int lanes = Math.max(1, Math.min(streams, files.size()));
+        Integer[] order = new Integer[files.size()];
+        for (int i = 0; i < order.length; i++) {
+            order[i] = i;
+        }
+        Arrays.sort(order,
+                (a, b) -> Long.compare(files.get(b).length(), files.get(a).length()));
+        long[] load = new long[lanes];
+        int[] laneOf = new int[files.size()];
+        for (Integer index : order) {
+            int pick = 0;
+            for (int l = 1; l < lanes; l++) {
+                if (load[l] < load[pick]) {
+                    pick = l;
+                }
+            }
+            laneOf[index] = pick;
+            load[pick] += files.get(index).length();
+        }
+        List<List<String>> groups = new ArrayList<>();
+        for (int l = 0; l < lanes; l++) {
+            groups.add(new ArrayList<>());
+        }
+        for (int i = 0; i < files.size(); i++) {
+            groups.get(laneOf[i]).add(files.get(i).getAbsolutePath());
+        }
+        return groups;
+    }
+
+    /**
+     * 把这一趟送出去：几条流同时各跑一趟完整对话，等它们全部收尾。
+     *
+     * <p># 为什么是 N 次完整的 FFI 调用，而不是在 Rust 里并行
+     *
+     * <p>协议规定一条连接只承载一个请求（{@code /Discover} 一条、{@code /Ask}+{@code /Upload}
+     * 另一条），所以「多流」没有别的实现方式：它就是 N 趟独立投送。把它做成 N 次
+     * {@link Native#sendWithProgress} 调用，Rust 那边一行都不用改——每条流照旧是「发现、
+     * 请求、发档案」，各自的 {@code Client}、各自的连接、各自的计数器，{@code crates/ffi}
+     * 里也没有任何全局可变状态会被它们踩到（那个 {@code Mutex} 在 BLE 那边）。
+     *
+     * <p>代价写在设置页那一行里：一条流一次 {@code /Ask}，所以对面手机上会为每一趟各问一次
+     * 「接受」。
+     *
+     * <p># 一条倒下就全停
+     *
+     * <p>对面拒了其中一次请求、或者那条连接断了，剩下的几条没有继续的意义：这次投送已经
+     * 不是一个完整的交付。所以第一条抛出异常时置 {@link Flight#abort} 并掐掉全部连接，
+     * 由调用方那句 {@code catch} 统一说这一次的结论——而不是让 N 条流各说一遍。
+     */
+    private long sendLanes(Peers.Peer peer, List<List<String>> lanes, Flight flight,
+                           SettingsScreen tuned) throws Exception {
+        byte[][] frames = new byte[lanes.size()][];
+        CountDownLatch finished = new CountDownLatch(lanes.size());
+        for (int lane = 0; lane < lanes.size(); lane++) {
+            int index = lane;
+            Thread worker = new Thread(() -> {
+                try {
+                    frames[index] = transfer(peer, lanes.get(index), flight, index, tuned);
+                } catch (Throwable failed) {
+                    flight.abort.set(true);
+                    if (flight.failure.compareAndSet(null, failed)) {
+                        Log.i(TAG, "lane " + index + " stopped the whole send: " + failed);
+                        hangUpAll();
+                    }
+                } finally {
+                    finished.countDown();
+                }
+            }, "opairdrop-send-" + index);
+            worker.setDaemon(true);
+            worker.start();
+        }
+        finished.await();
+        Throwable failed = flight.failure.get();
+        if (failed instanceof Exception) {
+            throw (Exception) failed;
+        }
+        if (failed != null) {
+            throw new IOException(String.valueOf(failed), failed);
+        }
+        // 每条流回的帧各自带一行 {@code bytes}，加起来才是这一次真的送出去多少。
+        long bytes = 0;
+        for (byte[] frame : frames) {
+            if (frame != null) {
+                bytes += Report.parse(new String(frame, java.nio.charset.StandardCharsets.UTF_8)).bytes;
+            }
+        }
+        return bytes;
+    }
+
+    /**
      * 连一次，握手完，返回一条能收发字节的 TLS 连接。
      *
-     * <p>{@link #live} 在握手之前就指向裸 socket、握手之后改指 TLS 那一层：取消只有一条路
+     * <p>{@link #live} 在握手之前就装着裸 socket、握手之后换成 TLS 那一层：取消只有一条路
      * ——把 socket 关掉——而握手正卡着的时候，能关的也只有下面那条。
      *
      * <p># 握手只认它广播的那份证书
@@ -1791,21 +1983,30 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * <p>连接本身在 {@link #connectTls}——预查询那条不碰 live 的连接也走它，证书钉住的逻辑
      * 因此只有一份。
      */
-    private SSLSocket open(Peers.Peer peer, int connectMs, int readMs) throws IOException {
-        live = rawSocket(peer, connectMs, readMs);
+    private SSLSocket open(Peers.Peer peer, int connectMs, int readMs, Flight flight)
+            throws IOException {
+        Socket raw = rawSocket(peer, connectMs, readMs);
+        // 裸 socket 先登记：握手要几百毫秒，人在那期间点取消，能关的只有这一条。
+        live.add(raw);
+        SSLSocket tls = null;
         try {
-            SSLSocket tls = connectTls(peer, live);
-            live = tls;
-            // 握手这一段可能有好几百毫秒，人在那期间点了取消的话，{@link #cancelSend} 能关到的
-            // 只有裸 socket（它当时还不知道 TLS 那一层）。这里再看一眼：真取消了就抛出去，
-            // 由下面那个 catch 把刚建成的这条关掉，别让传输白跑一趟 /Discover。
-            if (cancelling) {
+            tls = connectTls(peer, raw);
+            // 换成 TLS 那一层。同一个描述符，但取消时要关的是会写 {@code close_notify} 的那个。
+            // 先加新的再摘旧的：反过来的话，两步之间取消会两手空空（见 {@link #live} 第三点）。
+            live.add(tls);
+            live.remove(raw);
+            // 真取消了就抛出去，由下面那个 catch 把刚建成的这条关掉，别让传输白跑一趟
+            // /Discover。/Ask 之前那一条同理由 {@code second} 里的检查兜住。
+            if (cancelling || flight.abort.get()) {
                 throw new IOException("cancelled during the connection");
             }
             return tls;
         } catch (IOException failed) {
-            closeQuietly(live);
-            live = null;
+            live.remove(raw);
+            if (tls != null) {
+                live.remove(tls);
+            }
+            closeQuietly(tls != null ? tls : raw);
             throw failed;
         }
     }
@@ -2595,16 +2796,56 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * 这一趟发送走到了哪儿。
      *
      * <p>只回答两个问题，而它们在失败时说的不是同一件事：{@link #moving}——对面点了接受没有；
-     * {@link #bytes}——有多少字节真的写进了那条 socket。传输线程里那个进度回调填，同一个线程
-     * 的 catch 读，所以不需要锁，{@code volatile} 只是为了让「跨了 runOnUiThread 之后再读」
-     * 这件事在读的人眼里是显然的。
+     * {@link #sentBytes()}——有多少字节真的写进了那几条 socket。传输线程里那几个进度回调填，
+     * 同一个线程的 catch 读，所以**单流时**不需要锁。
+     *
+     * <p># 多流之后为什么多了原子量
+     *
+     * <p>N 条流各在自己的线程上填同一块板子，「同一个线程」这条前提没有了；而下面那个
+     * {@code catch} 又只在其中一条线程上读它。所以逐条流的计数用 {@link AtomicLongArray}
+     * （一条流一个格子，谁也不写别人的），几条汇总量用原子布尔/原子整数。取读侧总和时
+     * 各格子各取一次加起来——中途可能读到半新半旧的一组和，而这是进度条，不是账本。
      */
     private static final class Flight {
-        /** 进度相位进过 SENDING：对面已经在手机上点了接受。 */
-        volatile boolean moving;
+        /** 有几条流在跑。{@link #sent} 就是按它开的。 */
+        final int lanes;
 
-        /** 已经写出去的字节数。{@link Native.Progress#SENDING} 之前恒为 0。 */
-        volatile long bytes;
+        /** 每条流最近一次报的「已经写下多少」。各流各算自己的分母，所以不能合成一个数。 */
+        final AtomicLongArray sent;
+
+        /** 进度相位进过 SENDING：对面已经在手机上点了接受。任意一条流进过就算。 */
+        final AtomicBoolean moving = new AtomicBoolean();
+
+        /**
+         * 一条流倒下之后置位：其余几条没有继续的意义。
+         *
+         * <p>与人按下的取消分开记，因为两件事在界面上的说法完全不同——取消是「已取消」，
+         * 而这里要如实说原因。{@code cancelling} 只由人点的那一下置位。
+         */
+        final AtomicBoolean abort = new AtomicBoolean();
+
+        /** 第一个倒下的原因。谁先到谁算，后面的不再覆盖。 */
+        final AtomicReference<Throwable> failure = new AtomicReference<>();
+
+        /** 已经跑完的流数：{@code DONE} 每条流各来一次，界面只该在最后一条上说一次。 */
+        final AtomicInteger finished = new AtomicInteger();
+
+        /** 日志去重：上一次记下来的整体十分位。整件事一条曲线，不是每条流一条。 */
+        final AtomicInteger decile = new AtomicInteger(-1);
+
+        Flight(int lanes) {
+            this.lanes = lanes;
+            this.sent = new AtomicLongArray(lanes);
+        }
+
+        /** 几条流加起来写了多少字节。 */
+        long sentBytes() {
+            long total = 0;
+            for (int i = 0; i < lanes; i++) {
+                total += sent.get(i);
+            }
+            return total;
+        }
     }
 
     private static final class Report {
