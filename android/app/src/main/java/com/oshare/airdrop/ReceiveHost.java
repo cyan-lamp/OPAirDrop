@@ -3,13 +3,7 @@ package com.oshare.airdrop;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
-import android.os.Messenger;
 
-import org.json.JSONArray;
-import org.json.JSONException;
-import org.json.JSONObject;
-
-import java.io.IOException;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -19,15 +13,25 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 一次接收从「有人要发」到「收完了」的每一步，都从这里说出去。
+ * 还没结束的每一次接收的登记簿，以及那颗等答案的闩。
  *
  * <p># 它为什么存在
  *
  * <p>接收这件事本身完全在协议层里：{@link Listener} 收字节，库决定答什么，文件落在磁盘
- * 上。这些都不需要界面。需要界面的只有三件事——有人要发东西、走到百分之几、收完了——而
- * 这三件事现在都落在流体云胶囊（{@link LiveCard}）与本应用自己的通知（{@link Confirmation}
- * 与 {@link ReceiveService}）上。这个类是唯一知道「两条路说的是同一件事」的地方：它产生
- * 事件，谁在听谁就画。
+ * 上。需要人过目的只有一刻——有人要发东西——那一刻由流体云胶囊（{@link LiveCard}）或本应用
+ * 自己的通知（{@link Confirmation} 与 {@link ReceiveService}）送到眼前，两条路最后都把答案
+ * 落回同一个闩上。这个类就是那份登记加那颗闩：按 {@code session} 记住没结束的接收，好让
+ * 卡片、通知、广播里的按钮找得到它。
+ *
+ * <p># 它不画，也不再说事件
+ *
+ * <p>2026-11-16 之前这里往互传进程推 {@code incoming_transfer}，由它照着画卡。那条路撤掉时
+ * 只掐了出口（{@code emit} 变成空方法），拼事件的那几段、binder 桥那个回信地址、以及界面晚
+ * 到时用来重放的 {@code snapshot} 全都留在原地——五处调用每收一次仍在拼一个 {@code JSONObject}
+ * 然后扔掉，而 {@code snapshot} 一个调用者也没有。2026-11-19 把这些一并清了。
+ *
+ * <p>现在对外可见的状态只有两个出口，都不经过这里：卡片由 {@link LiveCard} 直接推，进度由
+ * {@code Listener.Meter} 投到那张卡上。这个类只管登记与回答。
  *
  * <p># 为什么状态按 session 存在这里
  *
@@ -36,33 +40,14 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@code session}。这个名字由这里产生，同时交给 {@link Confirmation#ask}，于是流体云上的
  * 按钮和通知上的按钮回答的是同一个闩。
  *
- * <p># 为什么状态码是这些数
- *
- * <p>1002 与 1006/1007 是从互传那一侧沿用的号（分别指「邀请」与「已经失败的」），中间两个
- * 是这个项目自己起的。真正的判据是 {@code phase}：
- * 对面按 {@code phase} 决定标题和按钮，{@code status} 只在读不到 {@code phase} 时兜底。
- *
  * <p># 它不做什么
  *
  * <p>它不判断该不该收。该不该收是人的事，它只负责把问题送到人眼前、把答案带回来。它也不
- * 管文件落在哪儿——目录由 {@link Listener} 决定，这里只是把结果照原样说出去。
+ * 管文件落在哪儿——落点由 {@link Listener} 算出来，说给人听的是 {@code Listener.last()}。
  */
 final class ReceiveHost {
 
     private static final String TAG = "OPAirDrop";
-
-    /** 有人要发东西过来，等一个回答。 */
-    private static final int PENDING = 1002;
-    /** 答应之后正在收。 */
-    private static final int RECEIVING = 1003;
-    /** 人不收。 */
-    private static final int REJECTED = 1004;
-    /** 收完了并且已经落到磁盘上。 */
-    private static final int COMPLETE = 1006;
-    /** 没收到，或者收到了没存下来。 */
-    private static final int FAILED = 1007;
-    /** 人中途取消，或者被对面撤掉。 */
-    private static final int CANCELLED = 1008;
 
     /**
      * 卡片上【取消接收】那颗按钮的广播。带 {@link Confirmation#EXTRA_ID}，值是 session。
@@ -74,51 +59,21 @@ final class ReceiveHost {
      */
     static final String CANCEL = "com.oshare.airdrop.RECEIVE_CANCEL";
 
-    /** 保护下面两个字段。{@link Attempt} 自己的字段不归它管。 */
+    /** 保护下面这份表。{@link Attempt} 自己的字段不归它管。 */
     private static final Object LOCK = new Object();
 
-    /** 互传进程里那个 UI 的回信地址。空表示这个时刻没有谁能画。 */
-    private static Messenger ui;
-
-    /** 还没结束的接收，键是 session。用来回答指令和重放快照。 */
+    /**
+     * 还没结束的接收，键是 session。
+     *
+     * <p>只用来回答指令：卡片、通知、广播里的按钮都拿着 session 来这里找那次接收。它不再
+     * 「重放快照」——界面晚到时该看的是 {@link LiveCard} 自己手上那张卡，不是这里补画一遍。
+     */
     private static final LinkedHashMap<String, Attempt> LIVE = new LinkedHashMap<>();
 
     /** session 与 id 的同一个来源：一次接收一个号，只增不减。 */
     private static final AtomicLong IDS = new AtomicLong();
 
     private ReceiveHost() {}
-
-    /**
-     * 通道另一端报到了。
-     *
-     * <p>收到 {@code hello} 时调一次。之后每一条事件都往这里送，直到对面消失。
-     */
-    static void attach(Messenger client) {
-        synchronized (LOCK) {
-            ui = client;
-        }
-    }
-
-    /**
-     * 对面没了。只清掉还是它的那一个，免得把一个刚连上来的新客户端一起抹掉。
-     *
-     * <p>参数是「谁没了」而不是没有参数：每个连接一个界面，一条连接断开和另一条连接建立
-     * 可以发生在同一个瞬间，无条件清空会把新的那条一起抹掉。
-     */
-    static void detach(Messenger expected) {
-        synchronized (LOCK) {
-            if (ui == expected) {
-                ui = null;
-            }
-        }
-    }
-
-    /** 现在有人能画吗。决定这一次是走流体云还是走通知。 */
-    static boolean attached() {
-        synchronized (LOCK) {
-            return ui != null && ui.getBinder().isBinderAlive();
-        }
-    }
 
     /** 开一次接收。每个连接一个，不管这个连接最后会不会真的传东西。 */
     static Attempt open(Context context, Socket peer) {
@@ -159,23 +114,6 @@ final class ReceiveHost {
         }
         attempt.cancel();
         return true;
-    }
-
-    /**
-     * 把还没结束的每一次接收重说一遍。
-     *
-     * <p>界面在一个时刻打开，而接收可能在它打开之前就开始了：进程被杀掉又拉起来、弹窗被
-     * 关掉再点开、卡片重画。每一条都从同一次接收的最后一条事件接着往下说，所以人看到的
-     * 不会是一个空白的「正在恢复」，而是这件事现在的样子。
-     */
-    static void snapshot() {
-        ArrayList<Attempt> live;
-        synchronized (LOCK) {
-            live = new ArrayList<>(LIVE.values());
-        }
-        for (Attempt attempt : live) {
-            attempt.replay();
-        }
     }
 
     /**
@@ -254,34 +192,24 @@ final class ReceiveHost {
         return find(session) != null;
     }
 
-    /**
-     * 往互传进程发事件的那条路，已经停用。
+    /*
+     * 这里原来有一个 {@code private static void emit(JSONObject)}，往互传进程推一条
+     * {@code incoming_transfer}，由它照着画卡。
      *
-     * <p>2026-11-16 15:45：接收侧不再依赖互传画卡（改由 {@link LiveCard}），但这条桥还留着，
-     * 于是真机上出现了一件怪事——传输过程中通知栏和流体云里**同时**有一加互传自己的一条普通
-     * 通知，它不属于我们，也点不动。原因是每收一次我们还在给互传发事件，它就照着画一张。
+     * <p>2026-11-16 15:45 起它就是个空方法体了。当时真机上出现了一件怪事：传输过程中通知栏
+     * 和流体云里**同时**有一加互传自己的一条普通通知，它不属于我们，也点不动——原因是每收一次
+     * 我们还在给互传发事件，它就照着画一张。出口当天下班前就掐了，拼事件的那五处却留到
+     * 2026-11-19 才清掉，中间每收一次都白拼一个 {@code JSONObject} 扔进垃圾桶。
      *
-     * <p>出口在这里掐断了：调用点仍在拼那个 {@code JSONObject}，拼完交给这里，然后被丢掉。
-     * 那点分配是上一版桥接的残骸，无害但也没用，清理邀请那一支时可以一并删掉。
-     *
-     * <p>LSPosed 作用域**没有**跟着删：2026-11-19 换了一套实现又装回来了（{@link FluidModule}），
-     * 管的是另一件事——把流体云的 {@code remindType} 从 0 抬到 11，让卡片自己摊开。它跟互传
-     * 进程无关，作用域是 {@code com.android.systemui}，不是互传。
+     * <p>顺带说明一件容易读反的事：LSPosed 作用域**没有**跟着删。2026-11-19 换了一套实现又装
+     * 回来的 {@link FluidModule} 管的是另一件事——把流体云的 {@code remindType} 从 0 抬到 11，
+     * 让卡片自己摊开。它跟互传进程无关，作用域是 {@code com.android.systemui}。
      */
-    private static void emit(JSONObject event) {
-        // 有意留空：本应用的所有对外可见状态都走 LiveCard。
-    }
 
     private static void forget(String session) {
         synchronized (LOCK) {
             LIVE.remove(session);
         }
-    }
-
-    /** 扩展名到 MIME。猜不出来给一个通用的，不给人一个「打不开」的空字符串。 */
-    private static String mime(String name) {
-        String guessed = java.net.URLConnection.guessContentTypeFromName(name);
-        return guessed == null ? "application/octet-stream" : guessed;
     }
 
     /**
@@ -306,9 +234,9 @@ final class ReceiveHost {
          * 有人真的回答过。
          *
          * <p>和 {@link #accepted} 不是一件事：两者都为假时，「人说了不行」和「一直没人理」
-         * 长得一模一样，而对人来说这是两句话——前者该说「已拒绝」，后者该说「没人应答」。
-         * 过去两种情况共用一句「已拒绝」，于是超时被读成「它自己拒的」，这不是猜错，是
-         * 我们从来没把这件事记下来。
+         * 长得一模一样，而它们该被说成两句不同的话——一句进日志，另一句决定连接断了之后要不要
+         * 留一张失败卡（见 {@link #abandon}）。过去两种情况共用一句「已拒绝」，于是超时被读成
+         * 「它自己拒的」；这不是猜错，是我们从来没把这件事记下来。
          */
         private volatile boolean answered;
 
@@ -316,9 +244,9 @@ final class ReceiveHost {
          * 人在哪个表面上回答的：{@code "card"} 或 {@code "notification"}，没人回答时是
          * {@code null}。
          *
-         * <p>记它的理由只有一条：卡片会不会出现是这台机器上最不可观测的一件事，
-         * {@link #attached()} 只说明 binder 活着，所以「这次到底是怎么被回答的」必须是事实，
-         * 不能由 {@code attached} 推出来。
+         * <p>记它的理由只有一条：卡片会不会出现，是这台机器上最不可观测的一件事。别处也没有
+         * 能推出它的东西（那个 binder 桥 2026-11-19 一并删了），所以「这次到底是怎么被回答的」
+         * 只可能是事实，不能是推断。
          */
         private volatile String answeredFrom;
 
@@ -333,7 +261,7 @@ final class ReceiveHost {
         /** 这条连接。人说取消时关掉它，读字节的那条线程会从这里出来。 */
         private final Socket peer;
 
-        /** 人按过取消。收尾时用来说「已取消」而不是「连接已断开」。 */
+        /** 人按过取消。收尾时用它把日志写成 {@code cancelled}，而不是 {@code unanswered}。 */
         private volatile boolean cancelled;
 
         /**
@@ -345,20 +273,17 @@ final class ReceiveHost {
          */
         private PendingIntent cancelling;
 
-        /** 对面叫什么。第一条事件之后才可能知道，后面几条要接着用。 */
+        /** 对面叫什么。摘要解析出来之后才可能知道，后面几条要说的话都接着用它。 */
         private String sender = "Apple 设备";
 
         /**
-         * 对面报上来的那份清单：叫什么、多大。
+         * 对面报了几份。
          *
-         * <p>邀请那一刻就知道了，而且必须一路带着。卡片每收到一条事件就整份重建、重新
-         * 算一次摘要，它只看这一条——所以只挂在邀请那一帧上的话，「2 个文件」会在进度
-         * 刚开始时就消失，卡片退回「文件信息未知」，而那正是这个字段要修的东西。
-         *
-         * <p>{@code null} 是「还不知道」，空表是「对面没报」。两者对卡片的说法一样，对
-         * 排查不一样，所以在这里分开。
+         * <p>只要一个数：进度卡第二行那句「3 个文件」用它，而卡片此后每一帧都要说这句话，
+         * 所以它得留在字段上，不能只活过一次邀请。还不知道是 0，对面没报也是 0——两种情形
+         * 说的话一样，没有必要分开记。
          */
-        private JSONArray offered;
+        private int offeredCount;
 
         /**
          * 这次邀请解析出来之后的那一份，留着给收尾用。
@@ -394,9 +319,6 @@ final class ReceiveHost {
          * 拉满（失败画成功）也不该转圈（那是「还在动」）。见 {@link LiveCard#failed}。
          */
         private int percent = -1;
-
-        /** 最后说出去的那条，用来重放。跨线程读，所以是 volatile。 */
-        private volatile JSONObject last;
 
         private Attempt(Context context, long id, String session, Socket peer) {
             this.context = context;
@@ -440,17 +362,9 @@ final class ReceiveHost {
             this.offer = offer;
             sender = offer.sender;
             announced = true;
-            // 先把「哪几份」记下来再报事件：卡片看到邀请的那一帧就该看得到件数和名字，
-            // 而不是先看一眼「文件信息未知」、等下一次更新才对。
-            offered = filesOf(offer.files);
-            try {
-                emit(newEvent("pending", PENDING)
-                        .put("name", sender)
-                        .put("message", offer.body())
-                        .put("progress", -1));
-            } catch (JSONException impossible) {
-                Log.w(TAG, "receive invitation unavailable", impossible);
-            }
+            // 先把「哪几份」记下来再画卡：卡片第一帧就该看得到件数，而不是先写一句
+            // 「准备中」、等下一次刷新才对。
+            offeredCount = offer.files.size();
             // 只有一条表面：流体云。互传那张卡与它的叫醒逻辑已经撤掉（2026-11-16 16:40），
             // 于是这里不再有「卡片在不在」这个中间状态——发出去就是发出去了。
             Log.i(TAG, "invitation " + session + " from " + sender
@@ -481,7 +395,7 @@ final class ReceiveHost {
             // 出口只有三条：胶囊（cloud）、普通通知（Confirmation.ask）、以及正开着的界面。
             // 前两条都要 POST_NOTIFICATIONS 这条运行时权限，而新装的应用默认是关的——
             // 1.0.0 就是这么装上去的：授权为 false，系统把每一条通知静默丢弃，于是每次邀请
-            // 都走满三十秒再判拒绝。人看到的是「iPhone 发了，这边没反应」，日志里写的是
+            // 都走满六十秒再判拒绝。人看到的是「iPhone 发了，这边没反应」，日志里写的是
             // `unanswered`；那句话在这里是假的，真相是"没有人被告知"。
             //
             // 所以这一条不是优化，是把假话改成真话：没有出口就当场说不，让对面几百毫秒内
@@ -489,7 +403,7 @@ final class ReceiveHost {
             if (!cloud && !Notices.allowed(context) && !Listener.of(context).watched()) {
                 Log.w(TAG, "invitation " + session
                         + " dropped: no surface at all (notifications off, nothing on screen)");
-                end("rejected", REJECTED, "通知权限未开，这台设备现在收不到邀请");
+                end();
                 return false;
             }
             boolean panel = false;
@@ -526,22 +440,13 @@ final class ReceiveHost {
                     + " asked=" + asked
                     + " answered=" + (answered && answeredFrom != null ? answeredFrom : "nobody"));
             if (!wanted) {
-                // 拒绝的话必须说清是谁拒的。过去两种情况共用「已拒绝」，于是超时被读成
-                // 「我没点它，它自己拒的」——那不是人看错，是我们没写明白。
-                // `expired` 是标题表里本来就有的一个相位（「邀请已过期」），只是从来没有
-                // 人发过它：状态码两边都是 1004（对发送端都是同一个 401），区别只在标题。
-                end(answered ? "rejected" : "expired", REJECTED, answered
-                        ? "已拒绝"
-                        : (decisionMs / 1000) + " 秒内没人应答，已放弃");
+                // 「人说了不行」和「一直没人理」的分别只在上一条日志里：对发送端是同一个 401，
+                // 对人也一样——这张卡撤掉，不留话。要分得清就得去看那一行。
+                end();
             } else {
-                // 答过之后，最后那一帧不能再留在「邀请」上。
-                //
-                // 界面晚到一步时会按最后那一帧重放（{@link #snapshot}），而这条连接马上就要
-                // 去读 /Upload 了。中间这一段如果不说话，重放出来的就是那张已经答过的邀请——
-                // 于是同一个问题被问第二遍，这一次没人会答，六十秒后屏幕上出现「已拒绝」。
-                // 人在那一刻的感觉就是「我没点拒绝，它自己拒的」。
-                //
-                // 说的是实话：人说了收，接下来就是收。字节还没到，所以没有百分比。
+                // 答过之后，邀请那张卡不能再挂着两个按钮：人已经按了，按钮还亮着就会有人再按
+                // 一次。这一帧把它改写成「正在接收」。说的是实话——人说了收，接下来就是收；
+                // 字节还没到，所以没有百分比。
                 progress(0, 0);
             }
             return wanted;
@@ -552,19 +457,14 @@ final class ReceiveHost {
             if (!announced || settled) {
                 return;
             }
-            try {
-                percent = total > 0 ? (int) Math.min(100L, done * 100L / total) : -1;
-                if (cloud) {
-                    // 同一个 id，同一朵云：邀请那张卡在这里变成进度，不需要先撤再发。
-                    //
-                    // 进度卡上带【取消接收】：点了「接收」之后，人在系统这一侧唯一的出口就是它。
-                    // 不发这一颗，一张传到 30% 的卡上就一个按钮也没有——人只能等，或者去杀进程。
-                    LiveCard.updateWithCancel(context, "正在接收", line(done, total), percent,
-                            cancelAction());
-                }
-                emit(newEvent("receiving", RECEIVING).put("progress", percent));
-            } catch (JSONException impossible) {
-                Log.w(TAG, "receive progress unavailable", impossible);
+            percent = total > 0 ? (int) Math.min(100L, done * 100L / total) : -1;
+            if (cloud) {
+                // 同一个 id，同一朵云：邀请那张卡在这里变成进度，不需要先撤再发。
+                //
+                // 进度卡上带【取消接收】：点了「接收」之后，人在系统这一侧唯一的出口就是它。
+                // 不发这一颗，一张传到 30% 的卡上就一个按钮也没有——人只能等，或者去杀进程。
+                LiveCard.updateWithCancel(context, "正在接收", line(done, total), percent,
+                        cancelAction());
             }
         }
 
@@ -604,9 +504,8 @@ final class ReceiveHost {
             if (percent >= 0) {
                 parts.add(percent + "%");
             }
-            int count = offered == null ? 0 : offered.length();
-            if (count > 0) {
-                parts.add(count + " 个文件");
+            if (offeredCount > 0) {
+                parts.add(offeredCount + " 个文件");
             }
             if (total > 0) {
                 // 封顶到 total：对端可以多发，而一条写着「112%」的卡只会让人以为哪里坏了。
@@ -618,11 +517,12 @@ final class ReceiveHost {
         /**
          * 收完了，文件已经在公共目录里。
          *
-         * <p>每一份的字节数与落点都从发布结果里取，不再共用一份参数：一次接收可能同时进
-         * 相册和文档，两个目录，而这块卡片上「存到哪儿」是唯一一句人真正需要的话。
+         * <p>卡片上只说两个数：几份、多少字节。落点不在这张卡上——它写的是「3 个文件 ·
+         * 4.2 MiB」，而「存到哪儿」由 {@code Listener.summarize} 那一句给，落在首页那一行。
+         * 一张卡塞不下第三个数，何况人下一步要的多半是点【打开文件】，不是读路径。
          *
-         * <p>没存下的那几份只报件数，不把它们混进 files 里——卡片上一条文件应当指着一份
-         * 真的存在的东西。
+         * <p>没存下的那几份不计进这里的件数：这个数指的是真的躺在磁盘上的东西，少了几份
+         * 要单独说出来（同一句里的「另有 N 个没存下」）。
          */
         void delivered(Publish.Result published) {
             if (!announced || settled) {
@@ -636,47 +536,11 @@ final class ReceiveHost {
                 LiveCard.finishWithActions(context, "接收完成",
                         published.entries().size() + " 个文件 · " + Listener.bytes(published.bytes()),
                         openAction(context, published));
-                // 收完也想摊开：这张卡上「存到哪儿」和【打开文件】是收尾那一步真正的信息，
-                // 而它们只在摊开的那一面看得见。但摊不摊开不归应用管——应用侧没有这个开关，
-                // 早先硬撬（Xposed 进 SystemUI 叫插件的 onExpand）会让这张卡在通知中心缺席、
-                // 并且点空白区域收不回去。所以这里不补救，宁可让人点一下胶囊；要它自己开，
-                // 去启用那个可选的 LSPosed 模块。
+                // 收完也想摊开：这张卡上【打开文件】是收尾那一步真正的按钮，而它在摊开的那一面
+                // 才看得见。但摊不摊开不归应用管——应用侧没有这个开关，早先硬撬（Xposed 进
+                // SystemUI 叫插件的 onExpand）会让这张卡在通知中心缺席、并且点空白区域收不
+                // 回去。所以这里不补救，宁可让人点一下胶囊；要它自己开，去启用那个可选的模块。
                 cloud = false;
-            }
-            try {
-                JSONArray files = new JSONArray();
-                for (Publish.Entry entry : published.entries()) {
-                    files.put(new JSONObject()
-                            .put("name", entry.name)
-                            .put("size", entry.size)
-                            .put("mime", mime(entry.name))
-                            // 存到哪儿是这块卡片上唯一一句人真正需要的话：这个应用没有浏览
-                            // 目录的入口，除了这里没有第二个地方会说出来。
-                            .put("directory", entry.directory)
-                            // 「打开文件」按下去要有一个能被别的应用读到的地址。收完之后
-                            // 字节归媒体库管，我们手上没有可共享的路径，所以只有媒体库给的
-                            // 这一串能担这件事——留空就等于那个按钮点了没反应。
-                            .put("uri", entry.uri == null ? "" : entry.uri.toString()));
-                }
-                JSONObject event = newEvent("complete", COMPLETE)
-                        .put("progress", 100)
-                        .put("terminal", true)
-                        .put("published", true)
-                        .put("files", files);
-                List<String> notes = new ArrayList<>();
-                // 一张卡上已经有发送端自己报的那个总量了，再写一句「共 X」就是同一件事说两遍，
-                // 而且两边的单位还不一样（对方写 MB，我们写 MiB）。只有真丢了东西的时候这个
-                // 数才不一样、才有话说——那时候它说的是「存下来的到底有多少」。
-                if (!published.skipped().isEmpty()) {
-                    notes.add("存下 " + Listener.bytes(published.bytes()));
-                    notes.add(published.skipped().size() + " 个没存下");
-                }
-                if (!notes.isEmpty()) {
-                    event.put("message", String.join("，", notes));
-                }
-                emit(event);
-            } catch (JSONException impossible) {
-                Log.w(TAG, "receive completion unavailable", impossible);
             }
             ReceiveHost.forget(session);
         }
@@ -709,20 +573,6 @@ final class ReceiveHost {
                 LiveCard.finishWithLink(context, "接收完成", linkLine(offer),
                         openLink(context, offer.urls));
                 cloud = false;
-            }
-            try {
-                JSONArray list = new JSONArray();
-                for (String url : offer.urls) {
-                    list.put(url);
-                }
-                JSONObject event = newEvent("complete", COMPLETE)
-                        .put("progress", 100)
-                        .put("terminal", true)
-                        .put("published", true)
-                        .put("links", list);
-                emit(event);
-            } catch (JSONException impossible) {
-                Log.w(TAG, "receive completion unavailable", impossible);
             }
             ReceiveHost.forget(session);
             return true;
@@ -763,7 +613,7 @@ final class ReceiveHost {
                 LiveCard.failedWithActions(context, "接收失败", message, percent, null);
                 cloud = false;
             }
-            settle("failed", FAILED, message);
+            settle();
         }
 
         /**
@@ -795,12 +645,13 @@ final class ReceiveHost {
             Log.i(TAG, "receive " + session + " ended "
                     + (cancelled ? "cancelled" : accepted ? "accepted" : "unanswered")
                     + " at " + percent + "%");
-            if (cancelled) {
-                end("cancelled", CANCELLED, "已取消");
-            } else if (accepted) {
+            if (accepted) {
                 failed("连接意外断开");
             } else {
-                end("failed", FAILED, "连接已断开");
+                // 人按了取消、或者一直没人应答——在这边是同一个收尾：撤卡，不留话。过去这两者
+                // 靠事件里那个 phase 分（{@code "cancelled"} / {@code "failed"}），而那条路
+                // 2026-11-19 已经清了，现在能分开它们的只有上面那一行日志。
+                end();
             }
         }
 
@@ -845,91 +696,26 @@ final class ReceiveHost {
             HangUp.now(peer);
         }
 
-        /** 把最后那条再说一遍。界面晚到的时候用。 */
-        void replay() {
-            JSONObject event = last;
-            if (event != null) {
-                ReceiveHost.emit(event);
-            }
-        }
-
-        /** 一条新事件，四条都带着的字段写在这里，免得每处都记一遍。 */
-        private JSONObject newEvent(String phase, int status) throws JSONException {
-            JSONObject event = new JSONObject()
-                    .put("ev", "incoming_transfer")
-                    .put("session", session)
-                    .put("id", id)
-                    .put("phase", phase)
-                    .put("status", status)
-                    .put("name", sender)
-                    .put("terminal", false)
-                    .put("published", false)
-                    .put("progress", -1);
-            // 邀请里那份清单，每一帧都带上。卡片的摘要只看得见手上这一条事件，所以它必须
-            // 每一条都完整——这不是缓存，是因为「同一件事只有一种说法」在这里的具体做法。
-            // 收完之后 {@link #delivered} 会用自己的那份盖掉它：那一份带着落点，才是人真正
-            // 需要的下一句话。
-            if (offered != null && offered.length() > 0) {
-                event.put("files", offered);
-            }
-            return event;
-        }
-
-        /**
-         * 邀请里那份清单，转成卡片认的形状。
-         *
-         * <p>和 {@link #delivered} 里那份只差一个 {@code directory}——还没收，当然还没有
-         * 落点。卡片按名字画前三个、按字节数画总数，两个字段都有就够了。
-         *
-         * <p>大小未知的（文件夹条目）给 -1 而不是 0：卡片那边见到负数会只报件数不报总数，
-         * 而这正是「对面没说」该有的说法。给 0 会画出一个「共 0 B」，那是假话。
-         */
-        private static JSONArray filesOf(List<Confirmation.Item> files) {
-            JSONArray out = new JSONArray();
-            for (Confirmation.Item file : files) {
-                try {
-                    out.put(new JSONObject()
-                            .put("name", file.name)
-                            .put("size", file.size));
-                } catch (JSONException impossible) {
-                    Log.w(TAG, "receive invitation file unavailable", impossible);
-                }
-            }
-            return out;
-        }
-
-        private void end(String phase, int status, String message) {
+        private void end() {
             if (cloud) {
                 // 没有收成就没有可留的东西：一张停在中间态、也没人能再点的常驻卡，比没有更糟。
                 // 失败是唯一的例外，它走 {@link #failed}——那一句解释值得留在屏幕上几秒。
                 LiveCard.drop(context);
                 cloud = false;
             }
-            settle(phase, status, message);
+            settle();
         }
 
-        private void settle(String phase, int status, String message) {
-            if (announced && !settled) {
+        private void settle() {
+            // 只在说过话的那一次置位：一次都没报到人眼前的连接（握手、探测、设置读不出来）
+            // 没有结果可覆盖，这一位对它没有意义。
+            if (announced) {
                 settled = true;
-                try {
-                    emit(newEvent(phase, status)
-                            .put("terminal", true)
-                            .put("published", false)
-                            .put("retryable", false)
-                            .put("message", message));
-                } catch (JSONException impossible) {
-                    Log.w(TAG, "receive " + phase + " unavailable", impossible);
-                }
             }
             // 退表是无条件的，包括一次话都没说过的连接。握手、探测、设置读不出来的那些连接
             // 在界面上不该留下任何痕迹，但它们在这张表里各占一个位置——漏收的结果是这张表
             // 只增不减，而且每一条都指向一个早就关掉的 socket。
             ReceiveHost.forget(session);
-        }
-
-        private void emit(JSONObject event) {
-            last = event;
-            ReceiveHost.emit(event);
         }
 
         private boolean await(long timeoutMs) {
