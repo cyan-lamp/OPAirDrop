@@ -700,9 +700,38 @@ final class Peers {
         /**
          * 敲不通到 {@link #KNOCK_FAILS} 次，已经判定它走了。
          *
-         * <p>置位之后 {@link #expire} 立刻删，不再等 {@link #CONNECTABLE_MS}。它**不是终局**：
-         * 只要还有一包从那台设备回来，{@link #heard} 就把它清掉——判断可以错，但不能错得
-         * 让一台还在的设备永久消失。
+         * <p>**它不改「显不显示」，只改「还等不等」。** 这一位没有任何一处参与
+         * {@link #snapshot} 或 {@link #connectable()}，列表里那一格在置位之后照旧画着。它省掉的
+         * 是 {@link #expire} 里那条 20 秒的沉默阈值：端口已经开口说过「不接」了，没必要再数秒。
+         *
+         * <p># 置位之后不是立刻删
+         *
+         * <p>这里原来说「置位之后 expire 立刻删，不再等 {@link #CONNECTABLE_MS}」，现在不成立了。
+         * {@code expire} 先看 {@code now - lastHeard(peer)}：不到 {@link #QUIET_BEFORE_GONE_MS}
+         * 就<b>留着不删，而且故意不清这一位</b>——端口那笔账是真的，只是还没到能动手的时候；
+         * 这段时间里它要是开口，{@link #alive} 会把这一位翻回去。过了 3 秒才立碑删除。
+         * 3 秒是 19:50 那四次「一删一放」换来的数字，理由全在 {@link #QUIET_BEFORE_GONE_MS}。
+         *
+         * <p># 它写入哪里
+         *
+         * <p>一处写 {@code true}：{@link #knock} 连续 {@link #KNOCK_FAILS} 次敲不通。
+         *
+         * <p>五处写 {@code false}，把「它还在」的所有证据来源都覆盖上：
+         * <ul>
+         *   <li>{@link #knock} 敲通——内核握手，全表最硬的一条证据；</li>
+         *   <li>{@link #alive} 端口守望敲通——每秒一次的同一类证据，存在的意义是别让一次瞬时
+         *       丢包留下的那个 1 一直挂在账上；</li>
+         *   <li>{@link #receive} 收到它任何一个包——它说话了。唯一的例外是它正挂着
+         *       {@link #unproven}：那种情况它的账只能由 {@code knock} 结，否则缓存应答就能
+         *       推翻内核给的 RST，18:16 那四趟回魂就是这么发生的；</li>
+         *   <li>{@link #recall} 冷启动按旧名单敲通；</li>
+         *   <li>{@link #resurrect} 墓碑还没冷、端口又开了。</li>
+         * </ul>
+         *
+         * <p>注意 mDNS 的 {@code gone}（TTL=0 的 goodbye，见 {@link #absorb}）**不写这一位**：
+         * 它直接把对端从表里 remove 掉，比这里快得多，两套机制互不相干。
+         *
+         * <p>所以判断可以错，但不能错得让一台还在的设备永久消失。
          */
         boolean gone;
 
@@ -1955,9 +1984,13 @@ final class Peers {
                     if (!peer.address.isEmpty()) {
                         buried.put(bare(peer.address), new Grave(peer, now));
                     }
+                    // 措辞改了：这条路现在也要安静满 QUIET_BEFORE_GONE_MS 才删，所以它不是
+                    // 「不靠沉默、只看端口」，而是两件事同时成立——端口回绝，沉默又过了地板。
+                    // 和下面那条按 timeout 删的区别，只在于这里的阈值是常数，不按节奏放大。
                     trace("dropped " + peer.name + "@" + peer.address + " after " + peer.knocks
-                            + " unanswered knocks at port " + peer.port + " (" + (now - lastHeard(peer))
-                            + " ms of mDNS silence) — the service is gone, not quiet");
+                            + " unanswered knocks at port " + peer.port + ", once its silence passed "
+                            + QUIET_BEFORE_GONE_MS + " ms (" + (now - lastHeard(peer))
+                            + " ms) — the port said no and the quiet outlasted the floor");
                     return true;
                 }
                 long silence = now - lastHeard(peer);
