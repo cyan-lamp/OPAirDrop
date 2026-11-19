@@ -207,6 +207,34 @@ final class LiveCard {
     }
 
     /**
+     * 正在接收的那张卡，额外挂一颗【取消接收】。
+     *
+     * <p># 为什么进度卡该有这颗按钮
+     *
+     * <p>发送侧一直有取消（{@link SendActivity} 的界面按钮），接收侧没有：点了「接收」之后，
+     * 人唯一能做的就是把手机放下等它传完。一个几百兆的视频传到一半、发现传错了设备，或者
+     * 对面那台手机就在手上要先说句话——这时卡片上没有任何出口，人只能去杀进程或者拔网络。
+     *
+     * <p># 为什么它只在进度中出现，不在邀请中出现
+     *
+     * <p>邀请那张卡上已经有【拒绝】了。同一个意思摆两颗按钮，人会以为它们不一样。这颗按钮
+     * 出现的那一刻，正是「拒绝」这个答案已经不可能再给的时候——人已经说了收。
+     *
+     * <p># 按下去之后发生什么
+     *
+     * <p>不是「把已收到的删掉」，是关掉那条连接（{@link ReceiveHost.Attempt#cancel}）。读字节
+     * 的线程从 {@code read} 里出来，走的是和对端走掉完全一样的一条路：卡片撤掉、页面上留一句
+     * 「已取消」。对端看到的是一次 abort，不是一次完成——这与它自己中途取消时发给我们的是
+     * 同一种信号（见 Plan.md 里 /Upload 的 RST 实测）。
+     *
+     * @param cancel 按【取消接收】时的广播；由 {@link ReceiveHost} 带着 session 造出来
+     */
+    static void updateWithCancel(Context context, String title, String shortText, int percent,
+                                 PendingIntent cancel) {
+        post(context, title, shortText, percent, false, false, null, null, null, "取消接收", cancel);
+    }
+
+    /**
      * 同一张卡，但**把它抬起来一次**（系统的抬头，也就是展开后那张大卡）。
      *
      * <p>用在四个时机上：接到邀请、开始发送、发送结束、接收完成。这四处都是「此刻有事发生，
@@ -441,6 +469,23 @@ final class LiveCard {
     private static void post(Context context, String title, String shortText, int percent,
                              boolean alert, boolean terminal, PendingIntent open, String openLabel,
                              PendingIntent retry) {
+        post(context, title, shortText, percent, alert, terminal, open, openLabel, retry,
+                null, null);
+    }
+
+    /**
+     * 同上，多一颗「进行中才能按」的按钮。
+     *
+     * <p>它是重载而不是把 {@code stop} 加进上面那个签名：上面那六处调用点里有五处永远没有这颗
+     * 按钮，为了一个只有接收进度用得到的参数，让它们各写一遍 {@code null}，读代码的人会以为
+     * 那五个 {@code null} 各自有含义。
+     *
+     * @param stopLabel 那颗按钮写什么；{@code stop} 为 {@code null} 时不看
+     * @param stop      进行中的那颗按钮，没有就不挂
+     */
+    private static void post(Context context, String title, String shortText, int percent,
+                             boolean alert, boolean terminal, PendingIntent open, String openLabel,
+                             PendingIntent retry, String stopLabel, PendingIntent stop) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.BAKLAVA) {
             return;
         }
@@ -478,6 +523,13 @@ final class LiveCard {
         }
         if (retry != null) {
             builder.addAction(new Notification.Action.Builder(null, "重试", retry).build());
+        }
+        // 进行中那颗（目前只有【取消接收】）。它和上面两颗不会同时出现：一颗说的是「这件事
+        // 还没结束，要不要停」，上面两颗说的是「这件事已经结束了，接下来做什么」。同一张卡上
+        // 同时问这两个问题，读的人只会以为这是一次已经失败的传输。
+        if (stop != null) {
+            builder.addAction(new Notification.Action.Builder(null,
+                    stopLabel == null ? "取消接收" : stopLabel, stop).build());
         }
         // 终态必须有这颗收尾按钮——哪怕没有别的按钮。没有它，一张停在 3% 的失败卡就只能等系统
         // 回收，而人拿不到「我已经知道了」这个动作。

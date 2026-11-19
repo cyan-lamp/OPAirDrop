@@ -5,9 +5,9 @@ import android.content.Context;
 import android.content.Intent;
 
 /**
- * 通知上那两个按钮的回调。
+ * 通知上那几颗按钮的回调。
  *
- * <p>它是 {@code exported=false} 的：能给它发广播的只有本应用自己，而那两个按钮的
+ * <p>它是 {@code exported=false} 的：能给它发广播的只有本应用自己，而那几颗按钮的
  * {@link android.app.PendingIntent} 带着本应用的身份，所以通知栏按下去仍然到得了这里。
  * 反过来，任何别的应用都发不进来——一个能被外面伪造的「接受」，等于没有问过。
  *
@@ -23,6 +23,13 @@ public final class DecisionReceiver extends BroadcastReceiver {
         }
         String id = intent.getStringExtra(Confirmation.EXTRA_ID);
         if (id == null) {
+            return;
+        }
+        // 【取消接收】不是一次回答：人已经说过「收」了，这一次说的是「收到一半不要了」。
+        // 它不能走下面的 answer(false)：那会把这次接收改写成「已拒绝」，而拒绝是另一件事
+        // ——那时对面还在问，还有一个 401 可以回；现在对面已经在传，能给的只有关连接。
+        if (ReceiveHost.CANCEL.equals(intent.getAction())) {
+            ReceiveHost.cancel(id);
             return;
         }
         boolean accepted = Confirmation.ACCEPT.equals(intent.getAction());

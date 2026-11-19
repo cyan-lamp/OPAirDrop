@@ -1,6 +1,8 @@
 package com.oshare.airdrop;
 
+import android.app.PendingIntent;
 import android.content.Context;
+import android.content.Intent;
 import android.os.Messenger;
 
 import org.json.JSONArray;
@@ -62,6 +64,15 @@ final class ReceiveHost {
     /** 人中途取消，或者被对面撤掉。 */
     private static final int CANCELLED = 1008;
 
+    /**
+     * 卡片上【取消接收】那颗按钮的广播。带 {@link Confirmation#EXTRA_ID}，值是 session。
+     *
+     * <p>它和 {@link Confirmation#ACCEPT}／{@link Confirmation#DECLINE} 走同一个接收器
+     * （{@link DecisionReceiver}）：那两颗回答的是「收不收」，这一颗回答的是「收到一半还要不要
+     * 继续」，但三颗按钮落在同一件事上——同一个 session 命名的同一次接收。分成两个接收器，
+     * 就要在两处各写一遍「先去表里找这一条」，而找错一次就是取消掉别人的传输。
+     */
+    static final String CANCEL = "com.oshare.airdrop.RECEIVE_CANCEL";
 
     /** 保护下面两个字段。{@link Attempt} 自己的字段不归它管。 */
     private static final Object LOCK = new Object();
@@ -323,6 +334,15 @@ final class ReceiveHost {
         /** 人按过取消。收尾时用来说「已取消」而不是「连接已断开」。 */
         private volatile boolean cancelled;
 
+        /**
+         * 进度卡上【取消接收】那颗按钮，第一次画进度时造一次。
+         *
+         * <p>造一次而不是每帧都造：进度卡每两百毫秒重画一次（见 {@link Listener.Meter}），
+         * 而 {@code PendingIntent.getBroadcast} 是一次会走到系统进程的调用，稳定在这个对象上
+         * 之后，重画就只剩一次 {@code notify}。
+         */
+        private PendingIntent cancelling;
+
         /** 对面叫什么。第一条事件之后才可能知道，后面几条要接着用。 */
         private String sender = "Apple 设备";
 
@@ -503,12 +523,37 @@ final class ReceiveHost {
                 percent = total > 0 ? (int) Math.min(100L, done * 100L / total) : -1;
                 if (cloud) {
                     // 同一个 id，同一朵云：邀请那张卡在这里变成进度，不需要先撤再发。
-                    LiveCard.update(context, "正在接收", line(done, total), percent);
+                    //
+                    // 进度卡上带【取消接收】：点了「接收」之后，人在系统这一侧唯一的出口就是它。
+                    // 不发这一颗，一张传到 30% 的卡上就一个按钮也没有——人只能等，或者去杀进程。
+                    LiveCard.updateWithCancel(context, "正在接收", line(done, total), percent,
+                            cancelAction());
                 }
                 emit(newEvent("receiving", RECEIVING).put("progress", percent));
             } catch (JSONException impossible) {
                 Log.w(TAG, "receive progress unavailable", impossible);
             }
+        }
+
+        /**
+         * 【取消接收】那颗按钮。
+         *
+         * <p>request code 按 id 分：同一台机器上可能同时有两条接收在进行（两台 iPhone 一起
+         * 发是真实的场景），而 {@code PendingIntent} 的 extras 只按 request code 区分——共用一个
+         * 编号，第二张卡会把第一张的 session 覆盖掉，于是人按「取消」取消掉的是另一次传输。
+         * 落在一个别的按钮都不用的段里（0x0C00 起），也是为了不和【接收】【拒绝】【打开文件】
+         * 撞上。
+         */
+        private PendingIntent cancelAction() {
+            if (cancelling == null) {
+                Intent intent = new Intent(context, DecisionReceiver.class)
+                        .setAction(CANCEL)
+                        .putExtra(Confirmation.EXTRA_ID, session);
+                cancelling = PendingIntent.getBroadcast(context,
+                        0x0C00 + (int) (id & 0x3FF), intent,
+                        PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            }
+            return cancelling;
         }
 
         /**
@@ -731,8 +776,10 @@ final class ReceiveHost {
         /**
          * 人说取消。
          *
-         * <p>还在等人回答的时候，取消就是拒绝；已经在收的时候，取消是把连接关掉——那条
+         * <p>还在等人回答的时候，取消就是拒绝；已经在收的时候，取消是把连接掐掉——那条
          * 读字节的线程会从 read 里出来，走的是和对端走掉完全一样的一条路。
+         *
+         * <p>真正关连接那一步不在这里做，见 {@link #abort}。
          */
         void cancel() {
             cancelled = true;
@@ -741,11 +788,65 @@ final class ReceiveHost {
                 answer(false, "card");
                 return;
             }
-            try {
-                peer.close();
-            } catch (IOException alreadyGone) {
-                // 已经断了：那条线程自己会走到收尾。
-            }
+            abort();
+        }
+
+        /**
+         * 把这条连接掐掉。**必须不在调用者线程上做**。
+         *
+         * <p># 为什么不能就地 close
+         *
+         * <p>按【取消接收】的那一下走的是广播：{@link DecisionReceiver} 在**主线程**上被唤起，
+         * 于是这个方法也在主线程上跑。而 {@code peer} 是 {@code SSLSocket}，它的
+         * {@code close()} 不是把描述符一扔了事——它会先写一个 TLS {@code close_notify} 收尾，
+         * 也就是一次真实的写网络。2026-11-19 14:12 那一版就是这么崩的：
+         *
+         * <pre>
+         * NetworkOnMainThreadException
+         *   at ReceiveHost$Attempt.cancel(ReceiveHost.java:791)
+         *   at DecisionReceiver.onReceive(DecisionReceiver.java:32)
+         * </pre>
+         *
+         * <p>崩的是整个进程，卡片和传输一起没了。一次「我不想收了」换来一次崩溃，比没有这颗
+         * 按钮更糟。
+         *
+         * <p># 为什么是 RST 而不是好好地说再见
+         *
+         * <p>取消这个动作，在线的另一端只该有一种读法：**这次传输被中止了**。而正常的
+         * {@code close()} 在收包缓冲里还压着没读完的字节时，内核发的本来就是 RST——见
+         * {@link Listener#hangUp} 里那段实测。这里索性把这件事说明白：先把
+         * {@code SO_LINGER(0)} 设上，再关，RST 立刻出去，不等发送缓冲排空。
+         *
+         * <p>这和对面是 iPhone 时的行为是同一个信号：2026-11-19 那次实测，我们在 iPhone 上
+         * 中途取消，它回的正是 RST。现在反过来，我们也是回它一个 RST。
+         *
+         * <p># 那条读字节的线程怎么办
+         *
+         * <p>它不用叫醒，也不该被指望能叫醒：另一个线程 {@code close()} 一个正在 {@code read}
+         * 里阻塞的 socket，并不保证唤醒那次 read（Linux 上 fd 的引用还在 syscall 手里）。能
+         * 指望的是两件事，而这两件事在传输中本来就成立——{@link Listener#serve} 给 socket 设了
+         * SoTimeout 兜底，且对面此刻正在不停发字节，read 每收一块就返回一次；下一次 read 撞上
+         * 一个已关闭的 socket，立刻抛 {@code SocketException: Socket closed}。
+         *
+         * <p>单开一条线程而不是丢进公共线程池：这件事只做一次、做完就死，占一个池位没有意义，
+         * 而取消是人在急的时候按的——不值得排在别人后面。
+         */
+        private void abort() {
+            Thread cutting = new Thread(() -> {
+                try {
+                    // 先设，再关：反过来的话 close 已经开始走 TLS 收尾，就晚了。
+                    peer.setSoLinger(true, 0);
+                } catch (IOException alreadyGone) {
+                    // 描述符早就没了。照样往下走，close 幂等。
+                }
+                try {
+                    peer.close();
+                } catch (IOException alreadyGone) {
+                    // 已经断了：那条线程自己会走到收尾，并把这句「已取消」说出去。
+                }
+            }, "airdrop-receive-abort");
+            cutting.setDaemon(true);
+            cutting.start();
         }
 
         /** 把最后那条再说一遍。界面晚到的时候用。 */
