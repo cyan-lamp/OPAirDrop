@@ -47,7 +47,6 @@ import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.security.GeneralSecurityException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -1567,7 +1566,16 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         // 读在起线程之前，是因为「开几条流」这一件事必须在动手之前定下来，而建连超时那三个
         // 数字要发给每一条流——分开读会读到表的两份副本，N 条流用 N 套超时。
         SettingsScreen tuned = Tuning.read(this);
-        List<List<String>> lanes = share(files, streamCount(tuned, files.size()));
+        // 一条流：那就是一趟完整的「发现、请求、发档案」。2026-11-20 之前这里按
+        // `client.streams` 切 N 组并行，实测两条流合计吞吐与单流相同（3.02–3.25 对
+        // 2.97–3.14，Plan.md §3.3.1），而对面手机上要多弹一次确认框，第二框晚点就白丢
+        // 三分之一的时间窗——所以那个旋钮删了，这里固定一条。
+        //
+        // 仍然是「一组文件」而不是「一列文件」：{@link #sendLanes} 收的就是分组，留着这个
+        // 形状，将来真要复测多流时不必把这几十行再写一遍。分组的前提没变——一个文件分不给
+        // 两条流，因为 /Ask 报的是一份份带类型、带图标的条目，/Upload 送的是它们的 DVZip，
+        // 协议里没有「某个文件的第 N 段」这种说法。
+        List<List<String>> lanes = Collections.singletonList(paths);
         Log.i(TAG, "send uses " + lanes.size() + " lane(s) for " + paths.size() + " file(s)");
 
         new Thread(() -> {
@@ -1848,57 +1856,17 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         }
     }
 
-    /**
-     * 这一次要开几条流。
+    /*
+     * 这里原来有两个方法：`streamCount()`（读 `client.streams`，再按文件数封顶）和
+     * `share()`（大文件优先的贪心装箱，把文件摊成 N 组、各组字节数尽量接近）。
      *
-     * <p>上限由文件和设置一起给：一条流只能承载**整个文件**——{@code /Ask} 报的是一份份
-     * 带类型、带图标的条目，{@code /Upload} 送的是它们的 DVZip，两者都没有「某个文件的第 N
-     * 段」这种说法。所以一个文件分不给两条流，文件数就是硬上限。**一个文件的多流并行不存在**，
-     * 这不是偷懒，是协议的形状。
+     * 2026-11-20 连同那行设置一起删掉，理由不是「没用过」，是**测过了不提速**：两条流
+     * 合计 3.02–3.25 MB/s，单流 2.97–3.14，叠加是假的（Plan.md §3.3.1）；而每多一条流，
+     * 对面 iPhone 上就多弹一次「接受」。装箱那段逻辑本身是对的，将来若要复测，照这几条
+     * 重写即可：大文件先摆、每次放进当时最空的那一组（按数量均分会把「视频 + 一张照片」
+     * 和「八张照片」配成一组，两者差两个数量级）；组内保持人选的原始顺序，好让日志和对面
+     * 那份清单读起来还是原来那个顺序。上限永远是文件数——一个文件分不给两条流。
      */
-    private static int streamCount(SettingsScreen tuned, int files) {
-        long want = Tuning.count(tuned, "client.streams", 1);
-        return (int) Math.max(1, Math.min(want, files));
-    }
-
-    /**
-     * 把文件摊成最多 {@code streams} 组，让各组的字节数尽量接近。
-     *
-     * <p>大文件先摆、每次放进当时最空的那一组。不是「按数量均分」：一份 500 MB 的视频配上
-     * 九个 2 MB 的照片，按数量分会得到「视频 + 一张照片」和「八张照片」两组，两者差两个数量
-     * 级，并行的意义当场归零——快的那组早就在等慢的那组了。
-     *
-     * <p>组内保持人选的原始顺序，只是为了让日志和对面那份清单读起来还是原来那个顺序。
-     */
-    private static List<List<String>> share(List<File> files, int streams) {
-        int lanes = Math.max(1, Math.min(streams, files.size()));
-        Integer[] order = new Integer[files.size()];
-        for (int i = 0; i < order.length; i++) {
-            order[i] = i;
-        }
-        Arrays.sort(order,
-                (a, b) -> Long.compare(files.get(b).length(), files.get(a).length()));
-        long[] load = new long[lanes];
-        int[] laneOf = new int[files.size()];
-        for (Integer index : order) {
-            int pick = 0;
-            for (int l = 1; l < lanes; l++) {
-                if (load[l] < load[pick]) {
-                    pick = l;
-                }
-            }
-            laneOf[index] = pick;
-            load[pick] += files.get(index).length();
-        }
-        List<List<String>> groups = new ArrayList<>();
-        for (int l = 0; l < lanes; l++) {
-            groups.add(new ArrayList<>());
-        }
-        for (int i = 0; i < files.size(); i++) {
-            groups.get(laneOf[i]).add(files.get(i).getAbsolutePath());
-        }
-        return groups;
-    }
 
     /**
      * 把这一趟送出去：几条流同时各跑一趟完整对话，等它们全部收尾。
@@ -1911,8 +1879,8 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * 请求、发档案」，各自的 {@code Client}、各自的连接、各自的计数器，{@code crates/ffi}
      * 里也没有任何全局可变状态会被它们踩到（那个 {@code Mutex} 在 BLE 那边）。
      *
-     * <p>代价写在设置页那一行里：一条流一次 {@code /Ask}，所以对面手机上会为每一趟各问一次
-     * 「接受」。
+     * <p>代价是一条流一次 {@code /Ask}：N 条流，对面手机上就问 N 次「接受」。所以现在固定
+     * 只有一条（§3.3.1 的实测），这个形状留着只是为了将来复测时不必重写。
      *
      * <p># 一条倒下就全停
      *

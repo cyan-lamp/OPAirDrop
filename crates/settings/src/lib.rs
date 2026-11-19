@@ -243,17 +243,12 @@ pub const CATALOG: &[Setting] = &[
         title: "等待接受超时",
         summary: "档案已经在发，等的是对面手机上那个人点「接受」。他犹豫多久都合法，所以它比上面那行长得多。",
     },
-    Setting {
-        key: "client.streams",
-        kind: Kind::Number {
-            min: 1,
-            max: 6,
-            unit: Unit::Plain,
-        },
-        default: "1",
-        title: "并行连接数",
-        summary: "把要发的文件分成几组、同时投送。iPhone 一条连接只答一个请求，所以每一组都是一趟完整的投递，对面手机上会为每一趟各问一次「接受」。1 就是老样子。",
-    },
+    // 这里原来有一行 `client.streams`（并行连接数，1–6，默认 1）。2026-11-20 删掉：
+    // 两条流合计吞吐与单流相同（3.02–3.25 vs 2.97–3.14，Plan.md §3.3.1），而代价是 iPhone
+    // 上多弹一次确认框、晚点第二框就白丢三分之一时间窗。一个不提速、只在对面多问一句的
+    // 旋钮，留在设置页里就是给人一个坏选择。多流那条路本身没删（`SendActivity.sendLanes`
+    // 仍是 N 条流的形状），复测时把这里加回来即可；磁盘上旧值会被 `retired()` 读过去并在
+    // 下一次保存时清掉。
     Setting {
         key: "http.response_limit",
         kind: Kind::Number {
