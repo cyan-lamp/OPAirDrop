@@ -16,6 +16,7 @@ import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 把收到的文件放进公共目录：照片与视频进 {@code DCIM/AirDrop}，其余进
@@ -65,6 +66,18 @@ final class Publish {
     /** 一次传输一个暂存目录，收完就删。 */
     private static final String STAGING = "_staging";
 
+    /**
+     * 给暂存目录的名字加的不重号。
+     *
+     * <p>光靠时间戳不够了：门口现在同时站着好几条连接（见 {@code Listener} 的类注释），
+     * 而两条在同一个毫秒里要目录是完全可能的。那种情况下 {@code mkdirs()} 第二次会返回
+     * false——第二条连接于是死在一句「暂存目录建不出来」上，而那句话对谁都不成立。
+     *
+     * <p>进程内计数器就够：这台设备上只有一个应用进程会建暂存目录，而重启之后计数器从 1
+     * 重新开始，时间戳却已经换了一个。
+     */
+    private static final AtomicLong STAGES = new AtomicLong();
+
     private static final int BUFFER = 64 * 1024;
 
     private Publish() {}
@@ -73,13 +86,15 @@ final class Publish {
      * 这一次接收的暂存目录。
      *
      * <p>建在应用自己的外部目录里：那里不需要权限，和公共目录同一个分区，而且它本来
-     * 就是这个应用唯一一直写的地方。每次一个时间戳子目录，
-     * 上一轮万一没清干净，也不会和这一轮的文件名撞上。
+     * 就是这个应用唯一一直写的地方。每次一个时间戳子目录，上一轮万一没清干净，也不会和
+     * 这一轮的文件名撞上。时间戳后面再跟一个进程内序号：同一个毫秒里两条连接都要目录时，
+     * 只有时间戳的名字是一样的（见 {@link #STAGES}）。
      */
     static File stage(Context context) throws IOException {
         File base = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
         File root = new File(base != null ? base : context.getFilesDir(), STAGING);
-        File directory = new File(root, Long.toString(System.currentTimeMillis(), 36));
+        File directory = new File(root, Long.toString(System.currentTimeMillis(), 36)
+                + "-" + STAGES.incrementAndGet());
         if (!directory.mkdirs()) {
             throw new IOException("暂存目录建不出来：" + directory);
         }

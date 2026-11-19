@@ -18,6 +18,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 
 import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLServerSocket;
@@ -47,13 +49,25 @@ import javax.net.ssl.SSLSocket;
  * a phone asked for one during TLS 1.3 does not present it, it gives up — the failure moves into
  * the handshake, from "reset after the transfer" to "no handshake at all".
  *
- * <p># Why one thread and not a pool
+ * <p># Where the door is, and why it stays open
  *
- * <p>A receiver answers one peer at a time — an AirDrop transfer is one connection, and a
- * second sender waits its turn rather than writing into the same directory concurrently.
- * Serialising them is not a limitation to work around; it is the rule that keeps two
- * arrivals from racing for the same file name. The thread exists only because a socket
- * cannot be read on the UI thread at all.
+ * <p>Accepting is one thread; serving is not. The accept loop hands each connection to a thread
+ * of its own and goes straight back to {@code accept()}, because the slow part of serving is not
+ * this device's work — it is a person deciding. A connection that has asked whether to receive
+ * something can sit there for the whole sixty-second invitation timeout, and while it did, the
+ * old loop was inside its {@code serve()}: the next peer's TLS handshake had not even begun. On
+ * 2026-11-19 19:54 that closed the door for 12.3 seconds ({@code offer} at 23.400,
+ * {@code accepted} at 35.755), and on the other side of the link it looks exactly like a
+ * receiver that is slow to show a card, or one that has gone away.
+ *
+ * <p>What is still one at a time is the card. The invitation, the progress drawn on it, and the
+ * move of finished files into the public directory all happen under {@link #card} — and that
+ * lock is taken in the one place a person is asked, never before the handshake. There is one
+ * fluid-cloud card on this device (one notification id), so two invitations at once would
+ * overwrite each other's buttons; and two publishes at once would race for the same file name,
+ * which is the rule this class has always kept. Handshakes, request headers and {@code
+ * /Discover} probes were never part of that rule — holding the gate across them is precisely
+ * what made a parked invitation look like a dead receiver.
  *
  * <p># Why the settings are read per connection and not at start
  *
@@ -95,6 +109,15 @@ final class Listener {
     static final int PORT = 8770;
 
     /**
+     * 同时接待的连接数上限。
+     *
+     * <p>八个，而这个数不是调参调出来的：一个发送端会开两条连接（一条 {@code /Discover}
+     * 探测、一条 {@code /Ask} 邀请），所以八条就是四台设备在同一秒里点发送。再往上不是
+     * 拒绝，是退回旧做法——见 {@link #handOver}。
+     */
+    private static final int PEERS = 8;
+
+    /**
      * How long a peer has to finish its TLS handshake, when the table cannot be read.
      *
      * <p>Twelve seconds, from the legacy server. A handshake on this link measured about a
@@ -111,13 +134,11 @@ final class Listener {
     /**
      * How long a finished handshake has to say something.
      *
-     * <p>This bound matters more here than it did in the legacy server, and the reason is the
-     * difference between them: that one gave every connection a thread of its own, so a silent
-     * socket cost a thread; this one has a single thread, so a silent socket costs every other
-     * sender until it expires. A phone that completes a handshake and then changes its mind —
-     * which it does repeatedly while a share sheet is open — is the common case, not an attack.
-     * Eight seconds is the legacy figure, and it is an order of magnitude longer than a real
-     * sender needs to frame its first request.
+     * <p>每条连接现在都有自己的线程（见类注释），所以一条不说话的 socket 不再连累别人：它
+     * 只花掉一个线程、一个描述符、以及「还没结束的接收」那张表里的一个位置——而那张表会被
+     * 界面重放到卡片上。上限仍然要有：不设的话同样这条连接会占着线程直到 TCP 自己放弃，那是
+     * 几分钟。一台握完手就改了主意的手机会反复来（分享面板开着的时候就是这样），那是常态，
+     * 不是攻击；八秒是 legacy 的数字，比一个真实发送端拼出第一句请求需要的时长多一个量级。
      */
     private static final int REQUEST_TIMEOUT_MS = 8_000;
 
@@ -150,10 +171,11 @@ final class Listener {
      * The longest a connection may be drained before it is closed anyway.
      *
      * <p>{@link #CLOSING_QUIET_MS} ends the drain for a peer that has stopped talking; this
-     * ends it for a peer that has not. Both are needed because the serving thread is single
-     * (see the class comment on why): a sender that keeps writing after its transfer was
-     * answered must not hold every other sender behind it. One second is the same order as
-     * the pause, and still short enough that the next transfer is not waiting on it.
+     * ends it for a peer that has not. A thread of its own made this bound less urgent — a drain
+     * no longer blocks anybody else — but it is still what keeps a peer that keeps writing after
+     * its transfer was answered from pinning a thread and a descriptor until TCP gives up. One
+     * second is the same order as the pause, and still short enough that the next transfer is
+     * not waiting on it.
      */
     private static final long CLOSING_DRAIN_NANOS = 1_000_000_000L;
 
@@ -231,6 +253,45 @@ final class Listener {
     private Thread worker;
     /** Volatile because the loop reads it outside the lock, in the finally that tidies up. */
     private volatile boolean stopping;
+
+    /**
+     * 此刻正在被接待的连接数：握着 socket、握着线程的那些。
+     *
+     * <p>只用来判 {@link #PEERS}。用它而不是一个池对象，是因为这里要的只有一件事——「手里
+     * 还有没有手」。线程本身就是池：它们跑完就结束，没有需要回收的队列，也没有需要关闭的
+     * executor；{@code stop()} 关掉的是端口，不是一条正在往里写字节的传输。
+     */
+    private final AtomicInteger serving = new AtomicInteger();
+
+    /**
+     * 那一次「问人」的独占权：一张卡，一次只问一个人。
+     *
+     * <p># 为什么要有
+     *
+     * <p>这台设备只有一张流体云卡——{@link LiveCard} 用的是同一个通知 id（{@code 0x0B00}）。
+     * 两条邀请同时在场时，后一条会把前一条的【接收】【拒绝】盖掉，而按钮里带着各自的
+     * session，于是人按下去取消/接收的是另一次传输。一旦接受了，进度也画在同一张卡上：两条
+     * 传输各画各的百分比，人看到的只会是两个都不对的数。最后还有一步只该一个人做——把暂存
+     * 目录里的文件搬进公共目录、在那里决定重名谁赢（见 {@link Publish#run}）。
+     *
+     * <p># 为什么在这里，而不是在 accept 之后
+     *
+     * <p>它必须**恰好**套在「问人」这一步上，早一点都不行。套在握手前（或套在整个
+     * {@code serve()} 外面）就是改之前的样子：一次邀请停满六十秒，这期间下一条连接的 TLS
+     * 握手根本还没开始，`/Discover` 也答不了——对面看到的是「这台设备有时很久才显示，有时
+     * 一直不显示」。
+     *
+     * <p># 谁拿、谁放
+     *
+     * <p>拿在 {@link #serve} 的 {@code decide} 回调里（库第一次要问人时），放在同一条线程的
+     * finally 里。用 {@link ReentrantLock#isHeldByCurrentThread()} 判断「我拿过没有」，而不是
+     * 另设一个标志位：这件事锁自己就知道，多一个变量就多一个会和它不一致的地方。
+     *
+     * <p>代价写在这里，因为它是一个真实的取舍：两条邀请同时到达时，第二条会等到第一条被回答
+     * 或者过期为止。这是「一台设备只有一张卡」的直接后果，不是排队排错了地方——而在此之前，
+     * 那段时间连门都是关着的。
+     */
+    private final ReentrantLock card = new ReentrantLock();
 
     /**
      * The announcer: the half of discovery that makes this device appear in a share sheet.
@@ -445,8 +506,9 @@ final class Listener {
      *
      * <p>Closing the socket is what unblocks {@code accept}; there is no other way to
      * interrupt a thread parked in it. A transfer already in progress is allowed to finish —
-     * killing it mid-archive would leave half a file that looks whole — so the loop ends
-     * after the current connection does, and {@link #running()} stays true until then.
+     * killing it mid-archive would leave half a file that looks whole — and it finishes on the
+     * thread that is serving it, so the loop itself ends at once: {@link #running()} goes false
+     * when the port closes, whether or not a transfer is still draining behind it.
      */
     void stop() {
         ServerSocket open;
@@ -552,23 +614,14 @@ final class Listener {
                     setState("接受连接失败：" + describe(broken), true);
                     break;
                 }
-                // Not try-with-resources any more, and the comment that used to be here said
-                // why it was: a serve that throws still has to release the descriptor. That
-                // still has to be true, so the close moved into `hangUp` and stayed in a
-                // `finally` — but it is no longer a bare `close()`, because a bare close is
-                // what made the sender's screen hang. See {@link #hangUp}.
+                // 绝不在这条线程上 serve：见类注释「Where the door is」。接待一条连接里最慢的
+                // 一件事是等人点按钮——一次邀请可以停满六十秒，停在这条线程上就等于把门口关了
+                // 那么久，而门口关着的时候，下一条连接连 TLS 握手都还没开始。
                 //
-                // The catch that used to sit here is gone with the resource: it caught the
-                // `IOException` the implicit close could throw, and `serve` reports its own
-                // failures without throwing any. Nothing in this block can throw now.
-                try {
-                    // The cast is what the socket factory above guarantees; accepting a plain
-                    // Socket here is not a case that can arise, and a defensive instanceof
-                    // would only hide it if it did.
-                    serve((SSLSocket) peer);
-                } finally {
-                    hangUp((SSLSocket) peer);
-                }
+                // The cast is what the socket factory above guarantees; accepting a plain
+                // Socket here is not a case that can arise, and a defensive instanceof
+                // would only hide it if it did.
+                handOver((SSLSocket) peer);
             }
         } finally {
             // First, so the last thing peers hear from this device is that it is gone. The
@@ -582,9 +635,59 @@ final class Listener {
             } else {
                 // The loop ended because the socket broke. Its reason is already on the
                 // page; this redraw is for the button, which has to go back to 开始接收 now
-                // that there is no thread behind it.
+                // that the port is closed — a transfer still draining on its own thread does
+                // not make this device reachable again.
                 tell();
             }
+        }
+    }
+
+    /**
+     * 把一条已经接下的连接交给它自己的线程，然后立刻回去接听下一条。
+     *
+     * <p>「门一直开着」就是这一件事。接待一条连接里最慢的步骤不是本机的活，是等人点按钮：
+     * 一次邀请可以停满整张表的六十秒，而 2026-11-19 19:54 那次停了 12.3 秒——那段时间里旧
+     * 代码正停在 {@code serve()} 里，下一条连接的 TLS 握手根本没开始。
+     *
+     * <p>并发有上限，但上限不是丢连接：手边的线程用完时，第九条连接回到这条线程上被接待，
+     * 也就是旧行为——它会让下一条多等一会儿，但它不会被拒绝，也不会被扔进一个没人读的队列。
+     * 真实的上限是四台设备同时发：每台开两条连接（一条探测、一条邀请）。
+     *
+     * <p>线程是 daemon，跑完就结束。{@link #stop()} 不去碰它们：它关的是端口，而一条正在
+     * 往盘里写字节的传输该被允许写完——半份文件看起来和完整的那份一模一样。
+     */
+    private void handOver(SSLSocket peer) {
+        if (serving.get() >= PEERS) {
+            handle(peer);
+            return;
+        }
+        serving.incrementAndGet();
+        Thread thread = new Thread(() -> {
+            try {
+                handle(peer);
+            } finally {
+                serving.decrementAndGet();
+            }
+        }, "opairdrop-peer");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    /**
+     * 接待一条连接，直到它结束：{@code serve}，然后无论结果如何都把它好好送走。
+     *
+     * <p>{@code serve} 把自己的失败都收在里头，一声不抛；这里仍然接一层，因为接住它的代价
+     * 是零，而不接的代价是旧的死法——那条线程以前就是 accept 循环本身，于是一次没预料到的
+     * 运行时异常死掉的不是一条连接，是整个接收端。
+     */
+    private void handle(SSLSocket peer) {
+        try {
+            serve(peer);
+        } catch (RuntimeException unexpected) {
+            Log.w(TAG, "connection from " + where(peer) + " broke the server: "
+                    + describe(unexpected));
+        } finally {
+            hangUp(peer);
         }
     }
 
@@ -948,8 +1051,8 @@ final class Listener {
         // 一次接收，三个表面：本应用的通知、互传那张卡片、以及页面上的进度。它们说的是同一
         // 件事，所以由同一个对象发出去，而不是各自在自己那一层里再算一遍（见 ReceiveHost）。
         ReceiveHost.Attempt attempt = ReceiveHost.open(context, peer);
-        // 谁在看进度。每条连接一个，因为接收端一次只服务一个对端（见类注释「Why one
-        // thread and not a pool」），所以进度条上最多只有一条连接的数字。
+        // 谁在看进度。每条连接一个：进度只画在那条连接自己的邀请上，而同一时刻只有一条连接
+        // 拿着卡（见 {@link #card}），所以卡上那个数永远只属于一个人。
         Meter meter = new Meter(attempt);
         // 库里按路径写文件，而公共目录（Pictures、Movies…）在 targetSdk 37 下只能走媒体库，
         // 所以先落到应用自己的暂存目录，收完再由 Publish 搬进公共目录并挂到媒体库上。
@@ -957,8 +1060,8 @@ final class Listener {
         File staged = null;
         try {
             staged = Publish.stage(context);
-            // 有人要发东西过来时问一次。问的是人，所以这条线程会停在这里等——它本来也只
-            // 服务这一个连接，等的时候没有别的事该做。
+            // 有人要发东西过来时问一次。问的是人，所以这条线程会停在这里等——它只服务这一个
+            // 连接，等的时候确实没有别的事该做；但别的连接各有各的线程，门不会因此关上。
             byte[] frame = Native.serveWatched(
                     staged.getAbsolutePath(),
                     screen.stored(),
@@ -987,6 +1090,12 @@ final class Listener {
                         // 就没有任何地方还记得它，而对端到底在分享面板里叫什么，是「别人能不能
                         // 找到我们」这件事唯一能留下证据的地方。
                         Log.i(TAG, "offer from " + summary.replace('\t', ' '));
+                        // 门在这里才关上，而且只关到这一步为止（见 {@link #card}）：一台设备
+                        // 只有一张流体云卡，两条邀请同时在场会互相盖掉对方的按钮；接受之后的
+                        // 进度、以及最后把文件搬进公共目录那一步，也都在这把锁里。而握手、读
+                        // 请求头、/Discover 全在锁外——把它们排在这扇门后面，正是「弹窗迟迟
+                        // 不出来」和「有时候一直不显示这台设备」的成因（见类注释）。
+                        card.lock();
                         // 问在有卡片的时候是卡片，没卡片的时候是通知——两条路都落回同一个闩，
                         // 所以这里不需要知道这一刻是哪一种。
                         return attempt.decide(summary);
@@ -1057,6 +1166,13 @@ final class Listener {
             // 像其余出口那样把卡撤掉（见 ReceiveHost.Attempt#failed）。
             attempt.failed(because);
         } finally {
+            // 这一次接待结束了，把卡交出去，下一条邀请才能问出口。用 isHeldByCurrentThread
+            // 而不是另设一个标志位：这把锁有没有被这条线程拿过，它自己知道；多一个变量就是
+            // 多一个会和它不一致的地方。握手失败、设置读不出来的那些连接从来没拿到过，
+            // 这里也就什么都不做。
+            if (card.isHeldByCurrentThread()) {
+                card.unlock();
+            }
             // 暂存里的东西只有两种下场：搬进公共目录，或者被删掉。走到这里时两种都已经发生
             // 过了，剩下的是空目录和搬失败的那几份——留着它们只是让 app 的数据目录一直长大。
             Publish.discard(staged);
