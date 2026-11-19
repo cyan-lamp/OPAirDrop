@@ -269,6 +269,50 @@ final class Peers {
     private static final int KNOCK_FAILS = 2;
 
     /**
+     * 端口守望多久问一次 8770。
+     *
+     * <p># 它补的是 mDNS 看不见的那两个沿
+     *
+     * <p>2026-11-19 19:15 那次两端同时记录（App 日志 + 从设备侧每 0.8 秒 {@code nc -6 -z … 8770}），
+     * 两个沿第一次都有数：
+     * <pre>
+     * 19:15:44.93  8770 关（r=0→1）
+     * 19:15:46.37  它说的最后一包 mDNS   ← 端口已经关了，它又替自己说了 1.44 秒
+     * 19:15:48.78  dropped              ← 3.9 秒，后面这 2.4 秒是我自己的静默等待加两次敲门
+     * 19:15:59.84  8770 开（r=1→0）
+     * 19:16:02.48  suspect（记录这才回来）
+     * 19:16:02.73  ready                ← 2.9 秒，这 2.6 秒里我按 300 毫秒一档问了 8–9 次，无人应答
+     * </pre>
+     *
+     * <p>两段浪费长在同一个地方：**我只看 mDNS**。关掉之后它有 1.44 秒余温，打开之后要 2.6 秒
+     * 才答得上话，而这两段时间里端口的状态早就翻过去了。端口是内核态的事实，让它来说「沿在哪」，
+     * 比等对端开口早得多。
+     *
+     * <p>1 秒是取样周期。判死仍要 {@link #KNOCK_FAILS} 两次独立样本，所以丢一拍不影响结论，
+     * 只让「走了」晚一秒被发现；而每台每秒一个 SYN、且只在面板开着时才发，代价比 mDNS 自己
+     * 一秒一次的查询还小。
+     *
+     * <p>周期是「两次取样的间隔」，不是「睡多久」：探测本身是阻塞的（{@link #WATCH_TIMEOUT_MS}），
+     * 固定睡 1 秒会让真实周期变成 1 秒 + 探测耗时，相位一路往后漂。19:28 那一轮端口
+     * {@code 35.774} 就开了，守望 {@code 37.808} 才看见它——2.03 秒，比一个周期还长，漂掉的那
+     * 一截就藏在这里。
+     */
+    private static final long WATCH_EVERY_MS = 1_000;
+
+    /**
+     * 守望探测一次允许多久，和 {@link #KNOCK_TIMEOUT_MS} 分开。
+     *
+     * <p>守望问的是「**现在**通不通」，敲门问的是「它到底在不在」，两件事对时间的要求相反：
+     * 前者一晚一拍就晚一次显示，后者要顶得住 AWDL 时隙调度吃掉一个 SYN。实测这一侧的端口
+     * 应答只要 9–13 毫秒（{@code ECONNREFUSED} 也是 9 毫秒就回来），400 毫秒是三十倍余量。
+     *
+     * <p>把失败当失败仍然安全：守望**从不记账**。它探测失败只是转给 {@link #knockNow}，由
+     * {@link #knock} 用满 {@link #KNOCK_TIMEOUT_MS} 再量一次——所以短超时换来的误判，代价
+     * 只是一次多余的敲门，不会是误删。
+     */
+    private static final int WATCH_TIMEOUT_MS = 400;
+
+    /**
      * 一台被敲门证死之后，这个地址的那个「死」字保留多久。
      *
      * <p># 它治的是「删了又回来」
@@ -690,13 +734,44 @@ final class Peers {
     private final Map<String, Peer> peers = new LinkedHashMap<>();
 
     /**
-     * 被敲门证死的地址（不带 scope），值是被证死的时刻。
+     * 被敲门证死的地址（不带 scope），值是那块碑——证死的时刻，连同那台设备当时的样子。
      *
      * <p>它比 {@link Peer} 活得久：对端一删，表里就没有记录记得「这台刚被验过、确实不在」，
      * 下一包缓存应答就能把它原样加回来——这正是 18:16 那四趟回魂的机制。墓碑是那张留在
      * 表外的账，和 {@link #peers} 用同一把锁。理由和时限见 {@link #BURIED_MS}。
      */
-    private final Map<String, Long> buried = new LinkedHashMap<>();
+    private final Map<String, Grave> buried = new LinkedHashMap<>();
+
+    /**
+     * 一条墓碑：被证死的那台设备（连同它自己说过的名字、型号、指纹、地址和端口），以及时刻。
+     *
+     * <p># 为什么留整只 {@link Peer}，而不只留端口
+     *
+     * <p>因为「它回来了」这件事**不必等 mDNS**。它被证死之前说过自己是谁，墓碑只是把它留在
+     * 表外；端口一开，那台设备就已经在全表最硬的判据上成立了（见 {@link #knock}），剩下的只是
+     * 一个名字。19:28 的实测把这两件事的代价分得很清楚：端口 {@code 19:28:35.774} 就开了，
+     * 记录 {@code 38.600} 才回来——中间那 2.8 秒里它一次都没答我们的查询，因为它的 mDNS 注册
+     * 还没做完（见 {@link #watch}）。等记录，等的是一句它此刻还说不出来的话。
+     */
+    private static final class Grave {
+        final Peer peer;
+        final long when;
+        /**
+         * 守望已经量到「它的端口通了」。
+         *
+         * <p>它不是结论，是一张便条：只看不写的人（{@link #watch}）把看到的写在便条上，动手
+         * 的人（浏览线程，见 {@link #resurrect}）照着便条把事办完。**{@code peers} 这张表只有
+         * 浏览线程改**——{@link #absorb} 遍历它时不加锁，跨线程 put 会抛
+         * {@code ConcurrentModificationException}，而那个异常会顺着 {@link #loop} 的 catch
+         * 把整条浏览掐掉。为了早 250 毫秒，不值得冒这个。
+         */
+        boolean answered;
+
+        Grave(Peer peer, long when) {
+            this.peer = peer;
+            this.when = when;
+        }
+    }
 
     /**
      * 敲门的线程，一条就够。
@@ -707,6 +782,19 @@ final class Peers {
      */
     private final ExecutorService knocker = Executors.newSingleThreadExecutor(task -> {
         Thread worker = new Thread(task, "opairdrop-knock");
+        worker.setDaemon(true);
+        return worker;
+    });
+
+    /**
+     * 守望的线程，和 {@link #knocker} 分开。
+     *
+     * <p>守望自己也要阻塞（{@link #reachable} 最长 {@link #KNOCK_TIMEOUT_MS}），挤进敲门那条
+     * 单线程队列就会把真正的敲门顺序往后推——而敲门晚一拍，列表就多挂一秒假格子。分开之后
+     * 两边各跑各的，汇合点只有 {@link #knockNow}：守望只负责「该问了」，记账仍然只有一处。
+     */
+    private final ExecutorService watchdog = Executors.newSingleThreadExecutor(task -> {
+        Thread worker = new Thread(task, "opairdrop-watch");
         worker.setDaemon(true);
         return worker;
     });
@@ -764,8 +852,12 @@ final class Peers {
      * <p>{@link #foreign} 是累计数，一旦不为零就永远不为零，于是「我刚才还听得见吗」这个问题
      * 它答不了——而这正是「40 秒里一台设备都没出现」时最需要回答的：我们是听不见，还是对面
      * 没说话。两个原因的处理完全不同（一个要重开 socket，一个只能等）。
+     *
+     * <p>{@code volatile} 是 {@link #watch} 逼出来的：它在另一条线程上拿这个数当「现在该不该
+     * 去敲谁的门」的门槛，而写它的只有浏览线程。没有它，那个循环可能永远读不到更新——于是要
+     * 么一直以为链路是静的（守望白跑），要么一直以为链路是通的（在聋的时候照样敲）。
      */
-    private long lastForeign;
+    private volatile long lastForeign;
 
     /**
      * 本次浏览里，听到过别人的地址记录没有。**不随 socket 重开清零。**
@@ -974,6 +1066,8 @@ final class Peers {
             // 冷启动先按上一次的名单敲一遍门：mDNS 得等对方开口，敲门不用。见 {@link #recall}。
             // 交给敲门线程，浏览线程的查询节奏一秒都不能被它拖慢。
             knocker.execute(this::recall);
+            // 守望和询问同时起步：mDNS 那两个沿看不见的部分全靠它，见 {@link #watch}。
+            watchdog.execute(this::watch);
             // 一次浏览一套账。这两个是字段而不是局部变量，因为它们要跨 socket 活下来；但跨
             // 「关掉面板再打开」就没有意义了——那时候链路、对端、我们绑的 socket 全是新的。
             heardEver = false;
@@ -1620,13 +1714,13 @@ final class Peers {
                 // 等一次验证。AirDrop 关掉之后 iOS 会拿缓存继续答 mDNS，记录和端口会给出相反
                 // 的答案，而这里只信端口。
                 if (!peer.unproven && peer.connectable()) {
-                    Long dead = buried.get(bare(peer.address));
-                    if (dead != null && now - dead < BURIED_MS) {
+                    Grave dead = buried.get(bare(peer.address));
+                    if (dead != null && now - dead.when < BURIED_MS) {
                         peer.unproven = true;
                         peer.reported = false;
                         trace("suspect " + peer.name + "@" + peer.address
                                 + ": records are back but this address was proved gone "
-                                + ((now - dead) / 1000) + " s ago — knocking before showing it");
+                                + ((now - dead.when) / 1000) + " s ago — knocking before showing it");
                     }
                 }
                 if (peer.connectable() && !peer.reported && !peer.unproven) {
@@ -1792,6 +1886,9 @@ final class Peers {
         // 因为它们量的是同一件事：这条 socket 上还有没有声音。
         boolean deaf = lastForeign == 0 || now - lastForeign > LINK_QUIET_MS;
         synchronized (peers) {
+            // 先办「回来了」，再办「走了」。这一步必须在浏览线程上：守望量到了就写在碑上，
+            // 表的改动集中在这里，{@link #absorb} 那些不加锁的遍历才不会撞上并发修改。
+            resurrect();
             int before = peers.size();
             // 「还在」的证据有两个来源：它答了（seenAt，记录解析出来了），或者它只是在说话
             // （heardFrom，查询包）。后者以前根本不算数，于是一台明明在链路上不停发查询的
@@ -1805,7 +1902,7 @@ final class Peers {
                     // 先把墓碑立上再删。删掉之后表里再没有一件事记得「这个地址刚被验过」，
                     // 而下一包缓存应答一两秒就到——没有这块碑，它原样就回来了，见 #BURIED_MS。
                     if (!peer.address.isEmpty()) {
-                        buried.put(bare(peer.address), now);
+                        buried.put(bare(peer.address), new Grave(peer, now));
                     }
                     trace("dropped " + peer.name + "@" + peer.address + " after " + peer.knocks
                             + " unanswered knocks at port " + peer.port + " (" + (now - lastHeard(peer))
@@ -1866,7 +1963,7 @@ final class Peers {
             }
             // 墓碑只留这么久。过期之后这条地址再冒出来就是一台普通的新设备——一次历史结论
             // 不该永久压住一台真的回来的手机。
-            buried.values().removeIf(when -> now - when >= BURIED_MS);
+            buried.values().removeIf(grave -> now - grave.when >= BURIED_MS);
             return before - peers.size();
         }
     }
@@ -1955,7 +2052,7 @@ final class Peers {
             // **我们这侧**没有把包送出去的路（曾经实测过 awdltun0 上一条 IPv6 路由都没有，
             // 于是 `ip -6 route get` 把 fe80:: 送到 rmnet_data3 去了）。拿这种失败去删设备，
             // 就是把自己的路由故障记在对面头上。这类一律不投票，退回到 20 秒的天花板。
-            if (why.contains("unreachable") || why.contains("No route")) {
+            if (ourFault(why)) {
                 // 可疑对端遇到这种失败就放行：我们连包都发不出去，等于没有证据。宁可暂时多显示
                 // 一台已经走了的设备，也不能因为自家路由问题把一台在旁边的手机藏起来。
                 boolean doubt = peer.unproven;
@@ -2089,15 +2186,287 @@ final class Peers {
     }
 
     /**
+     * 端口守望：不等 mDNS 开口，每秒直接问一次 8770 开不开。
+     *
+     * <p>它只做两件事，都是「mDNS 看不见、端口看得见」的那两个沿。
+     *
+     * <p># 在列表里的：端口一关就交给敲门去核
+     *
+     * <p>AirDrop 关掉之后它还会拿缓存答我们 1.44 秒（19:15:44.93 关的端口，最后一包到 46.37
+     * 才停）。这 1.44 秒里「沉默」一毫秒都没攒够，{@link #knockIfDue} 于是什么也不做——它其实
+     * 早就走了，我们却在等一段永远不会开始的安静。这里直接量端口，失败就转 {@link #knockNow}：
+     * 判死仍然只归 {@link #knock} 那笔账管，守望只把「什么时候该问」提前了。
+     *
+     * <p># 埋在土里的：端口一开就放回列表，不等记录
+     *
+     * <p>19:15:59.84 端口就开了，记录到 19:16:02.48 才回来，中间 2.6 秒按 300 毫秒一档问了
+     * 8–9 次都没人应。当时我以为是查询没带「请单播回」（QU）那一位，查过了：{@code
+     * crates/ffi/src/browse.rs} 里查询的 class 就是 {@code CLASS_IN | CLASS_UNICAST}，位一直在。
+     * 19:28 又量了一遍，两次的落点是同一个数：
+     * <pre>
+     * 19:15:59.84  8770 开
+     * 19:16:02.48  suspect（记录回来）        ← 端口开后 2.64 秒
+     *
+     * 19:28:35.774 8770 开
+     * 19:28:37.808 grave（看见端口开了，当场单播问了一句）
+     * 19:28:38.600 suspect（记录回来）        ← 端口开后 2.83 秒
+     * </pre>
+     *
+     * <p>问与不问，记录都在端口开后 2.6–2.8 秒回来；而问了的那次，是问完 0.79 秒之后才回来——
+     * 一个来回在这条链路上只要十几毫秒（敲门实测 9–13 毫秒，见 {@link #WATCH_TIMEOUT_MS}）。
+     * 结论：**那 2.6 秒里它答不上来，不是没听见，是它还没注册完**。一句它此刻说不出来的记录，
+     * 问几遍都说不出来。所以守望不再指望查询，改为直接把墓碑里那台设备放回列表（见
+     * {@link #revive}）：端口开着的那一秒它就已经在全表最硬的判据上成立了，名字晚一两秒对齐
+     * 不影响任何一件事。
+     *
+     * <p>墓碑**不在这里撤**，也不在这里上屏：守望只把「端口通了」写在碑上（{@link
+     * Grave#answered}），由浏览线程在下一拍把它放回列表（{@link #resurrect}）。表的写权只归
+     * 浏览线程一处，判据也还是那一条：TCP connect 通了——这条路上没有第二种「还在」的定义。
+     */
+    private void watch() {
+        long next = System.currentTimeMillis();
+        while (running) {
+            // 睡到「下一拍」，不是「睡一拍」：探测本身是阻塞的，固定 sleep 会把真实周期拉成
+            // 1 秒 + 探测耗时，相位一路往后漂——19:28 端口开了 2.03 秒才被发现，漂掉的一截
+            // 就在这儿。
+            next += WATCH_EVERY_MS;
+            long wait = next - System.currentTimeMillis();
+            if (wait > 0) {
+                try {
+                    Thread.sleep(wait);
+                } catch (InterruptedException stopped) {
+                    return;
+                }
+            } else {
+                // 上一拍超支了。节拍对齐到现在，不补课：攒下的那几拍量的都是过去，补它没用。
+                next = System.currentTimeMillis();
+            }
+            if (!running) {
+                return;
+            }
+            long now = System.currentTimeMillis();
+            // 先把墓碑抄一份出来：下面每一次探测都是阻塞的，绝不能攥着 peers 那把锁跑。
+            List<String> addresses = new ArrayList<>();
+            List<Grave> graves = new ArrayList<>();
+            synchronized (peers) {
+                for (Map.Entry<String, Grave> entry : buried.entrySet()) {
+                    addresses.add(entry.getKey());
+                    graves.add(entry.getValue());
+                }
+            }
+            for (int i = 0; i < graves.size(); i++) {
+                Grave grave = graves.get(i);
+                String address = addresses.get(i);
+                // 上一拍已经量到了，便条还在等人来收：别再问一遍。
+                if (grave.answered) {
+                    continue;
+                }
+                // scope 现取：AirDrop 一开一关就把 awdltun0 换成另一块网卡，碑里那份可能已经过期。
+                if (nicIndex != 0) {
+                    grave.peer.scope = nicIndex;
+                }
+                if (reachable(grave.peer, WATCH_TIMEOUT_MS) != null) {
+                    continue;
+                }
+                // 通着。只贴便条，不动表——理由在 {@link #Grave#answered}。
+                synchronized (peers) {
+                    if (buried.get(address) == grave) {
+                        grave.answered = true;
+                    }
+                }
+            }
+            // 别人全都不说话了，先别敲谁的门：那量的是我们自己的听筒，不是它们走没走。
+            // 这条和 {@link #expire} 里 LINK_DEAD_MS 的用法是同一个道理。
+            if (lastForeign == 0 || now - lastForeign > LINK_QUIET_MS) {
+                continue;
+            }
+            for (Peer peer : snapshot()) {
+                if (!peer.connectable() || peer.unproven || peer.knocking) {
+                    continue;
+                }
+                if (now - peer.knockedAt < KNOCK_EVERY_MS) {
+                    continue;
+                }
+                // 守望用短超时（{@link #WATCH_TIMEOUT_MS}）：它只负责「该问了」，量得准不准由
+                // {@link #knock} 用满 {@link #KNOCK_TIMEOUT_MS} 再说。这里超时会转成一次敲门，
+                // 所以短超时的代价只是多问一次，不会是误删。
+                String why = reachable(peer, WATCH_TIMEOUT_MS);
+                if (why == null) {
+                    // 通着。它说没说话是 mDNS 的账，这里一个字都不改——但敲门的账要清，见 alive。
+                    if (peer.knocks > 0) {
+                        alive(peer);
+                    }
+                    continue;
+                }
+                if (ourFault(why)) {
+                    // 我们没把包送出去。这种失败不能记在它头上，见 {@link #knock}。
+                    continue;
+                }
+                knockNow(peer, System.currentTimeMillis());
+            }
+        }
+    }
+
+    /**
+     * 把守望已经量到「端口通了」的墓碑放回列表。跑在浏览线程上，由 {@link #expire} 每拍叫一次。
+     *
+     * <p>只在浏览线程改表，理由写在 {@link Grave#answered} 上。代价是这批设备要等下一拍
+     * （收包超时是 250 毫秒）才上屏——和它替掉的那 2.8 秒比，250 毫秒不值得去抢。
+     */
+    private void resurrect() {
+        List<String> ready = new ArrayList<>();
+        for (Map.Entry<String, Grave> entry : buried.entrySet()) {
+            if (entry.getValue().answered) {
+                ready.add(entry.getKey());
+            }
+        }
+        // 先收名字再动手：revive 会删 entries，边遍历边删是另一条 CME。
+        for (String address : ready) {
+            Grave grave = buried.get(address);
+            if (grave != null) {
+                revive(address, grave);
+            }
+        }
+    }
+
+    /**
+     * 端口答了：把墓碑里那台设备放回列表，不等它的记录。
+     *
+     * <p># 凭什么现在就敢上屏
+     *
+     * <p>「连得上 = 还在」是全表最硬的一条证据（见 {@link #knock}），而这里做的和它一模一样：
+     * 一次 TCP connect。它通了，就已经是最强的结论，没有第二条判据能说它不在——所以
+     * 「等记录 → 发现可疑 → 敲门 → 上屏」这条链里，**头一步是纯等待**。19:28 的实测：端口
+     * {@code 19:28:35.774} 就开了，记录 {@code 38.600} 才回来，那 2.8 秒里它一次都没答我们
+     * （见 {@link #watch}）：它在注册，不在回答。
+     *
+     * <p># 名字会短暂是旧的，而这不是问题
+     *
+     * <p>碑里存的是它被证死之前的样子，实例名可能已经过期（Apple 每分钟换一次）。列表画的
+     * 却是 {@link Peer#kind()}——TXT 里的型号，见 {@link Peer#name} 的说明——实例名只做表键和
+     * 日志。等真正的记录在一两秒后回来，新实例名会带着同一台机器的地址走 {@link #inherit}，
+     * 旧的那格自动退掉。**指纹也是旧的**，但证书不会在两分钟内换：真换了，握手那一关会拒绝，
+     * 而不是在这条路上错认。
+     *
+     * <p># 为什么不排一次敲门
+     *
+     * <p>{@link #knock} 拿到的就是同一个 connect 的结果，再敲一遍只多一次往返，还要排在
+     * {@link #recall} 后面排队。唯一的实质差别是它顺手撤碑——这里也撤，并且撤在同一把锁里。
+     */
+    private void revive(String address, Grave grave) {
+        long now = System.currentTimeMillis();
+        Peer back;
+        synchronized (peers) {
+            // 这一拍之前别人可能已经办完了：{@link #knock} 成功会撤碑。碑不在就什么都别做
+            // ——判据只有这一处。
+            if (buried.get(address) != grave) {
+                return;
+            }
+            buried.remove(address);
+            // 记录有可能先一步把它带回来了，那一份此刻挂着 unproven 藏在表外。表里那份比碑新
+            // （记录是刚读到的，碑是两分钟前的样子），所以优先用它；表里没有才把碑那份放回去。
+            Peer known = peers.get(grave.peer.name);
+            back = known == null ? grave.peer : known;
+            if (known == null) {
+                peers.put(back.name, back);
+            }
+            if (back.port <= 0) {
+                back.port = grave.peer.port;
+            }
+            if (nicIndex != 0) {
+                back.scope = nicIndex;
+            }
+            back.unproven = false;
+            back.gone = false;
+            back.knocks = 0;
+            back.knocking = false;
+            back.reported = true;
+            back.readyAt = now;
+            // 两个时刻都得是现在：seenAt 是「记录到了」，不推的话下一轮 expire 就按沉默
+            // 把它删了；heardFrom 是「它还在」的证据，而这条证据是我们刚刚量到的。
+            back.seenAt = now;
+            back.heardFrom = now;
+            dirty = true;
+        }
+        trace("revived " + back.name + "@" + address + ":" + back.port + " — its port answered "
+                + ((now - grave.when) / 1000) + " s after the tombstone, so it is here;"
+                + " the records can catch up on their own");
+        // 还是要问一句：真正要对齐的是型号和指纹（都在 TXT 里），而碑里那份可能已经隔了
+        // 一个实例名的周期。这一句不参与判决，只为让名字早一点到位。
+        ask(back);
+    }
+
+    /**
+     * 守望的一次成功探测：它还在。
+     *
+     * <p>不能只「什么都不做」。{@link Peer#knocks} 是「连着几次敲不通」的账，而它原来只有
+     * {@link #knock} 成功时才会清零。守望比 {@link #knockIfDue} 勤得多——一秒一次——于是
+     * **一次瞬时丢包留下的那个 1 会一直挂在账上**，等哪天再丢一包就凑满 {@link #KNOCK_FAILS}
+     * 变成一次误删，而两次失败可能隔着十分钟。连得上就是全表最硬的那条「还在」的证据，这里
+     * 把账清掉，语义和 {@link #knock} 里那一句完全一样。
+     */
+    private void alive(Peer peer) {
+        synchronized (peers) {
+            peer.knocks = 0;
+            peer.gone = false;
+        }
+    }
+
+    /**
+     * 单播问一句：把这条查询直接发给它的 5353。
+     *
+     * <p>和 {@link #prompt} 发的是同一串字节（带 QU 位，见 {@code crates/ffi/src/browse.rs}），
+     * 差别只在「谁能当收信人」：那边只问在列表里的，这条问的是一个具体地址。
+     *
+     * <p>**它不参与判决**，只为让记录早一点到。19:28 量过：刚注册完的那台对端对着单播查询
+     * 0.79 秒才答，而这 0.79 秒里它本来也会自己宣告——所以这一句省不下那 2.6 秒的注册时间，
+     * 别指望它。它值钱的地方是「已经上屏了，但型号和指纹还是旧的」那一小段：问一句能让它们
+     * 早一两百毫秒对齐。
+     */
+    private void ask(Peer peer) {
+        MulticastSocket open = socket;
+        if (open == null || open.isClosed()) {
+            return;
+        }
+        try {
+            byte[] query = Native.mdnsQuery();
+            open.send(new DatagramPacket(query, query.length, address(peer), PORT));
+        } catch (Exception lost) {
+            // 地址暂时不可用，或者 socket 刚被关掉。下一拍再来，这里不是判断的地方。
+        }
+    }
+
+    /**
+     * 这次失败说的是「我们发不出去」，还是「它不接」。
+     *
+     * <p>{@code Network is unreachable} / {@code No route to host} 属于前者：曾经实测过
+     * {@code awdltun0} 上一条 IPv6 路由都没有，于是 {@code ip -6 route get} 把 {@code fe80::}
+     * 送到 {@code rmnet_data3} 去了。拿这种失败去删设备，就是把自己家的路由故障记在对面头上。
+     */
+    private static boolean ourFault(String why) {
+        return why.contains("unreachable") || why.contains("No route");
+    }
+
+    /**
      * TCP 连一次它的服务端口。
      *
      * @return 连上了返回 {@code null}；否则返回「为什么没连上」，原样带异常名和消息——
      *         调用方要靠它把「它不接」和「我们发不出去」分开。
      */
     private static String reachable(Peer peer) {
+        return reachable(peer, KNOCK_TIMEOUT_MS);
+    }
+
+    /**
+     * 同上，但自己定探测允许多久。
+     *
+     * <p>两个超时的分工见 {@link #WATCH_TIMEOUT_MS}：守望要快（它一晚一拍就晚一次显示），
+     * 敲门要准（它要顶得住 AWDL 时隙调度吃掉一个 SYN）。
+     */
+    private static String reachable(Peer peer, int timeout) {
         Socket probe = new Socket();
         try {
-            probe.connect(new InetSocketAddress(address(peer), peer.port), KNOCK_TIMEOUT_MS);
+            probe.connect(new InetSocketAddress(address(peer), peer.port), timeout);
             return null;
         } catch (Exception failure) {
             String message = failure.getMessage();
