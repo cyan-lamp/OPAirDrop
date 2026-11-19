@@ -91,6 +91,21 @@ final class SendHost {
     private static PendingIntent stopping;
     private static String stoppingSession;
 
+    /**
+     * 最近一次的终态：谁、说的哪句、什么码。
+     *
+     * <p>它不是缓存，是**唯一能让卡片自己摆正的依据**。理由见 {@link #settleCard}：那颗
+     * 【取消发送】会一直留在屏上（系统留着前一帧），而人按下去时这一趟早就结束了——那时
+     * 应用侧唯一知道「这张卡该长什么样」的地方，就是这里。
+     *
+     * <p>只记一趟，不记一串：同一个通知 id 全机只有一张卡（{@link LiveCard#ID}），记多了
+     * 也没地方摆，而陌生的 session 本来就不该由这里去猜。
+     */
+    private static String settledSession;
+    private static String settledTitle;
+    private static String settledLine;
+    private static int settledStatus = -1;
+
     private SendHost() {}
 
     /** 卡片上的「取消」要落回正在跑的那一次发送，那是唯一知道怎么停下它的人。 */
@@ -136,14 +151,61 @@ final class SendHost {
         synchronized (LOCK) {
             listener = canceller;
         }
-        if (listener == null) {
-            return false;
+        boolean stopped = false;
+        if (listener != null) {
+            try {
+                stopped = listener.cancel(session);
+            } catch (Throwable failure) {
+                Log.w(TAG, "cancel from the card failed", failure);
+            }
         }
-        try {
-            return listener.cancel(session);
-        } catch (Throwable failure) {
-            Log.w(TAG, "cancel from the card failed", failure);
-            return false;
+        if (!stopped) {
+            // 按在一趟已经结束（或者页面已经不在）的发送上。按钮那边没戏了，但卡还在屏上
+            // 站着——那正是 2026-11-19 那 6 次连按的成因。
+            settleCard(session);
+        }
+        return stopped;
+    }
+
+    /**
+     * 那一趟已经结束了：把卡摆回终态，让那颗【取消发送】跟着一起消失。
+     *
+     * <p># 它修的是什么
+     *
+     * <p>2026-11-19 23:22:32.943 就投出了「发送完成」，65 秒后还有 6 次取消广播打在同一次
+     * 发送上（`no send is listening for 2f391a32…`，5 秒内 6 连按），而应用侧那一分钟
+     * 一条卡片日志都没有——屏上那张是系统留着的前一帧，按钮仍是【取消发送】。人按了没反应，
+     * 只能再按，于是又一个「点了没用」的按钮。
+     *
+     * <p>两道闸：{@link LiveCard} 现在在按钮行变化时**先撤再投**（治成因），这里治症状——
+     * 万一还是被按到，就撤掉重投一次，卡当场回到正确模样，日志里留下 `card re-flushed`。
+     *
+     * <p># 为什么只认「最近那一趟」
+     *
+     * <p>同一个通知 id 也归接收侧（{@link LiveCard#ID} 全机一张），所以不能见到陌生 session
+     * 就 {@code drop}——那会把一次正在进行的接收连卡一起撤掉。只有这个 session 正好是刚才
+     * 那一趟，才知道该显示什么，也才敢动手。返回 {@code false} 时什么都不做，交回给调用方。
+     */
+    private static void settleCard(String session) {
+        Context context = context();
+        String title;
+        String line;
+        int status;
+        synchronized (LOCK) {
+            if (context == null || session == null || !session.equals(settledSession)) {
+                return;
+            }
+            title = settledTitle;
+            line = settledLine;
+            status = settledStatus;
+        }
+        Log.i(TAG, "cancel from the card after the send finished: re-flushing the card");
+        // 先撤：{@link LiveCard#restate} 走的是同一种形状，不撤的话系统没有理由重建那一行。
+        LiveCard.drop(context);
+        if (status == SUCCESS) {
+            LiveCard.restate(context, title, line, 100, null);
+        } else {
+            LiveCard.restate(context, title, line, Math.max(0, lastPercent), retry(context));
         }
     }
 
@@ -243,14 +305,33 @@ final class SendHost {
             return;
         }
         if (status == SUCCESS) {
+            settle(session, status, "发送完成", line);
             LiveCard.finishWithActions(context, "发送完成", line, null);
             return;
         }
         if (status == CANCELLED) {
+            // 撤卡这一支没有终态可言：屏上已经什么都没有，也就没有一颗按得到的旧按钮。
+            // 记成空，是为了让 {@link #settleCard} 在这趟之后不认任何 session。
+            settle(null, status, null, null);
             LiveCard.drop(context);
             return;
         }
+        settle(session, status, label(status), line);
         LiveCard.failedWithActions(context, label(status), line, lastPercent, retry(context));
+    }
+
+    /**
+     * 记下这一次的终态。写在这里而不是让 {@link #settleCard} 自己推：那句话是
+     * {@link #label} 给的、那个百分比是 {@link #lastPercent} 记的，撇开这一处再算一遍就是
+     * 第二个会走样的副本。
+     */
+    private static void settle(String session, int status, String title, String line) {
+        synchronized (LOCK) {
+            settledSession = session;
+            settledStatus = status;
+            settledTitle = title;
+            settledLine = line;
+        }
     }
 
     /**

@@ -103,6 +103,14 @@ final class LiveCard {
     /** 上面那几条只扫一次。这个类每秒要投五次通知，不该每次附送四次 binder 往返。 */
     private static boolean swept;
 
+    /**
+     * 上一次投出去那张卡的「按钮行长什么样」，见 {@link #post} 里那一段。
+     *
+     * <p>{@code null} 是「还没投过」——第一张卡无论如何都要撤一次（那时本来也没东西可撤，
+     * 代价是一次空 binder）。
+     */
+    private static String lastShape;
+
     /** 两次响铃之间至少隔这么久，免得同一件事被重投时连叫两声。 */
     private static final long CHIME_GAP = 1500L;
 
@@ -279,6 +287,23 @@ final class LiveCard {
     }
 
     /**
+     * 把一张**已经投过的**终态卡按原样再摆一遍，不抬头。
+     *
+     * <p>只有一个调用者：{@link SendHost} 发现那颗【取消发送】按在了一趟已经结束的发送上。
+     * 那时屏上那张卡是旧的（按钮还是进行中那一行），重投一次才能把它换成终态的样子。
+     *
+     * <p>为什么不是再走一遍 {@link #finishWithActions}：那个入口会抬头。人为了一件早就结束的
+     * 事点了一下，得到的回应不该是通知栏里又弹一次「发送完成」——那会读成「刚才那次又成功了
+     * 一遍」。
+     *
+     * @param retry 失败卡上那颗【重试】；成功卡传 {@code null}
+     */
+    static void restate(Context context, String title, String shortText, int percent,
+                        PendingIntent retry) {
+        post(context, title, shortText, percent, false, true, null, null, retry);
+    }
+
+    /**
      * 失败的那张卡：停在断开那一刻的百分比上，挂【重试】【取消】，**不自己消失**。
      *
      * <p># 为什么不像以前那样八秒后自己下去
@@ -337,6 +362,10 @@ final class LiveCard {
         Notification card = builder.build();
         immersive(card);
         manager.notify(ID, card);
+        // 邀请卡不走 {@link #post}（它不发进度条、走的是另一条会响的渠道），所以形状得在这里
+        // 自己记一笔：否则下一张进度卡的形状与上一次传输留下的那个恰好相同时，系统会把
+        // 「拒绝/接收」这两个答案留在屏上。
+        lastShape = "invite";
         // 响了才算「通知到了」。系统那条路对提升过的通知不出声（见 alertChannel 的注释），
         // 所以这一声得我们自己发。放在 notify 之后：卡先在原位站好，声音再跟上，
         // 人抬头时看到的就是「已经在那儿的那张卡」，而不是「先响一声、卡再慢慢浮出来」。
@@ -543,6 +572,24 @@ final class LiveCard {
             builder.addAction(new Notification.Action.Builder(null, label, done(context)).build());
         }
         Notification card = builder.build();
+        // 按钮行和上一张不一样时，**先撤再投**，而不是把内容改掉。
+        //
+        // 2026-11-19 23:22:32.943 已经投出「发送完成」，65 秒后仍有人在按那颗【取消发送】：
+        // 5 秒内 6 次广播全部落在已经结束的那一趟上（`no send is listening for 2f391a32…`），
+        // 而应用侧那一分钟一条卡片日志都没有——屏上那张是系统留着的前一帧，按钮还是旧的。
+        // 只改内容做不到这件事：进度卡挂【取消发送】、终态卡挂【完成】/【重试】，同一条通知
+        // 记录上换按钮行，系统有可能只换了字、没换那一行按得到的东西。
+        //
+        // 判据是「形状」而不是「是不是终态」：邀请卡（拒绝/接收）→ 进度卡（取消接收）也是
+        // 同一种变化——那是人在对面手机上点了「接收」的那一刻，两个答案换成一个出口。
+        String shape = (open != null ? "open" : "")
+                + (retry != null ? "retry" : "")
+                + (stop != null ? "stop" : "")
+                + (terminal ? "|end" : "|live");
+        if (!shape.equals(lastShape)) {
+            manager.cancel(ID);
+            lastShape = shape;
+        }
         manager.notify(ID, card);
         Log.i(TAG, "live card: " + title + " · " + shortText + " · " + percent + "%"
                 + (alert ? " (heads-up)" : ""));

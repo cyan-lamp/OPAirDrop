@@ -29,8 +29,11 @@ public final class SendCancel extends BroadcastReceiver {
         }
         // 返回值是「真的停下了才算真」。页面已经销毁（那边 unregister 过）时这里会拿到
         // false——那时没有传输可停，卡片也不该由这条广播去撤，交给它自己那一趟的收尾。
+        // 但 false 还有另一种来源：屏上那张卡是旧的，人按在了一趟早就结束的发送上。
+        // 这两种都由 {@link SendHost#cancel} 去收拾（它能分辨：只有「正好是刚才那一趟」
+        // 才重投终态卡），这里只管把话说清楚。
         if (!SendHost.cancel(session)) {
-            Log.i("OPAirDropSend", "cancel from the card: no send is listening for " + session);
+            Log.i("OPAirDropSend", "cancel from the card: nothing to stop for " + session);
         }
     }
 }
