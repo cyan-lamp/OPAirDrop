@@ -1,6 +1,7 @@
 package com.oshare.airdrop;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.net.wifi.WifiManager;
 import android.os.Handler;
 import android.os.Looper;
@@ -292,6 +293,29 @@ final class Peers {
      * 重新打开时记录一到就会被敲通，所以这个长度不会让人等——只影响「多久之后不再追究」。
      */
     private static final long BURIED_MS = 120_000;
+
+    /**
+     * 上一次浏览里能连的那几台，落在磁盘上，留给下一次冷启动。
+     *
+     * <p># 为什么要记到磁盘
+     *
+     * <p>mDNS 是**对方说、我们听**：它那一刻不讲，我们只能等。2026-11-19 18:26 的日志里，
+     * 进程被系统 stop 掉（`o-stop(40)`，从最近任务划掉）之后重启，`browse` 在 18:26:29.86
+     * 就开始问了，而 iPhone 直到 18:26:45.24 才答——**15.4 秒**的空列表。这期间它可能正在
+     * 收一个 24 MB 的文件，也可能只是应答器在睡。等待本身没有错，错在**已经把地址忘掉了**：
+     * 那条链路本地地址由 MAC 推出来，跨进程重启不会变。
+     *
+     * <p>所以能连的时候把「名字 + 地址 + 端口」写下来。下次启动先按这张旧名单敲一遍门——
+     * 敲通就立刻显示（实测 25–38 毫秒），不必等它开口；敲不通就当没这回事，交给 mDNS。
+     * 判据还是那一个：**端口开着才算在**，所以旧名单不会把一台已经走了的设备留在屏幕上。
+     */
+    private static final String PREFS = "peers";
+
+    /** 旧名单存在这个键下，一行一台：{@code 名字 \t 地址 \t 端口}。 */
+    private static final String REMEMBERED = "remembered";
+
+    /** 最多记几台。名单只是冷启动的加速器，长了既没用又容易被淘汰的老设备占着。 */
+    private static final int REMEMBERED_MAX = 6;
 
     /**
      * 能连的对端，在「丢两包要多久」之上再留多少毫秒。
@@ -938,6 +962,9 @@ final class Peers {
             // 一台身边什么都没有的手机，在日志里和「根本没开始问」长得一模一样。
             publish(null);
             startedAt = System.currentTimeMillis();
+            // 冷启动先按上一次的名单敲一遍门：mDNS 得等对方开口，敲门不用。见 {@link #recall}。
+            // 交给敲门线程，浏览线程的查询节奏一秒都不能被它拖慢。
+            knocker.execute(this::recall);
             // 一次浏览一套账。这两个是字段而不是局部变量，因为它们要跨 socket 活下来；但跨
             // 「关掉面板再打开」就没有意义了——那时候链路、对端、我们绑的 socket 全是新的。
             heardEver = false;
@@ -1447,6 +1474,8 @@ final class Peers {
      */
     private boolean absorb(String lines) {
         boolean changed = false;
+        // 这一轮有没有新的一台进列表——有就重写一次磁盘名单，见 {@link #remember}。
+        boolean entering = false;
         synchronized (peers) {
             String[] rows = lines.split("\n");
             for (String row : rows) {
@@ -1574,10 +1603,15 @@ final class Peers {
                 if (peer.connectable() && !peer.reported && !peer.unproven) {
                     peer.reported = true;
                     peer.readyAt = now;
+                    entering = true;
                     trace("ready " + peer.name + "@" + peer.address + ":" + peer.port
                             + " after " + (now - startedAt) + " ms of browsing");
                 }
             }
+        }
+        // 名单只在有新的一台进列表时重写：写盘是异步的，但没必要每收一包就攒一次。
+        if (entering) {
+            remember();
         }
         return changed;
     }
@@ -1918,6 +1952,110 @@ final class Peers {
                 trace("knock: " + peer.name + " did not answer at port " + peer.port + " "
                         + peer.knocks + " times in a row — marking it gone");
             }
+        }
+    }
+
+    /**
+     * 把此刻能连的设备写进磁盘。
+     *
+     * <p>写「能连的」而不是「见过的」：不能连的记下来也没有用，下次敲门一定敲不通，白白花掉
+     * 一次 {@link #KNOCK_TIMEOUT_MS} 的可能。理由和名单的作用见 {@link #PREFS}。
+     */
+    private void remember() {
+        StringBuilder list = new StringBuilder();
+        int kept = 0;
+        synchronized (peers) {
+            for (Peer peer : peers.values()) {
+                if (kept >= REMEMBERED_MAX) {
+                    break;
+                }
+                // 可疑的不记：它此刻正被怀疑已经走了，记下来等于把怀疑变成下一次的默认。
+                if (!peer.connectable() || peer.unproven || own.contains(bare(peer.address))) {
+                    continue;
+                }
+                if (list.length() > 0) {
+                    list.append('\n');
+                }
+                list.append(peer.name).append('\t').append(peer.address)
+                        .append('\t').append(peer.port);
+                kept++;
+            }
+        }
+        SharedPreferences prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        prefs.edit().putString(REMEMBERED, list.toString()).apply();
+    }
+
+    /**
+     * 冷启动时按旧名单先敲一遍门，敲通就当场显示。
+     *
+     * <p>这是列表里唯一不靠 mDNS 的一条路，所以它只在「等 mDNS 明显要花掉几秒」的场合赢。
+     * 敲不通就什么都不做——**不显示比显示了再删掉好**，这也正是它敢用旧名单的原因：
+     * 名字可能过时（iPhone 每分钟换一个实例名），但地址不会，而且判据仍是端口开不开。
+     *
+     * <p>跑在敲门线程上，不占浏览线程：单个用满超时是 {@link #KNOCK_TIMEOUT_MS}，而浏览线程
+     * 每 300–1000 毫秒要发一次查询，被它卡住就把「等 mDNS」这件事本身也拖慢了。
+     */
+    private void recall() {
+        SharedPreferences prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        String saved = prefs.getString(REMEMBERED, "");
+        if (saved == null || saved.isBlank()) {
+            return;
+        }
+        boolean found = false;
+        for (String line : saved.split("\n")) {
+            String[] field = line.split("\t");
+            if (field.length < 3) {
+                continue;
+            }
+            String name = field[0].trim();
+            String address = field[1].trim();
+            int port = parseInt(field[2]);
+            if (name.isEmpty() || address.isEmpty() || port <= 0
+                    || own.contains(bare(address))) {
+                continue;
+            }
+            Peer probe = new Peer(name);
+            probe.address = address;
+            probe.port = port;
+            probe.scope = nicIndex;
+            long before = System.currentTimeMillis();
+            String why = reachable(probe);
+            long took = System.currentTimeMillis() - before;
+            synchronized (peers) {
+                if (why != null) {
+                    trace("recall: " + name + "@" + address + ":" + port + " did not answer in "
+                            + took + " ms (" + why + ") — leaving it to mDNS");
+                    continue;
+                }
+                Peer peer = peers.get(name);
+                if (peer == null) {
+                    peer = new Peer(name);
+                    peer.scope = nicIndex;
+                    peers.put(name, peer);
+                }
+                // 地址和端口照旧以记录为准：这条旧名单只是在记录到之前顶一会儿。
+                if (peer.address.isEmpty()) {
+                    peer.address = address;
+                }
+                if (peer.port <= 0) {
+                    peer.port = port;
+                }
+                long now = System.currentTimeMillis();
+                peer.unproven = false;
+                peer.gone = false;
+                peer.knocks = 0;
+                peer.reported = true;
+                peer.readyAt = now;
+                peer.seenAt = now;
+                peer.heardFrom = now;
+                found = true;
+                trace("recall: " + name + "@" + address + ":" + port + " answered in " + took
+                        + " ms — showing it after " + (now - startedAt)
+                        + " ms of browsing, before mDNS says anything");
+            }
+        }
+        if (found) {
+            publish(null);
         }
     }
 
