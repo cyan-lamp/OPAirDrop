@@ -26,7 +26,7 @@ import android.os.VibratorManager;
  * <p>互传那张卡是它自己的窗口，画在它的进程里。要用它，就得先让互传活着、把它叫醒、再钩住
  * 它画卡的那一层——这条链上有三处会坏（进程在不在、binder 通不通、钩子对不对得上这一版
  * ROM），而且**没有一处会告诉我们它到底画出来了没有**。2026-11-16 13:14 就是这样：`attached`
- * 为真、事件也送到了互传进程，屏幕上什么都没有，三十秒后按时过期。
+ * 为真、事件也送到了互传进程，屏幕上什么都没有，超时后按时过期。
  *
  * <p>Android 16 把这件事收进了系统：一条「进度型」的常驻通知 + {@code setRequestPromotedOngoing}，
  * 系统就把它提升为实时通知，ColorOS 把它画在流体云那个位置。画的人是系统，所以我们不需要知道
@@ -55,6 +55,12 @@ import android.os.VibratorManager;
  * 插件 ViewModel 的 onExpand，看着能让卡片摊开，代价是**通知中心里那张卡不见了、点空白
  * 区域收不回去**——因为它只在「展开」这一帧被摆好了姿态，系统其余的状态迁移没有跟着走。
  * 一个能摊开但收不回去、还在通知中心缺席的卡，比一颗需要人点一下的胶囊更糟。
+ *
+ * <p>现在唯一会影响摊开的，是包内那个**可选的** LSPosed 模块（{@code FluidModule}）。它
+ * 不调 onExpand，只把系统算出来的 {@code remindType} 从 0 抬到 11，剩下交给系统自己的状态
+ * 机去摆——所以通知中心里那张卡还在、点空白也收得回去。启用它，卡片在桌面态就展开、本应用
+ * 在前台也照弹；不启用，这一页的代码一个字都不用变，只是停在胶囊上，而且本应用在前台时
+ * 系统会把那张卡整张丢掉。
  *
  * <p>所以这里只投一张**规矩的**实时通知：{@code ProgressStyle} +
  * {@code setRequestPromotedOngoing} + {@code setShortCriticalText}，全部是
@@ -399,11 +405,17 @@ final class LiveCard {
      * 这里原来有一个 {@code expand(Context)}，往 {@code com.android.systemui} 发一条广播，
      * 让 Xposed 模块进 SystemUI 调流体云插件的 onExpand。
      *
-     * <p>它已经删了，连带 {@code FluidModule} 和整个 LSPosed 声明。理由是它换来的东西不值：
-     * 卡片确实会摊开一下，但**通知中心里那张卡同时消失了，点空白区域也收不回去**——
-     * 每次都需要用户去通知中心手动划掉。一个摊开了却收不回去的卡，不如一颗点一下就开的胶囊。
+     * <p>**这条广播已经撤了**：卡片确实会摊开一下，但**通知中心里那张卡同时消失了，点空白
+     * 区域也收不回去**，每次都需要用户去通知中心手动划掉。一个摊开了却收不回去的卡，不如
+     * 一颗点一下就开的胶囊。绕开系统自己的状态机是它的全部病根。
      *
-     * <p>现在这张卡完全由系统管：{@code ProgressStyle} + {@code setRequestPromotedOngoing}
+     * <p>但 {@code FluidModule} 与 LSPosed 声明**没有**跟着走：2026-11-19 换了一套实现又装
+     * 回来，不再调 {@code onExpand}，只把系统算出来的 {@code remindType} 从 0 抬到 11
+     * （{@code REMIND_TYPE_FORCED}），剩下的 {@code CAPSULE → CARD} 迁移交给系统自己走完——
+     * 所以通知中心里那张卡还在、点空白也收得回去。详见 {@link FluidModule}。模块是可选的：
+     * 不启用就停在胶囊上，这一页的代码一个字都不用变。
+     *
+     * <p>这一侧仍然只有公开 API：{@code ProgressStyle} + {@code setRequestPromotedOngoing}
      * 决定它是不是实时通知，展开与收起由用户点击和系统策略决定。应用侧没有、也不该有
      * 这个开关——{@code android.jar} 里根本没有类似方法（{@code Notification.Builder} 上只有
      * {@code setRequestPromotedOngoing} 和 {@code setShortCriticalText}）。
