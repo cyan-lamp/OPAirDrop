@@ -364,11 +364,23 @@ final class ReceiveHost {
          */
         private Confirmation.Offer offer;
 
-        /** 有没有对外说过话。没说过就不用收尾。 */
-        private boolean announced;
+        /**
+         * 有没有对外说过话。没说过就不用收尾。
+         *
+         * <p>{@code volatile} 是给 {@link #progress} 看的：进度从 2026-11-19 起由另一条线程
+         * 投递（见 {@code Listener.Meter}），那条线程要读这个标志才敢画卡。没有它，一个
+         * 早先在读线程上写下的 {@code true} 可以永远不被看到，进度就永远画不出来。
+         */
+        private volatile boolean announced;
 
-        /** 结果已经说过了。收尾不再覆盖它。 */
-        private boolean settled;
+        /**
+         * 结果已经说过了。收尾不再覆盖它。
+         *
+         * <p>同样是因为投递换了线程：这一位由读线程在收尾时置上，由投递线程在每一次进度
+         * 之前检查。不加 {@code volatile}，一条**迟到的**进度就可能盖掉「接收完成」——
+         * 屏幕上于是出现一张停在 97%、写着正在接收、再也不会动的卡。
+         */
+        private volatile boolean settled;
 
         /**
          * 最后一次说出去的进度；负数表示对端什么都没声明。

@@ -1108,6 +1108,10 @@ final class Listener {
                     meter);
             // 字节已经收完了，接下来的安静属于搬文件，不属于这条线。
             stall.stop();
+            // 而且要在这里就把进度投递停掉：下面 {@code meter.finished} 和
+            // {@code attempt.delivered} 要往同一张卡上写「接收完成」，一条还在飞的进度落在
+            // 它后面，屏幕上就是一张停在 97%、再也不会动的卡。{@code close} 会等投递线程退出。
+            meter.close();
             // A discovery probe and an empty share both come back empty; neither is worth a
             // line on the page, and leaving the previous transfer up is the truthful state
             // of "nothing new arrived".
@@ -1176,6 +1180,10 @@ final class Listener {
                         + describe(refused));
                 return;
             }
+            // 先把投递停掉再往卡上写失败：否则一条还在飞的「正在接收」会落在失败那句后面，
+            // 屏幕上就只剩一张停在半路、再也不会动的进度卡。上面那两处 {@code return} 由
+            // {@code finally} 兜住——它们本来就不许碰卡。
+            meter.close();
             String because = because(refused, meter.bytes());
             Log.w(TAG, "receive from " + where(peer) + " failed: " + describe(refused));
             setState("接收失败：" + because, true);
@@ -1196,6 +1204,9 @@ final class Listener {
             if (stall != null) {
                 stall.stop();
             }
+            // 投递线程也一样：上面那两处都走不到的时候（比如 {@code Publish.stage} 就抛了）
+            // 这里收。幂等，只有第一次真做事。
+            meter.close();
             // 暂存里的东西只有两种下场：搬进公共目录，或者被删掉。走到这里时两种都已经发生
             // 过了，剩下的是空目录和搬失败的那几份——留着它们只是让 app 的数据目录一直长大。
             Publish.discard(staged);
@@ -1604,11 +1615,29 @@ final class Listener {
     /**
      * 把库里报的字节数变成至多每秒五条的状态更新。
      *
-     * <p># 为什么必须节流
+     * <p># 为什么投递不在读字节的那条线程上
      *
-     * <p>{@link Native.Landing#landed} 是按落地块调用的，一次传输就是成千上万次，而每一次
-     * 更新都是一次 binder 事务，全都发生在正在读字节的那条线程上——传输在等它。进度每秒
-     * 重画超过五次，人眼也读不出区别，所以这里选的是「够快」而不是「最快」。
+     * <p>{@link Native.Landing#landed} 是从 {@code inbox} 的写循环里调过来的，也就是在**正
+     * 读着 socket 的那条线程**上。这里原来是就地投递：节流到每 200 ms 一条，然后直接
+     * {@code attempt.progress}——一次 {@code notify} 到 SystemUI，外加一次
+     * {@code getNotificationChannel}，全都压在读线程里。
+     *
+     * <p>节流压住的是**频率**，压不住**阻塞**：只要单次投递本身要几百毫秒（这台机器上那条
+     * binder 路上还压着一个 Xposed 模块），200 ms 这个间隔就永远满足，于是每一条都放行、
+     * 每一条都堵在读线程上。对端看到的是一条不读数据的连接，收到的字节就只能一格格往前挪
+     * ——2026-11-19 21:17 那次是 1.2 秒恰好 128 KiB（约 100 KiB/s），而同一台 iPhone、同一条
+     * {@code awdltun0} 上发送方向是 2.5 MB/s，差 25 倍。
+     *
+     * <p>所以投递搬到自己的线程上：{@code landed} 只做两件事——记下数字、把信箱点亮。读线程
+     * 不再等 UI，线也就不会因为 UI 忙而停。数字仍然是最新的：信箱只有一格，投递线程每次取
+     * 的都是它醒来那一刻的值，中间被覆盖掉的那些本来就没人看得见。
+     *
+     * <p># 为什么必须停得下来
+     *
+     * <p>进度和收尾是同一张卡上的两句话，先后顺序不能乱：一条还在飞的进度落在「接收完成」
+     * 之后，屏幕上就是一张停在 97%、还写着正在接收、再也不会动的卡。所以 {@link #close} 是
+     * 阻塞的——它等到投递线程真的退出才返回，调用点在 {@code serveWatched} 返回之后、
+     * {@code delivered} 之前；{@code ReceiveHost} 的 {@code settled} 是第二道闸。
      *
      * <p># 为什么收尾不在这里的回调里
      *
@@ -1628,8 +1657,30 @@ final class Listener {
          */
         private final ReceiveHost.Attempt attempt;
 
-        /** 上次投递的时刻（{@link System#nanoTime}）；0 表示一次都还没投递过。 */
-        private long postedAt;
+        /**
+         * 单格信箱：读线程放，投递线程取。见类注释。
+         *
+         * <p>读线程只在这一把锁里停几微秒——投递线程画卡时是**在锁外**的（它取完数字就
+         * 出去），所以 UI 慢多久都不会变成读线程的等待。
+         */
+        private final Object slot = new Object();
+
+        /** 有新的数字没画过。由 {@link #slot} 守护。 */
+        private boolean pending;
+
+        /** 已经收工，投递线程该退出了。由 {@link #slot} 守护。 */
+        private boolean closed;
+
+        /** 对端声明的总数；0 表示它什么都没说。 */
+        private volatile long total;
+
+        /** 投出去几条、一共花了多少毫秒、最坏一条多少毫秒。只给日志。 */
+        private long posts;
+        private long postMillis;
+        private long worstMillis;
+
+        /** 上面那笔账报过一次没有。由 {@link #slot} 守护。 */
+        private boolean tallied;
 
         /**
          * 最后一次报上来的已落地字节数。
@@ -1653,23 +1704,111 @@ final class Listener {
          */
         private volatile long lastAt;
 
+        /** 画卡的那条线程。一条连接一条，随 {@link #close} 退出。 */
+        private final Thread poster;
+
         Meter(ReceiveHost.Attempt attempt) {
             this.attempt = attempt;
+            this.poster = new Thread(this::post, "opairdrop-post");
+            this.poster.setDaemon(true);
+            this.poster.start();
         }
 
         @Override
         public void landed(long done, long total) {
             this.done = done;
+            this.total = total;
+            // 记在投递之前：被节流掉的那几次恰恰是最后几次，漏记的话，一个在两百毫秒内断掉
+            // 的传输会被读成「一个字节都没走过」。
             this.lastAt = System.nanoTime();
-            long now = lastAt;
-            // 第一条立刻投出去：否则前两百毫秒里一个小文件已经收完了，人什么都没看见。
-            if (postedAt != 0 && now - postedAt < INTERVAL_MS * 1_000_000L) {
-                return;
+            synchronized (slot) {
+                pending = true;
+                slot.notifyAll();
             }
-            postedAt = now;
-            // 进度只画在流体云那张卡上（{@code attempt.progress}）。普通通知不再画任何进度：
-            // 同一条传输在两处同时走进度，一处是胶囊、一处是通知栏，人只会看见两个不一样的数。
-            attempt.progress(done, total);
+        }
+
+        /**
+         * 投递线程：有新数字就画一张，画完歇够 {@link #INTERVAL_MS}。
+         *
+         * <p>歇的那一段用「截止时刻」而不是 {@code wait(200)}：{@link #landed} 每来一块就
+         * {@code notifyAll} 一次，按间隔睡会被提前叫醒，节流等于没有。提前醒只重算剩下的时间。
+         */
+        private void post() {
+            while (true) {
+                synchronized (slot) {
+                    while (!pending && !closed) {
+                        try {
+                            slot.wait();
+                        } catch (InterruptedException stop) {
+                            return;
+                        }
+                    }
+                    if (closed) {
+                        return;
+                    }
+                    pending = false;
+                }
+                // 锁外画卡：UI 慢多久都只慢这一条线程，读线程不受影响。
+                long before = System.nanoTime();
+                attempt.progress(done, total);
+                long took = (System.nanoTime() - before) / 1_000_000L;
+                // 这三个数只有这一条线程写，读的是 close()，靠 join 建立先后。
+                posts++;
+                postMillis += took;
+                if (took > worstMillis) {
+                    worstMillis = took;
+                }
+                long next = System.nanoTime() + INTERVAL_MS * 1_000_000L;
+                synchronized (slot) {
+                    while (!closed) {
+                        long left = (next - System.nanoTime()) / 1_000_000L;
+                        if (left <= 0) {
+                            break;
+                        }
+                        try {
+                            slot.wait(left);
+                        } catch (InterruptedException stop) {
+                            return;
+                        }
+                    }
+                    if (closed) {
+                        return;
+                    }
+                }
+            }
+        }
+
+        /**
+         * 收工：等投递线程退出，返回之后不会再有进度上卡。
+         *
+         * <p>幂等，而且会从三条路进来（收完、断开、{@code finally} 兜底）——只有第一次做事。
+         * 它阻塞到投递线程真的退出为止，这是「收尾那句话不会被迟到的进度盖掉」的唯一保证。
+         */
+        void close() {
+            synchronized (slot) {
+                closed = true;
+                slot.notifyAll();
+            }
+            poster.interrupt();
+            try {
+                poster.join(2_000);
+            } catch (InterruptedException interrupted) {
+                // 正在关掉接收端。把中断还回去，让上层知道它该退出。
+                Thread.currentThread().interrupt();
+            }
+            boolean say = false;
+            synchronized (slot) {
+                if (!tallied && posts > 0) {
+                    tallied = true;
+                    say = true;
+                }
+            }
+            if (say) {
+                // 这笔账回答的是「读线程是不是在等 UI」：总时间占传输时长一大半、最坏一次
+                // 几百毫秒，那就是。数字不该出现在卡上，只该出现在这里。
+                Log.i(TAG, "progress posts: " + posts + " in " + postMillis
+                        + " ms, worst " + worstMillis + " ms");
+            }
         }
 
         /** 有没有字节真的落地过。见 {@link #done}。 */
@@ -1708,10 +1847,11 @@ final class Listener {
      * <p>一种是**对面不发了**——那边停了、AWDL 那头在重传、或者对面在等我们。这时这条线程
      * 正躺在 {@code read} 里，栈上只有一帧 socketRead。
      *
-     * <p>另一种是**我们自己没在读**：每次进度更新都要走 binder 到 SystemUI，而在这台机器上
-     * 那条路上还压着一个 Xposed 模块（logcat 里「提醒级别 0 → 11，让卡片自己展开」那一行）。
-     * SystemUI 一忙，这条线程就卡在 binder 上，对端看到的是一条不读数据的连接——那和我们
-     * 「收得慢」是两件事，要改的地方也不同。
+     * <p>另一种是**我们自己没在读**——写盘、算摘要、或者别的什么同步调用把这条线程占住了。
+     * 2026-11-19 之前最大的那一处是进度投递（每条进度都要走 binder 到 SystemUI，而这条路上
+     * 还压着一个 Xposed 模块），它已经搬到 {@link Meter} 自己的线程上；如果栈上仍然出现
+     * binder 帧，说明还有一处没搬完。对端看到的是一条不读数据的连接——那和我们「收得慢」是
+     * 两件事，要改的地方也不同。
      *
      * <p>两种只在栈上分得开，所以线安静超过 {@link #LIMIT_MS} 就取一次栈，一条连接只取一次。
      */
