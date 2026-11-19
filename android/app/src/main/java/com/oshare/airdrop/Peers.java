@@ -119,10 +119,11 @@ final class Peers {
      * {@link #CONNECTABLE_MS}（2.2 秒）。上面那两次闪烁都发生在没有可连对端、查询提到 300 毫秒
      * 一次的时候，这个条件现在被写进了判断里，而不是靠一个对所有人生效的大数来回避。
      *
-     * <p>**2026-11-19 起两档又同值了**（都是 6 秒），但合并的方向是反的：不是把这一档压短，是
-     * 把能连那一档放长。理由是它连着两次删掉正在说话的设备，而短阈值要换来的「关掉后快两秒
-     * 消失」根本不值得——对端不讲 goodbye（见上），那两秒也只能靠猜。细节见
-     * {@link #CONNECTABLE_MS}。
+     * <p>**2026-11-19 起两档曾短暂同值（都是 6 秒），当天 17:16 之后又分开了**：能连那一档继续
+     * 往上走到 20 秒（理由见 {@link #CONNECTABLE_MS} 最后一段——对面是成段休眠，六秒必闪），
+     * 这一档留在 6 秒，只负责「还不完整」的对端。合并的方向从一开始就是反的：不是把这一档压短，
+     * 是把能连那一档放长。短阈值要换来的「关掉后快两秒消失」根本不值得——对端不讲 goodbye
+     * （见上），那两秒也只能靠猜。
      */
     private static final long EXPIRE_MS = 6_000;
 
@@ -165,8 +166,34 @@ final class Peers {
      *
      * <p>真正的解法不在这里，在 {@link #prompt}：把「它静了」这件事本身变少，而不是在事后
      * 猜它静得够不够久。
+     *
+     * <p># 2026-11-19 17:16：六秒也不够，因为对面是**成段休眠**，不是丢包
+     *
+     * <p>那一轮旁边一直有一台 iPad 在说话（{@code foreign} 每半秒涨），所以链路是活的、
+     * {@link #LINK_QUIET_MS} 那道门根本没关上。iPhone 的轨迹是这样的：
+     * <pre>
+     * 17:16:09.642 ready   ac064e658d14 after 1394 ms of browsing
+     * 17:16:12.521 prompted … after 1949 ms of silence      ← 单播叫了一次
+     * 17:16:16.632 dropped … after 6060 ms (threshold 6000, rhythm 420 ms, gaps 2)
+     * 17:16:30.683 ready   … after 2197 ms                  ← 十四秒后原样回来
+     * 17:16:32.901 prompted … after 1828 ms                 ← 连续三次单播，全无应答
+     * 17:16:36.298 prompted … after 2078 ms
+     * 17:16:41.881 prompted … after 1760 ms
+     * 17:16:46.240 dropped … after 6119 ms (threshold 6000, rhythm 1216 ms, gaps 2)
+     * </pre>
+     * 两次删除都是踩在第一个检查点上，说明它真实的安静比六秒更长；而三次单播一次都没回来，
+     * 说明这段时间它不是「漏听了一个包」——它的应答器整段没在工作。同一时刻
+     * {@code iw dev wonder0 station dump} 里它的站点条目 {@code connected time} 一路涨、
+     * {@code signal −26 dBm}，**802.11 是通的，只有 AirDrop 那层在睡**。它答几包、睡六到八秒、
+     * 再答几包，任何小于八秒的门槛都必然闪。
+     *
+     * <p>所以下限抬到 **20 秒**，也就是 {@link #LINK_DEAD_MS} 那条天花板。两个数合成一个不是
+     * 省事：它们回答的是同一个问题——「沉默多久之后我们才有资格说它走了」。在我们能拿到的
+     * 信号里，答案已经明确是「很久，而且我们分不清它是在睡还是走了」，那就只有一条路：**容得
+     * 下，直到容不下为止**。代价照旧写在明处：对方真关掉 AirDrop，这个格子会多留十几秒。
+     * 那比「活着的设备每六秒消失一次」划算，因为后者会让人以为功能坏了。
      */
-    private static final long CONNECTABLE_MS = 6_000;
+    private static final long CONNECTABLE_MS = 20_000;
 
     /**
      * 能连的对端，在「丢两包要多久」之上再留多少毫秒。
@@ -208,6 +235,68 @@ final class Peers {
     private static final long PROMPT_AFTER_MS = 1_500;
 
     /**
+     * 整条链路安静超过多久，就认为「我们现在什么都不知道」。
+     *
+     * <p>2026-11-19 16:50 抓到的现场：{@code prompted … after 1509 ms} → {@code dropped … after
+     * 6079 ms (threshold 6000, rhythm 1049 ms, gaps 262, max 1745 ms)} → 紧接着
+     * {@code pulse: 0 peer(s), foreign 270 (last 7844 ms ago)} → **4.5 秒后同一个实例名原样回来**
+     * （{@code ready 38de3d7e83f4 … after 276735 ms of browsing}）。也就是说那段沉默不属于这台
+     * 设备，属于链路：**7.8 秒里我们一个外部包都没收到**，连别的地址记录都没有。
+     *
+     * <p>这两种沉默必须分开，因为它们要求相反的处置：
+     * <ul>
+     *   <li>链路活着、只有它在安静 → 它是真走了，删掉（{@link #timeout}）；</li>
+     *   <li>链路自己也安静了 → **我们聋了**，这时候「它沉默多久」量的是我们自己的听筒，
+     *       拿它判设备走没走等于用「没听见」冒充「它没说话」。</li>
+     * </ul>
+     *
+     * <p>4 秒。两个实测数夹出来的：
+     * <ul>
+     *   <li>健康链路的最大间隔 **3144 ms**（{@code rhythm 1281 ms, gaps 10, max 3144}）——
+     *       {@link #LINK_QUIET_MS} 必须在它之上，否则健康时也会把自己判成聋子，6 秒那条路
+     *       就永远轮不到；</li>
+     *   <li>真停顿是 **7844 ms**、真离开是 **20000 ms 以上**。</li>
+     * </ul>
+     *
+     * <p>它原来还必须落在 {@link #CONNECTABLE_MS} 之下（「4 秒对 6 秒，留了两秒」），因为那时
+     * 「聋了」是唯一能救一台即将被 6 秒删掉的设备的理由。现在 {@link #CONNECTABLE_MS} 自己就是
+     * 20 秒，比它长得多，这层关系没了：能连的对端两个分支拿到同一个阈值（{@link #timeout}
+     * 兜出来也是 20 秒）。剩下真正靠它的只有「还不完整」的对端，它们仍按 {@link #EXPIRE_MS}
+     * 的 6 秒走。
+     *
+     * <p>**这条规矩解决不了的情况，说清楚**：链路如果「静 3 秒、响半秒、再静 3 秒」地闪，
+     * 每次响都把它重置回「活着」，而设备的沉默是一路涨上去的。要挡住那种情况得按「链路活着的
+     * 时间」累计而不是看瞬时状态，但那会引入第二套时钟（`pulse` 里的 `quiet=` 和 `prompt()`
+     * 用的都是墙上时间），把日志搅乱。等真抓到闪的场景再说。
+     *
+     * <p>**现在只有 {@link #expire} 用它**。浏览循环曾经也拿它决定「该不该重开 socket」，那样
+     * 是错的：同一个误差，「先别删」的代价是零，「拆掉重开」的代价是把路上的应答全丢掉。重开
+     * 那一侧已经分开成 {@link #DEAF_SILENCE_MS}（20 秒），理由和 17:20 的现场都在那里。
+     */
+    private static final long LINK_QUIET_MS = 4_000;
+
+    /**
+     * 链路一直不回来时，最多留它多久。
+     *
+     * <p>{@link #LINK_QUIET_MS} 那条规矩是「不知道就先别删」，但没有上限就成了「永远不删」：
+     * 对端真的走了、链路跟着死掉，两者在计时器眼里和一次 8 秒停顿长得一模一样。所以给一个
+     * 天花板——20 秒。取这个数的理由：真机上量到的停顿是 7.8 秒，取两倍多一点留出二次停顿的
+     * 余量；而人对着一个空了 20 秒的格子，早就自己重开面板了，再早删也只是把同一件事做早。
+     *
+     * <p>**这不是「把阈值调大」**。正常路径仍然是 6 秒；只有在我们一个字都听不见、根本没法
+     * 判断的时候，才退到这条线。
+     *
+     * <p>**20 秒会误删一种情况，说清楚**：2026-11-19 17:10 这一轮，同一台 iPhone 静了 **130 秒**
+     * 才回来，而这 130 秒不是「我们聋了」——`/proc/net/dev` 上 `awdltun0` 的 RX 字节与包数
+     * 20 秒里一个没动、TX 涨了 55 个包，说明对面真的一个字都没发。同一时刻
+     * `iw dev wonder0 station dump` 里它的站点条目已经没了，回来时 `connected time` 从头计
+     * （{@code 4 seconds}，而信号是 −26 dBm，不是距离问题）。把天花板抬到 130 秒以上能保证
+     * 「不误删」，代价是留一个点下去连不上的格子两分多钟——比空着更糟。所以这条线是**取舍**，
+     * 不是测量结果；真凶在 802.11 那条关联上，不在这张表里。
+     */
+    private static final long LINK_DEAD_MS = 20_000;
+
+    /**
      * 量节奏时，短于这个的间隔不采样。
      *
      * <p>同一轮应答常被拆成 PTR/SRV/TXT 几个包，前后只差几毫秒；把它当「它的说话周期」记下来
@@ -246,6 +335,23 @@ final class Peers {
      * 新 {@code Peer}、统计归零——被闪烁打断的样本永远攒不够十次，看到的全是半截数据。
      */
     private static final boolean DIAG = false;
+
+    /**
+     * 每 {@link #PULSE_MS} 打一行「还看得见谁、它安静了多久」。
+     *
+     * <p>和为 {@link #DIAG} 分开，因为目的相反：{@code DIAG} 要求「不许删」（否则攒不够样本），
+     * 而这里要看的恰恰是**删掉之前和之后**各是什么样，所以行为一点都不能改。
+     *
+     * <p>**临时开关，量完分布就关。** 10 秒一行，开着的时候日志里每 10 秒多一行。
+     *
+     * <p>2026-11-19 17:30 关掉：`CONNECTABLE_MS` 定到 20 秒之后的最后一轮（round15，3 分 20 秒）
+     * 里它显示 `1 peer(s), foreign 135→207, quiet 2–1195 ms`，一次删除都没有，要看的分布已经
+     * 拿到了。留着只会每 10 秒多一行，把真出事时的上下文挤走。
+     */
+    private static final boolean PULSE = false;
+
+    /** {@link #PULSE} 的节奏。10 秒：一屏能放下三五分钟的历史，又不至于把别的行挤走。 */
+    private static final long PULSE_MS = 10_000;
 
     /** 诊断态下的「永不删」，只为把分布采样完整。 */
     private static final long DIAG_HOLD_MS = 30_000;
@@ -362,6 +468,13 @@ final class Peers {
         boolean reported;
 
         /**
+         * 这一轮静默里是否已经单播叫过它一声。
+         *
+         * <p>只为让日志别刷屏：一次静默叫一次，它一说话就重置。见 {@link #prompt}。
+         */
+        boolean prompted;
+
+        /**
          * 它**第一次**凑齐地址和端口的时刻，也就是它在列表里第一次可能出现的那一刻。
          *
          * <p>页面拿它当「还可以等一下名字」的起点：真名要连上去问 {@code /Discover} 才有，
@@ -469,8 +582,45 @@ final class Peers {
      */
     private int foreign;
 
+    /**
+     * 最后一次读到**别人**地址记录的时刻，{@link System#currentTimeMillis()}。
+     *
+     * <p>{@link #foreign} 是累计数，一旦不为零就永远不为零，于是「我刚才还听得见吗」这个问题
+     * 它答不了——而这正是「40 秒里一台设备都没出现」时最需要回答的：我们是听不见，还是对面
+     * 没说话。两个原因的处理完全不同（一个要重开 socket，一个只能等）。
+     */
+    private long lastForeign;
+
+    /**
+     * 本次浏览里，听到过别人的地址记录没有。**不随 socket 重开清零。**
+     *
+     * <p>它只回答一件事：我们还有没有「对端多久说一次话」的底。有底的时候，沉默才有意义，
+     * 才能拿去和 {@link #DEAF_SILENCE_MS} 比；没底的时候（刚打开发送面板），沉默什么都说明
+     * 不了，只能数自己开过几次口。
+     *
+     * <p>不能用 {@link #foreign} 代劳：那个是**每块 socket 自己**的账，{@link #open} 会清零，
+     * 于是「刚重开」和「刚启动」长得一模一样。2026-11-19 17:20 那一轮的抖动正是这么来的——
+     * 重开之后 {@code lastForeign} 是 0，程序以为又从零开始了，而实际上它已经听了九十秒。
+     */
+    private boolean heardEver;
+
+    /** 当前这块 socket 是什么时候开的，{@link System#currentTimeMillis()}。 */
+    private long openedAt;
+
+    /**
+     * 当前这块 socket 开出之后，组播问过几次。
+     *
+     * <p>和 {@code loop()} 里那个 {@code asked} 不是一回事：那个跨 socket 累计，只用来打
+     * 「问了多少次一包未收」那一行。判「哑」必须用**这块 socket** 的数——冷启动那一档说的是
+     * 「我刚开、按 300 毫秒一次问了四声、一声都没回」，它在重开之后也该从零开始。
+     */
+    private int askedSinceOpen;
+
     /** 下一次「哑了」检查允许重开 socket 的时刻。 */
     private long nextDeaf;
+
+    /** 下一次打 {@link #PULSE} 那一行的时刻。 */
+    private long nextPulse;
 
     /** 下次重开要等多久。见 {@link #DEAF_RETRY_MS}。 */
     private long deafWait = DEAF_RETRY_MS;
@@ -490,12 +640,56 @@ final class Peers {
     private static final int REBIND_FAILS = 3;
 
     /**
-     * 问了几次仍然只读到自己的地址，就认定「我们在发、但听不见」。
+     * 至少问过几次，才允许认定「我们在发、但听不见」。
      *
-     * <p>4 次 × {@link #ASK_EAGER_MS} = 1.2 秒：够长，不至于把一台答得慢的对端误判成聋；够短，
-     * 人还站在分享面板前面。
+     * <p>4 次：冷启动时按 {@link #ASK_EAGER_MS} 问是 4 × 300 = 1.2 秒，够长，不至于把一台答得
+     * 慢的对端误判成聋；够短，人还站在分享面板前面。
+     *
+     * <p>**它只管冷启动那一半**，不是通用时间门槛：一次都没听见过时没有「它多久说一次」的底，
+     * 只能数自己开过几次口（4 × 300 = 1.2 秒）。听见过之后换成 {@link #DEAF_SILENCE_MS}，
+     * 因为那时候要问的是「安静了多久」，而这个数是按次计的不是按时间计的。
      */
     private static final int DEAF_QUERIES = 4;
+
+    /**
+     * 链路安静了多久，才允许认定「我们聋了、该重开 socket」。**20 秒，不是 4 秒。**
+     *
+     * <p># 4 秒是错的，17:20 那一轮把它打穿了
+     *
+     * <p>原来这里直接用 {@link #LINK_QUIET_MS}（4 秒），理由是「和 {@code expire()} 问的是
+     * 同一件事，就用同一个数」。问的事确实相同，但**要做的动作不同**：那边只是「先别删」，
+     * 猜错一次没有任何代价；这边要拆掉 socket 再建一块，猜错一次就把正在路上的一串应答全丢了。
+     * 同一个误差，两种代价，就不该共用一个数。
+     *
+     * <p>2026-11-19 17:20（{@code CONNECTABLE_MS} 抬到 20 秒之后的第一轮）：
+     * <pre>
+     * 17:20:38.892 deaf: 16 queries sent, nothing from anyone for 4082 ms — reopening
+     * 17:20:43.647 deaf: 21 queries … for 20374 ms
+     * 17:20:53.938 deaf: 30 queries … for 30415 ms
+     * 17:21:13.997 deaf: 57 queries … for 5769 ms
+     * 17:21:21.526 deaf: 65 queries … for 4047 ms
+     * 17:21:26.780 deaf: 70 queries … for 4054 ms
+     * 17:21:32.049 deaf: 75 queries … for 4085 ms
+     * 17:21:46.087 deaf: 87 queries … for 82564 ms
+     * </pre>
+     * 九十秒里重开了八次。旁边只有一台 iPhone，而它的应答器是成段休眠的（答几包、睡六到八秒，
+     * 见 {@link #CONNECTABLE_MS}）——**于是「四秒没人说话」在这条链路上是常态**，我们把这个
+     * 常态当成了自己的故障，一圈一圈地拆 socket。这是自己给自己制造的丢包。
+     *
+     * <p># 20 秒是和 {@link #LINK_DEAD_MS} 同一个数，但理由不同
+     *
+     * <p>那个数是「不知道就先别删」的天花板，这个数是「再不动手就是装死」的下限，两个都落在
+     * 「沉默到我们已经没有信息了」这一刻——真到了这里，删掉它和重开一次赌一把是同一件事，
+     * 做哪个都不比另一个更武断。
+     *
+     * <p># 另外，中途变聋从来没被观测到过
+     *
+     * <p>这条路修的是一类**假想**故障。唯一像它的现场是 17:10 那次静默 130 秒，后来用
+     * {@code /proc/net/dev} 量清楚了：{@code awdltun0} 的 RX 字节和包数 20 秒里一个没动、
+     * TX 涨了 55 个包——对面一个字都没发，不是我们聋了，重开 socket 也救不了（那一轮重开过，
+     * 没有用）。所以这条路径只剩兜底意义，**宁可慢，不要吵**。
+     */
+    private static final long DEAF_SILENCE_MS = 20_000;
 
     /** 第一次重开 socket 之前等多久；之后每哑一次翻倍，直到 {@link #DEAF_CEIL_MS}。 */
     private static final long DEAF_RETRY_MS = 5_000;
@@ -581,11 +775,16 @@ final class Peers {
             // 一台身边什么都没有的手机，在日志里和「根本没开始问」长得一模一样。
             publish(null);
             startedAt = System.currentTimeMillis();
+            // 一次浏览一套账。这两个是字段而不是局部变量，因为它们要跨 socket 活下来；但跨
+            // 「关掉面板再打开」就没有意义了——那时候链路、对端、我们绑的 socket 全是新的。
+            heardEver = false;
+            deafWait = DEAF_RETRY_MS;
             while (running) {
                 long now = System.currentTimeMillis();
                 if (now >= nextAsk) {
                     send(query);
                     asked++;
+                    askedSinceOpen++;
                     // 一台能连的都没有时问得勤一些：那是人正盯着空列表等它出现的时刻。
                     nextAsk = now + (ready() == 0 ? ASK_EAGER_MS : ASK_EVERY_MS);
                     // 组播那一份可能谁也没收到。对已经静了一会儿的对端再单独叫一声，见
@@ -632,20 +831,44 @@ final class Peers {
                 // 单播于是回到我们这边。重开之后接收端会失去单播，但它在 AWDL 上只靠组播活着
                 // （实测 iPhone 在浏览链路上只答不问，见 {@link #CONNECTABLE_MS}），而面板一关
                 // 我们就让出端口，它下一个包照样收得到。
-                if (foreign == 0 && asked >= DEAF_QUERIES && now >= nextDeaf) {
+                // 判据必须是「**最近**还听得见吗」，不能是 `foreign == 0`。`foreign` 是累计数
+                // （见 {@link #foreign}）：冷启动时它是 0，但只要听见过一次就永远不为 0，于是
+                // 中途变聋永远触发不了重开。2026-11-19 17:10 这一轮就是这样：`foreign` 冻在 34
+                // 一动不动、空了 130 秒，而自愈条件一次都没成立——`lastForeign` 本来是专为回答
+                // 这个问题加的，`expire()` 已经在用它，这里漏了。
+                //
+                // 两条路分开判，因为能用的量不同，而**分界线是「本次浏览听见过没有」**
+                // （{@link #heardEver}），不是「这块 socket 听见过没有」。两块的区别是重开：
+                // 重开会把 `lastForeign` 清零，于是「刚重开」和「刚启动」长得一模一样，而 17:20
+                // 那一轮的抖动就是被这个假象点着的——重开完立刻走冷启动那条、`asked` 又早过百、
+                // 条件恒真，五秒后接着重开。
+                //   · 一次都没听见过（冷启动）→ 没有「它多久说一次」的底，只能数**这块 socket**
+                //     问了几次，4 × {@link #ASK_EAGER_MS} = 1.2 秒。用时间门槛会把这条路从
+                //     1.2 秒拖到 20 秒，而冷启动正是人站在面板前面干等的那一段。
+                //   · 听见过之后 → 用安静了多久，门槛是 {@link #DEAF_SILENCE_MS}（20 秒）。
+                //     重开之后计时从 {@link #openedAt} 重新起，不然 `lastForeign == 0` 会被算成
+                //     「从纪元开始就没声音」。
+                long quiet = now - (lastForeign == 0 ? openedAt : lastForeign);
+                boolean deaf = heardEver ? quiet > DEAF_SILENCE_MS : askedSinceOpen >= DEAF_QUERIES;
+                if (deaf && now >= nextDeaf) {
                     nextDeaf = now + deafWait;
                     deafWait = Math.min(deafWait * 2, DEAF_CEIL_MS);
-                    trace("deaf: " + asked + " queries sent, not one address but our own —"
-                            + " reopening the socket (someone else is bound to 5353)");
+                    trace("deaf: " + askedSinceOpen + " queries on this socket, nothing from"
+                            + " anyone for " + quiet + " ms — reopening the socket (someone"
+                            + " else may be bound to 5353, or the link is down)");
                     sendFails = 0;
                     reopen();
-                } else if (foreign > 0 && deafWait != DEAF_RETRY_MS) {
+                } else if (!deaf && heardEver && deafWait != DEAF_RETRY_MS) {
                     // 听见了。下一次万一又哑，还是从最短的那一档开始等。
                     deafWait = DEAF_RETRY_MS;
                 }
                 if (DIAG && now - lastDigest >= DIAG_EVERY_MS) {
                     lastDigest = now;
                     digest();
+                }
+                if (PULSE && now >= nextPulse) {
+                    nextPulse = now + PULSE_MS;
+                    pulse();
                 }
                 if (dirty) {
                     publish(null);
@@ -699,6 +922,11 @@ final class Peers {
         bound = nic == null ? null : nic.getName();
         // 这一块 socket 得自己证明听得见。上一次听到的别人的地址不算数——那可能来自上一个 socket。
         foreign = 0;
+        lastForeign = 0;
+        // 但「本次浏览听见过没有」不能跟着清零，见 {@link #heardEver}：重开之后的沉默和启动时的
+        // 沉默是两件事，前者有底、后者没有。
+        openedAt = System.currentTimeMillis();
+        askedSinceOpen = 0;
         try {
             socket.setTimeToLive(255);
         } catch (Exception ignored) {
@@ -898,10 +1126,19 @@ final class Peers {
         long now = System.currentTimeMillis();
         for (Peer peer : snapshot()) {
             if (!peer.connectable() || now - lastHeard(peer) < PROMPT_AFTER_MS) {
+                // 它刚说过话，下一次静默重新算起。
+                peer.prompted = false;
                 continue;
             }
             try {
                 socket.send(new DatagramPacket(query, query.length, address(peer), PORT));
+                if (!peer.prompted) {
+                    peer.prompted = true;
+                    // 这一行是「单播到底管不管用」唯一的证据：它之后要紧跟一条 quiet 归零的
+                    // pulse，或者紧跟一个 dropped——两者都说明这次叫醒了没有。
+                    trace("prompted " + peer.name + " by unicast after "
+                            + (now - lastHeard(peer)) + " ms of silence");
+                }
             } catch (Exception unreachable) {
                 // 它可能真的走了，也可能这个地址暂时不可用。等下一轮再叫，这里不是判断的地方。
             }
@@ -1081,12 +1318,24 @@ final class Peers {
                     }
                     case "addr" -> {
                         if (own.contains(bare(field[2]))) {
-                            // 自己的宣告绕回来了。地址不填，它就进不了可连接的列表。
+                            // 自己的宣告绕回来了。这里原来只做「不填地址」，于是这个实例会一直
+                            // 挂在表里：地址永远空（所以永远 partial）、记录又一直刷新（所以永远
+                            // 不过期），最后变成一行常驻的
+                            // `nothing connectable yet (1 instance(s) with partial records)`——
+                            // 表里明明空了却写着 1，把「对面真的走了」这件事盖住了。
+                            //
+                            // 地址是自己的，就证明**这个 host 就是我们**。实例名每分钟换一次，
+                            // 所以按 host 整个收掉，而不是只收这一条。
+                            if (peers.values().removeIf(peer -> field[1].equals(peer.host))) {
+                                changed = true;
+                            }
                             continue;
                         }
                         // 别人的地址进来了——不论这条记录最后有没有用上，它都证明了一件事：
                         // 这条 socket 听得见。{@link #foreign} 只记这个，不记「谁说的」。
                         foreign++;
+                        lastForeign = System.currentTimeMillis();
+                        heardEver = true;
                         // 地址行属于主机名，回填给所有指向这台主机的实例。
                         for (Peer peer : peers.values()) {
                             if (peer.host.equals(field[1])) {
@@ -1289,6 +1538,10 @@ final class Peers {
      */
     private int expire() {
         long now = System.currentTimeMillis();
+        // 我们这侧还听得见吗？`lastForeign` 是「最后一条**别人的**地址记录」的时刻，自己的宣告
+        // 绕回来不算（那一条在上面被 own 挡掉了）。它一停，表里每一台的「沉默」就同时开始涨，
+        // 因为它们量的是同一件事：这条 socket 上还有没有声音。
+        boolean deaf = lastForeign == 0 || now - lastForeign > LINK_QUIET_MS;
         synchronized (peers) {
             int before = peers.size();
             // 「还在」的证据有两个来源：它答了（seenAt，记录解析出来了），或者它只是在说话
@@ -1297,7 +1550,9 @@ final class Peers {
             // 列表里却是空的，过一秒它又被下一帧查询带回列表。这就是「闪烁」。
             peers.values().removeIf(peer -> {
                 long silence = now - lastHeard(peer);
-                long threshold = timeout(peer);
+                // 链路自己也安静的时候不用 timeout()，见 LINK_QUIET_MS：那一段沉默量的是我们
+                // 自己的听筒，不是这台设备。只留一个天花板，免得「不知道就先别删」变成「永不删」。
+                long threshold = deaf ? LINK_DEAD_MS : timeout(peer);
                 if (silence < threshold) {
                     return false;
                 }
@@ -1307,7 +1562,9 @@ final class Peers {
                 // 兜底删的」和「按实测的丢包宽度删的」。
                 trace("dropped " + peer.name + "@" + peer.address + " after " + silence
                         + " ms of silence (threshold " + threshold + ", rhythm " + peer.period
-                        + " ms, gaps " + peer.gaps + ", max " + peer.gapMax + " ms)");
+                        + " ms, gaps " + peer.gaps + ", max " + peer.gapMax + " ms"
+                        + (deaf ? ", link silent " + (lastForeign == 0
+                                ? "since open" : "for " + (now - lastForeign) + " ms") : "") + ")");
                 return true;
             });
             // 一台设备只有一个当前实例，但实例名每分钟换一次（Apple 的隐私设计）。
@@ -1360,6 +1617,41 @@ final class Peers {
                     + " min=" + peer.gapMin + " max=" + peer.gapMax
                     + " quiet=" + (now - lastHeard(peer)) + " ms");
         }
+    }
+
+    /**
+     * 打一行「现在看得见什么」。
+     *
+     * <p>要回答的是「设备自己消失」这个问题里从没被问清的那一半：到底是**它不说话了**，还是
+     * **我们听不见了**。一行里三个数就能分开：
+     * <ul>
+     *   <li>{@code quiet=} 表里那台安静了多久——它在说、还是已经很久没吭声；</li>
+     *   <li>{@code foreign last … ms ago} 最近一次听见别人的地址记录是什么时候——几百毫秒说明
+     *       这条 socket 好好的，几十秒说明我们聋了，而这两种情况要做的事完全不同；</li>
+     *   <li>{@code q=}/{@code a=} 它是在答还是在自己问。</li>
+     * </ul>
+     *
+     * <p>**必须每 {@link #PULSE_MS} 无条件打，不能只打变化。** {@code announce} 只在列表变了
+     * 时写，于是「一切正常」在日志里和「什么都没在发生」长得一模一样——前面几轮正是被这一点
+     * 引向「抓 150 秒一个字都没有 = 没在跑」的错误结论。
+     */
+    private void pulse() {
+        long now = System.currentTimeMillis();
+        List<Peer> all = snapshot();
+        StringBuilder line = new StringBuilder();
+        for (Peer peer : all) {
+            if (line.length() > 0) {
+                line.append(", ");
+            }
+            line.append(peer.name)
+                    .append(peer.connectable() ? "" : "(partial)")
+                    .append(" q=").append(peer.questions)
+                    .append(" a=").append(peer.replies)
+                    .append(" quiet=").append(now - lastHeard(peer));
+        }
+        trace("pulse: " + all.size() + " peer(s), foreign " + foreign
+                + (lastForeign == 0 ? " (never)" : " (last " + (now - lastForeign) + " ms ago)")
+                + (line.length() == 0 ? "" : " — " + line));
     }
 
     /**
