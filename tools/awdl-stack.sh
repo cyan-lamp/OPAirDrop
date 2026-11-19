@@ -750,6 +750,118 @@ apply_tuning() {
     esac
 }
 
+# ---------------------------------------------------------------------------
+# TCP tuning: the congestion control, and the queue it paces from
+#
+# The driver set above decides how much air one frame gets. This decides how many
+# frames TCP keeps in flight, and on this link that was the second half of the
+# gap. Measured 2026-11-20, same phone, same receiver, 20 x 14 MiB of `/dev/urandom`
+# (incompressible, so wire bytes and disk bytes are the same number), rate taken
+# from the app's own per-decile progress lines:
+#
+#   2.75 MB/s   cubic + pfifo_fast   per-decile 2.75 2.81 2.83 2.86 2.76 2.54 ...
+#   3.14 MB/s   bbr   + fq           per-decile 2.93 3.25 3.10 3.12 3.13 3.14 ...
+#   2.97 MB/s   bbr   + fq  (rerun)
+#
+# The dip is the whole story. `ss -tin` read mid-transfer showed `retrans 0/1120`
+# against 114244 segments out -- 0.98% -- and cubic halves its window on every
+# one of those, then spends the next segments climbing back. That sawtooth is the
+# 2.54 entry, and it is why the average sits 0.4 MB/s under where the curve
+# otherwise runs. BBR does not look at loss, so the sawtooth is gone and the +11%
+# with it. `fq` is not decoration: BBR paces, and fq is the clock it paces
+# against. `pfifo_fast` has no pacing clock at all, so `cc=bbr` alone on this
+# phone is half a change.
+#
+# Both runs land at 2.97-3.14, i.e. the change is real and small. The comment is
+# here mainly to stop the ceiling being re-read into it: this does not raise the
+# ceiling. Mid-transfer the same session sat at `cwnd 46-56` segments (~77 KB)
+# against a peer that advertised `wscale:9` (32 MB), with `minrtt 3.413 ms` and a
+# live `rtt 17.9 ms` -- ~45 KB, ~14 ms of queue sitting between `awdltun0` and
+# the passthru bridge. That queue is the cap, at ~26 Mbps, and two parallel
+# streams measured the same day did not add: 140 KB in flight between them, the
+# same ~3.2 MB/s, and `rtt` pushed to 19-23 ms. What this buys is a constant
+# factor on a link that was leaving 11% on the floor; what it cannot buy is the
+# ~20% the queue itself is holding.
+#
+# Runtime rather than insmod parameters, because that is what these are: a sysctl
+# and a qdisc. Neither survives a reboot, and the qdisc does not even survive a
+# daemon restart (the tunnel is recreated), which is why this is re-asserted at
+# every daemon start instead of written once.
+TUNE_CC=bbr
+TUNE_QDISC=fq
+
+# The tunnel belongs to `awdld`, so its name is not ours to assume. `awdltun0` is
+# what this build creates; the glob covers a daemon that was handed another index
+# after an earlier run left the first name taken by a dying process.
+tun_dev() {
+    for d in awdltun0 awdltun1; do
+        [ -e "/sys/class/net/$d" ] && { echo "$d"; return 0; }
+    done
+    for p in /sys/class/net/awdltun*; do
+        [ -e "$p" ] || continue          # an unmatched glob stays literal
+        echo "${p##*/}"
+        return 0
+    done
+    return 1
+}
+
+tune_tcp() {
+    # The sysctl first and unconditionally: `boot` can be asked for the stack
+    # while the daemon is still coming up, and the congestion control is worth
+    # setting whether or not there is a tunnel to put it on yet.
+    cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+    avail=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)
+    case " $avail " in
+        *" $TUNE_CC "*)
+            if [ "$cc" != "$TUNE_CC" ]; then
+                # The first value this boot saw, so `stop` can hand it back. Not
+                # overwritten on a second `boot`: that would record `bbr` and
+                # leave `stop` restoring what it just set.
+                [ -e "$STATE/cc-before" ] || printf '%s\n' "$cc" > "$STATE/cc-before"
+                printf '%s' "$TUNE_CC" > /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null
+                cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+            fi
+            ;;
+        *)
+            say "TCP_TUNING cc=$TUNE_CC unavailable (have:${avail:-none}), leaving $cc"
+            ;;
+    esac
+
+    command -v tc >/dev/null 2>&1 || { say "TCP_TUNING cc=$cc qdisc=no-tc"; return 0; }
+    dev=$(tun_dev) || { say "TCP_TUNING cc=$cc qdisc=no-tun"; return 0; }
+    have=$(tc qdisc show dev "$dev" 2>/dev/null | head -n 1)
+    case "$have" in
+        "qdisc $TUNE_QDISC "*) ;;
+        *)
+            # `replace`, not `add`: a tunnel that came back keeps nothing, and a
+            # tunnel that never went away already has a root qdisc. Both are the
+            # same command.
+            tc qdisc replace dev "$dev" root "$TUNE_QDISC" 2>/dev/null
+            have=$(tc qdisc show dev "$dev" 2>/dev/null | head -n 1)
+            ;;
+    esac
+    say "TCP_TUNING cc=$cc qdisc=$(printf '%s' "$have" | cut -d' ' -f2) dev=$dev"
+}
+
+# Hand the congestion control back.
+#
+# `stop` means the phone goes back to the user, and this is a global sysctl: it
+# was raised for a 17 ms AWDL link, and leaving a machine-wide knob changed for a
+# link that no longer exists is the same mistake as leaving Wi-Fi off. The qdisc
+# needs no equivalent -- it lives on the tunnel, and the tunnel goes with the
+# daemon.
+restore_cc() {
+    was=$(cat "$STATE/cc-before" 2>/dev/null)
+    [ -n "$was" ] || return 0
+    cur=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+    if [ "$cur" != "$was" ]; then
+        printf '%s' "$was" > /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null
+        cur=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+    fi
+    say "TCP_RESTORED cc=$cur"
+    rm -f "$STATE/cc-before"
+}
+
 link_up() {
     phy=$(find_wonder_phy) || { say 'wonder wiphy not present (did wonder.ko load?)'; return 1; }
     say "wonder_phy=$phy"
@@ -950,6 +1062,15 @@ cmd_status() {
     else
         say "iface $AWDL_IF=absent"
     fi
+    # Read back rather than re-derived from the config above: this is the one line
+    # that answers "is the tuning actually in the phone", and a receipt that
+    # repeats what the script meant to do is not a receipt.
+    tun=$(tun_dev)
+    if [ -n "$tun" ]; then
+        say "tcp cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo '?') dev=$tun qdisc=$(tc qdisc show dev "$tun" 2>/dev/null | head -n 1 | cut -d' ' -f2)"
+    else
+        say "tcp cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo '?') dev=absent"
+    fi
 }
 
 cmd_start() {
@@ -1051,6 +1172,10 @@ cmd_stop() {
     # un-throttled. `freezer_restore` is a no-op when `boot` never had to set
     # it, which is the case for a `start`/`stop` pair that never shared a link.
     freezer_restore || true
+    # And the one sysctl this script changes on purpose. Same principle, same
+    # place: `stop` means the phone goes back to the user, and `bbr` was raised
+    # for a 17 ms link that no longer exists.
+    restore_cc || true
     # Same principle, one layer up: `stop` means the phone goes back to the
     # user, and a root loop that writes `cgroup.procs` every 2 s is not part of
     # "back to the user". The app keeps whatever freezer policy the ROM wants
@@ -1122,6 +1247,10 @@ start_daemon() {
     if DAEMON_PID=$(ctl_daemon); then
         DAEMON_TUN=$(grep -q TUN_READY "$STATE/awdld.log" 2>/dev/null && echo up || echo unknown)
         say "DAEMON_ALREADY pid=$DAEMON_PID"
+        # Re-asserted even though nothing was started: the sysctl survived the
+        # previous run, the qdisc did not, because the tunnel it hangs on is
+        # recreated by every daemon start. One `tc` on a path that already forks.
+        tune_tcp
         return 0
     fi
     [ -x "$BASE/awdld" ] || { say "no $BASE/awdld to start"; DAEMON_TUN=absent; return 1; }
@@ -1162,6 +1291,10 @@ start_daemon() {
         if grep -q TUN_READY "$STATE/awdld.log" 2>/dev/null; then
             DAEMON_TUN=up
             say "DAEMON_TUN $(grep -m 1 TUN_READY "$STATE/awdld.log")"
+            # The only moment the tunnel is known to be new. `TUN_READY` is the
+            # daemon's word for "it has an address", which is also the first
+            # moment a root qdisc can be attached to it.
+            tune_tcp
             return 0
         fi
         pidof awdld >/dev/null 2>&1 || { DAEMON_TUN=gone; break; }
@@ -1786,7 +1919,11 @@ case "${1:-status}" in
     # which is how `boot 'Air'` used to start a daemon called `OPAirDrop`.
     boot) cmd_boot "$@" ;;
     stop) cmd_stop ;;
-    link) link_up ;;
+    # `tune_tcp` after the link rather than inside `link_up`: `link` is the entry
+    # point that runs with a daemon already up, and it is the one path that never
+    # passes through `start_daemon` -- so it is also the one path where the qdisc
+    # would otherwise never be attached.
+    link) link_up && tune_tcp ;;
     share) cmd_share ;;
     exclusive) cmd_exclusive ;;
     status) cmd_status ;;
