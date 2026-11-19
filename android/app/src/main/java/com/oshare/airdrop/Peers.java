@@ -867,7 +867,16 @@ final class Peers {
      */
     private static final long DEAF_SILENCE_MS = 20_000;
 
-    /** 第一次重开 socket 之前等多久；之后每哑一次翻倍，直到 {@link #DEAF_CEIL_MS}。 */
+    /**
+     * 第一次重开 socket 之前等多久；之后每哑一次翻倍，直到 {@link #DEAF_CEIL_MS}。
+     *
+     * <p>翻倍这件事只在 2026-11-19 18:52 之后才真的生效：在那之前每轮都被复位回这个数，
+     * 于是重开间隔恒等于 {@link #DEAF_SILENCE_MS}。复位现在只发生在「真收到别人的地址记录」
+     * 那一刻，也就是唯一能证明「不再聋了」的证据出现的时候。
+     *
+     * <p>表里一台都没有时直接跳到 {@link #DEAF_CEIL_MS}，理由在 browse 循环里那段注释：
+     * 空表的沉默不是聋，是没人说话。
+     */
     private static final long DEAF_RETRY_MS = 5_000;
 
     /**
@@ -1040,17 +1049,33 @@ final class Peers {
                 //     「从纪元开始就没声音」。
                 long quiet = now - (lastForeign == 0 ? openedAt : lastForeign);
                 boolean deaf = heardEver ? quiet > DEAF_SILENCE_MS : askedSinceOpen >= DEAF_QUERIES;
+                boolean empty;
+                synchronized (peers) {
+                    empty = peers.isEmpty();
+                }
+                // 退避的复位**不在这里**。以前这里是 `else if (!deaf …) deafWait = DEAF_RETRY_MS`，
+                // 而 reopen() 会把 `lastForeign` 清零、`quiet` 改从 `openedAt` 起算——于是「刚
+                // 重开」立刻被当成「不聋了」，退避每轮都被洗回 5 秒，翻倍那行代码一次也没生效过。
+                // 2026-11-19 18:39 的现场：连着六行 `nothing from anyone for 20 05x ms`，一次
+                // 40 秒都没有。复位挪到真正收到别人的地址记录那里（见 absorb 的 `addr` 分支）。
                 if (deaf && now >= nextDeaf) {
-                    nextDeaf = now + deafWait;
+                    // 表里一台都没有的时候，沉默是**意料之中**的：这条链路上没有谁该说话。拆
+                    // socket 治不了这件事，而每拆一次都要把路上的应答丢掉一遍（见
+                    // {@link #DEAF_SILENCE_MS}）。所以这条路退到最长的那一档，只当慢速自检。
+                    //
+                    // 为什么敢这么慢：发现新设备走的是**组播**（它自己 announce）加 TCP 敲门
+                    // （{@link #knock}），两条路都不经过「查询的单播应答」。所以表空时放慢，
+                    // 不会拖慢「边上新来一台」的显示速度——被拖慢的只有「我们连组播都聋了」
+                    // 这种更少见的情形，而那种情形还有 {@link #rebind} 每秒在核网卡。
+                    long wait = empty ? DEAF_CEIL_MS : deafWait;
+                    nextDeaf = now + wait;
                     deafWait = Math.min(deafWait * 2, DEAF_CEIL_MS);
                     trace("deaf: " + askedSinceOpen + " queries on this socket, nothing from"
                             + " anyone for " + quiet + " ms — reopening the socket (someone"
-                            + " else may be bound to 5353, or the link is down)");
+                            + " else may be bound to 5353, or the link is down)"
+                            + (empty ? "; the list is empty, so this is the slow probe" : ""));
                     sendFails = 0;
                     reopen();
-                } else if (!deaf && heardEver && deafWait != DEAF_RETRY_MS) {
-                    // 听见了。下一次万一又哑，还是从最短的那一档开始等。
-                    deafWait = DEAF_RETRY_MS;
                 }
                 if (DIAG && now - lastDigest >= DIAG_EVERY_MS) {
                     lastDigest = now;
@@ -1538,6 +1563,10 @@ final class Peers {
                         foreign++;
                         lastForeign = System.currentTimeMillis();
                         heardEver = true;
+                        // 真有人答了，退避从头开始。以前这一句在 browse 循环里按「不聋」复位，
+                        // 而「刚重开」天生就是不聋（`quiet` 从 `openedAt` 起算），于是它每轮
+                        // 都把退避洗回最短档——见 browse 循环里那段注释。
+                        deafWait = DEAF_RETRY_MS;
                         // 地址行属于主机名，回填给所有指向这台主机的实例。
                         for (Peer peer : peers.values()) {
                             if (peer.host.equals(field[1])) {
