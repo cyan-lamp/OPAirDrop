@@ -478,6 +478,16 @@ final class ReceiveHost {
                 return false;
             }
             boolean panel = false;
+            // 「问在哪」与「卡还在不在」原来是同一个变量，而下面的 finally 会在被拒时把 cloud
+            // 置回 false（那时卡片确实该撤），日志却在更后面才写——于是每一行 refused 都落成
+            // `asked=nobody`。读起来像「根本没有卡片、没人被告知」，真相却是「卡片在过，人拒了」。
+            // 2026-11-19 19:52:23 那一行就是这么被读错的：它被当成「流体云那一路没被选中」的
+            // 证据，而那时唯一的异常只是拒绝之后卡片被撤掉了。
+            //
+            // 三档而不是两档：上一条 return 保证到这里至少有一条出口在，所以「没有云卡」不一定
+            // 是「通知」，也可能只是界面正开着（通知权限关着的时候问的就是屏幕）。
+            final String asked = cloud ? "cloud"
+                    : Notices.allowed(context) ? "notice" : "screen";
             boolean wanted = false;
             try {
                 wanted = (panel || cloud) ? await(decisionMs) : Confirmation.ask(context, session, summary);
@@ -498,7 +508,7 @@ final class ReceiveHost {
                     // 前半句是「问在哪」，后半句是「答在哪」。它们可以不同：卡片先问、三秒后
                     // 兜底通知接手，人是从通知进来的——这正是那段兜底存在的理由，日志必须能
                     // 把它和「卡片画出来了」区分开。
-                    + " asked=" + (cloud ? "cloud" : "nobody")
+                    + " asked=" + asked
                     + " answered=" + (answered && answeredFrom != null ? answeredFrom : "nobody"));
             if (!wanted) {
                 // 拒绝的话必须说清是谁拒的。过去两种情况共用「已拒绝」，于是超时被读成

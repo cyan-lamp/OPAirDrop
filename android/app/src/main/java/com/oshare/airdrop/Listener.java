@@ -294,12 +294,19 @@ final class Listener {
     private volatile String asideProblem = "";
 
     /**
-     * 蓝牙广播到底发出去了没有。
+     * 协议栈说它在广播了没有。
      *
      * <p>这一位存在的理由只有一个：{@link #announceOverBluetooth} 是一次性的敲门，敲不开就
      * 结束了，不像 socket 那样会重连。而「先拨开关、再在权限框上点允许」是最常见的顺序——
      * 那次敲门必然发生在权限到手之前。没有这一位，就没有任何依据判断「现在再敲一次」是否
      * 有意义，只能盲目重试或者永远不试。
+     *
+     * <p>判据只认 {@code advertising}。原来是「开头不是 {@code failed: } 就算醒了」，那会把
+     * {@code starting} 也算成已醒——而 {@code starting} 恰恰是后台线程那次调用**唯一**的返回：
+     * {@code bleAdvertise()} 把注册投给电台线程之后立刻读状态，读到的一定是刚置上的
+     * {@code starting}。于是 {@link StackKeeper} 那每八秒一次的补敲一旦发生，这一位就永远停在
+     * true；后来栈真的回了 {@code failed:}，{@link #reannounce} 也再不会被放行——而它要补的
+     * 正是「点完允许、重新敲一次」那个窟窿。
      */
     private volatile boolean announced;
 
@@ -669,10 +676,17 @@ final class Listener {
         try {
             String line = new String(Native.bleAdvertise(context), java.nio.charset.StandardCharsets.UTF_8);
             Log.i(TAG, "ble: " + line);
-            // Rust 侧把四态压成这一行（idle / starting / advertising / failed: 原因），所以
-            // 判断只有一个依据：开头不是 `failed: ` 就算醒了。`already started` 也算——这条
-            // 路径只在广播没发出去时才被叫到，真撞上它说明别处已经把它拉起来了，结论一样。
-            announced = !line.startsWith("failed: ") || line.contains("already started");
+            // Rust 侧把四态压成这一行（idle / starting / advertising / failed: 原因），而这里
+            // 要回答的是**「现在还有一份注册在栈上吗」**，不是「这一次敲成功了吗」。
+            //
+            // `starting` 必须算没醒：它只说明话递出去了、回话还没到（后台线程那次调用的唯一
+            // 返回），而 {@link #retryAnnouncing} 与 {@link #reannounce} 靠这一位决定「再敲
+            // 一次还有没有意义」。再敲一次本身不要紧——{@code bleAdvertise} 见到 {@code
+            // is_awake} 就直接回流状态行，不会重复注册。
+            //
+            // `already started` 要算醒：那是栈在说「已经有一份在播」（{@code ADVERTISE_FAILED_
+            // ALREADY_STARTED}，见 {@code ble::explained}）。它比我们这本账更权威，所以照旧认它。
+            announced = line.startsWith("advertising") || line.contains("already started");
         } catch (Throwable refused) {
             // 一个没有蓝牙权限的接收端仍然能在 8770 上收东西，所以这里不是错误路径。
             announced = false;
@@ -688,8 +702,9 @@ final class Listener {
      * 接收端在听，人以为在等，而这台机器在对端的扫描里依然不存在，直到开关被拨第二次。人刚
      * 点完「允许」就发现还是收不到东西，这是最难自证的一件事。
      *
-     * <p>两道闸：没在跑的接收端不敲（广播没有意义），已经发出去的也不敲（重复注册只会得到
-     * {@code already started}）。所以从 {@code onResume} 每回一次都调是安全的。
+     * <p>两道闸：没在跑的接收端不敲（广播没有意义），已经确认在广播的也不敲——再敲一次不会
+     * 重复注册（{@code bleAdvertise} 见到 {@code is_awake} 就直接回流状态行），但那一次是空转，
+     * 也拿不到新信息。所以从 {@code onResume} 每回一次都调是安全的。
      */
     void reannounce() {
         synchronized (lock) {
@@ -741,8 +756,9 @@ final class Listener {
             // 的尾巴上（{@code ble stopped: idle} 之后紧接着的一次 start），r0 侧没有重新注册，
             // 于是 iPhone 的分享面板永远等不到那二十字节——mDNS 发得再对也没人听。
             //
-            // {@code announceOverBluetooth} 幂等（Rust 侧对已在广播的回答是 already started），
-            // 所以这里可以每 tick 叫一次；真失败时也只是再记一句，不会有多余的广播。
+            // {@code announceOverBluetooth} 幂等：{@code bleAdvertise} 见到 {@code is_awake}
+            // 就回流状态行，不会重复注册。所以这里可以每 tick 叫一次；真卡在 {@code starting}
+            // 时它还会每 tick 留一行，那正是我们想看见的那种「没动静」。
             if (!announced) {
                 announceOverBluetooth();
             }

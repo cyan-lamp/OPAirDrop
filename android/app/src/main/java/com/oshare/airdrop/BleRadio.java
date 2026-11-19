@@ -10,6 +10,7 @@ import android.bluetooth.le.BluetoothLeAdvertiser;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 
 import java.nio.charset.StandardCharsets;
@@ -32,7 +33,22 @@ import java.nio.charset.StandardCharsets;
  */
 final class BleRadio {
 
-    private static final String TAG = "OPAirDrop/Ble";
+    /**
+     * 与其它几层同一个标签，句子前面用一段前缀区分（{@code radio| }，对照 {@code stack| }、
+     * {@code tile| }）。
+     *
+     * <p>为什么不是 {@code ble: }：那个前缀在 {@link Listener} 与 {@code SendActivity} 里已经
+     * 占住了，意思是「{@code bleAdvertise()} 返回了哪一行」——**调用方看到的东西**。而这里写的
+     * 是「协议栈回头说了什么」。两者在 {@code starting} 上逐字相同，挤在同一个前缀下，正好
+     * 就是「把 {@code starting} 读成失败」的那条路。
+     *
+     * <p>这里原本写的是 {@code OPAirDrop/Ble}。logcat 的标签过滤是精确匹配，于是这一层写的每
+     * 一句判决都落在抓取范围之外：2026-11-19 之前的所有日志里，蓝牙的结局只有 {@link Listener}
+     * 转述的那一句，而那一句是 {@code bleAdvertise()} 的**返回值**，不是栈说的话。结果是
+     * {@code starting} 一百多次、{@code advertising} 二十几次这个不对称被读成「广播大部分时候
+     * 没起来」，而它其实只说明「叫的那一下判决还没回来」。
+     */
+    private static final String TAG = "OPAirDrop";
 
     /**
      * {@link Native#bleVerdict(int)} 的负数码，与 {@code ble::refusal} 一一对应。
@@ -59,7 +75,41 @@ final class BleRadio {
     private static BluetoothLeAdvertiser advertiser;
     private static AdvertiseCallback listener;
 
+    /**
+     * 注册与撤销都在这一条 looper 上排队。
+     *
+     * <p>为什么不是主线程：{@code startAdvertising} 把判决投给**调用线程**的 looper，所以调用
+     * 它的线程必须有 looper——服务里的后台线程没有，那会变成一个什么都不说的空指针（下面
+     * {@code catch} 里那条注释说的就是这个）。原来这里退而求其次选了主线程，代价是判决和
+     * 界面抢同一条队列：App 不在前台、主线程被别的东西占住时，判决就跟着一起等。
+     *
+     * <p>2026-11-19 的 {@code round30.log} 记着那一次的代价——19:38:57.757 {@code starting}
+     * 之后，直到 19:40:14.842 才有 {@code advertising}，中间 **77.085 秒一行日志都没有**。
+     * 那不是广播慢，是「问完了没人来收答案」。
+     *
+     * <p>代价是一个常驻的空转 looper 线程：没有消息时它就阻塞在 epoll 上，与界面线程的存活
+     * 无关，也不需要跟着服务的生命周期起停。
+     */
+    private static HandlerThread radio;
+    private static Handler dispatcher;
+
     private BleRadio() {
+    }
+
+    /**
+     * 惰性起一次，之后固定复用。
+     *
+     * <p>{@code synchronized} 是必要的：{@link #start} 与 {@link #stop} 会从服务线程、
+     * {@link StackKeeper} 的 {@code opairdrop-stack}、以及 {@link Listener} 的回调线程同时
+     * 进来，两边都判 {@code null} 就会起两条线程、各自持有一半的状态。
+     */
+    private static synchronized Handler dispatcher() {
+        if (dispatcher == null) {
+            radio = new HandlerThread("opairdrop-ble");
+            radio.start();
+            dispatcher = new Handler(radio.getLooper());
+        }
+        return dispatcher;
     }
 
     /**
@@ -72,8 +122,9 @@ final class BleRadio {
      * 还没判决"和"当场就拒绝了"只有一条路径，Rust 的状态机不必猜这次是同步还是异步。
      *
      * <p>线程：{@code startAdvertising} 把结果投递给调用线程的 looper，而服务里的后台线程
-     * 没有 looper——那会把一个权限问题变成一个什么都不说的空指针。已经在主线程时原地执行
-     * 而不是 post，日志里的顺序才是真实的顺序。
+     * 没有 looper——那会把一个权限问题变成一个什么都不说的空指针。所以这里固定投到
+     * {@link #dispatcher()} 那条专用线程；已经站在那条线程上时原地执行而不是 post，日志里的
+     * 顺序才是真实的顺序。
      */
     static void start(
             final Context context,
@@ -146,7 +197,7 @@ final class BleRadio {
                 listener = new AdvertiseCallback() {
                     @Override
                     public void onStartSuccess(AdvertiseSettings inEffect) {
-                        Log.i(TAG, "start: " + hex(data) + " mode=" + inEffect.getMode()
+                        Log.i(TAG, "radio| start: " + hex(data) + " mode=" + inEffect.getMode()
                                 + " tx=" + inEffect.getTxPowerLevel());
                         settle(0);
                     }
@@ -166,10 +217,11 @@ final class BleRadio {
                 }
             }
         };
-        if (Looper.myLooper() == Looper.getMainLooper()) {
+        Handler handler = dispatcher();
+        if (Looper.myLooper() == handler.getLooper()) {
             begin.run();
         } else {
-            new Handler(Looper.getMainLooper()).post(begin);
+            handler.post(begin);
         }
     }
 
@@ -183,16 +235,17 @@ final class BleRadio {
                 try {
                     advertiser.stopAdvertising(listener);
                 } catch (RuntimeException alreadyGone) {
-                    Log.w(TAG, "stopAdvertising: " + alreadyGone);
+                    Log.w(TAG, "radio| stopAdvertising: " + alreadyGone);
                 }
                 advertiser = null;
                 listener = null;
             }
         };
-        if (Looper.myLooper() == Looper.getMainLooper()) {
+        Handler handler = dispatcher();
+        if (Looper.myLooper() == handler.getLooper()) {
             end.run();
         } else {
-            new Handler(Looper.getMainLooper()).post(end);
+            handler.post(end);
         }
     }
 
@@ -201,6 +254,11 @@ final class BleRadio {
      *
      * <p>日志在这里打而不是在 Rust 里：这一层没有 logcat，而状态机在那边——所以句子从那边
      * 回来，落笔在这边。
+     *
+     * <p>{@code radio| } 这段前缀是要紧的。同样的四个字 {@code starting} 在 {@link Listener}
+     * 那边是 {@code ble: starting}，含义完全不同：那一行是 {@code bleAdvertise()} 的返回值，
+     * 也就是「话递出去了、回话还没到」；而这里这一行是协议栈真的回了话。两者混读一次，就够
+     * 让人以为广播大部分时候没起来。
      */
     private static void settle(int code) {
         byte[] line = Native.bleVerdict(code);
@@ -208,9 +266,9 @@ final class BleRadio {
                 ? "(no state line)"
                 : new String(line, StandardCharsets.UTF_8);
         if (code == 0) {
-            Log.i(TAG, text);
+            Log.i(TAG, "radio| " + text);
         } else {
-            Log.w(TAG, text);
+            Log.w(TAG, "radio| " + text);
         }
     }
 
