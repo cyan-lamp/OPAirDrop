@@ -147,6 +147,50 @@ pub struct Decoder<R: Read> {
     done: bool,
     /// Bytes consumed from `inner` so far, so a bad header can name its offset.
     offset: u64,
+    /// The first [`HEAD_DUMP`] bytes of the body, kept only to explain a bad header.
+    ///
+    /// A refused length says what the four bytes were, which is not enough to tell a
+    /// desynchronised reader from a sender that framed something else. 2026-11-19
+    /// 20:57:55 is the case that forced this: an iPhone offered a 1.9 MB photo and the
+    /// reader stopped 77 ms later at `offset 115` on `0x00000000`, so the first block
+    /// was 111 bytes — legal per DVZ-3, and nothing like the 64 KiB of DVZ-2. Either
+    /// the sender emitted a block that size or we read the body from the wrong place,
+    /// and the four bytes at the failure point cannot say which.
+    head: Vec<u8>,
+    /// The first [`DECODED_DUMP`] bytes of the first block, after it was inflated.
+    ///
+    /// The raw head answers a different question than it looks like it answers: when the
+    /// payload is deflated, all it shows past `78 9c` is entropy. Whether those 111 bytes
+    /// were a cpio header the sender chose to compress or the middle of a stream we
+    /// started reading too late is only visible in the *decoded* bytes — `070701…` means
+    /// the sender really framed a tiny block, gibberish means we were not at a boundary.
+    /// Worth the extra sixty bytes: reproducing this costs the person on the other phone
+    /// another tap, so one log line has to be enough to decide.
+    decoded: Vec<u8>,
+    /// Blocks accepted before the refusal, so "the second block" can be said out loud.
+    blocks: u32,
+}
+
+/// How much of the body [`Decoder::head`] keeps. Two block headers, one 64-byte block,
+/// and a little slack: enough to see a framing mistake, short enough to fit a log line.
+const HEAD_DUMP: usize = 96;
+
+/// How much of the first block's inflate output [`Decoder::decoded`] keeps.
+const DECODED_DUMP: usize = 64;
+
+/// Bytes as space-separated hex, or `-` when there are none.
+fn hex_of(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "-".to_string();
+    }
+    let mut out = String::with_capacity(bytes.len() * 3);
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 impl<R: Read> Decoder<R> {
@@ -158,7 +202,30 @@ impl<R: Read> Decoder<R> {
             position: 0,
             done: false,
             offset: 0,
+            head: Vec::new(),
+            decoded: Vec::new(),
+            blocks: 0,
         }
+    }
+
+    /// Copies bytes of the body into [`Decoder::head`] until it is full.
+    fn keep(&mut self, bytes: &[u8]) {
+        let room = HEAD_DUMP - self.head.len();
+        if room > 0 {
+            let take = room.min(bytes.len());
+            self.head.extend_from_slice(&bytes[..take]);
+        }
+    }
+
+    /// Everything the decoder knows about how the body started, as one clause.
+    ///
+    /// Only ever built on a refusal, so the cost of formatting a hundred bytes one at a
+    /// time is paid at most once per transfer.
+    fn diagnosis(&self) -> String {
+        let mut out = format!("{} block(s) were read first", self.blocks);
+        out.push_str(&format!("; the body began 0x{}", hex_of(&self.head)));
+        out.push_str(&format!("; block one decoded to 0x{}", hex_of(&self.decoded)));
+        out
     }
 
     /// Loads the next block into `self.block`; `false` at a clean end of body.
@@ -172,20 +239,25 @@ impl<R: Read> Decoder<R> {
                     self.done = true;
                     return Ok(false);
                 }
-                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "DVZip block header truncated")),
+                Ok(0) => {
+                    self.keep(&header[..got]);
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "DVZip block header truncated"));
+                }
                 Ok(n) => got += n,
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             }
         }
         self.offset += 4;
+        self.keep(&header);
         let raw = u32::from_be_bytes(header);
         let length = (raw & LENGTH_MASK) as usize;
         if length == 0 || length > MAX_BLOCK {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "implausible DVZip block length {length} (header 0x{raw:08x} at offset {at})"
+                    "implausible DVZip block length {length} (header 0x{raw:08x} at offset {at}); {}",
+                    self.diagnosis()
                 ),
             ));
         }
@@ -193,25 +265,38 @@ impl<R: Read> Decoder<R> {
         let mut payload = vec![0u8; length];
         let mut filled = 0;
         while filled < length {
-            match self.inner.read(&mut payload[filled..]) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!("DVZip block truncated at {filled} of {length}"),
-                    ))
-                }
-                Ok(n) => filled += n,
+            let read = match self.inner.read(&mut payload[filled..]) {
+                Ok(n) => n,
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
+            };
+            if read == 0 {
+                self.keep(&payload[..filled]);
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "DVZip block truncated at {filled} of {length}; {}",
+                        self.diagnosis()
+                    ),
+                ));
             }
+            filled += read;
         }
         self.offset += length as u64;
+        self.keep(&payload);
 
         self.block = if raw & STORED != 0 {
             payload
         } else {
             inflate(&payload)?
         };
+        // Only the first block: the question this answers is about where the body
+        // started, and block two onwards would push the first out of the log line.
+        if self.decoded.is_empty() {
+            let take = DECODED_DUMP.min(self.block.len());
+            self.decoded.extend_from_slice(&self.block[..take]);
+        }
+        self.blocks += 1;
         self.position = 0;
         Ok(true)
     }
@@ -371,6 +456,31 @@ mod tests {
         let err = Decoder::new(&body[..]).read_to_end(&mut Vec::new()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("implausible"), "{err}");
+    }
+
+    #[test]
+    fn a_refused_header_reports_what_came_before_it() {
+        // A four-byte stored block followed by four zero bytes. The refusal is about the
+        // second header, but the bytes that matter are the first block's: without them a
+        // log line cannot tell a sender that framed an 111-byte block from a reader that
+        // started at the wrong offset. 2026-11-19 20:57:55 was exactly that question.
+        let mut body = Vec::new();
+        body.extend_from_slice(&(0x8000_0000u32 | 4).to_be_bytes());
+        body.extend_from_slice(b"abcd");
+        body.extend_from_slice(&[0u8; 4]);
+
+        let err = Decoder::new(&body[..]).read_to_end(&mut Vec::new()).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("at offset 8"), "{text}");
+        assert!(text.contains("1 block(s) were read first"), "{text}");
+        assert!(
+            text.contains("the body began 0x80 00 00 04 61 62 63 64 00 00 00 00"),
+            "the body so far should be in the message: {text}"
+        );
+        assert!(
+            text.contains("block one decoded to 0x61 62 63 64"),
+            "the first block's content should be in the message: {text}"
+        );
     }
 
     #[test]

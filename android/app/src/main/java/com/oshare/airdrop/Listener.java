@@ -1058,8 +1058,13 @@ final class Listener {
         // 所以先落到应用自己的暂存目录，收完再由 Publish 搬进公共目录并挂到媒体库上。
         // 暂存目录只属于这一次连接，finally 里无条件删掉。
         File staged = null;
+        // 卡住的时候取一次栈（见 {@link Stall}）。只在 {@code serveWatched} 那一段里开着：
+        // 收完之后 {@code Publish} 搬文件也可能要几秒，那时「线安静」是正常的，不该报。
+        Stall stall = null;
         try {
             staged = Publish.stage(context);
+            stall = new Stall(meter, where(peer));
+            stall.start();
             // 有人要发东西过来时问一次。问的是人，所以这条线程会停在这里等——它只服务这一个
             // 连接，等的时候确实没有别的事该做；但别的连接各有各的线程，门不会因此关上。
             byte[] frame = Native.serveWatched(
@@ -1101,6 +1106,8 @@ final class Listener {
                         return attempt.decide(summary);
                     },
                     meter);
+            // 字节已经收完了，接下来的安静属于搬文件，不属于这条线。
+            stall.stop();
             // A discovery probe and an empty share both come back empty; neither is worth a
             // line on the page, and leaving the previous transfer up is the truthful state
             // of "nothing new arrived".
@@ -1137,6 +1144,17 @@ final class Listener {
             // catch 也只把 "Connection reset" 写进日志、不上报，理由写得很直白：分享面板关了、
             // 文件发给了别的设备、这是这一分钟里第四次重连——每两秒闪一次的红线不是证据。
             // 真正需要人看一眼的失败（设置读不出来、目录写不进去、连接被系统掐断）仍然上线。
+            // 这一行回答的是「这次是谁先撒手」。2026-11-19 21:01–21:04 连收七次，六次停在
+            // 64 / 192 / 576 KiB，每次日志里只有一句 {@code connection … ended: Socket closed}，
+            // 而那句话在 libcore 里是**本机**关掉 fd 的措辞（对端走掉留下的是 reset 或 EOF）
+            // ——它既可能是「对面收手、本机内核跟着收 fd」，也可能是「这一侧有人 close 了它」，
+            // 两种可能指向的改法正好相反，而光靠这一句话分不出来。所以把手上的三样证据一起
+            // 打出来：异常到底是哪一类、这条 socket 在**本进程里**有没有被 close 过、断之前线
+            // 安静了多久。三样凑齐了，{@code closed=true} 且安静几秒，那就是人在等一个卡住的
+            // 传输，而不是网络把人踢了；`false` 且只安静几十毫秒，才是对面先撒手。
+            Log.i(TAG, "connection from " + where(peer) + " broke after " + millis(openedAt)
+                    + " ms: " + refused.getClass().getName() + ", closed=" + peer.isClosed()
+                    + ", " + meter.quiet() + ", " + bytes(meter.bytes()) + " landed");
             if (routine(refused)) {
                 Log.i(TAG, "connection from " + where(peer) + " ended: " + describe(refused));
                 return;
@@ -1172,6 +1190,11 @@ final class Listener {
             // 这里也就什么都不做。
             if (card.isHeldByCurrentThread()) {
                 card.unlock();
+            }
+            // 断了的时候上面那句 {@code stall.stop()} 走不到（异常直接跳到 finally），所以这里
+            // 再收一次。收完之后线还会安静很久——那是收尾，不是卡住。
+            if (stall != null) {
+                stall.stop();
             }
             // 暂存里的东西只有两种下场：搬进公共目录，或者被删掉。走到这里时两种都已经发生
             // 过了，剩下的是空目录和搬失败的那几份——留着它们只是让 app 的数据目录一直长大。
@@ -1379,7 +1402,12 @@ final class Listener {
         return total + " B";
     }
 
-    /** A failure's own words, or its class when it has none. */
+    /**
+     * A failure's own words, or its class when it has none.
+     *
+     * <p>只给日志用。屏幕上那句走 {@link #readable}：这里的原文可以是一整段英文加十六进制
+     * （见 {@code dvzip.rs} 的诊断），那是拿来搜和拿来读证据的，不是拿来给人看的。
+     */
     private static String describe(Throwable failed) {
         String message = failed.getMessage();
         return message == null || message.isEmpty() ? failed.toString() : message;
@@ -1418,6 +1446,8 @@ final class Listener {
      * @param landed 断之前已经落地的字节数
      */
     private static String because(Throwable failed, long landed) {
+        // 兜底那一句走 {@link #readable} 而不是 {@link #describe}：原因见那边。这一处是**唯一**
+        // 会把这句送到屏幕上的地方（{@code setState} 与 {@code attempt.failed} 都用它）。
         for (Throwable cause = failed; cause != null; cause = cause.getCause()) {
             if (aborted(cause)) {
                 if (landed > 0) {
@@ -1431,7 +1461,48 @@ final class Listener {
                 break;
             }
         }
-        return describe(failed);
+        return readable(failed);
+    }
+
+    /**
+     * 一句人能读的失败原因。原文只进日志。
+     *
+     * <p>这里原来直接把 {@link #describe} 的返回值交出去，理由是「目录写不进去、设置读不出来
+     * 这类原文本来就带着人能看懂的那半句」。2026-11-19 20:57 那张卡把这个理由推翻了：人看到的是
+     *
+     * <pre>
+     * 接收失败 · transport: the archive could not be read:
+     *            implausible DVZip block length 0 (header 0x00000000 at offset 115)
+     * </pre>
+     *
+     * <p>——英文、术语、十六进制，三样他都不知道该怎么读。而那时这段原文还只有一句；随后
+     * {@code dvzip.rs} 为了查清那一次的成因又往里加了「读过几块、body 起始字节、首块解出什么」，
+     * 加起来上百个字符的十六进制。那些字节是**给日志的**：{@link #describe} 原样进 logcat
+     * （见 {@code serve} 里那句 {@code Log.w(… failed: …)}），屏幕上不该出现它们。
+     *
+     * <p>所以分成两条出口。认不出来的失败回一句不点名的实话，而不是把英文倒给屏幕：认不出来的
+     * 那些（SSL 握手没谈成、磁盘写满）本来就该去日志里看，屏幕上多编一个字都是猜。
+     */
+    private static String readable(Throwable failed) {
+        String raw = describe(failed);
+        // 这几句都来自 Rust 侧 {@code Display} 的固定措辞（inbox::Error 的五个变体），
+        // 是这条链路上**唯一**稳定的锚点：异常类型一路被 JNI 抹平成 IOException。
+        if (raw.contains("the archive could not be read")) {
+            return "对面发来的文件包读不出来，让他再发一次";
+        }
+        if (raw.contains("the inbox could not be written")) {
+            return "文件没能写到存储上，检查空间够不够";
+        }
+        if (raw.contains("exceeds the inbox budget of")) {
+            return "一次传的超过了单次接收上限，没有存下";
+        }
+        if (raw.contains("no free name for")) {
+            return "同名文件太多，另起一个名字也存不下";
+        }
+        if (raw.contains("resolves outside the inbox")) {
+            return "这一份的文件名不安全，没有存下";
+        }
+        return "连接在中途出了问题，这一份没有存下";
     }
 
     /** The peer's address, for a log line; "?" when the socket never had one. */
@@ -1572,6 +1643,16 @@ final class Listener {
          */
         private volatile long done;
 
+        /**
+         * 最后一次有字节落地的时刻（{@link System#nanoTime}）；0 表示一个字节都没走过。
+         *
+         * <p>存在的理由只有一个：连接断掉的那一刻，{@code Socket closed} 这句话分不出「对面
+         * 传到一半收手」和「对面早就停了、几秒后才断」。差的就是这一段时间——断之前线安静了
+         * 五十毫秒是中止，安静了四秒是**停住**，而停住要找的是别的东西（见 {@code serve} 的
+         * catch 里那一行）。
+         */
+        private volatile long lastAt;
+
         Meter(ReceiveHost.Attempt attempt) {
             this.attempt = attempt;
         }
@@ -1579,7 +1660,8 @@ final class Listener {
         @Override
         public void landed(long done, long total) {
             this.done = done;
-            long now = System.nanoTime();
+            this.lastAt = System.nanoTime();
+            long now = lastAt;
             // 第一条立刻投出去：否则前两百毫秒里一个小文件已经收完了，人什么都没看见。
             if (postedAt != 0 && now - postedAt < INTERVAL_MS * 1_000_000L) {
                 return;
@@ -1595,11 +1677,104 @@ final class Listener {
             return done;
         }
 
+        /** 线安静了多久，毫秒；一个字节都还没走过时是 -1。见 {@link #lastAt}。 */
+        long silentMillis() {
+            long since = lastAt;
+            return since == 0 ? -1 : (System.nanoTime() - since) / 1_000_000L;
+        }
+
+        /** 同一件事，说成日志里的半句话。 */
+        String quiet() {
+            long silent = silentMillis();
+            return silent < 0 ? "no byte ever landed" : "last byte " + silent + " ms before the break";
+        }
+
         /** 有结果了。 */
         void finished(String text) {
             // 收完那句话由流体云的卡说（带【打开文件】【完成】）。这里不再另发一条普通通知，
             // 否则一次接收会在通知栏和胶囊里各留一条同样的话，而其中一条点不动。
         }
+    }
+
+    /**
+     * 线安静下来的时候，把那条读字节的线程在哪儿打出来。
+     *
+     * <p># 为什么要一条线程干这件事
+     *
+     * <p>2026-11-19 21:01–21:04 那六次中断，卡片上的数停在 64–576 KiB 就不动了，过一会儿
+     * 连接才断。数不动只有一个直接原因：{@link Meter#landed} 没被调用，也就是没有字节落地。
+     * 但「没有字节落地」有两种完全不同的情形，而它们在日志上长得一模一样：
+     *
+     * <p>一种是**对面不发了**——那边停了、AWDL 那头在重传、或者对面在等我们。这时这条线程
+     * 正躺在 {@code read} 里，栈上只有一帧 socketRead。
+     *
+     * <p>另一种是**我们自己没在读**：每次进度更新都要走 binder 到 SystemUI，而在这台机器上
+     * 那条路上还压着一个 Xposed 模块（logcat 里「提醒级别 0 → 11，让卡片自己展开」那一行）。
+     * SystemUI 一忙，这条线程就卡在 binder 上，对端看到的是一条不读数据的连接——那和我们
+     * 「收得慢」是两件事，要改的地方也不同。
+     *
+     * <p>两种只在栈上分得开，所以线安静超过 {@link #LIMIT_MS} 就取一次栈，一条连接只取一次。
+     */
+    private static final class Stall implements Runnable {
+
+        /**
+         * 静默多久算「卡住」。
+         *
+         * <p>比节流的间隔（200 ms）大一个数量级，比人开始怀疑（三秒左右）小一点：慢传输里
+         * 合法的空档也有一两百毫秒，而任何超过两秒半的空档，人都已经在看那块屏幕了。
+         */
+        private static final long LIMIT_MS = 2_500;
+
+        private final Meter meter;
+        private final String who;
+        /** 要取栈的那条线程：就是调 {@code serveWatched} 的那条。 */
+        private final Thread reader;
+        private volatile boolean halted;
+
+        Stall(Meter meter, String who) {
+            this.meter = meter;
+            this.who = who;
+            this.reader = Thread.currentThread();
+        }
+
+        void start() {
+            Thread watcher = new Thread(this, "opairdrop-stall");
+            watcher.setDaemon(true);
+            watcher.start();
+        }
+
+        /** 这一段结束了——收完了、断了、或者根本没开始。可以重复调。 */
+        void stop() {
+            halted = true;
+        }
+
+        @Override
+        public void run() {
+            while (!halted) {
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException done) {
+                    return;
+                }
+                long silent = meter.silentMillis();
+                // 还没开始传的时候不报：那会儿的「安静」只是人在看那张邀请卡。
+                if (silent < LIMIT_MS || meter.bytes() == 0) {
+                    continue;
+                }
+                Log.w(TAG, "no byte for " + silent + " ms at " + bytes(meter.bytes())
+                        + " from " + who + "; the reading thread was here:" + stackOf(reader));
+                return;
+            }
+        }
+    }
+
+    /** 一条线程此刻的栈，一行一帧，最里面那帧在前。 */
+    private static String stackOf(Thread thread) {
+        StringBuilder out = new StringBuilder();
+        for (StackTraceElement frame : thread.getStackTrace()) {
+            out.append("\n    at ").append(frame);
+        }
+        return out.toString();
     }
 
     private void setState(String text, boolean failed) {

@@ -771,6 +771,14 @@ final class ReceiveHost {
          * 样无关，跟人做过什么有关：人点了接收之后，任何一个断法都是「这次没收到」。
          */
         void abandon() {
+            // 三种收尾里有两种是**完全安静**的：人按取消走撤卡（{@link #end}），没人应答也
+            // 走撤卡，两条都不写日志；第三种失败也只由 {@code Listener} 那边先喊一句「连接
+            // 断了」。所以「这次到底是谁断的」在没有这一行的时候是查不出来的：2026-11-19
+            // 21:01–21:03 连收七次，六次停在 64 / 192 / 576 KiB，卡片上什么都不留、日志里也
+            // 分不出「人按了取消」和「对面走了」——而这两件事在下一步该改哪儿上，答案相反。
+            Log.i(TAG, "receive " + session + " ended "
+                    + (cancelled ? "cancelled" : accepted ? "accepted" : "unanswered")
+                    + " at " + percent + "%");
             if (cancelled) {
                 end("cancelled", CANCELLED, "已取消");
             } else if (accepted) {
