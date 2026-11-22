@@ -1252,9 +1252,25 @@ bool opairshare_pas_raw_admit(struct dp_soc *soc, qdf_nbuf_t nbuf)
 	if (!passthru_native_data_rx || !qdf_nbuf_is_raw_frame(nbuf))
 		return false;
 	atomic64_inc(&opairshare_native_raw_seen);
-	if (qdf_nbuf_is_frag(nbuf) || qdf_nbuf_is_rx_chfrag_cont(nbuf) ||
-	    qdf_nbuf_is_nonlinear(nbuf) ||
-	    !qdf_nbuf_is_rx_chfrag_start(nbuf) || !qdf_nbuf_is_rx_chfrag_end(nbuf)) {
+	/* An A-MSDU does not arrive as one buffer. REO splits it into a chain with
+	 * one MSDU per buffer, and it sets `start` on the head and `end` on the tail
+	 * only -- every middle link carries neither. The old test here demanded
+	 * `start && end` on the same buffer, so an aggregated frame was refused
+	 * link by link: head (no `end`), middles (no flags), tail (`cont`). That is
+	 * the whole reason advertising A-MSDU made receive slower instead of
+	 * faster (2026-11-22), and why `native_raw_incomplete` sat at 17-41%.
+	 *
+	 * Admitting each link is the correct delivery, not a workaround: the caller
+	 * walks the chain nbuf by nbuf (dp_be_rx.c, `nbuf = nbuf->next`) and
+	 * `dp_rx_deliver_raw_passthru()` takes exactly one MSDU per call.
+	 *
+	 * What still has to be refused is a buffer that is not an MSDU boundary at
+	 * all -- a fragment or a non-linear one -- and an orphan that is neither the
+	 * head nor a continuation, which is what a truncated PPDU looks like.
+	 */
+	if (qdf_nbuf_is_frag(nbuf) || qdf_nbuf_is_nonlinear(nbuf) ||
+	    (!qdf_nbuf_is_rx_chfrag_start(nbuf) &&
+	     !qdf_nbuf_is_rx_chfrag_cont(nbuf))) {
 		atomic64_inc(&opairshare_native_raw_incomplete);
 		return false;
 	}

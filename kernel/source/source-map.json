@@ -29,7 +29,7 @@
   },
   "kernel/driver/dp_rx.c": {
     "kernel_path": "vendor/qcom/opensource/wlan/qca-wifi-host-cmn/dp/wifi3.0/dp_rx.c",
-    "sha256": "f03497624506e06595fe6699e47a6acf7cd54472c894c20d6d93a5a7995b0a93"
+    "sha256": "0aef7484b95406e90a8acca32c464cec0dc19bd015e30aab18660cda6b591f4b"
   },
   "kernel/driver/dp_rx_err.c": {
     "kernel_path": "vendor/qcom/opensource/wlan/qca-wifi-host-cmn/dp/wifi3.0/dp_rx_err.c",
