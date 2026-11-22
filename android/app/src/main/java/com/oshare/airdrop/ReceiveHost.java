@@ -400,9 +400,12 @@ final class ReceiveHost {
                 // 情形：启用可选的模块（FluidModule 把 remindType 抬到 11），卡片由系统自己
                 // 摆开；不启用，就靠高重要性渠道 + setOnlyAlertOnce(false) 先抬头一次把人叫到，
                 // 看不看得清那两个按钮交给用户点一下胶囊。
-                LiveCard.invite(context, offer.title(), offer.body(),
-                        Confirmation.decision(context, session, true),
-                        Confirmation.decision(context, session, false));
+                PendingIntent yes = Confirmation.decision(context, session, true);
+                PendingIntent no = Confirmation.decision(context, session, false);
+                LiveCard.invite(context, offer.title(), offer.body(), yes, no);
+                // 六十秒不再隐形。原来这段时间里卡片一动不动，时间一到它自己消失，人只会觉得
+                // 「它怎么不见了」——倒计时把「还剩多久」和「到点会发生什么」一起说清楚。
+                countdown(decisionMs, offer, yes, no);
             }
             // 三条出口都不通的时候，别让对面等满六十秒。
             //
@@ -742,8 +745,42 @@ final class ReceiveHost {
             ReceiveHost.forget(session);
         }
 
-        private boolean await(long timeoutMs) {
-            try {
+        /**
+         * 邀请卡上的倒计时。每秒改写一次，直到有人回答、超时、或者这次接待收尾。
+         *
+         * <p>用的是 {@link #decided} 当节拍器，不是另建一个"停"标志：{@code await(1s)} 返回真
+         * 就说明有人答了（接受或拒绝），直接退出；返回假就是又过了一秒，接着画。超时那一下
+         * 也由它自然退出——最后一帧画到 1 秒就不会再画，不会出现「还有 0 秒」挂在屏幕上。
+         *
+         * <p>60 秒这条上限由 {@link Confirmation#decisionTimeout} 决定，这里只负责显示它，
+         * 不自己算一遍：两处各写一个数，改了一处另一处就会说谎。
+         */
+        private void countdown(long decisionMs, Confirmation.Offer offer,
+                               PendingIntent yes, PendingIntent no) {
+            int total = (int) ((decisionMs + 999) / 1000);
+            Thread ticker = new Thread(() -> {
+                for (int left = total - 1; left >= 1; left--) {
+                    try {
+                        if (decided.await(1, TimeUnit.SECONDS)) {
+                            return;
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    try {
+                        LiveCard.inviteQuiet(context, offer.title(), offer.body(left),
+                                yes, no);
+                    } catch (Throwable ignored) {
+                        // 通知被禁、渠道被关：画不上去就算了，倒计时不是这次接待的前提。
+                    }
+                }
+            }, "opairdrop-countdown");
+            ticker.setDaemon(true);
+            ticker.start();
+        }
+
+        private boolean await(long timeoutMs) {            try {
                 decided.await(timeoutMs, TimeUnit.MILLISECONDS);
             } catch (InterruptedException interrupted) {
                 // 接收端正在被关掉。把中断还回去，让上层知道它该退出。

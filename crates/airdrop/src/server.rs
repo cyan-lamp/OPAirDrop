@@ -422,6 +422,14 @@ impl<R: Receiver> Server<R> {
             // Nothing follows a decline, so closing is the honest framing of a finished
             // conversation.
             send(output, &Response::new(401).with_keep_alive(false))?;
+            // 回完不能就这么 return。对端可能还在发它的请求体，这时关连接是 RST，而不是
+            // FIN —— 而 RST 会把对端还没读走的字节一起丢掉，包括刚写出去的这个 401。
+            // 屏幕上的表现就是「一直等待」，然后自己超时变失败，看起来像我们从没回答过。
+            //
+            // 人手动点拒绝时这条不太显眼（他本来就盯着屏幕，而且请求体多半早就发完了）；
+            // 超时那条一定会撞上：那 30 秒里对端可能还在重发同一个 /Ask。drain 把剩下的
+            // body 读完，close 就成了普通结束。
+            drain(input, self.drain_limit);
             return Ok(false);
         }
         let answer = self.receiver.ask(Some(&parsed));

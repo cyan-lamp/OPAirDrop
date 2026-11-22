@@ -194,7 +194,7 @@ pub const CATALOG: &[Setting] = &[
             max: 300_000,
             unit: Unit::Milliseconds,
         },
-        default: "60000",
+        default: "30000",
         title: "等人应答时长",
         summary: "邀请弹出后多久没人应答就当作拒绝。卡片和通知用同一个数。",
     },

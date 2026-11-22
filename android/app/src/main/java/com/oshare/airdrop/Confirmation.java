@@ -52,6 +52,19 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 走过来拿起手机，于是每一次都白等成拒绝。六十秒的代价是发送端多等半分钟，而它自己也有超时，
  * 真的等不及会先放手；我们到点回一个 401，比让它一直吊着强。所以这里不再追求「早于对面」，
  * 只追求「人来得及」。
+ *
+ * <p># 2026-11-23：三十秒，并且这次是为了「早于对面」
+ *
+ * <p>六十秒的代价在真机上露出来了：发送端自己也是六十秒判超时，两边同时到点，我们那条 401
+ * 出门时对面已经不听——人看到的是 iPhone 那边「失败」，而不是「已拒绝」，而这两句话在
+ * AirDrop 里是两件不同的事。三十秒留出整整半分钟，401 一定先到。
+ *
+ * <p>时序上这不是拍脑袋：我们这个数从**读完 /Ask 的 body** 开始算，对面的六十秒从它
+ * **发出 /Ask** 开始算，中间隔着一次 TLS 往返与解析，本来就已经晚了一截。再加上三十秒对
+ * 六十秒的差额，两边真正拉开。
+ *
+ * <p>代价是「人不在手机跟前」时更容易白等成拒绝（原来正因为这个从三十改成六十）。这一条
+ * 是用户 2026-11-23 00:13 明确选的：宁可短，也要让对面看见「已拒绝」。
  */
 final class Confirmation {
 
@@ -77,7 +90,7 @@ final class Confirmation {
     /**
      * 等人回答多久的回落值。表读不出来时用这个数，所以它必须和表里的默认值一样。
      */
-    private static final long TIMEOUT_MS = 60_000;
+    private static final long TIMEOUT_MS = 30_000;
 
     /**
      * 等人回答多久——表里是 {@code receive.decision_timeout_ms}，上面是它成为一行之前的数。
@@ -140,9 +153,17 @@ final class Confirmation {
 
         private final String body;
 
-        private Offer(String sender, String body, List<Item> files, long links, List<String> urls) {
+        /**
+         * 等人回答的秒数。倒计时每一帧都要用它，所以它跟着 Offer 走，而不是让卡片那边
+         * 再算一遍——两处各写一个数，注水的那一处迟早会说谎。
+         */
+        private final int seconds;
+
+        private Offer(String sender, String body, int seconds,
+                      List<Item> files, long links, List<String> urls) {
             this.sender = sender;
             this.body = body;
+            this.seconds = seconds;
             this.files = files;
             this.links = links;
             this.urls = urls;
@@ -164,9 +185,19 @@ final class Confirmation {
             return files.isEmpty() && links > 0;
         }
 
-        /** 正文说清几件、多大。 */
+        /** 正文说清几件、多大，并说明还等多久。 */
         String body() {
-            return body;
+            return body(seconds);
+        }
+
+        /**
+         * 同一句正文，把倒计时那个数字换成 {@code left}。
+         *
+         * <p>数字长在句子里，不是挂在句尾——「还有 58 秒」是一句旁注，「58 秒后无人应答将
+         * 自动拒绝」是这件事本身的规则，人扫一眼就知道不点会怎样。
+         */
+        String body(int left) {
+            return body + "，" + left + " 秒后无人应答将自动拒绝。";
         }
     }
 
@@ -216,9 +247,14 @@ final class Confirmation {
         // 「当作拒绝」和结果页那句「已放弃」是两句话说了两件事。人没看见这条邀请、或者看见了
         // 还没来得及伸手，都不等于他拒绝了——发送端拿到的是同一个 401，但屏幕上说什么由这里
         // 决定。到点之后那张卡写的是「已放弃」，所以在还没到点的时候就得是同一句话。
-        return new Offer(sender, what + (bytes > 0 ? " · " + size(bytes) : "")
-                + "，" + seconds(timeoutMs) + " 秒内没人应答就放弃。",
-                entries(field, 4), links, urls(field, 5));
+        Offer built = new Offer(sender, what + (bytes > 0 ? " · " + size(bytes) : ""),
+                (int) seconds(timeoutMs), entries(field, 4), links, urls(field, 5));
+        // 这一行是为了回答「卡片上为什么还是六十秒」：它把**解析出来**的秒数与那张卡最终
+        // 会显示的第二行一起打出来。如果这里已经是 30 而屏幕上仍是 60，那问题就在卡片
+        // 之后（旧卡没收掉、或者另有投递路径）；如果这里还是 60，就说明 decisionTimeout
+        // 读到的不是我们以为的那个数。
+        Log.i(TAG, "invite built: " + timeoutMs + " ms -> \"" + built.body() + "\"");
+        return built;
     }
 
     /**

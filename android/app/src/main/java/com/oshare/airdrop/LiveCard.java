@@ -333,6 +333,29 @@ final class LiveCard {
      */
     static void invite(Context context, String title, String shortText,
                        PendingIntent accept, PendingIntent refuse) {
+        postInvite(context, title, shortText, accept, refuse, false);
+    }
+
+    /**
+     * 同一张邀请卡的静默更新帧：倒计时每秒喊一次，只换第二行。
+     *
+     * <p>文案由调用方给全（「58 秒后无人应答将自动拒绝。」），这里不拼字——数字长在句子里
+     * 才读得出这是规则，挂在句尾只是旁注。
+     *
+     * <p>{@code setOnlyAlertOnce(true)} 是这个方法存在的理由：邀请卡走的是会响的那条渠道，
+     * 更新帧要是也响，就成了每秒一声的门铃；它同时压掉抬头，卡已经在那儿了。
+     */
+    static void inviteQuiet(Context context, String title, String text,
+                            PendingIntent accept, PendingIntent refuse) {
+        postInvite(context, title, text, accept, refuse, true);
+    }
+
+    /**
+     * 邀请卡唯一的构建点。{@code tick} 为假是第一次投递（要响、要抬头），
+     * 为真就是倒计时的更新帧（不响、不抬头）。
+     */
+    private static void postInvite(Context context, String title, String shortText,
+                                   PendingIntent accept, PendingIntent refuse, boolean tick) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.BAKLAVA) {
             return;
         }
@@ -342,16 +365,18 @@ final class LiveCard {
         }
         channel(manager);
         alertChannel(manager);
+        String text = shortText;
         Notification.Builder builder = new Notification.Builder(context, ALERT_CHANNEL)
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentTitle(title)
-                .setContentText(shortText)
-                .setShortCriticalText(shortText)
+                .setContentText(text)
+                .setShortCriticalText(text)
                 // 邀请阶段**不画进度条**：这时没有任何字节在走，一条轨道只会让人以为传输已经开始。
                 // 轨道从「点了接收」那一刻起才该出现（{@link #update} 会给这张卡换上 ProgressStyle）。
                 .setOngoing(true)
-                // 邀请必须抬头：它问的是一个需要人在几秒内回答的问题。
-                .setOnlyAlertOnce(false)
+                // 邀请必须抬头：它问的是一个需要人在几秒内回答的问题。倒计时的更新帧反过来，
+                // 一秒抬一次头等于把这张卡变成干扰。
+                .setOnlyAlertOnce(tick)
                 .setShowWhen(false)
                 .setRequestPromotedOngoing(true)
                 // 先「拒绝」后「接收」：加进来的顺序就是左右顺序，而主导动作该在右边——
@@ -365,6 +390,9 @@ final class LiveCard {
         // 自己记一笔：否则下一张进度卡的形状与上一次传输留下的那个恰好相同时，系统会把
         // 「拒绝/接收」这两个答案留在屏上。
         lastShape = "invite";
+        if (tick) {
+            return;
+        }
         // 响了才算「通知到了」。系统那条路对提升过的通知不出声（见 alertChannel 的注释），
         // 所以这一声得我们自己发。放在 notify 之后：卡先在原位站好，声音再跟上，
         // 人抬头时看到的就是「已经在那儿的那张卡」，而不是「先响一声、卡再慢慢浮出来」。
