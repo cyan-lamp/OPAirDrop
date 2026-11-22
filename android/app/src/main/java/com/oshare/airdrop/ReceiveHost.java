@@ -343,6 +343,20 @@ final class ReceiveHost {
         }
 
         /**
+         * 人自己按过【取消接收】没有。
+         *
+         * <p>问这一句的地方只有两处，而且问的都是同一件事：**这次收尾该不该说成失败**。
+         * 人按了取消之后，{@link HangUp#now} 会发 RST，读字节的那条线程从 {@code read} 里
+         * 冒出来的异常与「对面走了」完全同形（{@code Socket closed} / {@code Connection
+         * reset}），下游那两处失败分支分不出来——但这里分得出来，因为只有人会调
+         * {@link #cancel}。所以判据不是异常长什么样，是人做过什么，与 {@link #answered}
+         * 那条判据同源。
+         */
+        boolean cancelled() {
+            return cancelled;
+        }
+
+        /**
          * 有人要发东西过来：说出去，然后等人回答。
          *
          * <p>会阻塞调用线程，和 {@link Confirmation#ask} 一样，因为调用它的那条线程本来就
@@ -645,7 +659,14 @@ final class ReceiveHost {
             Log.i(TAG, "receive " + session + " ended "
                     + (cancelled ? "cancelled" : accepted ? "accepted" : "unanswered")
                     + " at " + percent + "%");
-            if (accepted) {
+            if (cancelled) {
+                // 人自己按的【取消接收】：这不是失败，是**他要的**结果。
+                //
+                // 过去这里先看 accepted，于是「人点了接收、传到一半按了取消」照样走
+                // {@code failed("连接意外断开")}，胶囊上弹一条说对面断了的红字——因果整个
+                // 说反了：对面没有断，是我们把它掐了。取消只有一个下场：撤卡，不留话。
+                end();
+            } else if (accepted) {
                 failed("连接意外断开");
             } else {
                 // 人按了取消、或者一直没人应答——在这边是同一个收尾：撤卡，不留话。过去这两者
@@ -676,6 +697,9 @@ final class ReceiveHost {
          */
         void cancel() {
             cancelled = true;
+            // 与 HangUp 里那一行配对：这一行是「广播到了、决定取消」，那一行是「RST 交给内核」。
+            // 两行相减就是我们的反应时间；再和对面说失败的时刻比，才知道延迟在谁那儿。
+            Log.i(TAG, "cancel requested at " + percent + "%");
             if (decided.getCount() > 0) {
                 // 人是从卡片上的取消进来的，所以来源记 card；日志里那一句要知道是谁按的。
                 answer(false, "card");

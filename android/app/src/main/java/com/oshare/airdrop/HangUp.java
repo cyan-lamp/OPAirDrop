@@ -1,5 +1,7 @@
 package com.oshare.airdrop;
 
+import android.util.Log;
+
 import java.io.IOException;
 import java.net.Socket;
 
@@ -43,6 +45,7 @@ final class HangUp {
             return;
         }
         Thread cutting = new Thread(() -> {
+            long asked = android.os.SystemClock.elapsedRealtime();
             try {
                 // 先设，再关。
                 peer.setSoLinger(true, 0);
@@ -54,6 +57,11 @@ final class HangUp {
             } catch (IOException alreadyGone) {
                 // 已经断了：那条正在跑的线程自己会遇到异常并走到收尾，不用在这里补一句。
             }
+            // 这一行是为了回答「我们是不是发得太慢」：它量的是从按下取消到 RST 交给内核的
+            // 墙钟时间，不包含任何等待。若这一行总是个位数毫秒，而对面过几秒才说失败，
+            // 那延迟就不在我们这侧——别再往这里加逻辑。
+            Log.i("OPAirDrop", "hangup: RST handed to the kernel after "
+                    + (android.os.SystemClock.elapsedRealtime() - asked) + " ms");
         }, "opairdrop-hangup");
         cutting.setDaemon(true);
         cutting.start();

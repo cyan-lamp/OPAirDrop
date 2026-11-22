@@ -1210,6 +1210,17 @@ final class Listener {
                         + describe(refused));
                 return;
             }
+            // 人自己按的取消，和「对面走了」在异常这一层完全同形：{@link ReceiveHost.Attempt}
+            // 的 cancel() 走 HangUp 发 RST，读字节的线程照样从 read 里抛出来。差别只在人做
+            // 过什么，所以判据用 attempt.cancelled() 而不是异常类型。
+            //
+            // 不在这里让开的代价是屏幕上说反话：人主动掐掉一次传输，胶囊却弹一条「接收失败：
+            // 连接意外断开」——对面没断，是我们掐的。取消只有一个下场：撤卡，不留话。
+            if (attempt.cancelled()) {
+                Log.i(TAG, "connection from " + where(peer) + " cancelled by the user: "
+                        + describe(refused));
+                return;
+            }
             // 先把投递停掉再往卡上写失败：否则一条还在飞的「正在接收」会落在失败那句后面，
             // 屏幕上就只剩一张停在半路、再也不会动的进度卡。上面那两处 {@code return} 由
             // {@code finally} 兜住——它们本来就不许碰卡。
