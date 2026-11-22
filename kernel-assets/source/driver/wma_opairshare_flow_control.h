@@ -100,6 +100,35 @@ static int opairshare_flow_forget_locked(void)
 	return 0;
 }
 
+/*
+ * Unconditional counterpart of opairshare_flow_forget_locked(), for teardown
+ * paths that run when the firmware is already gone.
+ *
+ * opairshare_flow_forget_locked() refuses with -EBUSY while the bridge still
+ * looks accepting or while frames are pending, and it refuses with -EIO if the
+ * queue-control call itself fails.  Both refusals are correct for a healthy
+ * stop, and both are unavoidable on the SSR force-cleanup path: the frames that
+ * would drain the queue can never complete because the MAC that owed us the
+ * completions is the thing that crashed.  A refusal there is not a retryable
+ * condition -- it just leaves the dev_hold() from opairshare_flow_bind_locked()
+ * in place forever, so unregister_netdevice() spins on
+ *
+ *     waiting for wondertap0 to become free. Usage count = 2
+ *
+ * every ten seconds while holding RTNL, which wedges the rest of the teardown.
+ * Nothing below can fail: the netdev is being destroyed, so the queue state the
+ * pause flag describes is about to stop existing.
+ */
+static void opairshare_flow_force_forget_locked(void)
+{
+	if (!opairshare_flow_dev)
+		return;
+	opairshare_flow_paused = false;
+	dev_put(opairshare_flow_dev);
+	opairshare_flow_dev = NULL;
+	opairshare_flow_puts++;
+}
+
 static int opairshare_flow_get(char *out, const struct kernel_param *kp)
 {
 	unsigned long flags;

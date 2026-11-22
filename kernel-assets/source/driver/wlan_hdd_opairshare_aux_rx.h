@@ -8,8 +8,42 @@
 #include "wlan_pkt_capture_ucfg_api.h"
 
 static bool passthru_aux_monitor;
-module_param(passthru_aux_monitor, bool, 0444);
+module_param(passthru_aux_monitor, bool, 0644);
 MODULE_PARM_DESC(passthru_aux_monitor, "Opt-in native monitor RX companion for PAS/NDI");
+
+/* Runtime-writable on purpose (2026-11-22): the shipped bytes kept in the
+ * "gz.bak" payload under kernel-assets deliver AWDL data through the DP raw
+ * path, not through this monitor -- measured over one boot, the monitor moved
+ * 3.2 MB in 8 099 packets while `wonder0` moved 88.3 MB in 71 825, a 27x
+ * difference on the same traffic.  The overlay build depends on the monitor
+ * instead, and that is where its 1/12..1/20 receive throughput comes from.
+ * Making this writable is what lets the two paths be compared on one binary:
+ * write 0 to take the monitor out without an insmod, write 1 to put it back.
+ * The default is still off, nothing turns it on by itself. */
+
+/* Match the auxiliary monitor channel to the primary PAS vdev.
+ *
+ * The primary vdev starts at 80 MHz EHT (chanmode 26, 2SS) whenever the
+ * passthru channel request is wide, but the monitor used to be pinned to
+ * 20 MHz / 11n unconditionally.  An iPhone sending at 80 MHz then arrives at
+ * a receiver listening on a 20 MHz slice: measured 2026-11-22, 41% of frames
+ * (1582 of 3860) were flagged incomplete at passthru_raw_admit while the
+ * receive direction idled at ~0.1-0.5 MB/s against a 3-4 MB/s TX direction.
+ * Bringing the monitor up on the same width/PHY as the data vdev lets it copy
+ * the whole PPDU instead of a fragment.
+ *
+ * Runtime-writable on purpose: a wide monitor on this firmware has historically
+ * (2026-11-22) triggered `cause=7003` recovery on some builds.  Write 0 to fall
+ * back to the old 20 MHz / 11n behaviour with no rebuild.  Gated on the same
+ * opairshare_passthru_want_wide() the data vdev uses, so a narrow bring-up is
+ * left byte-for-byte unchanged.
+ */
+static bool passthru_aux_wide = true;
+module_param(passthru_aux_wide, bool, 0644);
+MODULE_PARM_DESC(passthru_aux_wide,
+    "Bring the aux monitor up at 80 MHz EHT to match the primary vdev (0=legacy 20 MHz 11n)");
+
+extern bool opairshare_passthru_want_wide(void);
 
 /* Direct auxiliary creation must mirror the native OTHER_BSS setup. */
 static bool opairshare_aux_flags_owned;
@@ -340,8 +374,14 @@ static int opairshare_aux_start(struct hdd_context *hdd_ctx,
 		goto fail;
 	ctx = WLAN_HDD_GET_MONITOR_CTX_PTR(mon->deflink);
 	ctx->freq = freq;
-	ctx->bandwidth = CH_WIDTH_20MHZ;
-	ctx->phy_mode = hdd_cfg_xlate_to_csr_phy_mode(eHDD_DOT11_MODE_11n);
+	if (READ_ONCE(passthru_aux_wide) && opairshare_passthru_want_wide()) {
+		ctx->bandwidth = CH_WIDTH_80MHZ;
+		ctx->phy_mode = hdd_cfg_xlate_to_csr_phy_mode(eHDD_DOT11_MODE_11be);
+		pr_info("OPAIRSHAREAUXWIDE: mon vdev at 80 MHz EHT to match primary\n");
+	} else {
+		ctx->bandwidth = CH_WIDTH_20MHZ;
+		ctx->phy_mode = hdd_cfg_xlate_to_csr_phy_mode(eHDD_DOT11_MODE_11n);
+	}
 	phase = "set-channel";
 	ret = wlan_hdd_set_mon_chan(mon);
 	osif_vdev_sync_trans_stop(sync);

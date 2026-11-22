@@ -1029,6 +1029,25 @@ wlan_hdd_update_queue_history_state(struct net_device *dev,
 	}
 }
 
+/*
+ * The passthrough tap is allocated with a single TX queue, so the per-AC index
+ * arithmetic in TX_GET_QUEUE_IDX() runs past the end of dev->_tx[] there.  Fold
+ * every index onto a queue that actually exists: with the full NUM_TX_QUEUES
+ * this is the identity, while on the tap all ACs collapse onto queue 0 -- which
+ * is exactly what a single FIFO means.
+ */
+static inline uint32_t hdd_tx_subqueue_idx(struct net_device *dev, uint32_t idx)
+{
+	uint32_t num;
+
+	if (!dev)
+		return 0;
+	num = qdf_min(dev->real_num_tx_queues, (uint32_t)NUM_TX_QUEUES);
+	if (idx < num)
+		return idx;
+	return num ? num - 1 : 0;
+}
+
 /**
  * wlan_hdd_stop_non_priority_queue() - stop non priority queues
  * @adapter: adapter handle
@@ -1041,13 +1060,13 @@ static inline void wlan_hdd_stop_non_priority_queue(struct hdd_adapter *adapter)
 
 	for (i = 0; i < TX_QUEUES_PER_AC; i++) {
 		netif_stop_subqueue(adapter->dev,
-				    TX_GET_QUEUE_IDX(HDD_LINUX_AC_VO, i));
+			hdd_tx_subqueue_idx(adapter->dev, TX_GET_QUEUE_IDX(HDD_LINUX_AC_VO, i)));
 		netif_stop_subqueue(adapter->dev,
-				    TX_GET_QUEUE_IDX(HDD_LINUX_AC_VI, i));
+			hdd_tx_subqueue_idx(adapter->dev, TX_GET_QUEUE_IDX(HDD_LINUX_AC_VI, i)));
 		netif_stop_subqueue(adapter->dev,
-				    TX_GET_QUEUE_IDX(HDD_LINUX_AC_BE, i));
+			hdd_tx_subqueue_idx(adapter->dev, TX_GET_QUEUE_IDX(HDD_LINUX_AC_BE, i)));
 		netif_stop_subqueue(adapter->dev,
-				    TX_GET_QUEUE_IDX(HDD_LINUX_AC_BK, i));
+			hdd_tx_subqueue_idx(adapter->dev, TX_GET_QUEUE_IDX(HDD_LINUX_AC_BK, i)));
 	}
 }
 
@@ -1063,13 +1082,13 @@ static inline void wlan_hdd_wake_non_priority_queue(struct hdd_adapter *adapter)
 
 	for (i = 0; i < TX_QUEUES_PER_AC; i++) {
 		netif_wake_subqueue(adapter->dev,
-				    TX_GET_QUEUE_IDX(HDD_LINUX_AC_VO, i));
+			hdd_tx_subqueue_idx(adapter->dev, TX_GET_QUEUE_IDX(HDD_LINUX_AC_VO, i)));
 		netif_wake_subqueue(adapter->dev,
-				    TX_GET_QUEUE_IDX(HDD_LINUX_AC_VI, i));
+			hdd_tx_subqueue_idx(adapter->dev, TX_GET_QUEUE_IDX(HDD_LINUX_AC_VI, i)));
 		netif_wake_subqueue(adapter->dev,
-				    TX_GET_QUEUE_IDX(HDD_LINUX_AC_BE, i));
+			hdd_tx_subqueue_idx(adapter->dev, TX_GET_QUEUE_IDX(HDD_LINUX_AC_BE, i)));
 		netif_wake_subqueue(adapter->dev,
-				    TX_GET_QUEUE_IDX(HDD_LINUX_AC_BK, i));
+			hdd_tx_subqueue_idx(adapter->dev, TX_GET_QUEUE_IDX(HDD_LINUX_AC_BK, i)));
 	}
 }
 
@@ -1079,7 +1098,7 @@ void hdd_wake_queues_for_ac(struct net_device *dev, enum hdd_wmm_linuxac ac)
 	uint8_t i;
 
 	for (i = 0; i < TX_QUEUES_PER_AC; i++)
-		netif_wake_subqueue(dev, TX_GET_QUEUE_IDX(ac, i));
+		netif_wake_subqueue(dev, hdd_tx_subqueue_idx(dev, TX_GET_QUEUE_IDX(ac, i)));
 }
 
 static inline
@@ -1088,7 +1107,7 @@ void hdd_stop_queues_for_ac(struct net_device *dev, enum hdd_wmm_linuxac ac)
 	uint8_t i;
 
 	for (i = 0; i < TX_QUEUES_PER_AC; i++)
-		netif_stop_subqueue(dev, TX_GET_QUEUE_IDX(ac, i));
+		netif_stop_subqueue(dev, hdd_tx_subqueue_idx(dev, TX_GET_QUEUE_IDX(ac, i)));
 }
 
 /**
@@ -1115,9 +1134,16 @@ int opairshare_pas_flow_queue_control(struct net_device *dev, unsigned int actio
 	if (!dev)
 		return -EINVAL;
 	adapter = WLAN_HDD_GET_PRIV_PTR(dev);
+	/*
+	 * The passthrough tap is allocated with a single TX queue on purpose
+	 * (see hdd_alloc_station_adapter), so requiring exactly NUM_TX_QUEUES
+	 * rejected every frame this path ever saw.  Accept any queue count the
+	 * tap can legitimately carry; the wake logic below adapts to it.
+	 */
 	if (!adapter || adapter->magic != WLAN_HDD_ADAPTER_MAGIC ||
 	    adapter->dev != dev || adapter->device_mode != QDF_PASSTHRU_MODE ||
-	    dev->real_num_tx_queues != NUM_TX_QUEUES)
+	    !dev->real_num_tx_queues ||
+	    dev->real_num_tx_queues > NUM_TX_QUEUES)
 		return -EINVAL;
 	BUILD_BUG_ON(WLAN_REASON_TYPE_MAX >= 31);
 	BUILD_BUG_ON(HDD_LINUX_AC_HI_PRIO * TX_QUEUES_PER_AC >= NUM_TX_QUEUES);
@@ -1147,6 +1173,18 @@ int opairshare_pas_flow_queue_control(struct net_device *dev, unsigned int actio
 	adapter->pause_map &= ~OPAIRSHARE_PAS_PAUSE_BIT;
 	global = adapter->pause_map;
 	sub = adapter->subqueue_pause_map;
+	/*
+	 * One FIFO, no per-AC outlets.  Indexing by AC here would run past the
+	 * end of dev->_tx[] on the single-queue tap, and one wake already covers
+	 * every AC because they all share that queue.  The sub-queue mask only
+	 * means something when each AC owns its own queues, which the tap
+	 * deliberately does not do.
+	 */
+	if (dev->real_num_tx_queues < NUM_TX_QUEUES) {
+		netif_wake_queue(dev);
+		woke = 1;
+		goto out;
+	}
 	if (!global) {
 		if (!(sub & BIT(WLAN_DATA_FLOW_CTRL_BE_BK))) {
 			hdd_wake_queues_for_ac(dev, HDD_LINUX_AC_BE);
@@ -1165,7 +1203,7 @@ int opairshare_pas_flow_queue_control(struct net_device *dev, unsigned int actio
 	if ((!global || global == BIT(WLAN_PEER_UNAUTHORISED)) &&
 	    !(sub & BIT(WLAN_DATA_FLOW_CTRL_PRI))) {
 		/* HI is one queue, unlike the four queues in each ordinary AC. */
-		netif_wake_subqueue(dev, HDD_LINUX_AC_HI_PRIO * TX_QUEUES_PER_AC);
+		netif_wake_subqueue(dev, hdd_tx_subqueue_idx(dev, HDD_LINUX_AC_HI_PRIO * TX_QUEUES_PER_AC));
 		woke++;
 	}
 out:
@@ -1239,7 +1277,8 @@ void wlan_hdd_netif_queue_control(struct hdd_adapter *adapter,
 		}
 		if (!adapter->pause_map) {
 			netif_wake_subqueue(adapter->dev,
-				HDD_LINUX_AC_HI_PRIO * TX_QUEUES_PER_AC);
+				hdd_tx_subqueue_idx(adapter->dev,
+					HDD_LINUX_AC_HI_PRIO * TX_QUEUES_PER_AC));
 			wlan_hdd_update_pause_time(adapter, temp_map);
 		}
 		spin_unlock_bh(&adapter->pause_map_lock);
@@ -1249,7 +1288,8 @@ void wlan_hdd_netif_queue_control(struct hdd_adapter *adapter,
 		spin_lock_bh(&adapter->pause_map_lock);
 		if (!adapter->pause_map) {
 			netif_stop_subqueue(adapter->dev,
-				    HDD_LINUX_AC_HI_PRIO * TX_QUEUES_PER_AC);
+				hdd_tx_subqueue_idx(adapter->dev,
+				    HDD_LINUX_AC_HI_PRIO * TX_QUEUES_PER_AC));
 			wlan_hdd_update_txq_timestamp(adapter->dev);
 			wlan_hdd_update_unpause_time(adapter);
 		}

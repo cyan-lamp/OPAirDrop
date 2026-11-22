@@ -64,6 +64,7 @@ const TLV_ELECTION_V1: u8 = 5;
 const TLV_CHANNEL_SEQUENCE: u8 = 18;
 const TLV_ELECTION_V2: u8 = 24;
 const TLV_HT_CAPABILITIES: u8 = 7;
+const TLV_VHT_CAPABILITIES: u8 = 17;
 const TLV_ARPA: u8 = 16;
 const TLV_DATA_PATH_STATE: u8 = 12;
 const TLV_VERSION: u8 = 21;
@@ -188,6 +189,7 @@ pub fn presence(
     election_v2(&mut out, node);
     service_params(&mut out);
     ht_capabilities(&mut out);
+    vht_capabilities(&mut out);
     if mif {
         arpa(&mut out, &node.name);
     }
@@ -339,7 +341,7 @@ fn service_params(out: &mut Vec<u8>) {
     });
 }
 
-/// One spatial stream, every MCS of it, and short guard intervals.
+/// What this node can receive — the whole of it, from a peer's point of view.
 ///
 /// This TLV is the only place a peer can learn what this node can receive. mac80211
 /// carries our data and our ACKs, but it sends no beacons on an IBSS interface and
@@ -347,34 +349,81 @@ fn service_params(out: &mut Vec<u8>) {
 /// element from this stack in any frame except this one. Whatever is written here is
 /// the whole of what the far end knows; nothing added to the interface can reach it.
 ///
+/// The history of the bytes, because both versions were measured and only one number
+/// is about rates:
+///
 /// The MCS set used to say `0x1b` — MCS 0, 1, 3 and 4, missing 2 and 5, 6, 7. That is
 /// a bitmask over MCS indices for one spatial stream, so a set with holes in it reads
 /// as a radio that cannot do the rates between the holes. An iPhone that picks a rate
 /// by walking its own table and intersecting it with the peer's will stop at the first
-/// gap. `0xff` is the honest description of a one-stream receiver: every index 0-7.
+/// gap. Widening it, and setting the 20 MHz short-GI bit, took the same 38.79 MB file
+/// from 60.38 s to 45.29 s — 464 -> 618.5 segments/s, peer frame gap p50 1.40 -> 0.93 ms,
+/// +33.5% on nothing but those bytes, with the interface reporting `20 MHz (no HT)` on
+/// both sides of the change. That is also the argument for leaving the interface alone
+/// if the rate ever looks wrong again (Task.md §5.8).
 ///
-/// The HT Capabilities Info word gains bit 4, short GI for 20 MHz. The interface runs
-/// 20 MHz only (`iw` reports no HT width), so bit 1, 40 MHz support, stays clear: a
-/// 40 MHz claim would invite a rate the channel plan cannot carry. Short GI is worth
-/// 11% of airtime on its own, and it costs nothing to honour — the radio already
-/// handles both guard lengths, the flag only tells the far end it may use the short one.
-///
-/// Measured, same 38.79 MB file, same interface state (`width: 20 MHz (no HT)`) on both
-/// sides of the change: wall clock 60.38 s -> 45.29 s, 464 -> 618.5 segments/s, peer frame
-/// gap p50 1.40 -> 0.93 ms, i.e. +33.5% on a pure change of these eleven bytes. That is
-/// the evidence for the paragraph above: editing the interface did nothing, editing this
-/// TLV moved the number. If someone is tempted to "fix" the rate by touching ibss join,
-/// this comment is the argument against it. Details in Task.md §5.8.
+/// Today's bytes are a different form, not an extension of that one, so that number
+/// does not carry over to them and this comment will not pretend it does.
 fn ht_capabilities(out: &mut Vec<u8>) {
     tlv(out, TLV_HT_CAPABILITIES, |v| {
-        // HT Capabilities Info: bit 4, short GI for 20 MHz. No 40 MHz, no LDPC, no
-        // STBC — none of those are things this receiver can actually do.
-        v.extend_from_slice(&0x0010u16.to_le_bytes());
-        v.extend_from_slice(&0x11ceu16.to_le_bytes());
-        // MCS RX set, one spatial stream: indices 0-7, all of them.
-        v.push(0xff);
-        v.push(0xff);
-        v.extend_from_slice(&0u16.to_le_bytes());
+        // Nine bytes lifted from an iOS 26 phone's own presence frame, field by field:
+        //
+        //   00 00     a two byte prefix, `0000` in every captured frame
+        //   6f 00     HT Capabilities Info, little endian — LDPC, 20/40, SGI20, SGI40,
+        //             RX STBC, Max A-MSDU 3839
+        //   1f        A-MPDU parameters — max RX A-MPDU 64 KB, MPDU density 16 us
+        //   ff ff     RX MCS mask — spatial streams 0 and 1, MCS 0-15
+        //   00 00     the tail these frames all carry
+        //
+        // What this replaces was eight bytes (`00 10 ce 11 ff ff 00 00`) and was itself
+        // measured: the same 38.79 MB file went 60.38 s -> 45.29 s, 464 -> 618.5
+        // segments/s, on nothing but those bytes. Which of them bought the 33.5% is not
+        // something that experiment separates — both the prefix and the A-MPDU parameters
+        // moved at once. So this is not "the old one plus a stream": it is the form with a
+        // proven end-to-end number behind it, adopted whole.
+        //
+        // The end-to-end number is `houji-airdrop`'s: this exact TLV, plus the VHT one
+        // below, is what took its link from VHT80 1SS MCS 7 to VHT80 2SS MCS 9 SGI80
+        // (866.7 Mbps) against an unmodified Apple peer. Two receive chains is the part
+        // that matters here: the radio has two, and until now every iPhone was told it had
+        // one, so nothing was ever sent 2x2 toward this phone.
+        v.extend_from_slice(&[0x00, 0x00, 0x6f, 0x00, 0x1f, 0xff, 0xff, 0x00, 0x00]);
+    });
+}
+
+/// TLV 17 — one standard VHT Capabilities element, id 191, twelve bytes of value.
+///
+/// Without it an Apple peer negotiates HT and stops there; the VHT rates it could pick —
+/// MCS 8 and 9, and SGI at 80 MHz — are not offered at all. It goes in both frame kinds,
+/// which is what Apple's own phones do.
+///
+/// The two maps below describe what this node *receives*; they are not a claim about what
+/// it sends. That used to be an asymmetry forced on us — the note here read that the driver
+/// pinned our transmit rate to one stream, based on a kernel log that said `nss:1 mcs:7`
+/// whatever it was told. That reading was wrong. The admission check in
+/// `wlan_hdd_wondertap.c` has upper bounds only and no `nss != 1` clause, and it assembles
+/// the rate code out of the caller's own `params->nss`. Nothing in the scripts ever called
+/// the fixed-rate command, so the only rate the vdev ever had was its boot default, and the
+/// `nss:1` was the absence of a caller rather than a clamp. `awdl-stack.sh` now calls it
+/// (`wonder-ven wonder0 rate 1 0 1 2 7`), and dmesg answers `nss=2 mcs=7`. The maps below
+/// still say what we accept, which is a separate statement from what we transmit.
+fn vht_capabilities(out: &mut Vec<u8>) {
+    tlv(out, TLV_VHT_CAPABILITIES, |v| {
+        // bf 0c — element 191, length 12. Inside a TLV 17 the value is a bare 802.11
+        // element, header included, which is why the element id repeats here.
+        v.extend_from_slice(&[0xbf, 0x0c]);
+        // VHT Capabilities Info = 0x30: short GI for 80 MHz and for 160 MHz, nothing else.
+        // Max MPDU length stays 0 (3895 bytes) on purpose: the receive path hands the stack
+        // one buffer per MPDU, and 3895 is what already fits. The captured Apple frame that
+        // also claims a 1 MB A-MPDU window (`30 00 80 03`) is deliberately *not* used here —
+        // that is a promise about our receive buffers, not about the peer's rates, and the
+        // peer would keep it.
+        v.extend_from_slice(&0x0000_0030u32.to_le_bytes());
+        // RX MCS map 0xfffa — streams 0 and 1 at MCS 0-9, stream 2 not supported.
+        v.extend_from_slice(&0xfffau16.to_le_bytes());
+        v.extend_from_slice(&0u16.to_le_bytes()); // RX highest rate: not stated
+        v.extend_from_slice(&0xfffau16.to_le_bytes()); // TX MCS map: the same two streams
+        v.extend_from_slice(&0u16.to_le_bytes()); // TX highest rate: not stated
     });
 }
 
@@ -624,6 +673,7 @@ mod tests {
                 "sequence" => TLV_CHANNEL_SEQUENCE,
                 "service" => TLV_SERVICE_PARAMS,
                 "ht" => TLV_HT_CAPABILITIES,
+                "vht" => TLV_VHT_CAPABILITIES,
                 "arpa" => TLV_ARPA,
                 "path" => TLV_DATA_PATH_STATE,
                 "version" => TLV_VERSION,
@@ -663,6 +713,7 @@ mod tests {
                 TLV_ELECTION_V2,
                 TLV_SERVICE_PARAMS,
                 TLV_HT_CAPABILITIES,
+                TLV_VHT_CAPABILITIES,
                 TLV_ARPA,
                 TLV_DATA_PATH_STATE,
                 TLV_VERSION,
@@ -670,6 +721,49 @@ mod tests {
         );
         // Every body was consumed exactly: they must add up to the frame's tail.
         assert!(list.iter().all(|t| !t.body.is_empty()));
+    }
+
+    #[test]
+    fn the_capability_tlvs_offer_a_second_stream() {
+        let s = Schedule::anchored(0, 149);
+        let frame = presence(&node(), &s, 0, 1, true, 36);
+
+        let ht = subframe(&frame, "ht").expect("an HT capabilities TLV");
+        assert_eq!(
+            ht.body,
+            &[0x00, 0x00, 0x6f, 0x00, 0x1f, 0xff, 0xff, 0x00, 0x00][..],
+            "the nine bytes an iOS 26 phone puts in its own presence frame"
+        );
+        assert_eq!(ht.body[4] & 0x03, 0x03, "A-MPDU length exponent 3: 64 KB");
+        assert_eq!(ht.body[2] & 0x01, 0x01, "LDPC");
+        assert_eq!(
+            &ht.body[5..7],
+            &[0xff, 0xff][..],
+            "the RX mask is two bytes wide because there are two streams"
+        );
+
+        let vht = subframe(&frame, "vht").expect("a VHT capabilities TLV");
+        assert_eq!(
+            vht.body,
+            &[
+                0xbf, 0x0c, // element 191, twelve bytes
+                0x30, 0x00, 0x00, 0x00, // VHT Capabilities Info: SGI80, SGI160
+                0xfa, 0xff, // RX MCS map 0xfffa
+                0x00, 0x00, // RX highest rate
+                0xfa, 0xff, // TX MCS map 0xfffa
+                0x00, 0x00, // TX highest rate
+            ][..]
+        );
+        assert_eq!(
+            vht.body[1] as usize,
+            vht.body.len() - 2,
+            "the element's own length agrees with the bytes after it"
+        );
+        assert_eq!(
+            vht.body[2] & 0x03,
+            0x00,
+            "Max MPDU 3895 stays declared: one receive buffer per MPDU"
+        );
     }
 
     #[test]

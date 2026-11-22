@@ -1,0 +1,11 @@
+# Files the real build tree contains but that we deliberately do NOT reproduce.
+#
+# Each line is `<path> <sha256> <reason>`. verify-reproduce.sh reports these separately:
+# a matching hash proves the entry is the known artefact rather than a newly introduced gap.
+#
+# Both of these are leftovers from the 2026-11-20 mis-mapping — they sit in the build tree
+# but never compile. See android/kernel-assets/source/driver/legacy/ for the byte-identical
+# evidence copies and README.md for the story.
+
+vendor/qcom/opensource/wlan/qca-wifi-host-cmn/target_if/p2p/src/target_if_p2p.c b78fcbd0751bf82ee7240a750813aa7c3eb8e6327b4186a23418c2984fbfea09 not-in-bzl-so-never-compiled; the -110 wait_event_timeout root cause. Correct copy lives at qcacld-3.0/components/target_if/p2p/src/
+vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/inc/wonder/wondertap.h 42832fe1e103e98818d4b234fd023a83bbaa15d2590e7bdc30dbddc4b2860546 duplicate-of-wonder/include/wonder/wondertap.h; no #include anywhere references this path

@@ -35,3 +35,12 @@ android/keystore.properties
 # Python leaves these behind the first time anyone runs a probe.
 __pycache__/
 *.pyc
+
+# Module payload backups: every `*.ko.gz` is a 5 MB gzip of a whole driver build,
+# and each experiment that swapped one left a copy behind (`.bak`, `.prev`,
+# `.selfbuild-backup`, `.eac-keep`, ...). What matters for reproducing a number is
+# *which* fingerprint ran, and that is recorded as text in `kernel-assets/README.md`
+# and in Plan.md — the bytes themselves are 5 MB each and answer nothing the
+# sha256 does not. The one payload that ships (assets/kernel in the APK) is the
+# un-suffixed `*.ko.gz`, which stays tracked.
+kernel-assets/*.ko.gz.*

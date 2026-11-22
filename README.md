@@ -51,7 +51,7 @@
 
 四颗的 `vermagic` 与原厂逐字符相同（`6.6.118-android15-8-o-4k SMP preempt mod_unload modversions aarch64`）。能顶掉原厂而**不是**替换文件，靠的是 `insmod` + 符号 CRC 一致：`/vendor` 分毫没动，`rmmod` 或重启即回原厂，这是这条路线唯一的回滚保证。
 
-这些字节的源码就在同一仓库：`android/kernel-assets/source/` 是上游的驱动覆盖层（44 个文件，`source-map.json` 逐条给出平台树落点）、7 个编号补丁（另有一个候选版 `0007-session-dp-candidate.patch`）和那串构建脚本。载荷清单、每个文件的 sha256、以及「从源码重建到哪一步了」都写在 [kernel-assets/README.md](android/kernel-assets/README.md)。一句话现状：**未打补丁的基线已经从官方源码复现过**（1359/1359 actions 全绿，`__versions` 588/588 与原厂一致，实机上 `rmmod` 原厂 → `insmod` 自建零报错、Wi-Fi 起来零丢包）；**打过补丁的这一颗还没有从源码复现**——现在跑的是上游给出的字节。
+这些字节的源码就在同一仓库：`kernel-assets/source/`（仓库根目录）是上游的驱动覆盖层（46 个文件，`source-map.json` 逐条给出平台树落点）、9 个编号补丁（另有一个候选版 `0007-session-dp-candidate.patch`）和那串构建脚本。载荷清单、每个文件的 sha256、以及「从源码重建到哪一步了」都写在 [kernel-assets/README.md](kernel-assets/README.md)。一句话现状：**未打补丁的基线已经从官方源码复现过**（1359/1359 actions 全绿，`__versions` 588/588 与原厂一致，实机上 `rmmod` 原厂 → `insmod` 自建零报错、Wi-Fi 起来零丢包）；**打过补丁的这一颗也复现了，而且是逐字节的**——`pristine HEAD + 覆盖层 + 9 个补丁` 与实际构建树的 114 个改动文件比，112 个完全相同、0 个不同，余下 2 个是归档为「预期不复现」的死文件。复现脚本是 `tools/kernel/verify-reproduce.sh`，一行命令给出上面这组数字。
 
 吞吐参数跟着脚本走，不留在谁的手输历史里。`tools/awdl-stack.sh` 把 22 项调优直接拼进 `insmod`，所以冷启动后的第一帧就是按这些数字发的；同一个列表在链路起来后还会再写一遍并逐项读回，覆盖那三条不走重载的路径——本 boot 已经换过栈、只跑 `link`、以及旧脚本留下的模块。读回对不上会打印 `TUNING_MISMATCH`，而不是安静地跑慢一点。其中 `nss=2` 是关键的一项：3.2 MB/s 那一轮实测就是双流，而脚本此前从未设过它，所以更早的实验都在单流上半速空口。
 
@@ -115,8 +115,8 @@ repo-src/
 │   └── ffi/           C ABI 与 JNI，Java 侧唯一入口
 ├── android/           Android 应用
 │   ├── app/           三页界面、发送页、接收服务、磁贴、驱动安装
-│   ├── kernel-assets/ 随包内核模块与拉起脚本
 │   └── build.sh       一条命令出 APK：先 Rust，后 Gradle
+├── kernel-assets/     随包内核模块、驱动源码覆盖层与拉起脚本（仓库根目录）
 ├── tools/             链路拉起、抓包与真机自测脚本
 ├── CHANGELOG.md
 └── LICENSE
@@ -134,8 +134,8 @@ bash android/build.sh assembleDebug
 bash android/build.sh clean
 
 # 全量测试
-cargo test --workspace          # 427 passed / 0 failed（1 ignored）
-bash crates/ffi/jvm/check.sh    # 375 条 ok，桌面 JVM + -Xcheck:jni
+cargo test --workspace          # 431 passed / 0 failed（1 ignored）
+bash crates/ffi/jvm/check.sh    # 394 条 ok，桌面 JVM + -Xcheck:jni
 ```
 
 JDK、SDK 与 Gradle 都放在 `tools/` 下，脚本按名字取而不查 `PATH`，可以用 `JAVA_HOME`、`GRADLE_BIN`、`CARGO_BIN` 覆盖。真机脚本在 `tools/`：`awdl-stack.sh` 拉起链路，`capture.sh` 抓隧道上的包，`tap.sh` 在 802.11 那一侧再抓一份（两者一比才知道是「对端没发」还是「我们收丢了」），`awdld-probe.sh` 看守护进程状态。

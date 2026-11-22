@@ -4,7 +4,16 @@
 static unsigned int passthru_awdl_rx_order_ms = 0;
 module_param(passthru_awdl_rx_order_ms, uint, 0644);
 MODULE_PARM_DESC(passthru_awdl_rx_order_ms, "Monitor RX reorder hold time, 0=off, milliseconds (max 400)");
-#define OPAIRSHARE_ORDER_WINDOW 64
+/* Reorder ring depth.  This is the receiver side of the ADDBA window, so it
+ * has to be at least as deep as the window the firmware accepts
+ * (OPAIRSHARE_BA_WINDOW_MAX in wma_opairshare_awdl_ba.h).  A shorter ring
+ * cannot hold the frames a 256-window sender is allowed to have in flight:
+ * opairshare_order_receive() treats "delta >= ring" as an overrun and jumps
+ * the window forward, which would drop exactly the frames the wider window
+ * exists to keep.  Must stay a power of two -- index and wrap both use
+ * & (OPAIRSHARE_ORDER_WINDOW - 1).
+ */
+#define OPAIRSHARE_ORDER_WINDOW 256
 static DEFINE_SPINLOCK(opairshare_order_lock);
 static struct sk_buff *opairshare_order_slots[OPAIRSHARE_ORDER_WINDOW];
 static u16 opairshare_order_seq[OPAIRSHARE_ORDER_WINDOW];
@@ -65,8 +74,8 @@ static void opairshare_order_advance(u16 end, struct sk_buff_head *out)
 
 static void opairshare_order_ready(struct sk_buff_head *out)
 {
-	while (opairshare_order_slots[opairshare_order_next & 63] &&
-	       opairshare_order_seq[opairshare_order_next & 63] == opairshare_order_next)
+	while (opairshare_order_slots[opairshare_order_next & (OPAIRSHARE_ORDER_WINDOW - 1)] &&
+	       opairshare_order_seq[opairshare_order_next & (OPAIRSHARE_ORDER_WINDOW - 1)] == opairshare_order_next)
 		opairshare_order_advance((opairshare_order_next + 1) & 4095, out);
 }
 

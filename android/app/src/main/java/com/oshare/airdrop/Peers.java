@@ -8,6 +8,7 @@ import android.os.Looper;
 
 import java.net.DatagramPacket;
 import java.io.IOException;
+import java.net.DatagramSocket;
 import java.net.Inet4Address;
 import java.net.Inet6Address;
 import java.net.InetAddress;
@@ -403,6 +404,27 @@ final class Peers {
 
     /** 最多记几台。名单只是冷启动的加速器，长了既没用又容易被淘汰的老设备占着。 */
     private static final int REMEMBERED_MAX = 6;
+
+    /**
+     * 连发几个预热的空包。三个，因为内核的未解析队列默认只留三个。
+     *
+     * <p>第一个包触发 NS，后两个排进队列，等 NA 一来三个一起出去——这条路径上丢一个包太常见
+     * （见下），多两个的代价是零。
+     */
+    private static final int WARM_PULSES = 3;
+
+    /** 预热打的端口，RFC 863 的 discard。对面不监听也无所谓，见 {@link #WARM_PULSES}。 */
+    private static final int WARM_PORT = 9;
+
+    /**
+     * 同一条地址多久之内不重复预热，毫秒。
+     *
+     * <p>邻居条目在 REACHABLE 之间是 30 秒（{@code base_reachable_time}），过了变 STALE——
+     * STALE 不阻塞发包（内核对 STALE 的做法是先把包发出去、同时补一条 NS），所以预热一次能
+     * 顶一整段。这个数定得比 30 秒短，是因为旧条目会被回收，没必要赌它一定在；又比「人挑文件」
+     * 长得多，所以面板开着的十几秒里每台设备只会被预热一次。
+     */
+    private static final long WARM_EVERY_MS = 20_000;
 
     /**
      * 能连的对端，在「丢两包要多久」之上再留多少毫秒。
@@ -813,6 +835,14 @@ final class Peers {
      * 表外的账，和 {@link #peers} 用同一把锁。理由和时限见 {@link #BURIED_MS}。
      */
     private final Map<String, Grave> buried = new LinkedHashMap<>();
+
+    /**
+     * 已经预热过的地址（不带 scope）到时刻。
+     *
+     * <p>只在浏览线程里读写，和 {@link #peers} 同一条线程，所以不需要锁——{@link #warm} 的
+     * 调用点和置位点都在 {@link #absorb} 里。
+     */
+    private final Map<String, Long> warmed = new LinkedHashMap<>();
 
     /**
      * 一条墓碑：被证死的那台设备（连同它自己说过的名字、型号、指纹、地址和端口），以及时刻。
@@ -1801,6 +1831,9 @@ final class Peers {
                     entering = true;
                     trace("ready " + peer.name + "@" + peer.address + ":" + peer.port
                             + " after " + (now - startedAt) + " ms of browsing");
+                    // 它刚变得能连，也就是「人可能在挑文件」的那一刻。趁这段时间把邻居解析做掉，
+                    // 等 SYN 真的要出去时不必再等一次 NS 的重传（见 {@link #warm}）。
+                    warm(peer, now);
                 }
             }
         }
@@ -1889,6 +1922,81 @@ final class Peers {
             return v6;
         }
         return Inet6Address.getByAddress(null, v6.getAddress(), scope);
+    }
+
+    /**
+     * 趁人还在挑文件，先让内核把对端的邻居解析做掉。
+     *
+     * <p># 省掉的是什么
+     *
+     * <p>链路本地 IPv6 的第一跳不是路由，是邻居解析：内核先要问一句「这个 {@code fe80::} 是谁」，
+     * 拿到应答才能把包递到二层。而 AWDL 的信道按时隙开合，那条 NS 一旦落在关着的窗口里就得等
+     * 重传。上游 {@code houji-airdrop} 量过同一件事：首次 {@code /Discover} 建连 **1.761 秒**，
+     * 其中绝大部分是首包 SYN 吃了一次 1 秒的 RTO；而三秒之后正式 {@code /Upload} 建连只要
+     * **8 毫秒**——同一台设备、同一条链路，差别只在邻居表里有没有那条记录。
+     *
+     * <p>一秒在我们这儿更贵：它在慢启动之前把整档速率白吃掉一次，而用户在分享面板上看见设备
+     * 到点发送常常只隔一两秒，等的人会以为卡住了。
+     *
+     * <p># 为什么落在「刚能连」这一刻
+     *
+     * <p>那是 {@link #absorb} 里唯一知道「地址和端口都齐了」的地方：比「收到第一条 SRV」晚
+     * （地址挂在主机名上，常常分两包到），又比用户点发送早得多。提前到这里，NS 与 NA 的往返
+     * 就发生在人挑文件的时候，SYN 出去时邻居条目已经是 REACHABLE。
+     *
+     * <p># 为什么是 UDP 而不是 {@code connect()}
+     *
+     * <p>TCP 会在对面留下一次半截握手——端口是开的，它会接受，然后被我们立刻关掉，在 AirDrop
+     * 的记录里留一笔没人要的连接。而这里要的只是「让内核去问一句它是谁」，一个字节的 UDP 打到
+     * {@code discard} 就够，对端连套接字都不会创建。收不到应答也无所谓：**NS 已经发出去了，
+     * 那才是这条预热唯一的产出。**
+     */
+    private void warm(Peer peer, long now) {
+        if (peer.address.isEmpty() || peer.port == 0) {
+            return;
+        }
+        String key = bare(peer.address);
+        Long last = warmed.get(key);
+        if (last != null && now - last < WARM_EVERY_MS) {
+            return;
+        }
+        // 一条地址一条记录，设备走了不会自己消失。攒到几十条就清空重建：它是纯缓存，
+        // 重建的代价只是一次多余的预热，而逐条淘汰要记两倍的状态。
+        if (warmed.size() > 64) {
+            warmed.clear();
+        }
+        warmed.put(key, now);
+        knocker.execute(() -> sendWarm(peer));
+    }
+
+    /** {@link #warm} 的活儿。跑在 {@link #knocker} 上：send 不阻塞，三个包是一瞬间的事。 */
+    private void sendWarm(Peer peer) {
+        InetAddress target;
+        try {
+            target = address(peer);
+        } catch (IOException no) {
+            trace("warm " + peer.name + ": no usable address (" + no.getMessage() + ")");
+            return;
+        }
+        byte[] one = new byte[1];
+        DatagramSocket socket = null;
+        try {
+            socket = new DatagramSocket(null);
+            // 显式绑一个 IPv6 通配地址：无参构造绑的是 IPv4 的 0.0.0.0，往 fe80:: 发会落到
+            // 另一套栈上。绑失败也不影响结果，所以外面的 catch 一起兜住。
+            socket.bind(new InetSocketAddress(InetAddress.getByName("::"), 0));
+            for (int i = 0; i < WARM_PULSES; i++) {
+                socket.send(new DatagramPacket(one, one.length, target, WARM_PORT));
+            }
+            trace("warm " + peer.name + "@" + peer.address + ": " + WARM_PULSES
+                    + " probes out, the first SYN will not wait for a neighbour");
+        } catch (Exception failed) {
+            trace("warm " + peer.name + "@" + peer.address + " failed: " + failed);
+        } finally {
+            if (socket != null) {
+                socket.close();
+            }
+        }
     }
 
     /**
@@ -2228,6 +2336,14 @@ final class Peers {
             probe.address = address;
             probe.port = port;
             probe.scope = nicIndex;
+            // 先解邻居，再敲门。这条路径上的等待最贵：`reachable` 的每一次 connect 都可能
+            // 撞上一整个 NS 重传周期，而 `KNOCK_TIMEOUT_MS` 只有 2.5 秒——冷启动时对端还没
+            // 出现在 mDNS 里，这一下既是首次建连，也常常是唯一一次机会。
+            //
+            // 这里直接调 `sendWarm` 而不是 `warm`：已经在 knocker 上了，再往 knocker 上排
+            // 一个任务只会排在本次 recall 之后，等于没做。也正因为绕过了 `warm`，那张限流表
+            // 不用碰（它只在浏览线程里读写）；冷启动最多六个旧对端，十八个包，不需要限流。
+            sendWarm(probe);
             long before = System.currentTimeMillis();
             String why = reachable(probe);
             long took = System.currentTimeMillis() - before;

@@ -6,18 +6,67 @@ module_param(passthru_awdl_addba, bool, 0644);
 MODULE_PARM_DESC(passthru_awdl_addba, "Answer AWDL ADDBA using native CDP RX BA setup");
 static unsigned int passthru_awdl_ba_window = 64;
 module_param(passthru_awdl_ba_window, uint, 0644);
+/* Ceiling for the negotiated window.
+ *
+ * This used to be a literal 64, so writing 256 to passthru_awdl_ba_window was
+ * accepted by the setter, echoed back by /sys, and then silently cut to 64
+ * before the value ever reached the firmware -- the parameter read 256 while
+ * the session ran at 64.  The limit was never a hardware one:
+ * hal_get_rx_max_ba_window_qca5332() reports HAL_RX_BA_WINDOW_1024, and
+ * dp_rx_tid.c takes QDF_MIN(requested, that) before sizing the REO queue.
+ * 256 is also the largest window the ADDBA field expresses cleanly together
+ * with the host reorder ring, which is sized by OPAIRSHARE_ORDER_WINDOW in
+ * wlan_hdd_opairshare_rx_order.h -- keep the two in step.
+ */
+#define OPAIRSHARE_BA_WINDOW_MAX 256
+/* A-MSDU Supported in the BA Parameter Set we answer with (bit 0 of dword 4
+ * of the ADDBA Response; see struct ieee80211_ba_parameterset in
+ * cdp_txrx_mob_def.h, B0).
+ *
+ * This was hardcoded to 0 -- the response said "this end cannot receive
+ * A-MSDU" while the TX side was busy merging up to 5 MSDUs into one MPDU.  A
+ * peer honours that bit: the iPhone answered by sending one MSDU per MPDU,
+ * which is the 3.42 MB/s tier the reference driver measures before it switches
+ * to two-subframe A-MSDUs (13.00 MB/s stage average, 29.54 MB/s single-burst
+ * peak once it does).
+ *
+ * Setting the bit is not a lie, because the receive side never had to
+ * deaggregate: the REO splits an A-MSDU into an nbuf chain with one MSDU per
+ * buffer before the host sees it (dp_rx.c::dp_rx_msdu_stats_update() decides
+ * "non A-MSDU" as qdf_nbuf_is_rx_chfrag_start() & ..._end() both true, so a
+ * chain *is* an A-MSDU, already split).  What the HOST does have to agree to
+ * is the size: 802.11-2016 caps an A-MSDU at 11454 octets and our REO queues
+ * are sized from passthru_awdl_ba_window / amsdu_bytes, both of which are
+ * already at their maxima here.
+ *
+ * Writable at runtime so the claim can be tested against the peer in one
+ * session: 1 = advertise, 0 = the old behaviour, byte for byte.
+ */
+static unsigned int passthru_awdl_ba_amsdu = 1;
+module_param(passthru_awdl_ba_amsdu, uint, 0644);
+MODULE_PARM_DESC(passthru_awdl_ba_amsdu,
+	"Advertise A-MSDU Supported in the ADDBA Response (0=never, default 1)");
 static atomic64_t opairshare_ba_requests = ATOMIC64_INIT(0);
 static atomic64_t opairshare_ba_prepared = ATOMIC64_INIT(0);
 static atomic64_t opairshare_ba_tx_ok = ATOMIC64_INIT(0);
 static atomic64_t opairshare_ba_tx_failed = ATOMIC64_INIT(0);
 static atomic64_t opairshare_ba_setup_failed = ATOMIC64_INIT(0);
 static atomic64_t opairshare_ba_delba = ATOMIC64_INIT(0);
+/* The window the DP actually ended up with, not the one we asked for.
+ * cdp_addba_responsesetup() hands back the value it programmed, so this is the
+ * only number that can tell a real 256 from a clamped one.  Absent it, the
+ * parameter read 256 and the session ran at whatever the clamp allowed, with
+ * nothing in /sys to show the difference.
+ */
+static atomic64_t opairshare_ba_window_eff = ATOMIC64_INIT(0);
 static int opairshare_ba_stats_get(char *out, const struct kernel_param *kp)
 {
 	(void)kp;
 	return scnprintf(out, 256,
-		"enabled=%u window=%u requests=%lld prepared=%lld tx_ok=%lld tx_failed=%lld setup_failed=%lld delba=%lld\n",
+		"enabled=%u window=%u window_eff=%lld amsdu=%u requests=%lld prepared=%lld tx_ok=%lld tx_failed=%lld setup_failed=%lld delba=%lld\n",
 		READ_ONCE(passthru_awdl_addba), READ_ONCE(passthru_awdl_ba_window),
+		(long long)atomic64_read(&opairshare_ba_window_eff),
+		READ_ONCE(passthru_awdl_ba_amsdu),
 		(long long)atomic64_read(&opairshare_ba_requests),
 		(long long)atomic64_read(&opairshare_ba_prepared),
 		(long long)atomic64_read(&opairshare_ba_tx_ok),
@@ -118,7 +167,8 @@ static void opairshare_ba_worker(struct work_struct *work)
 	rc = opairshare_target_ensure(wma, e->vdev, id, f + 10);
 	if (rc)
 		goto failed;
-	window = min_t(unsigned int, READ_ONCE(passthru_awdl_ba_window), 64);
+	window = min_t(unsigned int, READ_ONCE(passthru_awdl_ba_window),
+		       OPAIRSHARE_BA_WINDOW_MAX);
 	window = max_t(unsigned int, window, 1);
 	if (param >> 6)
 		window = min_t(u16, window, param >> 6);
@@ -133,6 +183,7 @@ static void opairshare_ba_worker(struct work_struct *work)
 		&code, &window, &timeout);
 	if (rc || code)
 		goto abort;
+	atomic64_set(&opairshare_ba_window_eff, window);
 	atomic64_inc(&opairshare_ba_prepared);
 	rc = cds_packet_alloc(64, (void **)&data, (void **)&buf);
 	if (rc)
@@ -145,8 +196,13 @@ static void opairshare_ba_worker(struct work_struct *work)
 	data[24] = 3;
 	data[25] = 1;
 	data[26] = token;
-	/* Immediate BA; A-MSDU-in-A-MPDU deliberately disabled for this test. */
+	/* Immediate BA, plus A-MSDU Supported when advertised.  Bit 0 told the
+	 * peer "no A-MSDU here" for the whole life of this file; see the note on
+	 * passthru_awdl_ba_amsdu above for what that cost and why it is safe.
+	 */
 	param = (window << 6) | (e->tid << 2) | BIT(1);
+	if (READ_ONCE(passthru_awdl_ba_amsdu))
+		param |= BIT(0);
 	data[29] = param;
 	data[30] = param >> 8;
 	data[31] = timeout;

@@ -26,6 +26,11 @@ import java.util.List;
  */
 public final class RoundTrip {
     private static int failures = 0;
+    // Counted, not inferred. This class used to print "all checks passed" and no number, and
+    // the four classes beside it each printed "ok, N checks" — so anyone adding up the five
+    // summary lines got a total that silently lacked this section's checks. The documents
+    // carried 355 / 375 / 381 for months; the real figure is 394 (see Plan.md §6.5).
+    private static int checks = 0;
 
     public static void main(String[] args) throws Exception {
         Path archive = Paths.get(args[0]);
@@ -55,10 +60,10 @@ public final class RoundTrip {
         overwritingReplacesRatherThanNumbering(archive, scratch);
 
         if (failures > 0) {
-            System.out.println(failures + " check(s) failed");
+            System.out.println("FAILED " + failures + " of " + checks);
             System.exit(1);
         }
-        System.out.println("all checks passed");
+        System.out.println("ok, " + checks + " checks");
     }
 
     private static void receiveLandsEveryMember(Path archive, Path inbox, List<String> expected)
@@ -382,6 +387,7 @@ public final class RoundTrip {
     }
 
     private static void check(String what, boolean ok, String detail) {
+        checks++;
         if (ok) {
             System.out.println("  ok    " + what);
         } else {

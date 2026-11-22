@@ -26,7 +26,8 @@ import java.util.regex.Pattern;
  * itself.
  */
 public final class SettingsCheck {
-    private static int failures = 0;
+    private static final List<String> failures = new ArrayList<>();
+    private static int checks = 0;
 
     public static void main(String[] args) throws Exception {
         Path home = Files.createDirectories(Paths.get(args[0]));
@@ -42,8 +43,93 @@ public final class SettingsCheck {
         aSaveIsWhatTheNextLaunchReads(file, screen);
         anEditIsUndoneByRevertAndReset(file, screen);
         bothSidesRefuseTheSameValues(file);
+        anUnreadableFileStillHasAUsableTable(home);
+
+        // 失败必须以非零退出码说出来。这个类原来是唯一不这么做的：它数着 failures，
+        // 却从来不看，于是 `check.sh` 照样 exit 0 打印 "ok, N checks"——一条真失败的
+        // 断言在日志里只是一个 FAIL 字样，构建是绿的。2026-11-21 就是这么发现
+        // 「目录冒充不可读文件」那条断言在退化成真时被静默放过的。
+        if (!failures.isEmpty()) {
+            System.out.println("FAILED " + failures.size() + " of " + checks);
+            for (String failure : failures) {
+                System.out.println("  " + failure);
+            }
+            System.exit(1);
+        }
+        System.out.println("ok, " + checks + " checks");
     }
 
+    /**
+     * 文件一个字节都读不出来时，表也得是能用的。
+     *
+     * <p>这条锁的是设备上真发生过的一次：{@code settings.conf} 的属主还是重装前的 uid，
+     * 应用读它得到 {@code EACCES}，而当时的接收入口把「读不出来」当成「拒掉这条连接」，
+     * 于是整台手机收不到任何东西——首页那行从「监听中」变成「异常」。
+     *
+     * <p>{@link SettingsScreen#open} 是那个故障的修法：读不出来就把文件改名挪开，再按
+     * 「首次启动」读一遍。改名只需要目录的写权限，不需要文件的读权限，所以这条路在
+     * {@code EACCES} 下也走得通——这正是它比「让用户去点删除」强的地方。
+     *
+     * <p>两条断言分别对应两条分支：挪得开时页面必须能用（旧字节留在
+     * {@code .unreadable} 里），挪不开时必须把原来那个错原样抛出去，让页面能说清楚
+     * 到底怎么了，而不是假装成一次首次启动。
+     */
+    private static void anUnreadableFileStillHasAUsableTable(Path home) throws IOException {
+        // 拿一个目录当配置文件：`fs::read` 对它返回 `EISDIR`，这条恢复路径就是这么进去的。
+        // 不用 chmod 造 EACCES，是因为这个检查在 Windows 上也跑，那里没有 POSIX 权限。
+        Path unusable = Files.createDirectories(home.resolve("unreadable.conf"));
+        Path aside = home.resolve("unreadable.conf.unreadable");
+
+        SettingsScreen table = SettingsScreen.open(unusable);
+        check("a file that cannot be read is recovered instead of refused", true, "");
+        check("the recovery says where the old bytes went", aside.equals(table.recoveredFrom()),
+                String.valueOf(table.recoveredFrom()));
+        check("the old bytes are still there under the aside name", Files.isDirectory(aside),
+                "nothing was moved");
+        check("the recovered file is gone from its own name", !Files.exists(unusable),
+                "it is still in the way");
+
+        // 设置页不是第一个读这张表的人：启动时 `Tuning` 已经读过一遍，那一次就把文件挪走了。
+        // 所以「页面要能看到落点」必须对**后来**读到的实例也成立，不能只在亲手改名的那个
+        // 实例上成立。这条断言的就是那一刻——真机上漏过，页面对被挪走的文件一个字没说。
+        SettingsScreen later = SettingsScreen.open(unusable);
+        check("a later read still reports the moved file", aside.equals(later.recoveredFrom()),
+                String.valueOf(later.recoveredFrom()));
+
+        check("a table built without reading has every row",
+                table.sections().stream().mapToInt(section -> section.settings().size()).sum()
+                        == SettingsScreen.catalog().size(),
+                "row count differs from the catalog");
+
+        SettingsScreen.Setting directory = table.setting("receive.directory");
+        check("the fallback table has a receive directory row", directory != null, "missing");
+        check("the fallback receive directory is empty", "".equals(directory.value()),
+                directory.value());
+        check("the fallback table names no fixed directory", directory.value().trim().isEmpty(),
+                directory.value());
+
+        SettingsScreen.Setting overwrite = table.setting("receive.overwrite");
+        check("the fallback table has an overwrite row", overwrite != null, "missing");
+        check("the fallback overwrite reads as off", "false".equals(overwrite.value()),
+                overwrite.value());
+
+        check("the fallback table is not dirty", !table.dirty(), "it looks edited");
+
+        // 第二条分支：连改名都不行。落点上先放一个非空目录，`REPLACE_EXISTING` 对非空目录
+        // 会拒绝（`DirectoryNotEmptyException`），于是 `open` 只能把原来那个错原样抛出。
+        Path stuck = Files.createDirectories(home.resolve("stuck.conf"));
+        Files.createDirectories(home.resolve("stuck.conf.unreadable"));
+        Files.write(home.resolve("stuck.conf.unreadable/in-the-way"), new byte[] {1});
+        boolean rethrown;
+        try {
+            SettingsScreen.open(stuck);
+            rethrown = false;
+        } catch (IOException expected) {
+            rethrown = true;
+        }
+        check("a file that cannot be moved aside still reports the original failure", rethrown,
+                "the recovery invented a way through");
+    }
     private static void theCatalogIsWellFormed(List<SettingsScreen.Setting> rows) {
         check("the catalog has rows", !rows.isEmpty(), "it was empty");
         Set<String> seen = new LinkedHashSet<>();
@@ -250,10 +336,11 @@ public final class SettingsCheck {
     }
 
     private static void check(String what, boolean ok, String detail) {
+        checks++;
         if (ok) {
             System.out.println("  ok    " + what);
         } else {
-            failures++;
+            failures.add(what + (detail == null || detail.isEmpty() ? "" : ": " + detail));
             System.out.println("  FAIL  " + what + (detail == null || detail.isEmpty() ? "" : ": " + detail));
         }
     }

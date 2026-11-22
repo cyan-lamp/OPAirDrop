@@ -26,7 +26,7 @@
 //!
 //! ```text
 //!   awdld [--iface wondertap0] [--tun awdltun0] [--name HOST]
-//!         [--channel 149] [--rate 36] [--uid N] [--burst N] [--quiet]
+//!         [--channel 149] [--rate 36] [--uid N] [--burst N] [--no-live] [--quiet]
 //! ```
 //!
 //! `--uid` names the process the tunnel belongs to. It is what the policy rule that makes
@@ -134,6 +134,13 @@ mod device {
         /// Left `None`, no control channel is opened at all and the radio is whatever
         /// `awdl-stack.sh` left it as.
         ctl: Option<String>,
+        /// Refuse to answer outside the slot map, i.e. restore the rule as it stood before
+        /// [`opairdrop_awdl::link::Link`] started treating freshly heard payload as proof
+        /// that the sender is listening.
+        ///
+        /// Only here to make the two runs of an A/B differ in nothing else. Not a
+        /// deployment switch: the default is what fixes the ack latency.
+        no_live: bool,
         quiet: bool,
     }
 
@@ -149,6 +156,7 @@ mod device {
                 uid: None,
                 burst: None,
                 ctl: None,
+                no_live: false,
                 quiet: false,
             }
         }
@@ -165,7 +173,7 @@ mod device {
             Ok(args) => args,
             Err(err) => {
                 eprintln!("awdld: {err}");
-                eprintln!("usage: awdld [--iface NAME] [--tun NAME] [--name HOST] [--channel N] [--rate N] [--uid N] [--burst N] [--ctl DIR] [--quiet]");
+                eprintln!("usage: awdld [--iface NAME] [--tun NAME] [--name HOST] [--channel N] [--rate N] [--uid N] [--burst N] [--ctl DIR] [--no-live] [--quiet]");
                 return Err(2);
             }
         };
@@ -268,6 +276,9 @@ mod device {
         if let Some(copies) = args.burst {
             link.set_burst(copies);
         }
+        if args.no_live {
+            link.set_live_override(false);
+        }
         if !args.quiet {
             // Printed because a sweep is read afterwards from logs that all look alike:
             // the run's own statement of how many copies it sent is the only thing that
@@ -279,6 +290,10 @@ mod device {
             );
             let _ = io::stdout().flush();
         }
+        // Printed unconditionally, unlike BURST: a log that does not say which arm of the
+        // A/B it came from is a log that cannot be compared against the other arm.
+        println!("LIVE override={}", if args.no_live { "off" } else { "on" });
+        let _ = io::stdout().flush();
 
         let radio_fd: RawFd = link.radio().as_raw_fd();
         let tun_fd = link.tunnel().fd();
@@ -480,6 +495,7 @@ mod device {
                     )
                 }
                 "--quiet" => args.quiet = true,
+                "--no-live" => args.no_live = true,
                 "--ctl" => args.ctl = Some(it.next().ok_or("--ctl needs a value")?),
                 "--burst" => {
                     args.burst = Some(

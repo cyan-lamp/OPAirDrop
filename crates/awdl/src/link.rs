@@ -136,6 +136,14 @@ pub struct Stats {
     /// whose `held` climbs while `adopted` stays at one is a peer whose map is flapping
     /// between the shapes it announces.
     pub maps_refused: u64,
+    /// Frames released by the live-peer override rather than by the peer's map.
+    ///
+    /// The count that says whether [`PEER_LIVE_US`] is doing anything. Its value alone is
+    /// not a result — a link carrying no traffic in the receive direction has nothing to
+    /// override — but `live` at zero while `wait` still shows a long tail means the gate is
+    /// not being reached by the path that was supposed to open it, and that is worth knowing
+    /// before the constant is made bigger.
+    pub tx_live: u64,
     /// Total microseconds between a packet entering the queue and its first copy going
     /// out, summed over packets.
     ///
@@ -161,7 +169,7 @@ impl fmt::Display for Stats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "tx={}p/{}B/{}f rx={}p/{}B echo={} foreign={} other={} bad={} psf={} mif={} anchored={} released={} txerr={} drop={} rxerr={} maps={}/{}/{}",
+            "tx={}p/{}B/{}f rx={}p/{}B echo={} foreign={} other={} bad={} psf={} mif={} anchored={} released={} txerr={} drop={} rxerr={} maps={}/{}/{} live={}",
             self.tx_packets,
             self.tx_bytes,
             self.tx_frames,
@@ -180,7 +188,8 @@ impl fmt::Display for Stats {
             self.rx_errors,
             self.maps_adopted,
             self.maps_held,
-            self.maps_refused
+            self.maps_refused,
+            self.tx_live
         )?;
         // Silent until something has actually been sent: a link that has never carried a
         // packet should not print a row of zeroes that reads like a measurement.
@@ -242,6 +251,31 @@ const ANCHOR_REJECT_LIMIT: u8 = 8;
 /// two slots of sixteen that the departed peer's map left open, at whatever phase drift
 /// has put there by now.
 const PEER_SILENCE_US: u64 = 2_000_000;
+
+/// How long a data frame just received is treated as proof that its sender is on this
+/// channel, and may therefore be answered outside the peer's own slot map.
+///
+/// The map is a *forecast*: it says where the peer expects to be in each of sixteen slots,
+/// and it is believed only after three agreeing announcements, held for
+/// [`SEQ_HOLD_US`](crate::schedule::SEQ_HOLD_US), and it moves as the phone's own timers
+/// move it. A data frame is not a forecast. It arrived here, on the channel this node
+/// never leaves, so its sender's radio was on this channel at the instant it was sent.
+///
+/// For the acknowledgements this crate sends, that fact outranks the map every time: the
+/// peer cannot send its next segment until our ack is on the air, and the map can hold
+/// that ack for seven slots. Measured on a phone the daemon was talking to on 2026-11-21:
+/// of 461 packets, **326 (70.7%) waited more than 16 ms** for a window, the average was
+/// 119 ms and the longest **492 ms** — half a sequence, because at the time the believed
+/// map named only two slots of sixteen on this channel. Those waits are what the far end
+/// reads as its own round trip, and they cap the receive direction long before the radio
+/// does.
+///
+/// The window is one burst period, not one slot. The phone's bursts arrive every 24.45 ms
+/// (see `AW_PERIOD_TU` for where that number comes from), so a frame from it is a frame
+/// from a sender that is mid-stream; a whole slot would keep the gate open for 27 ms after
+/// the last frame, which is most of a slot spent talking to a receiver that may already
+/// have left for its channel-6 slot. 25 ms is one period of evidence and no more.
+const PEER_LIVE_US: u64 = 25_000;
 
 /// AWDL-16: how far clear of the slot edge at its head a unicast frame must stay.
 ///
@@ -407,6 +441,21 @@ pub struct Link<R: Radio, T: Tunnel> {
     ///
     /// Zero until one is chosen. Only meaningful while `peer` is `Some`.
     last_anchor_us: u64,
+    /// When a data frame from a station was last read off the radio, whether or not the
+    /// tunnel wanted it, in microseconds on the schedule's clock. Zero until one arrives.
+    ///
+    /// Separate from `last_anchor_us`, which is refreshed by the presence frames that carry
+    /// a clock and therefore arrives every ~113 ms — far too sparse to answer "is the peer
+    /// listening right now". This one is refreshed by payload, and payload is the moment a
+    /// sender is by definition mid-stream and waiting for an ack. See [`PEER_LIVE_US`].
+    last_data_us: u64,
+    /// Whether [`Self::peer_live`] is allowed to open a window the peer's map closed.
+    ///
+    /// On by default, because it is the whole point of `last_data_us`. Here as a switch so
+    /// the cost of *not* having it can be measured on the same link, in the same minute,
+    /// against the same peer: a number compared against a baseline recorded a week earlier
+    /// on a different channel is not an A/B, it is two anecdotes.
+    live_override: bool,
     /// How far off the peer's boundary this node was, in TU, at the last frame.
     ///
     /// Positive means the peer's boundary is later than ours. The one number that says
@@ -451,6 +500,8 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
             next_mif_us: None,
             peer: None,
             last_anchor_us: 0,
+            last_data_us: 0,
+            live_override: true,
             phase_err_tu: 0,
             phy_mhz: None,
             anchor_rejects: 0,
@@ -471,6 +522,14 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
     /// How many copies a small packet is repeated into.
     pub fn burst(&self) -> u8 {
         self.burst
+    }
+
+    /// Turn the freshly-heard-payload override off, to measure what it is worth.
+    ///
+    /// Off restores the old rule exactly — a frame may start only in a slot the peer's own
+    /// map gives this node — so the two runs differ in nothing but this bit.
+    pub fn set_live_override(&mut self, on: bool) {
+        self.live_override = on;
     }
 
     /// The schedule, for a status line.
@@ -686,6 +745,16 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
             if !self.window_open(at, group) {
                 break;
             }
+            // Which of the two conditions opened it, asked once here and spent below.
+            //
+            // The counter is advanced only for a packet that actually leaves, and only on
+            // its first copy, so it is read the same way `tx_packets` is: "of the packets
+            // sent, how many went out because the peer had just spoken". Counting the
+            // check instead — which is what this did at first — also counts the two cases
+            // that follow: the head that is not due yet and gets rotated past, and the
+            // copies after the first. On a transfer that was 144 759 against 3 865
+            // packets, a number 37 times the traffic it described.
+            let live = !self.schedule.owns_now(at);
             if due_us > at {
                 if passed >= self.queue.len() {
                     break;
@@ -722,6 +791,9 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
                     if first {
                         self.stats.tx_packets += 1;
                         self.stats.tx_bytes += head.packet.len() as u64;
+                        if live {
+                            self.stats.tx_live += 1;
+                        }
                         // The wait this node imposed on the peer, closed here because
                         // this is the first instant any of the packet could be heard.
                         if queued_us != 0 {
@@ -766,12 +838,38 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
     /// to exist on this channel before it matters how far into it the clock is. A slot the
     /// peer spends elsewhere is a slot in which its receiver is elsewhere, and four copies
     /// inside it share that one slot's fate.
+    ///
+    /// **Unless the peer has just spoken to us.** The map is a forecast and payload is a
+    /// reading; when a data frame has arrived within [`PEER_LIVE_US`] the forecast has been
+    /// overtaken by an event, and the gate opens. That is the whole of the fix for the waits
+    /// [`PEER_LIVE_US`] documents: the acks this node owes the peer are the packets the
+    /// peer is blocked on, and they were the ones being held for up to half a sequence
+    /// because the believed map named two slots of sixteen on this channel while the phone
+    /// was in fact here, sending.
+    ///
+    /// The slot-position test is kept for that case, not dropped with the map test, because
+    /// it answers a different question: a frame that starts before the guard lands while the
+    /// peer is still closing out the previous slot, and one that starts after
+    /// [`WINDOW_LAST_TU`] runs past the boundary. Neither is about which channel anybody is
+    /// on.
     fn window_open(&self, now_us: u64, group: bool) -> bool {
-        if !self.schedule.owns_now(now_us) {
+        let pos = self.slot_position_tu(now_us);
+        if pos < guard_tu(group) || pos >= WINDOW_LAST_TU {
             return false;
         }
-        let pos = self.slot_position_tu(now_us);
-        pos >= guard_tu(group) && pos < WINDOW_LAST_TU
+        if self.schedule.owns_now(now_us) {
+            return true;
+        }
+        self.live_override && self.peer_live(now_us)
+    }
+
+    /// Whether a station has sent this node payload recently enough to count as present.
+    ///
+    /// Zero is "never", tested explicitly rather than left to arithmetic: a clock that has
+    /// not been running for [`PEER_LIVE_US`] yet would otherwise read as fresh evidence at
+    /// start-up.
+    fn peer_live(&self, now_us: u64) -> bool {
+        self.last_data_us != 0 && now_us.saturating_sub(self.last_data_us) <= PEER_LIVE_US
     }
 
     /// How far into the slot this instant sits, in time units from the boundary.
@@ -834,6 +932,12 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
                     self.stats.rx_echo += 1;
                     return Ok(false);
                 }
+                // Recorded before the two tests below, and for a reason that only exists
+                // because of them: a frame this node declines — addressed to somebody
+                // else, or refused by the tunnel — is still a frame that crossed this
+                // channel. What the gate wants to know is whether the radio that sent it
+                // was here, and that is already true by the time it is in hand.
+                self.last_data_us = now_us;
                 if dst != self.node.addr && !dst.is_group() {
                     self.stats.rx_not_ours += 1;
                     return Ok(false);
@@ -1255,6 +1359,129 @@ mod tests {
         assert!(l.schedule().owns_now(in_our_slot));
         assert_eq!(l.flush(in_our_slot), 1);
         assert_eq!(l.stats.tx_packets, 1);
+    }
+
+    #[test]
+    fn payload_from_the_peer_opens_a_slot_its_own_map_closed() {
+        // The receive direction, which is where the waits were. The peer's map names two
+        // slots of sixteen on this channel — the shape actually read off the air — so an
+        // ack queued anywhere else waits up to half a sequence. Payload from the peer in
+        // that gap proves its radio is here and is blocked on that ack, and that reading
+        // outranks the forecast.
+        let mut l = single_link();
+        let mut map = [6u8; SLOTS];
+        map[2] = 149;
+        map[9] = 149;
+        for _ in 0..3 {
+            l.schedule.offer_map(map, ANCHOR_US);
+        }
+
+        l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 8));
+        let mut buf = [0u8; 2048];
+        assert!(l.up(&mut buf, ANCHOR_US).expect("up"));
+
+        let in_the_gap = ANCHOR_US + 5 * SLOT_US + 30 * TU_US;
+        assert!(!l.schedule().owns_now(in_the_gap), "slot 5 is the peer's channel 6");
+        assert_eq!(l.flush(in_the_gap), 0, "no payload heard yet, so the map rules");
+        assert_eq!(l.stats.tx_live, 0);
+        // And the loop would have slept until slot 9: four slots and a guard away.
+        assert!(l.send_due_in(in_the_gap) > 3 * SLOT_US);
+
+        let payload = ipv6_to(&node().addr.link_local(), 64);
+        let from_peer = frame::data_frame(peer(), node().addr, 7, 7, &payload, 36);
+        l.radio.inbound.push(from_peer);
+        assert!(l.down(&mut buf, in_the_gap + 1_000).expect("down"));
+
+        let after = in_the_gap + 1_000 + TU_US;
+        assert_eq!(l.flush(after), 1, "the ack goes out four slots early");
+        assert_eq!(l.stats.tx_live, 1, "and the counter says which gate opened it");
+        // The wait is still charged from when the packet was queued, which here was four
+        // slots before the evidence arrived — so it lands in the over-16-ms bucket even
+        // though the frame left at the first instant the override allowed. That is the
+        // honest reading of this number: in a transfer the ack is queued *after* the
+        // payload that provokes it, and then the same path records the time unit instead
+        // of the sequence. `live` is what says the path was taken; `wait` is what says how
+        // long the packet had already been sitting.
+        assert_eq!(l.stats.tx_wait_n, 1);
+        assert_eq!(l.stats.tx_wait_buckets[6], 1, "queued long before the payload");
+        assert_eq!(l.stats.tx_wait_max_us, after - ANCHOR_US);
+    }
+
+    #[test]
+    fn the_live_override_lasts_one_burst_period_and_no_longer() {
+        // The override is evidence with a shelf life. The phone's bursts are 24.45 ms
+        // apart, so one period of silence is the difference between a sender mid-stream
+        // and a receiver that has left for its own slot — and a gate left open past that
+        // is airtime spent on a channel nobody is listening to.
+        let mut l = single_link();
+        let mut map = [6u8; SLOTS];
+        map[2] = 149;
+        map[9] = 149;
+        for _ in 0..3 {
+            l.schedule.offer_map(map, ANCHOR_US);
+        }
+
+        l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 8));
+        let mut buf = [0u8; 2048];
+        assert!(l.up(&mut buf, ANCHOR_US).expect("up"));
+
+        let heard_at = ANCHOR_US + 5 * SLOT_US + 30 * TU_US;
+        let payload = ipv6_to(&node().addr.link_local(), 64);
+        l.radio.inbound
+            .push(frame::data_frame(peer(), node().addr, 7, 7, &payload, 36));
+        assert!(l.down(&mut buf, heard_at).expect("down"));
+
+        // One microsecond inside the period: still evidence.
+        let inside = heard_at + PEER_LIVE_US;
+        assert_eq!(l.flush(inside), 1);
+
+        // Re-queue the same ack and ask again just past it. The slot is still one of the
+        // peer's channel-6 slots, so the answer is the map's, which is no.
+        l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 8));
+        assert!(l.up(&mut buf, inside).expect("up"));
+        let outside = heard_at + PEER_LIVE_US + 1;
+        assert_eq!(l.flush(outside), 0, "one microsecond late is not evidence");
+        assert_eq!(l.stats.tx_live, 1, "unchanged by the second attempt");
+    }
+
+    #[test]
+    fn switching_the_override_off_restores_the_map_exactly() {
+        // What `--no-live` is for: the same link, the same payload, the same instant, with
+        // the one bit flipped. Without this the only baseline available would be a log
+        // from another day, on another channel, against another peer.
+        let mut l = single_link();
+        l.set_live_override(false);
+        let mut map = [6u8; SLOTS];
+        map[2] = 149;
+        map[9] = 149;
+        for _ in 0..3 {
+            l.schedule.offer_map(map, ANCHOR_US);
+        }
+
+        l.tunnel.inbound.push(ipv6_to(&peer().link_local(), 8));
+        let mut buf = [0u8; 2048];
+        assert!(l.up(&mut buf, ANCHOR_US).expect("up"));
+
+        // A channel-6 slot, so the peer's map says no — and payload arrives one TU in.
+        let in_the_gap = ANCHOR_US + 5 * SLOT_US;
+        let payload = ipv6_to(&node().addr.link_local(), 64);
+        l.radio.inbound.push(frame::data_frame(
+            peer(),
+            node().addr,
+            7,
+            7,
+            &payload,
+            36,
+        ));
+        assert!(l.down(&mut buf, in_the_gap + 1_000).expect("down"));
+
+        assert_eq!(
+            l.flush(in_the_gap + 2_000),
+            0,
+            "the payload is heard and ignored"
+        );
+        assert_eq!(l.stats.tx_live, 0, "and counted as nothing");
+        assert_eq!(l.stats.tx_wait_n, 0, "the ack has not left yet");
     }
 
     #[test]

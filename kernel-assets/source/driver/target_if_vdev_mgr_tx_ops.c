@@ -480,6 +480,7 @@ static QDF_STATUS target_if_vdev_mgr_create_send(
 
 #ifdef DRIVER_PASSTHRU_MODE
 extern unsigned int opairshare_passthru_diag_flags(void);
+extern bool opairshare_passthru_want_wide(void);
 #endif
 
 static QDF_STATUS target_if_vdev_mgr_start_send(
@@ -523,12 +524,61 @@ static QDF_STATUS target_if_vdev_mgr_start_send(
 #ifdef DRIVER_PASSTHRU_MODE
 	if (wlan_vdev_mlme_get_opmode(vdev) == QDF_PASSTHRU_MODE) {
 		unsigned int diag = opairshare_passthru_diag_flags();
+		/* Two profiles. Which one applies is decided by
+		 * `opairshare_passthru_want_wide()` -- the same predicate the TX
+		 * path uses for bw_mask -- and NOT by `diag & 1`.
+		 *
+		 * That distinction is load-bearing. `diag` bit0 is `passthru_ht`,
+		 * and tools/awdl-stack.sh sets `passthru_ht=0` precisely when it
+		 * wants the wide profile, so an `if (diag & 1)` gate around the
+		 * wide branch would skip it in exactly the case it exists for.
+		 * The bit survives as a diagnostic pin only: ht=1 forces HT20 and
+		 * wins, because when the stack pins it, it means it.
+		 */
 		if (diag & 1) {
-			param->channel.phy_mode = (enum wlan_phymode)WMI_HOST_MODE_11NG_HT20;
+			/* Diagnostic pin: HT20, one chain. */
+			param->channel.phy_mode =
+				(enum wlan_phymode)WMI_HOST_MODE_11NG_HT20;
 			param->channel.allow_ht = 1;
 			param->channel.allow_vht = 0;
 			param->preferred_tx_streams = 1;
 			param->preferred_rx_streams = 1;
+			param->he_ops = 0;
+#ifdef WLAN_FEATURE_11BE
+			param->eht_ops = 0;
+			param->channel.puncture_bitmap = 0;
+#endif
+		} else if (opairshare_passthru_want_wide()) {
+#ifdef WLAN_FEATURE_11BE
+			/* 802.11be, 80 MHz. `phy_mode` carries a
+			 * WMI_HOST_MODE_* number, not an enum
+			 * wlan_phymode one -- that is why the cast is here and
+			 * why 26 is EHT80: wmi_unified_api.c indexes
+			 * mode_to_width[] with this value and only the WMI
+			 * numbering lines up there.
+			 */
+			param->channel.phy_mode =
+				(enum wlan_phymode)WMI_HOST_MODE_11BE_EHT80;
+#else
+			param->channel.phy_mode =
+				(enum wlan_phymode)WMI_HOST_MODE_11AC_VHT80;
+#endif
+			param->channel.allow_ht = 1;
+			param->channel.allow_vht = 1;
+			/* No `allow_eht` here: `struct mlme_channel_param`
+			 * (wlan_vdev_mgr_tgt_if_tx_defs.h:419-444) only carries
+			 * allow_ht / allow_vht. `allow_eht` lives in
+			 * `struct channel_param` for firmware scan and channel
+			 * requests, not in the vdev start. EHT is expressed by
+			 * phy_mode = 26 alone.
+			 */
+			/* Two chains, like the factory vdev start on this chip
+			 * (`chanmode 16 ... Tx SS 2`). The pinned profile above
+			 * stays 1SS on purpose: that is the shape every early
+			 * measurement was taken in.
+			 */
+			param->preferred_tx_streams = 2;
+			param->preferred_rx_streams = 2;
 			param->he_ops = 0;
 #ifdef WLAN_FEATURE_11BE
 			param->eht_ops = 0;

@@ -130,16 +130,66 @@ final class Responder {
     /**
      * What {@link #txt()} publishes, as one ordered map.
      *
-     * <p>Three keys, and each one is load-bearing:
+     * <p>Four keys, and each one is load-bearing:
      *
-     * <p>{@code flags} is the capability word in decimal — {@code 137} = {@code 0x089} =
-     * URL sharing, mixed types and "you may post /Discover to me". It is decimal because that is
-     * how the field is read: a phone's own entry in this same record says {@code flags=13311}, and
-     * an earlier build of the legacy app published the hex spelling {@code 9e1b}, which parses as
-     * {@code 9} — still a legal word, so the mistake never failed loudly, it just silently dropped
-     * the one bit that says a sender may ask. A receiver with neither of the two bits the
-     * protocol requires (mixed types, pipelining) is discarded before it is ever resolved, which
-     * is why this is not decoration.
+     * <p>{@code flags} is the capability word in decimal — {@code 13311} = {@code 0x33ff},
+     * which is the exact word an iPhone publishes for itself. It is decimal because that is how
+     * the field is read: the same phone's own entry in a neighbouring record says
+     * {@code flags=13311}, and an earlier build of the legacy app published the hex spelling
+     * {@code 9e1b}, which parses as {@code 9} — still a legal word, so the mistake never failed
+     * loudly, it just silently dropped the one bit that says a sender may ask. A receiver with
+     * neither of the two bits the protocol requires (mixed types, pipelining) is discarded
+     * before it is ever resolved, which is why this is not decoration.
+     *
+     * <p>Where {@code 0x33ff} comes from, and why it is copied verbatim rather than reasoned
+     * about: a capture of this device's own AWDL link ({@code .workbuddy/tmp/air1.pcap},
+     * frame 3) holds an Apple vendor-specific action frame — OUI {@code 00:17:f2}, category
+     * {@code 0x7f}, transmitter {@code 86:b2:eb:36:35:3d} — whose TXT payload is
+     * {@code flags=13311} next to the service UUID
+     * {@code fb21a1ba-07a1-4ee3-b466-d7a7379ff84f}. That transmitter is not this one; this
+     * device's own record in the same file is {@code h=857B86CE…} / {@code flags=137} from
+     * {@code c2:1e:af:43:00:d0}. So {@code 0x33ff} is what an iPhone says about itself, captured
+     * on the wire, and every value below that is not it was a guess.
+     *
+     * <p>Which bits, from three independent readings of the same field: the OpenDrop-derived
+     * {@code AirDropReceiverFlags} table, the {@code omdrop} protocol spec's MDNS-4, and
+     * arXiv 2606.26967 §3.2. They agree bit for bit, and they agree on two bits that matter
+     * for how quickly a sender can reach this device:
+     *
+     * <p>{@code 0x002} {@code SupportsDVZip} — the upload body may arrive as DVZip blocks. The
+     * spec's MDNS-5 says what its absence costs: "Without {@code SupportsDVZip}, senders upload
+     * gzip", and the paper describes the same bit as "enables adaptive compression". A sender
+     * that cannot use DVZip buffers the whole archive before it can compress it as one stream.
+     *
+     * <p>{@code 0x004} {@code SupportsPipelining} — a sender may start uploading while the
+     * question is still on screen. The paper is explicit that reception and consent are separate
+     * gates: "Upload data streams into memory while the Ask prompt is displayed; the semaphore
+     * gates processing, not reception." Advertising it is what tells a sender it may begin
+     * early instead of waiting for the answer to come back.
+     *
+     * <p>Two earlier values, both of them wrong, and the record of what they actually were
+     * because the difference is the whole point:
+     *
+     * <p>{@code 137} = {@code 0x0089} — URL sharing, mixed types, Discover. The spec's own
+     * "minimal receiver" example, which is what this was written as. Mandatory bits only, and
+     * neither {@code 0x002} nor {@code 0x004}.
+     *
+     * <p>{@code 2185} = {@code 0x0889} — introduced to add those two bits, and it did not. The
+     * arithmetic in the comment that shipped with it claims {@code 137 | 0x002 | 0x004}, but
+     * that is {@code 143} = {@code 0x008f}; {@code 2185 & 0x002} and {@code 2185 & 0x004} are
+     * both zero, and {@code 2185 ^ 137} is {@code 0x0800}. So the run that "tested DVZip and
+     * pipelining" advertised neither, added a bit the reference phone does not set, and any
+     * conclusion drawn from it was about nothing. {@code 0x33ff} sets both bits and clears that
+     * one.
+     *
+     * <p>{@code 0x33ff} also sets {@code 0x040 SupportsIris}, {@code 0x100}, {@code 0x200},
+     * {@code 0x1000} and {@code 0x2000}, and this comment does not claim to know what the last
+     * four do. They are here because they are in the reference word and the alternative is
+     * another guess: MDNS-5's "MUST NOT advertise a capability it doesn't implement" is about
+     * not promising a pipeline this device will not run, and what these bits buy a sender is
+     * unknown — whereas a word that differs from every phone's is a word a sender can branch on.
+     * The one bit that is *cleared* is {@code 0x800}, which is clear in the reference word and
+     * which the {@code 2185} run set by accident; whatever it means, no phone sets it.
      *
      * <p>{@code fl} is the same word under the name the older drafts used. iOS reads
      * {@code flags}; the drafts this code grew up on say {@code fl}. Both, because a word we
@@ -151,17 +201,31 @@ final class Responder {
      * disagree: publishing one certificate and presenting another makes every sender see a device
      * that does not match its own advertisement, and the rejection happens on their screen where
      * there is nothing to read. Uppercase hex without separators, which is the shape iOS writes.
+     *
+     * <p>{@code model} is what the device calls itself, {@link Listener#systemModel()} — the
+     * same string the {@code /Ask} answer carries as {@code ReceiverModelName}. It is published
+     * because it is the one thing a peer is known to read from this record: this crate's own
+     * {@code browse.rs} reads {@code model} off every iPhone it finds.
+     *
+     * <p>It is <em>not</em> the field that decides whether an iPhone transcodes. An earlier
+     * note here claimed it was, on the strength of Apple's "HEVC for supported devices, H.264
+     * for all other devices" — but publishing {@code model} changed nothing measurable: a
+     * 93 MB clip still arrived as 26.5 MB. The branch Apple describes is taken on
+     * {@code ReceiverMediaCapabilities} in the {@code /Discover} answer, not on this record,
+     * which is why that blob is the thing worth being careful with (see
+     * {@code opairdrop_airdrop::MEDIA_CAPABILITIES}).
      */
     private Map<String, String> txt() {
         Map<String, String> pairs = new LinkedHashMap<>();
         pairs.put("h", certHash);
+        pairs.put("model", Listener.systemModel());
         pairs.put("fl", FLAGS);
         pairs.put("flags", FLAGS);
         return pairs;
     }
 
-    /** {@code 0x089} in the decimal the field is read as; see {@link #txt()}. */
-    private static final String FLAGS = "137";
+    /** {@code 0x33ff} in the decimal the field is read as; see {@link #txt()}. */
+    private static final String FLAGS = "13311";
 
     private final Context context;
     private final String instance;
@@ -190,6 +254,17 @@ final class Responder {
     private Thread tickThread;
     private WifiManager.MulticastLock multicastLock;
     private volatile boolean running;
+
+    /**
+     * Pacing of the bind retry, and the thread that runs it.
+     *
+     * <p>Two seconds, not a backoff. The failure this retries is "the tunnel does not exist
+     * yet", and the tunnel appears on a scale of seconds; a backoff would spend a minute
+     * away from a link that is already there, and every one of those seconds is a device
+     * that answers on 8770 and announces nothing.
+     */
+    private static final long RETRY_MS = 2000L;
+    private Thread retrier;
 
     /** The group address, scoped to the interface where the platform allows it. */
     private volatile InetAddress group;
@@ -383,6 +458,7 @@ final class Responder {
         Thread opening;
         Thread receiving;
         Thread ticking;
+        Thread retrying;
         synchronized (lock) {
             running = false;
             held = socket;
@@ -397,6 +473,8 @@ final class Responder {
             receiveThread = null;
             ticking = tickThread;
             tickThread = null;
+            retrying = retrier;
+            retrier = null;
         }
         if (held != null) {
             // Withdraw before closing, and on this thread: the packets have to leave through the
@@ -407,6 +485,7 @@ final class Responder {
         interrupt(opening);
         interrupt(receiving);
         interrupt(ticking);
+        interrupt(retrying);
         releaseLock();
     }
 
@@ -426,6 +505,14 @@ final class Responder {
             synchronized (lock) {
                 opener = null;
             }
+            // 失败之后自己接着试，而不是等人再拨一次开关。
+            //
+            // 这台机器上最常见的失败就是 `bind()` 抛「没有网卡 awdltun0」——接收端比 AWDL
+            // 隧道早。原来只有两处会重试：`StackKeeper` 的 tick，和人来关再开一次。前者属于
+            // 某个界面，App 重启而开关还开着的时候根本没人叫它；后者要人自己发现「面板里没有
+            // 这台设备」。2026-11-21 凌晨连着两次都是这个形态：链路在、8770 在听、什么都不广播，
+            // 于是谁都看不见。
+            scheduleRetry();
             return;
         }
 
@@ -804,6 +891,44 @@ final class Responder {
             } catch (RuntimeException ignored) {
                 // A page that cannot be told is not a reason to lose the reason it wanted.
             }
+        }
+    }
+
+    /**
+     * Retries the bind every {@link #RETRY_MS} until there is a socket or the switch goes off.
+     *
+     * <p>One retrier at a time; it dies with the switch. {@link #start()} is what it calls, and
+     * that method is already safe to call from anywhere -- it returns while an opener is in
+     * flight and does the whole thing again once one is not.
+     */
+    private void scheduleRetry() {
+        synchronized (lock) {
+            if (!running || retrier != null) {
+                return;
+            }
+            retrier = daemon(() -> {
+                while (true) {
+                    try {
+                        Thread.sleep(RETRY_MS);
+                    } catch (InterruptedException stop) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                    synchronized (lock) {
+                        if (!running || socket != null) {
+                            retrier = null;
+                            return;
+                        }
+                        if (opener != null) {
+                            continue;
+                        }
+                    }
+                    start();
+                }
+                synchronized (lock) {
+                    retrier = null;
+                }
+            }, "opairdrop-mdns-retry");
         }
     }
 

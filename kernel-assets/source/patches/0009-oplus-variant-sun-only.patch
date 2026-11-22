@@ -1,0 +1,10 @@
+diff --git a/kernel_platform/oplus/bazel/oplus_modules_variant.bzl b/kernel_platform/oplus/bazel/oplus_modules_variant.bzl
+index e5ae4bae..2df5b54b 100755
+--- a/kernel_platform/oplus/bazel/oplus_modules_variant.bzl
++++ b/kernel_platform/oplus/bazel/oplus_modules_variant.bzl
+@@ -1,4 +1,4 @@
+-bazel_support_target = ["sun", "parrot"]
++bazel_support_target = ["sun"]
+ bazel_support_variant = ["perf"]
+ OPLUS_FEATURES = ""
+ LINUX_KERNEL_VERSION = "6.6"

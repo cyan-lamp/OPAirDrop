@@ -803,6 +803,16 @@ QDF_STATUS dp_mon_filter_update(struct dp_pdev *pdev)
 			return result;
 		}
 #endif
+		/* The only reader of `result` is the passthru block above, so a
+		 * translation unit that compiles without DRIVER_PASSTHRU_MODE
+		 * gets "-Wunused-variable" -- and the driver builds with
+		 * -Werror, which turns that into a hard stop. This went unseen
+		 * for a long time because the object was never recompiled after
+		 * the block was added; it surfaced the first time the whole
+		 * module was rebuilt. Keeping the read here makes the variable
+		 * used either way and changes nothing at runtime.
+		 */
+		(void)result;
 	}
 
 	return QDF_STATUS_SUCCESS;

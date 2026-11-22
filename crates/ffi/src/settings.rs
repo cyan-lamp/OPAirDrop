@@ -53,6 +53,9 @@ const DEVICE_MODEL: &str = "device.model";
 /// Key of the largest answer body a send will read.
 const RESPONSE_LIMIT: &str = "http.response_limit";
 
+/// Key of the capability blob the `/Discover` answer carries.
+const MEDIA_CAPABILITIES: &str = "receive.media_capabilities";
+
 /// Suffix of the sibling a save is written to before it is renamed into place.
 const PARTIAL: &str = ".part";
 
@@ -237,6 +240,33 @@ pub(crate) fn response_limit(values: &Values) -> usize {
     }
 }
 
+/// The capability blob a `/Discover` answer carries: `receive.media_capabilities`, or
+/// [`opairdrop_airdrop::MEDIA_CAPABILITIES`] when the row is blank.
+///
+/// The row exists because of what the blob *does*, not because anybody wants to tune it.
+/// DISC-3 says a receiver that leaves out `Codecs` and `ContainerFormats` gets media in
+/// widely supported formats, and for video that means every sender re-encodes 4K HEVC to
+/// H.264 before offering it — which is both why a large clip took minutes to prompt and why
+/// a 93 MB video came back as 26.5 MB. The blob now names `hvc1`, and an iPhone stops
+/// transcoding.
+///
+/// The catch is that DISC-3 only ever specifies `Version`; the shape of `Codecs` and
+/// `ContainerFormats` is folklore, reconstructed from one macOS capture. A guess that is
+/// wrong shows up as a device that stops prompting at all — the failure this file's own
+/// notes record for an earlier change to the answer. Waiting for a rebuild to undo that is
+/// not acceptable, so the value is editable from the settings screen: paste
+/// `{"Version": 1}` and the old behaviour is back on the next connection.
+///
+/// A blank row and an unset row are the same thing here, exactly as in [`model`]: the table
+/// spells "not set" as empty, and a person who clears the field wants the default rather
+/// than an answer with no capabilities at all.
+pub(crate) fn media_capabilities(values: &Values) -> Vec<u8> {
+    match trimmed(values, MEDIA_CAPABILITIES) {
+        Some(entered) => entered.as_bytes().to_vec(),
+        None => opairdrop_airdrop::MEDIA_CAPABILITIES.as_bytes().to_vec(),
+    }
+}
+
 /// The name to answer a peer with: `device.name`, then the system's own name for the phone,
 /// then [`model`].
 ///
@@ -274,9 +304,10 @@ pub(crate) fn name(values: &Values, system_name: &str, system_model: &str) -> St
 /// invite a person to rename their phone. That is precisely what it is for. The field is
 /// display-only on both sides of the protocol — nothing parses it, nothing branches on it, no
 /// sender decides anything from it — and a device that wants to say `iPhone 18` has no other
-/// way to say it. What the row cannot change is the capability blob in the `/Discover` answer:
-/// that is [`opairdrop_airdrop::MEDIA_CAPABILITIES`], a constant shared with every other
-/// implementation, and it says `{"Version": 1}` rather than naming a device at all.
+/// way to say it. What the row cannot change is what the `/Discover` answer claims the
+/// device can store: that is `receive.media_capabilities`, whose default is
+/// [`opairdrop_airdrop::MEDIA_CAPABILITIES`] — see [`media_capabilities`] for why it is now
+/// a row with a default rather than a constant with no way back.
 pub(crate) fn model(values: &Values, system: &str) -> String {
     match trimmed(values, DEVICE_MODEL) {
         Some(entered) => entered.to_string(),

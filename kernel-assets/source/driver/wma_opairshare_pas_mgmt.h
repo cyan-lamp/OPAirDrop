@@ -1,6 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Included only by wma_data.c, after the native wma_tx_packet definition. */
 #ifdef DRIVER_PASSTHRU_MODE
+/* Defined in wlan_hdd_wondertap.c and already consumed by the vdev-start hook
+ * in target_if_vdev_mgr_tx_ops.c, which turns it into
+ * WMI_HOST_MODE_11AC_VHT80.  The TX path has to agree with that decision:
+ * a tx_param that asks for 20 MHz makes the wide bring-up useless.
+ */
+extern bool opairshare_passthru_want_wide(void);
 #include <linux/workqueue.h>
 #include <linux/hrtimer.h>
 #include <linux/wait.h>
@@ -122,7 +128,22 @@ static u8 opairshare_awdl_attempts_snapshot(bool unicast)
 #define OPAIRSHARE_AGG_AWDL_LEN	8u
 #define OPAIRSHARE_AGG_IPV6_LEN	40u
 #define OPAIRSHARE_AGG_MAX_MSDU	2304u
-#define OPAIRSHARE_AGG_HARD_MAX	5u	/* subframes per A-MSDU, hard ceiling */
+/* Subframes per A-MSDU, hard ceiling.
+ *
+ * Was 5.  The ceiling is what a *submission* can carry, and a submission is
+ * expensive: opairshare_tx_metrics showed 188564 native frames at 46.4 ms each
+ * in wmi_prepare (the wait from handing the frame to WMI until the completion
+ * callback), i.e. roughly one AWDL slot per WMI round trip.  Throughput here is
+ * in-flight-bytes / that latency, so every extra subframe per submission is
+ * payload that rides for free on a wait we were going to pay anyway.
+ *
+ * 8 also fits: at the VHT A-MSDU ceiling of 11454 octets, eight subframes of a
+ * 1200-octet MSDU cost 26 + 8*(14+1200) + 7*2 = 9754 octets, so the byte budget
+ * binds before this count does for anything below ~1400-octet MSDUs.
+ * passthru_awdl_amsdu_max is 0644, so a run can still be walked back to 5 (or 2,
+ * the reference driver's winning setting) without a rebuild.
+ */
+#define OPAIRSHARE_AGG_HARD_MAX	8u	/* subframes per A-MSDU, hard ceiling */
 /* LLC + AWDL header + IPv6 + TCP with the 12-byte timestamp option */
 #define OPAIRSHARE_AGG_PEEK		(OPAIRSHARE_AGG_LLC_LEN + OPAIRSHARE_AGG_AWDL_LEN + OPAIRSHARE_AGG_IPV6_LEN + 32u)
 
@@ -435,11 +456,27 @@ static int opairshare_amsdu_max_set(const char *value, const struct kernel_param
 
 	if (rc)
 		return rc;
-	if (v < 2 || v > 5)
+	if (v < 2 || v > OPAIRSHARE_AGG_HARD_MAX)
 		return -EINVAL;
 	WRITE_ONCE(*(unsigned int *)kp->arg, v);
 	return 0;
 }
+/* Largest A-MSDU this parameter will accept, in octets of the finished MPDU
+ * (26-octet QoS header + 14-octet subframe header + subframe payload).
+ *
+ * 7935 was the HT ceiling and stayed there long after the data path stopped
+ * being HT: phy=2 is WMI_RATE_PREAMBLE_HT, whose MPDU cannot exceed 4095
+ * octets on the air, so anything above 7935 was refuse-to-set rather than
+ * refuse-to-send.  With phy=3 (VHT) the binding limit is 802.11-2016's A-MSDU
+ * maximum of 11454, and every frame left at 7935 is a frame whose tail was
+ * dropped on the floor (`followers_dropped`) instead of being carried.
+ *
+ * OPAIRSHARE_AMSDU_MAX_MSDU still caps a single subframe at 2304 octets -- that
+ * one is the spec's MSDU limit and is correct at every PHY -- so raising this
+ * bound only lets *more* subframes fit, never a larger one.
+ */
+#define OPAIRSHARE_AMSDU_BYTES_MAX 11454
+
 static int opairshare_amsdu_bytes_set(const char *value, const struct kernel_param *kp)
 {
 	unsigned int v;
@@ -447,7 +484,7 @@ static int opairshare_amsdu_bytes_set(const char *value, const struct kernel_par
 
 	if (rc)
 		return rc;
-	if (v < 128 || v > 7935)
+	if (v < 128 || v > OPAIRSHARE_AMSDU_BYTES_MAX)
 		return -EINVAL;
 	WRITE_ONCE(*(unsigned int *)kp->arg, v);
 	return 0;
@@ -465,16 +502,16 @@ module_param_cb(passthru_awdl_amsdu, &opairshare_amsdu_mode_ops, &passthru_awdl_
 MODULE_PARM_DESC(passthru_awdl_amsdu,
 	"A-MSDU: 0=off, 1=wrap small frames as 1-subframe A-MSDU (probe), 2=merge already-queued frames");
 module_param_cb(passthru_awdl_amsdu_max, &opairshare_amsdu_max_ops, &passthru_awdl_amsdu_max, 0644);
-MODULE_PARM_DESC(passthru_awdl_amsdu_max, "Max MSDUs per A-MSDU in mode 2 (2..5)");
+MODULE_PARM_DESC(passthru_awdl_amsdu_max, "Max MSDUs per A-MSDU in mode 2 (2..8)");
 module_param_cb(passthru_awdl_amsdu_bytes, &opairshare_amsdu_bytes_ops, &passthru_awdl_amsdu_bytes, 0644);
 MODULE_PARM_DESC(passthru_awdl_amsdu_bytes, "Max MPDU bytes (802.11 header + subframes) of an A-MSDU (128..7935)");
 module_param(passthru_awdl_ackfilter, bool, 0644);
 MODULE_PARM_DESC(passthru_awdl_ackfilter,
 	"Drop a queued plain TCP ACK once a newer ACK of the same flow is queued behind it");
 /* PHY for AWDL data frames.  0 = legacy OFDM at passthru_awdl_rate_mbps (unchanged).
- * 2 = HT, 3 = VHT: the WMI TX params carry MASKS (preamble, MCS, NSS) the firmware
- * may pick from, so this only requests a rate class; it does not prove it was used.
- * Needed because a non-HT PPDU may not carry an MPDU above 2346 octets.
+ * 2 = HT, 3 = VHT, 4 = HE: the WMI TX params carry MASKS (preamble, MCS, NSS) the
+ * firmware may pick from, so this only requests a rate class; it does not prove it
+ * was used.  Needed because a non-HT PPDU may not carry an MPDU above 2346 octets.
  */
 static unsigned int passthru_awdl_phy;
 /* 4 = VHT 16-QAM 2SS.  The radio has no rate adaptation for these frames:
@@ -485,6 +522,27 @@ static unsigned int passthru_awdl_phy;
  * only pay off when nothing else is on the channel.
  */
 static unsigned int passthru_awdl_mcs = 4;
+/* Accepted PHY classes, as WMI preamble indices (WMI_RATE_PREAMBLE):
+ *   0 OFDM, 2 HT, 3 VHT, 4 HE.
+ * The value is used as BIT(v) in tx_send_params.preamble_type, so it has to be
+ * the preamble index itself, not an opaque label.
+ *
+ * 4 is HE and not EHT, despite HE and EHT holding 3 and 4 in the wondertap
+ * enum.  Those two scales disagree from HE onwards: WMI_RATE_PREAMBLE is
+ * OFDM=0 CCK=1 HT=2 VHT=3 HE=4 EHT=5, while wondertap's own list is
+ * LEGACY=0 HT=1 VHT=2 HE=3 EHT=4.  They coincide only at the two values this
+ * parameter has always accepted (2 and 3), which is why the mismatch was
+ * invisible until now.
+ *
+ * EHT is refused on purpose rather than admitted and silently dropped:
+ * preamble_type is a 5-bit field (WMI_TX_SEND_PARAM_PREAMBLE_SET(dword1, 15, 5)),
+ * so EHT would need BIT(5) = 32 and the field cannot hold it.  A 32 written
+ * there masks to 0, i.e. "firmware picks", which looks like success and is not.
+ * The working EHT channel is wmi_vdev_param_fixed_rate, where
+ * wlan_hdd_wondertap.c maps WONDERTAP_RATE_PREAMBLE_EHT onto
+ * WMI_RATE_PREAMBLE_EHT through ASSEMBLE_RATECODE_V1 -- the preamble lives at
+ * bit 8 there and has the room.
+ */
 static int opairshare_phy_set(const char *value, const struct kernel_param *kp)
 {
 	unsigned int v;
@@ -492,11 +550,18 @@ static int opairshare_phy_set(const char *value, const struct kernel_param *kp)
 
 	if (rc)
 		return rc;
-	if (v != 0 && v != 2 && v != 3)
+	if (v != 0 && v != 2 && v != 3 && v != 4)
 		return -EINVAL;
 	WRITE_ONCE(*(unsigned int *)kp->arg, v);
 	return 0;
 }
+/* MCS ceilings by preamble: HT 7, VHT 9, HE 11.  The index is used as
+ * BIT(v) in tx_send_params.mcs_mask, a 12-bit field, so 11 fits.  An index
+ * above the chosen preamble's ceiling is not rejected per-preamble here --
+ * this setter has no reliable view of the PHY that will finally be used --
+ * but the firmware will not honour it, and opairshare_ba_stats/passthru_awdl
+ * telemetry is where that shows up.
+ */
 static int opairshare_mcs_set(const char *value, const struct kernel_param *kp)
 {
 	unsigned int v;
@@ -504,7 +569,7 @@ static int opairshare_mcs_set(const char *value, const struct kernel_param *kp)
 
 	if (rc)
 		return rc;
-	if (v > 9)
+	if (v > 11)
 		return -EINVAL;
 	WRITE_ONCE(*(unsigned int *)kp->arg, v);
 	return 0;
@@ -516,9 +581,11 @@ static const struct kernel_param_ops opairshare_mcs_ops = {
 	.set = opairshare_mcs_set, .get = param_get_uint,
 };
 module_param_cb(passthru_awdl_phy, &opairshare_phy_ops, &passthru_awdl_phy, 0644);
-MODULE_PARM_DESC(passthru_awdl_phy, "AWDL data PHY class: 0=legacy OFDM (default), 2=HT, 3=VHT");
+MODULE_PARM_DESC(passthru_awdl_phy,
+	"AWDL data PHY class as WMI preamble index: 0=legacy OFDM (default), 2=HT, 3=VHT, 4=HE (not EHT: see the note above opairshare_phy_set)");
 module_param_cb(passthru_awdl_mcs, &opairshare_mcs_ops, &passthru_awdl_mcs, 0644);
-MODULE_PARM_DESC(passthru_awdl_mcs, "MCS index requested when passthru_awdl_phy is 2 or 3 (0..9)");
+MODULE_PARM_DESC(passthru_awdl_mcs,
+	"MCS index requested when passthru_awdl_phy is 2, 3 or 4 (0..11; ceilings HT 7, VHT 9, HE 11)");
 
 /* A-MSDU geometry, 802.11-2016 9.3.2.2.2 (802.11-2012 8.3.2.2 for the byte
  * order). A subframe is DA(6) | SA(6) | Length(2) | MSDU | pad(0-3); the
@@ -535,6 +602,14 @@ MODULE_PARM_DESC(passthru_awdl_mcs, "MCS index requested when passthru_awdl_phy 
  */
 #define OPAIRSHARE_AMSDU_OVERHEAD(n)	((n) * OPAIRSHARE_AMSDU_SUBFRAME_HDR + \
 				 ((n) - 1) * OPAIRSHARE_AMSDU_MAX_PAD)
+/* Does NOT cap how many subframes we aggregate -- that is passthru_awdl_amsdu_max,
+ * itself capped by OPAIRSHARE_AGG_HARD_MAX (8). This constant only reserves slack
+ * in front of cds_packet_alloc() for the single-subframe wrap below, which is the
+ * most any one item can add beyond a length that already counted its own overhead:
+ * opairshare_agg_total() returns QoS(26) + layout(n), so the n>1 path needs no extra
+ * room and the n==0 path adds exactly OPAIRSHARE_AMSDU_OVERHEAD(1) = 14.
+ * Raising this number buys nothing; it is 1 because 1 is the true requirement.
+ */
 #define OPAIRSHARE_AMSDU_MAX_SUBFRAMES	1
 static unsigned int passthru_awdl_ack_policy;
 module_param(passthru_awdl_ack_policy, uint, 0644);
@@ -559,6 +634,7 @@ MODULE_PARM_DESC(passthru_awdl_rx_rearm, "Reuse normal RX sessions after real de
 /* Fixed149 profile: this does not establish general hopping support. */
 void opairshare_pas_rx_order_end(void);
 int opairshare_pas_mgmt_stop(uint8_t id);
+void opairshare_pas_mgmt_abandon(uint8_t id);
 static unsigned int opairshare_rx_fixed_bandwidth;
 static bool opairshare_rx_fixed_bandwidth_valid;
 
@@ -588,20 +664,48 @@ int opairshare_pas_rx_fixed_channel(u8 id, u16 freq, unsigned int bandwidth)
 		rc = -EIO;
 	else if (opairshare_rx_filter_armed) {
 		/* No radio operation is needed for this exact already-active channel.
-		 * Never use this shortcut for another frequency/width or bad gate.
+		 * Never use this shortcut for another frequency or a bad gate.
+		 *
+		 * A different width on the same frequency is *not* an error: the
+		 * caller reads 0 as "no shortcut available" and goes on to perform
+		 * the real channel change, while only 1 means "the radio is already
+		 * there".  Answering -EOPNOTSUPP here is what pinned the tap to
+		 * 20 MHz on 2026-11-20: `wonder-ven wonder0 freq 5745 2` (80 MHz)
+		 * came back -95 before the radio was ever asked, so a wider chandef
+		 * could not even be attempted.
 		 */
 		if (opairshare_rx_filter_active && !opairshare_rx_filter_fault &&
 		    !opairshare_rx_filter_pending && opairshare_rx_filter_id == id &&
 		    opairshare_rx_filter_freq == freq && opairshare_bridge_freq == freq &&
 		    opairshare_bridge_accepting)
-			rc = opairshare_rx_fixed_bandwidth_valid &&
-				bandwidth == opairshare_rx_fixed_bandwidth ? 1 : -EOPNOTSUPP;
+			rc = (opairshare_rx_fixed_bandwidth_valid &&
+			      bandwidth == opairshare_rx_fixed_bandwidth) ? 1 : 0;
 		else
 			rc = -EIO;
 	}
 	spin_unlock_irqrestore(&opairshare_bridge_lock, flags);
 	mutex_unlock(&opairshare_bridge_lifecycle);
 	return rc;
+}
+
+/* Record the width the radio actually ended up on after a real channel change.
+ * Without this the shortcut above keeps comparing against the width the session
+ * was born with, so the next set_freq for the same frequency is answered
+ * "already there" and the radio silently stays where it was -- the split
+ * between the announced channel and the real one this file exists to prevent,
+ * reintroduced through a stale width instead of a constant.
+ */
+void opairshare_pas_rx_note_bandwidth(unsigned int bandwidth)
+{
+	unsigned long flags;
+
+	mutex_lock(&opairshare_bridge_lifecycle);
+	spin_lock_irqsave(&opairshare_bridge_lock, flags);
+	opairshare_rx_fixed_bandwidth = bandwidth;
+	opairshare_rx_fixed_bandwidth_valid = true;
+	spin_unlock_irqrestore(&opairshare_bridge_lock, flags);
+	mutex_unlock(&opairshare_bridge_lifecycle);
+	pr_info("OPAIRSHARERXWIDTH: recorded bandwidth_enum=%u\n", bandwidth);
 }
 
 int opairshare_pas_rx_auto_start(u8 id, u16 freq, unsigned int bandwidth)
@@ -799,20 +903,41 @@ static unsigned int passthru_awdl_collect_us;
 module_param(passthru_awdl_collect_us, uint, 0644);
 static unsigned int passthru_awdl_nss = 1;
 module_param(passthru_awdl_nss, uint, 0644);
-static atomic64_t opairshare_bulk_packs[6];
+/* Histogram of "how many subframes went out in one submission", indexed by
+ * subframe count.  There is one more bucket than the ceiling because a
+ * submission carries 1..OPAIRSHARE_AGG_HARD_MAX subframes and a single-subframe
+ * frame is also worth counting.
+ *
+ * The size was a literal 6 while the ceiling was 5.  `nfol + 1` reaches the
+ * ceiling, so raising the ceiling to 8 without growing this array would have
+ * made every 7- and 8-subframe submission write 16 and 24 bytes past the end of
+ * a .bss object -- straight into whatever the linker put next.  Bound the array
+ * by the ceiling it is indexed with, not by a number that happens to match
+ * today.
+ */
+/* Room for all OPAIRSHARE_AGG_HARD_MAX+1 buckets plus the tail fields.  At 8
+ * buckets of 20-digit counters the worst case is ~290 bytes, so the previous
+ * literal 256 would have silently dropped `deferrals`/`nss` off the end --
+ * scnprintf() returns what it actually wrote, so the reader would just see a
+ * short line rather than an error.  The sysfs show buffer is a whole page.
+ */
+#define OPAIRSHARE_TXPACK_STATS_MAX	512
+static atomic64_t opairshare_bulk_packs[OPAIRSHARE_AGG_HARD_MAX + 1];
 static atomic64_t opairshare_collect_deferrals = ATOMIC64_INIT(0);
 static int opairshare_txpack_get(char *out, const struct kernel_param *kp)
 {
+    unsigned int i;
+    int n = 0;
     (void)kp;
-    return scnprintf(out, 256,
-        "p1=%lld p2=%lld p3=%lld p4=%lld p5=%lld deferrals=%lld collect_us=%u nss=%u\n",
-        (long long)atomic64_read(&opairshare_bulk_packs[1]),
-        (long long)atomic64_read(&opairshare_bulk_packs[2]),
-        (long long)atomic64_read(&opairshare_bulk_packs[3]),
-        (long long)atomic64_read(&opairshare_bulk_packs[4]),
-        (long long)atomic64_read(&opairshare_bulk_packs[5]),
+    n += scnprintf(out + n, OPAIRSHARE_TXPACK_STATS_MAX - n, "p1=%lld", (long long)atomic64_read(&opairshare_bulk_packs[1]));
+    for (i = 2; i <= OPAIRSHARE_AGG_HARD_MAX; i++)
+        n += scnprintf(out + n, OPAIRSHARE_TXPACK_STATS_MAX - n, " p%u=%lld", i,
+            (long long)atomic64_read(&opairshare_bulk_packs[i]));
+    n += scnprintf(out + n, OPAIRSHARE_TXPACK_STATS_MAX - n,
+        " deferrals=%lld collect_us=%u nss=%u\n",
         (long long)atomic64_read(&opairshare_collect_deferrals),
         READ_ONCE(passthru_awdl_collect_us), READ_ONCE(passthru_awdl_nss));
+    return n;
 }
 static const struct kernel_param_ops opairshare_txpack_ops = { .get = opairshare_txpack_get };
 module_param_cb(opairshare_tx_pack_stats, &opairshare_txpack_ops, NULL, 0444);
@@ -1240,7 +1365,27 @@ static void opairshare_bridge_worker(struct work_struct *work)
 				wma_update_tx_send_params(&mgmt.tx_param, opairshare_awdl_rate_id());
 				mgmt.tx_param.frame_type = WMA_TX_SEND_DATA_TYPE;
 				mgmt.tx_param.retry_limit = item->awdl_attempts;
-				mgmt.tx_param.bw_mask = BIT(2); /* 20 MHz */
+				/* bw_mask is a bitmap of the widths the target may
+				 * pick from, not a width (wmi_tx_send_params in
+				 * fw-api/wmi_unified.h): bit2 = 20 MHz, bit3 = 40,
+				 * bit4 = 80, bit5 = 160, bit6 = 80+80.
+				 * "If no bits are set, target can choose."
+				 *
+				 * This was BIT(2) unconditionally. Once the wide
+				 * profile started coming up as an 80 MHz vdev, that
+				 * meant every data frame was still handed to
+				 * firmware as a 20 MHz transmission -- the 80 MHz
+				 * channel was reserved and then never used. Measured
+				 * 2026-11-20: the wide run carried 1.28 MB/s against
+				 * a 3.24 MB/s narrow baseline, which is exactly what
+				 * a wide vdev with narrow data frames looks like.
+				 *
+				 * The width comes from the same predicate the
+				 * vdev-start hook uses, so the two cannot drift.
+				 */
+				mgmt.tx_param.bw_mask =
+					opairshare_passthru_want_wide() ?
+					BIT(4) : BIT(2); /* 80 MHz : 20 MHz */
 				if (READ_ONCE(passthru_awdl_phy)) {
 					mgmt.tx_param.preamble_type = BIT(READ_ONCE(passthru_awdl_phy));
 					mgmt.tx_param.mcs_mask = BIT(READ_ONCE(passthru_awdl_mcs));
@@ -1306,7 +1451,14 @@ static void opairshare_bridge_worker(struct work_struct *work)
 			goto drop;
 		}
 		atomic64_inc(&opairshare_bridge_submitted);
-        if (pack_bulk) atomic64_inc(&opairshare_bulk_packs[nfol + 1]);
+		/* Bracket, don't rely on indentation: this translation unit is built
+		 * with -Werror and clang's -Wmisleading-indentation fires when the
+		 * body of a single-statement `if` sits at a different tab stop.
+		 */
+		if (pack_bulk) {
+			atomic64_inc(&opairshare_bulk_packs[min_t(unsigned int, nfol + 1,
+								 OPAIRSHARE_AGG_HARD_MAX)]);
+		}
 		if (nfol) {
 			atomic64_inc(&opairshare_agg_frames);
 			atomic64_add(nfol + 1, &opairshare_agg_msdus);
@@ -1636,6 +1788,44 @@ int opairshare_pas_mgmt_stop(uint8_t id)
 		destroy_workqueue(wq);
 	mutex_unlock(&opairshare_bridge_lifecycle);
 	return 0;
+}
+
+/*
+ * Force teardown for the paths that run *after* the firmware is gone, i.e. the
+ * SSR force-cleanup branch of wlan_hdd_wondertap_unregister_ops().  It
+ * deliberately does not do what opairshare_pas_mgmt_stop() does, because none
+ * of that can succeed there:
+ *
+ *   - the drain handshake waits for completions the dead MAC owes us, so it
+ *     returns -ETIMEDOUT and takes the fifteen-second vdev teardown timeout
+ *     with it,
+ *   - opairshare_rx_filter_clear_locked() and opairshare_target_stop() are WMI
+ *     round trips into the reinitialising firmware,
+ *   - opairshare_flow_control_locked() would only re-enable queues on a netdev
+ *     that is being destroyed.
+ *
+ * What it must do is release the *software* references, because the netdev
+ * refcount is what decides whether unregister_netdevice() ever returns.  The
+ * bridge workqueue is left alone on purpose: destroying it here would flush a
+ * worker that is still trying to submit to a reinitialising MAC, and we run
+ * under RTNL, so a stall would be unbounded rather than merely slow.  Every
+ * SSR recovery is followed by a module reload, which reclaims it.
+ */
+void opairshare_pas_mgmt_abandon(uint8_t id)
+{
+	unsigned long flags;
+	unsigned int held;
+
+	mutex_lock(&opairshare_bridge_lifecycle);
+	spin_lock_irqsave(&opairshare_bridge_lock, flags);
+	opairshare_bridge_accepting = false;
+	opairshare_flow_force_forget_locked();
+	held = !!opairshare_flow_dev;
+	spin_unlock_irqrestore(&opairshare_bridge_lock, flags);
+	mutex_unlock(&opairshare_bridge_lifecycle);
+	pr_info("OPAIRSHAREABANDON: vdev=%u pending=%lld still_held=%u puts=%llu\n",
+		id, (long long)atomic64_read(&opairshare_bridge_pending), held,
+		(unsigned long long)opairshare_flow_puts);
 }
 #include "wma_opairshare_awdl_ba.h"
 #endif

@@ -102,7 +102,6 @@ final class LiveCard {
 
     /** 上面那几条只扫一次。这个类每秒要投五次通知，不该每次附送四次 binder 往返。 */
     private static boolean swept;
-
     /**
      * 上一次投出去那张卡的「按钮行长什么样」，见 {@link #post} 里那一段。
      *

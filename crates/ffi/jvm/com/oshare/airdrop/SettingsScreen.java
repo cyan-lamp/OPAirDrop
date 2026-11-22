@@ -2,7 +2,9 @@ package com.oshare.airdrop;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -293,8 +295,67 @@ public final class SettingsScreen {
      * <p>A missing file is not a failure: it is the first launch, and every row shows the
      * table's default. A file that exists and does not parse is refused — the message names
      * the line — because answering with defaults would throw away what the person had set.
+     *
+     * <p># A file that cannot be read at all is moved aside
+     *
+     * <p>`EACCES` is a different failure from "does not parse": there is no line to point at,
+     * the person did nothing wrong, and the machine will not let us look. Refusing it means
+     * every page that needs the table dies at once — the receiving row reads "异常", the
+     * feature page turns into a card that says it has nowhere to write, and the settings page
+     * offers only a delete button. That happened on a real phone: an install changed the
+     * app's uid, the file still belonged to the previous one, and the whole app stopped
+     * working over a permission bit.
+     *
+     * <p>The directory is ours, so the file can be *moved* even when it cannot be opened:
+     * rename needs write permission on the directory, not on the file. Moving it aside and
+     * reading again leaves a table that works, keeps the old bytes for anyone who wants to
+     * look with root, and costs the person his custom settings — which he had already lost,
+     * because nothing could read them. {@link #recoveredFrom} records what was moved.
      */
     public static SettingsScreen open(Path file) throws IOException {
+        try {
+            return read(file);
+        } catch (IOException unreadable) {
+            Path aside = aside(file);
+            try {
+                Files.move(file, aside, StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException cannotMove) {
+                // 改名都不行时没有别的办法：把原来那个错原样抛出去，让页面能说清楚。
+                throw unreadable;
+            }
+            // 挪完再读一遍。文件已经不在了，所以这一遍走的是「首次启动」那条路：
+            // 每一行都是默认值，而默认值正是这个类要的答案。
+            return read(file);
+        }
+    }
+
+    /**
+     * 那一次读不出来的设置文件被挪到了哪里；没发生过就是 null。
+     *
+     * <p>页面拿它说一句实话：现在显示的是默认值，原来那份东西还在这个路径下。不说的话，
+     * 人看到的是「设置全变回默认了」，而真正发生的事是「那份文件读不出来，被挪开了」。
+     *
+     * <p># 它读的是磁盘，不是「这次是不是我挪的」
+     *
+     * <p>这一点是踩过坑才定的。第一版把落点记在一个字段里，只有亲手执行了改名的那个
+     * 实例知道；可是这个类在启动时会被读**很多次**——{@link Tuning} 在别的页面之前就先读
+     * 一遍，那一次把文件挪走了，等设置页再来读时文件已经不在，于是它拿到一个干净的表，
+     * 字段是 null，那句实话永远说不出来（真机上验过：文件确实在
+     * {@code .unreadable} 下，页面却一个字没提）。
+     *
+     * <p>改成看磁盘之后，谁先读、读几次都不影响结论：落点在，就说明发生过这件事。
+     */
+    public Path recoveredFrom() {
+        Path aside = aside(file);
+        return Files.exists(aside) ? aside : null;
+    }
+
+    /** 挪开时的落点。固定一个名字，因为留一堆用不上的备份比留一个更难解释。 */
+    private static Path aside(Path file) {
+        return file.resolveSibling(file.getFileName() + ".unreadable");
+    }
+
+    private static SettingsScreen read(Path file) throws IOException {
         SettingsScreen screen = new SettingsScreen(file);
         for (Setting setting : catalog()) {
             screen.settings.add(setting);
@@ -307,6 +368,29 @@ public final class SettingsScreen {
                 setting.value = value;
                 screen.loaded.put(setting.key, value);
             }
+        }
+        screen.buildSections();
+        return screen;
+    }
+
+    /**
+     * The table with every row at its default, and nothing read from disk.
+     *
+     * <p>This is what the receiving path falls back to when the file cannot be read at all —
+     * a {@code chmod}, a half-written file, an owner that a reinstall changed. Refusing the
+     * connection instead would turn "one row is unreadable" into "this phone cannot receive
+     * anything", which is a much larger failure than the one that happened: every value on
+     * this table already has a default that works.
+     *
+     * <p>The settings page still shows the failure and still offers to delete the file, so
+     * the person can fix what this fallback only papers over. What the fallback buys is that
+     * they have a working receiver while they decide.
+     */
+    public static SettingsScreen defaults(Path file) {
+        SettingsScreen screen = new SettingsScreen(file);
+        for (Setting setting : catalog()) {
+            screen.settings.add(setting);
+            screen.loaded.put(setting.key, setting.value);
         }
         screen.buildSections();
         return screen;

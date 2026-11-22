@@ -75,9 +75,22 @@ public final class FluidModule extends XposedModule {
      * <p>它和上面的拦截器都在**流体云插件自己的 {@code DexClassLoader}** 里，用 SystemUI 的
      * loader {@code Class.forName} 找不到（2026-11-19 实测，日志是 {@code ClassNotFoundException}）。
      * 所以要先等到插件加载自己的类，借它那一刻的 loader。
+     *
+     * <p>**2026-11-21 系统更新后这个类名换过一次，而且是那种最难发现的换法**：新的
+     * {@code viewmodel.h} 依然存在（变成了一个只有三个状态回调的空壳 {@code ...statemachineengine.f}），
+     * 所以 {@code Class.forName} 照样成功，只在取字段时才报 {@code NoSuchFieldException: d} ——
+     * 日志里那一行「卡片不收回那一刀没装上：java.lang.NoSuchFieldException: d」就是这么来的。
+     * 真正搬走的是 {@code viewmodel.i}（继承 {@code seedling.base.b}），字段也重新排过：
+     * 卡列表 {@code d → e}、卡状态 {@code g → h}。
+     *
+     * <p>所以现在两个名字都试，而且**字段不再按名字取**（见 {@link #findStateField}）：
+     * 混淆器每次发版都会重排短名，但「状态是一个可变的 String，里面写着 CARD_STATE_*」
+     * 这个结构是它画卡时绕不开的。
      */
-    private static final String CARD_VIEW_MODEL =
-            "com.oplus.systemui.plugins.seedling.card.ui.viewmodel.h";
+    private static final String[] CARD_VIEW_MODELS = {
+            "com.oplus.systemui.plugins.seedling.card.ui.viewmodel.i",
+            "com.oplus.systemui.plugins.seedling.card.ui.viewmodel.h",
+    };
 
     /** {@code z} 为真、没有全屏意图、也不是 sticky 时系统自己就会给的值：胶囊 + 立即提醒。 */
     private static final int REMIND_TYPE_FORCED = 11;
@@ -105,9 +118,11 @@ public final class FluidModule extends XposedModule {
     /** 等插件加载类的那只临时钩子；装完就摘掉，不给每一次类加载都留一层壳。 */
     private static XposedInterface.HookHandle sLoaderWatch;
 
-    /** {@code CardContainerViewModel.d}：当前屏上那几张卡（{@code List<card.data.model.a>}）。 */
-    private static java.lang.reflect.Field sCardList;
-    /** {@code CardContainerViewModel.g}：卡片状态字符串，{@code CARD_STATE_AUTO} 之类。 */
+    /**
+     * 同一份 ViewModel 里那个卡片状态字符串（{@code CARD_STATE_AUTO} 之类）。
+     *
+     * <p>旧版叫 {@code g}、新版叫 {@code h}。同样按结构找：见 {@link #findStateField}。
+     */
     private static java.lang.reflect.Field sCardState;
 
     @Override
@@ -163,7 +178,9 @@ public final class FluidModule extends XposedModule {
             return chain.proceed();
         }
         Object name = chain.getArg(0);
-        if (!CARD_VIEW_MODEL.equals(name) && !FRONT_INTERCEPTOR.equals(name)) {
+        // 只认「卡片 ViewModel」这一个触发点，不认拦截器：拦截器那一刀按 2026-11-19 的取证
+        // 本来就不该装（装上反而让状态机判 REFUSED）。认它是白等一类加载。
+        if (!CARD_VIEW_MODELS[0].equals(name) && !CARD_VIEW_MODELS[1].equals(name)) {
             return chain.proceed();
         }
         sInstallingPlugin = true;
@@ -258,9 +275,19 @@ public final class FluidModule extends XposedModule {
      * 改它不会影响任何时长。
      */
     private void hookCardTimeout(ClassLoader pluginLoader) throws Exception {
-        Class<?> viewModel = Class.forName(CARD_VIEW_MODEL, false, pluginLoader);
-        sCardList = viewModel.getField("d");
-        sCardState = viewModel.getField("g");
+        Class<?> viewModel = null;
+        for (String name : CARD_VIEW_MODELS) {
+            try {
+                viewModel = Class.forName(name, false, pluginLoader);
+                break;
+            } catch (ClassNotFoundException ignored) {
+                // 另一个名字在更早/更晚的版本里，接着试。
+            }
+        }
+        if (viewModel == null) {
+            log(Log.ERROR, TAG, "两个类名都没有，这一版改了实现");
+            return;
+        }
 
         Method target = null;
         for (Method method : viewModel.getDeclaredMethods()) {
@@ -273,9 +300,13 @@ public final class FluidModule extends XposedModule {
             }
         }
         if (target == null) {
-            log(Log.ERROR, TAG, CARD_VIEW_MODEL + " 里找不到 l(String)，这一版改了实现");
+            log(Log.ERROR, TAG, viewModel.getName() + " 里找不到 l(String)，这一版改了实现");
             return;
         }
+
+        // 字段放在方法认出来之后再取：认错了类就根本不该动它的字段。
+        sCardState = findStateField(viewModel);
+        log(Log.INFO, TAG, "卡片状态字段=" + sCardState);
 
         hook(target)
                 .setPriority(PRIORITY_DEFAULT)
@@ -283,6 +314,31 @@ public final class FluidModule extends XposedModule {
                 .setId("opairdrop-card-keep")
                 .intercept(this::keepCard);
         log(Log.INFO, TAG, "已钩住卡片超时 " + target);
+    }
+
+    /**
+     * 找卡片状态那个字段：{@code CARD_STATE_AUTO} / {@code CARD_STATE_MANUAL} 就存在它里面。
+     *
+     * <p>同样不认名字（旧 {@code g}、新 {@code h}）。结构上它有两个特征：类型是
+     * {@code String}，而且**不是 final** —— 因为状态是运行时改的（见
+     * {@code capsule.data.repo.g} 里那句 {@code iVar.h = ... "CARD_STATE_MANUAL" : "CARD_STATE_AUTO"}）。
+     * 那一串 {@code final String} 是构造函数里定死的常量，排除掉就只剩它。
+     *
+     * <p>取不到不算致命：{@link #keepCard} 会退化成「只不收回、不改状态」，卡仍然留着，
+     * 只是要按按钮才消失。
+     */
+    private java.lang.reflect.Field findStateField(Class<?> viewModel) {
+        for (java.lang.reflect.Field field : viewModel.getDeclaredFields()) {
+            int modifiers = field.getModifiers();
+            if (java.lang.reflect.Modifier.isStatic(modifiers)) {
+                continue;
+            }
+            if (field.getType() == String.class && !java.lang.reflect.Modifier.isFinal(modifiers)) {
+                return field;
+            }
+        }
+        log(Log.ERROR, TAG, viewModel.getName() + " 里没有可变的 String 字段，状态改不动");
+        return null;
     }
 
     /**
@@ -300,11 +356,15 @@ public final class FluidModule extends XposedModule {
      *       否则卡会挂在那里没有任何手动关闭的办法。</li>
      * </ol>
      *
-     * <p>别家的卡一个字节都不动：先看 {@code d} 这个列表里有没有 key 带我们包名的元素。
+     * <p>别家的卡一个字节都不动：靠参数认。{@code l(String)} 的第一个参数就是卡片 key
+     * （形如 {@code 0|com.oshare.airdrop|2816|null|10456}），包名就在里面 —— 这比旧版去翻
+     * 卡列表里的 {@code a} 字段稳得多，那个字段名同样是混淆出来的，而且列表字段本身也已经
+     * 从 {@code d} 挪到了 {@code e}。能只读一个参数就不碰任何反射出来的字段。
      */
     private Object keepCard(XposedInterface.Chain chain) throws Throwable {
         Object self = chain.getThisObject();
-        if (self == null || !hasOurCard(self)) {
+        Object key = chain.getArg(0);
+        if (self == null || !(key instanceof String) || !((String) key).contains(SELF)) {
             return chain.proceed();
         }
         try {
@@ -316,36 +376,6 @@ public final class FluidModule extends XposedModule {
         }
         log(Log.INFO, TAG, "这张卡到期也不收回，改成手动展开态");
         return null;
-    }
-
-    /** 这一屏上的卡里有没有我们的（key 形如 {@code 0|com.oshare.airdrop|2816|null|10456}）。 */
-    private static boolean hasOurCard(Object viewModel) {
-        if (sCardList == null) {
-            return false;
-        }
-        try {
-            Object list = sCardList.get(viewModel);
-            if (!(list instanceof java.util.List)) {
-                return false;
-            }
-            for (Object card : (java.util.List<?>) list) {
-                if (card == null) {
-                    continue;
-                }
-                Object key;
-                try {
-                    key = card.getClass().getField("a").get(card);
-                } catch (Throwable t) {
-                    continue;
-                }
-                if (key instanceof String && ((String) key).contains(SELF)) {
-                    return true;
-                }
-            }
-        } catch (Throwable ignored) {
-            // 读不到就当作不是我们的：宁可让别家的卡按原样超时。
-        }
-        return false;
     }
 
     private void hookFrontBypass(ClassLoader loader) throws Exception {

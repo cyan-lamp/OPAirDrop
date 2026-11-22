@@ -18,6 +18,7 @@ import android.widget.TextView;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -208,6 +209,37 @@ final class SettingsPage {
     }
 
     /**
+     * 设置文件读不出来、被挪开过时，页顶那张卡；平时是空的。
+     *
+     * <p>不说这一句的代价在真机上见过一次：文件的属主被一次重装换掉，库读它得到
+     * {@code EACCES}，于是把文件挪到 {@code settings.conf.unreadable} 再按默认值起来——
+     * 从人的角度看，他设过的一切无声无息地变回了出厂值。真正发生的事是「那份文件我们读不动，
+     * 所以放到一边去了」，而这句话只有页面能说。
+     *
+     * <p>不用红色：没有东西坏掉，接收照常，只是他的自定义设置没读进来。一个红条会让人以为
+     * 现在就该处理什么。路径写在卡里，因为要找回旧值的人手里有 root 和 adb，他需要的是文件名。
+     */
+    private View recoveredNotice() {
+        Path aside = screen.recoveredFrom();
+        if (aside == null) {
+            // 一个零高度的 View，让 fill 不必为「有没有这张卡」分岔。
+            return new View(host);
+        }
+        LinearLayout card = chrome.card();
+        card.addView(chrome.text("旧的设置文件读不出来，已放到一边", 16, true, S.text));
+        TextView why = chrome.text(
+                "现在显示的是默认值。接收和发送都用默认值工作；原来那份文件没有被删除，"
+                        + "它在下面这个路径下。", 13, false, S.textDim);
+        why.setPadding(0, chrome.dp(6), 0, chrome.dp(6));
+        card.addView(why);
+        card.addView(chrome.caption(aside.toString()));
+        LinearLayout page = new LinearLayout(host);
+        page.setOrientation(LinearLayout.VERTICAL);
+        page.addView(card, chrome.margins(0, 16));
+        return page;
+    }
+
+    /**
      * 诊断板块底下那两颗：把级别掰回 debug，或者把当前的选择写下去。
      *
      * <p>它们只管日志级别，而诊断板块里现在**只剩这一行**——发现、发送、接收、设备四块都搬到
@@ -319,6 +351,8 @@ final class SettingsPage {
     private void fill() {
         body.removeAllViews();
         rows.clear();
+
+        body.addView(recoveredNotice());
 
         for (SettingsScreen.Section section : screen.sections()) {
             // 发现、发送、接收三块都撤了：发现没有可拨的，发送没有可设的，接收里唯一还用的

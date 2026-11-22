@@ -272,7 +272,6 @@ impl<R: Receiver> Server<R> {
                 // do not know what it was a request for.
                 Err(error) => return Err(Error::Http(error)),
             };
-
             let keep = if request.method() != "POST" {
                 // `405` and close: the body of a request we refuse is still in the stream,
                 // and framing it as the next head is how a refusal becomes a parse error.

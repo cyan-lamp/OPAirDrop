@@ -1,0 +1,16 @@
+diff --git a/vendor/qcom/opensource/wlan/qca-wifi-host-cmn/qdf/linux/src/qdf_nbuf.c b/vendor/qcom/opensource/wlan/qca-wifi-host-cmn/qdf/linux/src/qdf_nbuf.c
+index 8cb8f8af..07f4085e 100644
+--- a/vendor/qcom/opensource/wlan/qca-wifi-host-cmn/qdf/linux/src/qdf_nbuf.c
++++ b/vendor/qcom/opensource/wlan/qca-wifi-host-cmn/qdf/linux/src/qdf_nbuf.c
+@@ -6408,6 +6408,11 @@ unsigned int qdf_nbuf_update_radiotap(struct mon_rx_status *rx_status,
+ 	qdf_mem_copy(qdf_nbuf_data(nbuf), rtap_buf, rtap_len);
+ 	return rtap_len;
+ }
++
++uint16_t qdf_nbuf_get_radiotap_len(qdf_nbuf_t nbuf)
++{
++	return ieee80211_get_radiotap_len(qdf_nbuf_data(nbuf));
++}
+ #else
+ static unsigned int qdf_nbuf_update_radiotap_vht_flags(
+ 					struct mon_rx_status *rx_status,

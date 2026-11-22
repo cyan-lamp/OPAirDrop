@@ -1,0 +1,13 @@
+diff --git a/vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_data.c b/vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_data.c
+index 62b55874..1c7a4b23 100644
+--- a/vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_data.c
++++ b/vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_data.c
+@@ -3159,3 +3159,8 @@ bool wma_is_roam_in_progress(uint32_t vdev_id)
+ 
+ 	return wlan_cm_is_vdev_roam_started(wma->interfaces[vdev_id].vdev);
+ }
++
++/* OPAirShare passthru management/BA/target helpers.  Included once, here:
++ * the block calls wma_update_tx_send_params(), which is static to wma_data.c.
++ */
++#include "wma_opairshare_pas_mgmt.h"

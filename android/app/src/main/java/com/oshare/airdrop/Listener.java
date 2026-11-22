@@ -264,6 +264,15 @@ final class Listener {
     private final AtomicInteger serving = new AtomicInteger();
 
     /**
+     * 一共接下过多少条连接。只用于日志，不参与任何判断。
+     *
+     * <p>存在的理由只有一个：一次传输至少两条连接（探测和邀请），所以这个数字和它对端
+     * 报出的 {@code h} 一起，能把「同一台手机发来的两条连接」从「两台手机各来一条」里分出来。
+     * 没有它，日志里的时刻只是一串互不相干的 {@code accepted}。
+     */
+    private final AtomicInteger accepted = new AtomicInteger();
+
+    /**
      * 那一次「问人」的独占权：一张卡，一次只问一个人。
      *
      * <p># 为什么要有
@@ -621,6 +630,14 @@ final class Listener {
                 // The cast is what the socket factory above guarantees; accepting a plain
                 // Socket here is not a case that can arise, and a defensive instanceof
                 // would only hide it if it did.
+                //
+                // 时间戳，因为「弹窗慢」这件事此前只能靠人的感觉描述，而感觉不能用来定位。
+                // 一条邀请的等待被劈成两段：发送方从看到设备到发出 TCP 连接（不在本机，
+                // 量不到），以及本机从接受到问人（就在这里到 {@code serve} 里 decide 之间）。
+                // 打上这个时刻，两段就能分开算——如果两次 accept 相隔十几秒，那慢在门口；
+                // 如果 accept 很早而 decide 很晚，那慢在读取或解析。
+                Log.i(TAG, "accepted #" + accepted.incrementAndGet() + " from " + where(peer)
+                        + " at " + System.currentTimeMillis());
                 handOver((SSLSocket) peer);
             }
         } finally {
@@ -1040,11 +1057,18 @@ final class Listener {
         try {
             screen = SettingsScreen.open(file);
         } catch (IOException | RuntimeException unreadable) {
-            // A settings file that does not parse is the one failure a person can fix by
-            // hand, and refusing the connection is the alternative to receiving with values
-            // nobody chose.
-            setState("设置读不出来，连接被拒：" + unreadable.getMessage(), true);
-            return;
+            // 读不出来就用默认值接着收，不拒连接。
+            //
+            // 这条原来是把连接拒掉，理由是「不愿用没人选过的值收东西」。但代价不对等：表上
+            // 每一行都有能用的默认值，而拒掉之后这台手机就什么也收不到了——一次 chmod、
+            // 一个重装换掉的属主，就能把「一行读不出来」放大成「接收功能不存在」。设备上
+            // 真发生过一次（settings.conf 属主还是旧 uid），首页直接显示「异常」。
+            //
+            // 设置页仍然照常报这个错、仍然给删除按钮，所以人还是能把它修好；这一句留在
+            // 页面上，是让人知道现在用的是默认值而不是他设过的那些。
+            Log.i(TAG, "settings unreadable, receiving with defaults: " + describe(unreadable));
+            setState("设置读不出来，正在用默认值接收", false);
+            screen = SettingsScreen.defaults(file);
         }
 
         String configured = directoryOf(screen);
@@ -1094,7 +1118,13 @@ final class Listener {
                         // 谁想发什么。这三个字段（名字、件数、字节数）只在此时存在：连接一结束
                         // 就没有任何地方还记得它，而对端到底在分享面板里叫什么，是「别人能不能
                         // 找到我们」这件事唯一能留下证据的地方。
-                        Log.i(TAG, "offer from " + summary.replace('\t', ' '));
+                        //
+                        // 两个时刻一起打：accept 到握手、以及握手到问人。前者是本机的开销，后者
+                        // 是发送方读完 /Discover 之后自己想了多久才发 /Ask——「十秒才弹窗」到底
+                        // 是哪一段，这两个数一比就知道，而在此之前只有「感觉很久」。
+                        Log.i(TAG, "offer from " + summary.replace('\t', ' ') + " at "
+                                + System.currentTimeMillis() + ", " + millis(openedAt)
+                                + " ms after accept");
                         // 门在这里才关上，而且只关到这一步为止（见 {@link #card}）：一台设备
                         // 只有一张流体云卡，两条邀请同时在场会互相盖掉对方的按钮；接受之后的
                         // 进度、以及最后把文件搬进公共目录那一步，也都在这把锁里。而握手、读

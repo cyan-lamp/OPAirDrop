@@ -4769,3 +4769,4 @@ cm_send_ies_for_roam_invoke(struct wlan_objmgr_vdev *vdev, uint16_t dot11_mode)
 					op_mode);
 	return status;
 }
+

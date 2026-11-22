@@ -146,6 +146,16 @@ pub const CATALOG: &[Setting] = &[
         summary: "对端在探测应答里读到的机型。留空则使用系统报告的型号。",
     },
     Setting {
+        key: "receive.media_capabilities",
+        kind: Kind::Text { max_len: 4096 },
+        default: "",
+        title: "接收能力声明",
+        summary:
+            "探测应答里告诉对端「我能原样存下什么」。留空用内置值（声明 HEVC 与 MP4 容器）。\
+             这一行会覆盖内置值：只要填了内容，对端看到的就是这里的内容，而不是内置的那份——\
+             填入一份不含 public.mpeg-4 的声明（例如照抄真机 iPhone 的原文），对端仍会转码。",
+    },
+    Setting {
         key: "receive.directory",
         kind: Kind::Text { max_len: 512 },
         default: "",

@@ -32,7 +32,21 @@ MODULE_PARM_DESC(passthru_awdl_allow_concurrent,
 #include "cdp_txrx_ctrl.h"
 #include "cdp_txrx_mon.h"
 
-bool opairshare_passthru_monitor_active(void);
+/* The shipped qca_cld3_peach_v2.ko exports this, but no source in the build
+ * tree defines it: modpost fails with "opairshare_passthru_monitor_active
+ * undefined" as soon as the tree is rebuilt from the mirrored sources.  The
+ * shipped body is a single byte load of a .bss flag (0xaf90 in
+ * qca_cld3_peach_v2.ko: `adrp x8, 0xa000; ldrb w0, [x8]; ret`) and nothing in
+ * the tree ever writes that flag, so "never active" is what the shipped module
+ * does at runtime.  Keep the out-of-line definition so the module's symbol list
+ * stays identical, and make the answer explicit instead of reading a flag that
+ * does not exist here.
+ */
+bool opairshare_passthru_monitor_active(void)
+{
+	return false;
+}
+
 static void wt_reset_diagnostic_monitor_rx(void)
 {
 	void *soc;
@@ -53,6 +67,23 @@ module_param(passthru_dry_run, bool, 0644);
 static bool passthru_ht;
 module_param(passthru_ht, bool, 0444);
 MODULE_PARM_DESC(passthru_ht, "Diagnostic: use HT instead of EHT for passthru");
+/* Route the passthru channel change through 11ac.  Needed because SME rejects
+ * any width above 40 MHz for an 11n session, which is why every 80 MHz request
+ * came back -EOPNOTSUPP before the radio was ever asked.  It applies to the
+ * runtime change path always, and to the vdev START only when the request is
+ * itself 80 MHz or wider -- the 20/40 MHz bring-up keeps the shipped 11n/11be
+ * choice untouched.
+ */
+/* Enable the wide-channel profile: allow a passthru channel change wider than
+ * 40 MHz, i.e. the exclusive-radio 80 MHz bring-up.  The name is historical --
+ * the path no longer asks for 11ac (it asks for 11be, which is what produces
+ * `chanmode 26 (11BE_EHT80)`); the flag survives because it is the switch that
+ * bypasses the concurrency gate in wlan_hdd_set_wondertap_channel().
+ */
+static bool passthru_chan_11ac;
+module_param(passthru_chan_11ac, bool, 0444);
+MODULE_PARM_DESC(passthru_chan_11ac,
+	"Allow the wide (80 MHz) passthru channel change; phy mode stays 11be");
 static bool passthru_ndi_fw_authorize;
 module_param(passthru_ndi_fw_authorize, bool, 0444);
 MODULE_PARM_DESC(passthru_ndi_fw_authorize,
@@ -61,6 +92,19 @@ MODULE_PARM_DESC(passthru_ndi_fw_authorize,
 unsigned int opairshare_passthru_diag_flags(void)
 {
 	return (READ_ONCE(passthru_ht) ? 1 : 0) | (READ_ONCE(passthru_dry_run) ? 2 : 0);
+}
+
+/* Bandwidth of the most recent passthru channel request, in qdf_wondertap_rate_bw_t
+ * units. The vdev-start hook in target_if_vdev_mgr_tx_ops.c needs it because the
+ * start command carries no width of its own: firmware derives the width from
+ * phy_mode, and the bits below are the only place that knows whether this bring-up
+ * was asked to be wide.
+ */
+static unsigned int opairshare_wt_req_bw;
+
+bool opairshare_passthru_want_wide(void)
+{
+	return READ_ONCE(opairshare_wt_req_bw) >= WONDERTAP_RATE_BW_80;
 }
 
 
@@ -72,8 +116,11 @@ int opairshare_pas_channel_begin(uint8_t id, u64 *cookie);
 int opairshare_pas_channel_end(uint8_t id, u64 cookie, uint16_t freq, int error);
 void opairshare_pas_mgmt_resume(uint8_t id, uint16_t freq);
 int opairshare_pas_mgmt_stop(uint8_t id);
+/* Post-firmware-crash teardown: release software refs without WMI round trips. */
+void opairshare_pas_mgmt_abandon(uint8_t id);
 int opairshare_pas_rx_auto_start(u8 id, u16 freq, unsigned int bandwidth);
 int opairshare_pas_rx_fixed_channel(u8 id, u16 freq, unsigned int bandwidth);
+void opairshare_pas_rx_note_bandwidth(unsigned int bandwidth);
 int opairshare_pas_rx_setup_abort(u8 id);
 int opairshare_pas_rx_session_retire(u8 id);
 
@@ -201,7 +248,8 @@ static int opairshare_prepare_sta_dbs(struct hdd_context *hdd_ctx,
 static QDF_STATUS
 __wlan_hdd_set_wondertap_channel(struct hdd_context *hdd_ctx,
 				 struct hdd_adapter *adapter,
-				 const qdf_wondertap_set_freq_params_t *params)
+				 const qdf_wondertap_set_freq_params_t *params,
+				 bool runtime_retune)
 {
 	struct channel_change_req req = {0};
 	struct ch_params ch_params = {0};
@@ -221,6 +269,8 @@ __wlan_hdd_set_wondertap_channel(struct hdd_context *hdd_ctx,
 						 0, ch_width);
 	if (ret)
 		return QDF_STATUS_E_INVAL;
+	/* Read back by the vdev-start hook, which has no width of its own. */
+	WRITE_ONCE(opairshare_wt_req_bw, (unsigned int)params->bandwidth);
 	ret = opairshare_pas_rx_fixed_channel(adapter->deflink->vdev_id,
 			params->freq, params->bandwidth);
 	if (ret < 0)
@@ -239,8 +289,42 @@ __wlan_hdd_set_wondertap_channel(struct hdd_context *hdd_ctx,
 	req.sec_ch_offset = ch_params.sec_ch_offset;
 	req.center_freq_seg0 = ch_params.center_freq_seg0;
 	req.center_freq_seg1 = ch_params.center_freq_seg1;
-	sme_fill_channel_change_request(hdd_ctx->mac_handle, &req,
-					passthru_ht ? eCSR_DOT11_MODE_11n : eCSR_DOT11_MODE_11be);
+	/* The dot11 mode has to agree with the requested width: SME refuses
+	 * anything above 40 MHz for an 11n session, and an 11n vdev carrying
+	 * center 5775 came up with the tap UP but wonder0 stuck at NO-CARRIER --
+	 * firmware will not join an 80 MHz IBSS under HT20 (measured 2026-11-20).
+	 *
+	 * The target shape here is 802.11be / EHT80, not VHT80. Asking for
+	 * eCSR_DOT11_MODE_11be with an 80 MHz request is what LIM turns into
+	 * `chanmode 26 (11BE_EHT80), center_chan 5775, Tx SS 2`, i.e. exactly the
+	 * start the chip accepts. This branch used to ask for 11ac instead, which
+	 * replaced that EHT80 start with a VHT80 one and gained nothing: the
+	 * 126.8 MB / 1.28 MB/s run of 2026-11-20 was taken on the 11be shape.
+	 *
+	 * The 20/40 MHz profile keeps the 11n/11be choice this stack has always
+	 * used. `passthru_chan_11ac` still gates the wide path -- it is what
+	 * bypasses the concurrency check in wlan_hdd_set_wondertap_channel() --
+	 * but it no longer decides the phy mode.
+	 */
+	if (READ_ONCE(passthru_chan_11ac) &&
+	    (runtime_retune || params->bandwidth >= WONDERTAP_RATE_BW_80)) {
+		sme_fill_channel_change_request(hdd_ctx->mac_handle, &req,
+						eCSR_DOT11_MODE_11be);
+		/* The fill cannot make the request 11be by itself: it runs
+		 * sme_get_network_params(), which answers with the mode of an
+		 * existing session (11n here) via
+		 * csr_roam_get_phy_mode_band_for_bss(). Measured 2026-11-20 --
+		 * without this line an 80 MHz bring-up still reached firmware as
+		 * `chanmode 5 (11NG_HT20), center_chan 5775`, the tap came up and
+		 * wonder0 stayed NO-CARRIER. LIM derives the vdev phy_mode from
+		 * this field through wma_chan_phy_mode(), and 11be + 80 MHz is
+		 * what makes it EHT80 rather than VHT80.
+		 */
+		req.dot11mode = eCSR_DOT11_MODE_11be;
+	} else
+		sme_fill_channel_change_request(hdd_ctx->mac_handle, &req,
+					passthru_ht ? eCSR_DOT11_MODE_11n :
+					eCSR_DOT11_MODE_11be);
 	status = qdf_event_reset(&g_wt_ctx->wondertap_vdev_event);
 	if (QDF_IS_STATUS_ERROR(status))
 		return status;
@@ -292,6 +376,8 @@ __wlan_hdd_set_wondertap_channel(struct hdd_context *hdd_ctx,
 				adapter->deflink->vdev_id,
 				CDP_VDEV_SET_PASSTHRU_FREQ, val);
 	ret = opairshare_pas_channel_end(req.vdev_id, cookie, params->freq, 0);
+	if (!ret)
+		opairshare_pas_rx_note_bandwidth(params->bandwidth);
 	return qdf_status_from_os_return(ret);
 failed:
 	ret = opairshare_pas_channel_end(req.vdev_id, cookie, params->freq,
@@ -374,6 +460,22 @@ static
 void __wlan_hdd_destroy_wondertap_intf(struct hdd_context *hdd_ctx,
 				       struct hdd_adapter *adapter)
 {
+	/* The aux RX route holds a dev_hold() on the parent netdev for as long
+	 * as it is installed.  Releasing it here covers every teardown path --
+	 * normal stop, create failure, and the SSR force-cleanup done by
+	 * wlan_hdd_wondertap_unregister_ops -- because that path never calls
+	 * opairshare_aux_stop().  A leftover reference is exactly what makes
+	 * unregister_netdevice() spin forever on "waiting for wondertap0 to
+	 * become free. Usage count = 2".  The call is idempotent: once the
+	 * target pointer is NULL the route stop does nothing.
+	 */
+	opairshare_pas_aux_pre_stop(adapter);
+	/* Idempotent: a no-op once the flow-control bind has been forgotten or
+	 * abandoned.  Covers the teardown paths that never reach
+	 * opairshare_pas_mgmt_stop() -- notably create-failure, where a frame
+	 * can already have been accepted between start and the failure.
+	 */
+	opairshare_pas_mgmt_abandon(adapter->deflink->vdev_id);
 	wt_publish_event_ctx(NULL);
 	hdd_close_adapter(hdd_ctx, adapter, true);
 }
@@ -520,7 +622,7 @@ int __wlan_hdd_start_wondertap_intf(struct hdd_context *hdd_ctx,
 				   false);
 
 	status = __wlan_hdd_set_wondertap_channel(hdd_ctx, adapter,
-						  &params->channel);
+						  &params->channel, false);
 	if (QDF_IS_STATUS_ERROR(status)) {
 		ret = qdf_status_to_os_return(status);
 		goto delete_pe_session;
@@ -965,7 +1067,14 @@ int wlan_hdd_wondertap_set_freq(void *handle,
 	if (errno)
 		goto stop_trans;
 
-	if (!policy_mgr_is_chan_change_allowed_for_passthru(hdd_ctx->psoc,
+	/* The concurrency gate was written for a 20 MHz tap sharing a radio with
+	 * a STA.  In the wide-channel profile the radio is exclusive and the
+	 * whole point is a wider chandef, so the request goes through and SME is
+	 * left to judge it; otherwise every bw != 0 is refused here, before the
+	 * radio is asked anything.
+	 */
+	if (!READ_ONCE(passthru_chan_11ac) &&
+	    !policy_mgr_is_chan_change_allowed_for_passthru(hdd_ctx->psoc,
 							    wt_adapter->deflink->vdev_id,
 							    params->freq,
 							    wlan_hdd_wondertap_bw_to_hw_mode_bw(params->bandwidth))) {
@@ -975,7 +1084,8 @@ int wlan_hdd_wondertap_set_freq(void *handle,
 		goto stop_trans;
 	}
 
-	status = __wlan_hdd_set_wondertap_channel(hdd_ctx, wt_adapter, params);
+	status = __wlan_hdd_set_wondertap_channel(hdd_ctx, wt_adapter, params,
+						  true);
 	errno = qdf_status_to_os_return(status);
 
 stop_trans:
@@ -1260,6 +1370,24 @@ void wlan_hdd_wondertap_unregister_ops(struct device *dev, bool force_cleanup)
 	if (force_cleanup && g_wt_ctx) {
 		hdd_ctx = g_wt_ctx->hdd_ctx;
 		adapter = g_wt_ctx->wt_adapter;
+
+		/* Drop the aux route first: it holds a dev_hold() on this netdev
+		 * and would otherwise keep unregister_netdevice() waiting for a
+		 * reference that nothing else can release.  This path never runs
+		 * __wlan_hdd_stop_wondertap_intf(), so it has to do it here.
+		 */
+		opairshare_pas_aux_pre_stop(adapter);
+
+		/* Same reason, different owner.  The flow-control bind takes a
+		 * dev_hold() that only opairshare_flow_forget_locked() returns,
+		 * and that function refuses while the bridge still looks
+		 * accepting or while frames are pending -- both of which are
+		 * permanent once the MAC has crashed.  Refusing there leaves
+		 * Usage count = 2 and unregister_netdevice() below never
+		 * returns, with RTNL held.  Nothing in that path can be
+		 * retried, so use the abandoning variant.
+		 */
+		opairshare_pas_mgmt_abandon(adapter->deflink->vdev_id);
 
 		wlan_hdd_netif_queue_control(adapter,
 				     WLAN_STOP_ALL_NETIF_QUEUE_N_CARRIER,

@@ -284,6 +284,13 @@ pub(crate) struct Store {
     declared: u64,
     /// The budget and the collision rule, both from the settings.
     limits: Limits,
+    /// What the `/Discover` answer tells the peer it can store untouched.
+    ///
+    /// Held rather than read in `discover` because the settings are consumed before the
+    /// connection is served: `discover` runs inside the endpoint, where `Values` no longer
+    /// exists. The bytes are the row's value or [`opairdrop_airdrop::MEDIA_CAPABILITIES`],
+    /// already decided by `settings::media_capabilities`.
+    capabilities: Vec<u8>,
     /// What the connection has stored so far, in the frame a caller reads.
     landed: Report,
 }
@@ -297,7 +304,10 @@ impl Store {
 
 impl Receiver for Store {
     fn discover(&mut self) -> DiscoverAnswer {
-        DiscoverAnswer::new(self.name.clone())
+        // Not `DiscoverAnswer::new`: that answers with the crate constant, and the row is
+        // what makes a wrong guess undoable without a rebuild. See
+        // `settings::media_capabilities`.
+        DiscoverAnswer::with_capabilities(self.name.clone(), self.capabilities.clone())
     }
 
     /// Late exactly when there is somebody to ask: an early answer is written before the
@@ -633,6 +643,7 @@ pub(crate) unsafe fn serve(
         model: settings::model(&values, model),
         directory: PathBuf::from(directory),
         limits: settings::limits(&values),
+        capabilities: settings::media_capabilities(&values),
         landed: Report::default(),
         decide,
         watcher,
@@ -1221,6 +1232,7 @@ mod tests {
             model: String::new(),
             directory: root,
             limits: Limits::default(),
+            capabilities: opairdrop_airdrop::MEDIA_CAPABILITIES.as_bytes().to_vec(),
             landed: Report::default(),
             decide: None,
             watcher: None,

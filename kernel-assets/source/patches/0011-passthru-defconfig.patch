@@ -1,0 +1,10 @@
+diff --git a/vendor/qcom/opensource/wlan/qcacld-3.0/configs/sun_gki_peach-v2_defconfig b/vendor/qcom/opensource/wlan/qcacld-3.0/configs/sun_gki_peach-v2_defconfig
+index 6da3180d..18564dfd 100755
+--- a/vendor/qcom/opensource/wlan/qcacld-3.0/configs/sun_gki_peach-v2_defconfig
++++ b/vendor/qcom/opensource/wlan/qcacld-3.0/configs/sun_gki_peach-v2_defconfig
+@@ -423,3 +423,5 @@ CONFIG_WLAN_CHIPSET_LOG_MAX_SIZE=y
+ CONFIG_DP_FTM_MODE_SKIP_WBM_RING_INIT=y
+ CONFIG_FEATURE_WLAN_SUPPORT_USD=y
+ CONFIG_DP_TX_TRACKING=y
++CONFIG_DRIVER_PASSTHRU_MODE=y
++CONFIG_WONDER_SUPPORT=y

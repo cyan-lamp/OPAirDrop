@@ -28,7 +28,19 @@
 #define OPAIRSHARE_AGG_AWDL_LEN	8u
 #define OPAIRSHARE_AGG_IPV6_LEN	40u
 #define OPAIRSHARE_AGG_MAX_MSDU	2304u
-#define OPAIRSHARE_AGG_HARD_MAX	5u	/* subframes per A-MSDU, hard ceiling */
+/* Subframes per A-MSDU, hard ceiling.
+ *
+ * Kept in lockstep with the copy inlined into wma_opairshare_pas_mgmt.h.  That
+ * inlined copy is what the kernel compiles, this file is what stage54-agg.py
+ * regenerates it from: if the two disagree, a regeneration silently reverts the
+ * data path to the lower ceiling and nothing fails -- the link just goes back to
+ * five subframes a submission.  Nothing here enforces the match, so change both.
+ *
+ * 5 was the HT-era value.  A binding byte budget of 11454 octets (VHT A-MSDU
+ * ceiling) leaves room for 8 subframes at a 1200-octet MSDU:
+ * 26 + 8*(14+1200) + 7*2 = 9754, so the budget binds before this does.
+ */
+#define OPAIRSHARE_AGG_HARD_MAX	8u	/* subframes per A-MSDU, hard ceiling */
 /* LLC + AWDL header + IPv6 + TCP with the 12-byte timestamp option */
 #define OPAIRSHARE_AGG_PEEK		(OPAIRSHARE_AGG_LLC_LEN + OPAIRSHARE_AGG_AWDL_LEN + OPAIRSHARE_AGG_IPV6_LEN + 32u)
 

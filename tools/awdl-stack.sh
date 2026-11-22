@@ -131,6 +131,132 @@
 BASE=${BASE:-/data/local/tmp/opairdrop}
 STATE=$BASE/state
 AWDL_IF=wonder0
+
+# PHY class for the AWDL data frames.
+#
+# `passthru_awdl_phy` is not a diagnostic knob: it becomes
+# `tx_param.preamble_type = BIT(phy)` on every data frame. It used to be pinned
+# to 2 (HT) for every profile, including the 80 MHz one, on the belief that 2
+# meant VHT. It does not; see below. The value now follows the bandwidth,
+# because an HT preamble on an 80 MHz vdev is not a legal rate class.
+#
+# 2026-11-22: that caveat IS the wide profile's default now, not a fallback.
+# `passthru_awdl_phy` is a WMI_RATE_PREAMBLE index -- 0 OFDM, 1 CCK, 2 HT,
+# 3 VHT, 4 HE -- NOT the wondertap enum (0 LEGACY, 1 HT, 2 VHT, 3 HE, 4 EHT).
+# The two scales coincide only at 2 and 3, which is why `2` looked like VHT and
+# shipped as HT for so long. HT caps at 40 MHz and at a 4095-octet MPDU, so an
+# 80 MHz vdev transmitting HT preambles cannot carry the 7935-octet A-MSDUs
+# `amsdu_bytes` asks for: the oversize ones are exactly the frames that show up
+# as `followers_dropped`. VHT is the first preamble class that is both legal on
+# 80 MHz and allowed to carry an MPDU that large.
+#
+# EHT is still not reachable from here. `preamble_type` is a 5-bit field
+# (WMI_TX_SEND_PARAM_PREAMBLE_SET(dword1, 15, 5)) and EHT needs BIT(5), which
+# masks to zero -- "firmware picks", reported as success. The only EHT channel
+# is wmi_vdev_param_fixed_rate (preamble at bit 8), see
+# wlan_hdd_wondertap.c::opairshare_wt_set_fixed_rate().
+#
+# The four knobs below are one decision, not four. VHT on an HT20 vdev is not a
+# legal rate class any more than HT is on an 80 MHz one, and 11454 octets is the
+# *VHT* A-MSDU ceiling -- an HT vdev cannot carry it. So they follow the same
+# `$STATE/wide` switch the join and `passthru_ht` follow, and the narrow profile
+# stays byte-identical to the 3.24 MB/s baseline it was measured on.
+if [ -f "$STATE/wide" ]; then
+    # Wide: 80 MHz join, VHT preamble, VHT A-MSDU ceiling.
+    AWDL_PHY_DEF=3
+    AWDL_MCS_DEF=9
+    # Overridable because the two numbers are a *build* property, not a profile
+    # one: `passthru_awdl_amsdu_bytes` is range-checked by the module itself and
+    # its ceiling is `OPAIRSHARE_AMSDU_BYTES_MAX`. The overlay source raised that
+    # to 11454, but the shipped bytes in `kernel-assets/*.ko.gz.bak` still carry
+    # the 7935 HT ceiling, and passing 11454 to them fails `insmod` outright
+    # (`failed to load …: Invalid argument`, rc=12 at `driver-swap`).
+    # So a wide-join test on shipped bytes must pin these two to the values the
+    # module accepts: `AMSDU_MAX=5 AMSDU_BYTES=7935 … awdl-stack.sh boot`.
+    AMSDU_MAX=${AMSDU_MAX:-8}
+    AMSDU_BYTES=${AMSDU_BYTES:-11454}
+    # The vdev's FIXED TX RATE stays HT20 / 1 SS / MCS7 in the wide profile too,
+    # and that is not an oversight -- it is the only shape a peer in its
+    # non-transfer state can decode.
+    #
+    # 2026-11-22 05:30 measured the alternative. With this line at 2/2/1/2/9
+    # (VHT80 / 2 SS / MCS9) the two phones stopped seeing each other entirely:
+    # the daemon logged rx=0p/0B while `psf`, `peer_map` and `other` kept
+    # climbing, i.e. the receive path still heard the iPhone's presence frames
+    # but the iPhone could not decode a single one of ours. Its slot map at that
+    # moment was 8 slots on 149 and 1 on 6 -- the non-transfer shape -- and a
+    # receiver holding 20 MHz cannot demodulate an 80 MHz PPDU.
+    #
+    # This also explains why the 4.25 MB/s baseline ever worked: `wonder-ven feed`
+    # hardcoded 1/0/1/1/7 and nothing overrode it, so `wmi_vdev_param_chwidth`
+    # quietly clamped the "80 MHz" vdev back to 20 MHz at start-up. That bug was
+    # load bearing. Fixing it without this line is what made us disappear.
+    #
+    # So the width has to be re-introduced the way AWDL itself does it: stay at
+    # 20 MHz while discovering, widen once the peer enters its transfer state
+    # (slot map ~15x149 + 1x6). Until that two-phase switch exists in the driver,
+    # the wide profile buys only the A-MSDU ceiling, not the radio width.
+    #
+    # Override per-run to retest a wider rate: `VEN_PRE=2 VEN_BW=2 VEN_NSS=2
+    # VEN_MCS=9 tools/awdl-stack.sh boot`.
+    VEN_PRE_DEF=1; VEN_BW_DEF=0; VEN_GI_DEF=1; VEN_NSS_DEF=1; VEN_MCS_DEF=7
+else
+    # Narrow: HT20 join, HT preamble, HT A-MSDU ceiling.
+    AWDL_PHY_DEF=2
+    AWDL_MCS_DEF=7
+    AMSDU_MAX=${AMSDU_MAX:-5}
+    AMSDU_BYTES=${AMSDU_BYTES:-7935}
+    VEN_PRE_DEF=1; VEN_BW_DEF=0; VEN_GI_DEF=1; VEN_NSS_DEF=1; VEN_MCS_DEF=7
+fi
+
+# A/B knob for the data-frame rate class, same shape as VEN_* below.
+#
+# This exists because the wide profile's VHT request is the only untested step
+# between the known-good shape and a firmware hang (2026-11-22 10:53,
+# `Received firmware hang event`, mhi `cause=7003`, 0.9 s after the IBSS came
+# up). Everything else in the wide profile -- EHT80 vdev, 2 SS, bw_mask=80 MHz
+# -- was already in place on 2026-11-20 and survived, so the preamble class is
+# the variable. `AWDL_PHY=2 AWDL_MCS=7 tools/awdl-stack.sh boot` puts the rate
+# class back to HT while keeping the wide join and A-MSDU ceiling, which
+# separates "VHT preamble crashes firmware" from "80 MHz join crashes firmware"
+# without a rebuild.
+AWDL_PHY=${AWDL_PHY:-$AWDL_PHY_DEF}
+AWDL_MCS=${AWDL_MCS:-$AWDL_MCS_DEF}
+
+# The vdev's fixed TX rate, in `wonder-ven rate` terms. This is a SECOND enum
+# family from AWDL_PHY above and must not be confused with it:
+#
+#   wonder-ven rate : preamble LEGACY=0 HT=1 VHT=2 HE=3 EHT=4
+#   passthru_awdl_phy (WMI_RATE_PREAMBLE): OFDM=0 CCK=1 HT=2 VHT=3 HE=4 EHT=5
+#
+# They only coincide at 2 and 3, which is exactly why `phy=2` spent so long
+# looking like VHT when it was HT. The narrow defaults below are not a guess:
+# they are what `wonder-ven feed` already hardcodes, so leaving them in place
+# keeps the narrow profile byte-identical to the measured 3.24 MB/s baseline.
+#
+# Overridable from the environment so a slower knob can be tried without editing
+# the file: `VEN_PRE=4 tools/awdl-stack.sh boot`. EHT is deliberately not the
+# default -- see the long note at the call site, the vdev is created in chanmode
+# VHT80 and a preamble above the vdev's own mode has no rate table to draw from.
+VEN_PRE=${VEN_PRE:-$VEN_PRE_DEF}
+VEN_BW=${VEN_BW:-$VEN_BW_DEF}
+VEN_GI=${VEN_GI:-$VEN_GI_DEF}
+VEN_NSS=${VEN_NSS:-$VEN_NSS_DEF}
+VEN_MCS=${VEN_MCS:-$VEN_MCS_DEF}
+
+# Does our ADDBA Response advertise A-MSDU Supported?  (`BIT(0)` of the BA
+# Parameter Set, which upstream writes as a hard 0.)
+#
+# This is the receive direction's only lever and it is not bandwidth-dependent,
+# so it is not inside the wide/narrow branch. A peer will not put more than one
+# MSDU in an MPDU towards a receiver that said it cannot take them -- that is
+# the whole 3.42 MB/s -> 13.00 MB/s step in the reference driver, and it is why
+# receive sits still no matter how wide the channel is.
+#
+# Claims like this are safe to test because the REO deaggregates in hardware:
+# dp_rx sees an nbuf chain with one MSDU per buffer, not an A-MSDU. Override
+# with `BA_AMSDU=0 tools/awdl-stack.sh boot` to get the old byte-for-byte path.
+BA_AMSDU=${BA_AMSDU:-1}
 # The frequency to feed the tap and join the IBSS on. It is not a variable: it is
 # always the social channel, and `AWDL_FREQ` can only produce a complaint.
 #
@@ -489,10 +615,19 @@ load_stack() {
     # aggregate at 27.8 ms, 5x7935 gives 5641 B at 41.5 ms on a NOHT link, which is
     # why the pair only pays off together with HT20 (now 17.2 ms at 5x7935).
     #
-    # collect_us=1500 turns the aggregation timer on. At 0
+    # collect_us turns the aggregation timer on. At 0
     # `opairshare_collect_delay_locked()` returns on its first line, so an A-MSDU
     # ships only when the ring happens to fill: 3.6 msdu/agg, `deferrals` 0. At
     # 1500 the timer defers and the average went to 4.54 msdu/agg.
+    #
+    # It is now 2000 because the driver clamps it there anyway
+    # (`if (wait_us > 2000) wait_us = 2000;` in opairshare_collect_remaining),
+    # so anything above 2000 is the same number wearing a different label.
+    # Note what the timer cannot do: the goal is `amsdu_max` frames, and the
+    # wait only continues while more frames are actually queued. A queue that
+    # holds one frame per 2 ms produces one-frame aggregates no matter what
+    # this value says -- measured 2026-11-21, 58% of transmissions were single
+    # frames at 1500 us.
     #
     # retry=0 and tid=-1 are negative results, kept as defaults because both were
     # measured to hurt:
@@ -508,25 +643,47 @@ load_stack() {
     # are correct from the first frame, before any traffic exists. (`apply_tuning`
     # below re-asserts them at runtime for the paths that skip the reload.)
     TUNE_INSMOD="
-        passthru_awdl_amsdu=2 passthru_awdl_amsdu_max=5 passthru_awdl_amsdu_bytes=7935
+        passthru_awdl_amsdu=2 passthru_awdl_amsdu_max=$AMSDU_MAX passthru_awdl_amsdu_bytes=$AMSDU_BYTES
         passthru_awdl_collect_us=1500
-        passthru_awdl_phy=2 passthru_awdl_mcs=7 passthru_awdl_rate_mbps=54 passthru_awdl_nss=2
+        passthru_awdl_phy=$AWDL_PHY passthru_awdl_mcs=$AWDL_MCS passthru_awdl_rate_mbps=54 passthru_awdl_nss=2
         passthru_awdl_capacity=256 passthru_awdl_lowmark=128 passthru_awdl_backpressure=1
         passthru_awdl_attempts=3 passthru_awdl_retry=0 passthru_awdl_retry_max=8
         passthru_awdl_retry_budget_ms=500
-        passthru_awdl_ba_window=64 passthru_awdl_addba=1 passthru_awdl_ack_policy=0
+        passthru_awdl_ba_window=256 passthru_awdl_addba=1 passthru_awdl_ack_policy=0
+        passthru_awdl_ba_amsdu=$BA_AMSDU
         passthru_awdl_ackfilter=0 passthru_awdl_tid=-1 passthru_awdl_host_seq=1
         passthru_awdl_rx_order_ms=0"
+    # Both `passthru_ht` and `passthru_chan_11ac` are module parameters, so the
+    # wide profile has to be decided before insmod, not at retune time.
+    #
+    # `passthru_ht=0` is what actually gets a wide vdev: with ht=1 the start
+    # command goes out as `chanmode 5 (11NG_HT20)` and the computed 80 MHz
+    # centre is dropped; with ht=0 the same request lands as
+    # `chanmode 26 (11BE_EHT80), center_chan 5775, Tx SS 2`. Measured 2026-11-20,
+    # 126.8 MB transferred at 1.28 MB/s with `bad=0` on that shape -- the width
+    # was reserved and never used, because the TX path still asked for 20 MHz.
+    #
+    # `passthru_chan_11ac=1` is still what lets an 80 MHz request past the
+    # concurrency gate; it no longer forces a VHT phy mode (see
+    # wlan_hdd_wondertap.c), so the bring-up above stays 11be.
+    WIDE_CHAN_PARAM=0
+    HT_PARAM=1
+    if [ -f "$STATE/wide" ]; then
+        WIDE_CHAN_PARAM=1
+        HT_PARAM=0
+    fi
     # shellcheck disable=SC2086  # word splitting is the point: one insmod argument per word
     insmod "$BASE/qca_cld3_peach_v2.ko" \
-        passthru_awdl_addba=1 passthru_awdl_native_rx=1 passthru_ht=1 passthru_fwtype=7 \
+        passthru_ht=$HT_PARAM passthru_chan_11ac=$WIDE_CHAN_PARAM \
+        passthru_awdl_addba=1 passthru_awdl_native_rx=1 passthru_fwtype=7 \
         passthru_mon_rings=0 passthru_dry_run=0 passthru_mon_chan_sync=1 passthru_ndi_peer=1 \
-        passthru_ndi_no_up=1 passthru_mgmt_bridge=1 passthru_aux_monitor=1 passthru_tx_audit=1 \
+        passthru_ndi_no_up=1 passthru_mgmt_bridge=1 passthru_aux_monitor=${AUX_MON:-1} \
+        passthru_aux_wide=${AUX_WIDE:-1} passthru_tx_audit=1 \
         passthru_ndi_fw_authorize=0 passthru_awdl_wmi_raw=1 passthru_awdl_target_mac="" \
         passthru_awdl_target_auto=1 passthru_awdl_target_enable=1 passthru_awdl_target_auth=2 \
         passthru_native_data_rx=1 passthru_awdl_raw_rx=1 passthru_awdl_rx_dedup=1 \
         passthru_awdl_rx_auto=1 passthru_awdl_rx_rearm=1 \
-        passthru_sta_coexist=3 passthru_sta_regular_rx=1 passthru_sta_action_rx=1 \
+        passthru_sta_coexist=2 passthru_sta_regular_rx=1 passthru_sta_action_rx=1 \
         passthru_pas_discovery_actions=1 \
         $TUNE_INSMOD \
         || return 12
@@ -693,10 +850,10 @@ wait_sta() {
 # A refused write is reported, not retried: `backpressure` is compiled in (0444)
 # and everything else is writable. A value that reads back different from what was
 # written means the driver clamped it, which is the one thing worth knowing.
-TUNE_RUNTIME="amsdu=2 amsdu_max=5 amsdu_bytes=7935 collect_us=1500 phy=2 mcs=7
+TUNE_RUNTIME="amsdu=2 amsdu_max=$AMSDU_MAX amsdu_bytes=$AMSDU_BYTES collect_us=1500 phy=$AWDL_PHY mcs=$AWDL_MCS
     rate_mbps=54 nss=2 capacity=256 lowmark=128 attempts=3 retry=0 retry_max=8
-    retry_budget_ms=500 ba_window=64 ack_policy=0 ackfilter=0 tid=-1 host_seq=1
-    rx_order_ms=0"
+    retry_budget_ms=500 ba_window=256 ack_policy=0 ackfilter=0 tid=-1 host_seq=1
+    ba_amsdu=$BA_AMSDU rx_order_ms=0"
 
 passthru_dir() { echo /sys/module/qca_cld3_peach_v2/parameters; }
 
@@ -940,6 +1097,62 @@ link_up() {
             || { say 'wonder-ven feed failed; wondertap0 will not come up'; return 1; }
     fi
 
+    # Wide profile, off unless `$STATE/wide` exists.
+    #
+    # wonder.ko only accepts SET_FREQUENCY while the tap is inactive and caches
+    # it for the start_ap that `up` triggers, so the 80 MHz request has to be
+    # written here -- after the caches, before the interface is ever opened.
+    # A down/up cycle cannot be used instead: it loses the IBSS join and
+    # wonder0 sits at NO-CARRIER even at 20 MHz (measured 2026-11-20).
+    #
+    # What this buys, measured on the same date: the vdev starts as
+    # `chanmode 10 (VHT80), center_chan 5775, Tx SS 2` instead of
+    # `chanmode 5 (HT20)` with the wide centre silently dropped.
+    if [ -f "$STATE/wide" ]; then
+        "$BASE/wonder-ven" "$AWDL_IF" freq "$freq" 2 >/dev/null \
+            || { say 'wide: freq 80 refused'; return 1; }
+        say 'wide: cached 80 MHz before first up'
+    fi
+
+    # The vdev's fixed TX rate, cached before the same first `up` and for the
+    # same reason as the frequency: wonder.ko pushes cached_tx_rate into the vdev
+    # inside `wondertap_init` and only caches it afterwards, so a value written
+    # after `up` never reaches firmware except through the provider's probe hook,
+    # which only prints.
+    #
+    # This was the missing line. `wonder-ven feed` fills four caches and its rate
+    # default is 1/0/1/1/7 -- HT, 20 MHz, 1 SS, MCS7 -- and dmesg has been saying
+    # so all along:
+    #
+    #   Set fixed TX rate: preamble=1, bw=0, gi=1, nss=1, mcs=7
+    #
+    # `__wlan_hdd_wondertap_set_fixed_tx_rate()` then feeds that `bw` straight
+    # into `wmi_vdev_param_chwidth`, so the vdev that `freq 80` had just widened
+    # is narrowed back to 20 MHz one call later, and `wmi_vdev_param_fixed_rate`
+    # pins every frame on the vdev to a single HT20 rate. That is the observed
+    # "TX is still 20 MHz on an 80 MHz link", and it also explains a geometry
+    # mismatch that nothing else did: the peer descriptor a few lines further
+    # down takes its bandwidth from `params->channel.bandwidth` (80), while the
+    # vdev runs at `params->tx_rate.bw` (20).
+    #
+    # EHT is not the answer at this layer even though the driver maps it
+    # (`wlan_hdd_convert_wonder_preamble_to_wmi()` has an EHT case and
+    # ASSEMBLE_RATECODE_V1 puts preamble at bit 8, so it is not masked off like
+    # the 5-bit `preamble_type` field is). The vdev is created in chanmode VHT80;
+    # a fixed rate above the vdev's own mode has no rate table behind it. Making
+    # EHT real means raising the vdev mode, not this number.
+    #
+    # Failure here is not fatal -- worse rates than we have now is the worst case
+    # and the defaults are still in the cache from `feed`, so complain and go on.
+    if ! "$BASE/wonder-ven" "$AWDL_IF" rate "$VEN_PRE" "$VEN_BW" "$VEN_GI" \
+            "$VEN_NSS" "$VEN_MCS"; then
+        say "fixed rate $VEN_PRE/$VEN_BW/$VEN_GI/$VEN_NSS/$VEN_MCS refused;" \
+            'the vdev keeps the feed defaults (HT20 / 1 SS / MCS7)'
+    else
+        say "fixed rate cached: pre=$VEN_PRE bw=$VEN_BW gi=$VEN_GI" \
+            "nss=$VEN_NSS mcs=$VEN_MCS"
+    fi
+
     # `ip link set up` is the first thing that runs the vendor tap's
     # initialisation, and it is refused while the provider is still settling:
     # measured 2026-11-14, the first attempt after a cold `insmod wonder` returns
@@ -986,7 +1199,13 @@ link_up() {
         # fixed-freq is load bearing: without it mac80211 keeps rescanning to
         # merge with other IBSS networks of the same SSID, taking the radio off
         # this channel every 30s.
-        iw dev "$AWDL_IF" ibss join "$AWDL_SSID" "$freq" HT20 fixed-freq "$AWDL_BSSID" 2>/dev/null \
+        #
+        # The width here is mac80211's view, and it is what the peer reads out
+        # of the beacons' HT/VHT IEs. HT20 was the only option while the vdev
+        # was HT; in the wide profile the join asks for 80 MHz so the two agree.
+        JOIN_WIDTH=HT20
+        [ -f "$STATE/wide" ] && JOIN_WIDTH=80MHz
+        iw dev "$AWDL_IF" ibss join "$AWDL_SSID" "$freq" "$JOIN_WIDTH" fixed-freq "$AWDL_BSSID" 2>/dev/null \
             || say 'ibss join failed'
         wait_carrier "$AWDL_IF" || say 'carrier still down after 10s'
     fi
@@ -1445,6 +1664,56 @@ start_guard() {
     return 1
 }
 
+# `awdld` has exactly one fatal failure, and nothing above it notices.
+#
+# An error out of the packet socket is not a transient the read loop retries:
+# `awdld.rs` treats it as the end of the run and exits 1. The case that produces
+# it is the one the bring-up causes itself -- `wonder-ven freq` answers -EBUSY on
+# a tap that is already up, `link_up` recreates the interface to get round that,
+# and the netdev the AF_PACKET socket is pinned to is destroyed underneath it
+# (`awdld: reading the radio failed: Network is down (os error 100)`, measured
+# with `ifindex` going 286 -> 303). After that the daemon is gone for the rest of
+# the boot: the tap is up, the app looks like it is listening, and the phone is
+# invisible to every peer at once.
+#
+# This loop is the only thing still running at that moment, so it is where the
+# second chance has to live. Bounded on purpose: a daemon that dies because there
+# is nothing to bind to will die again, and a guard that respawns it every two
+# seconds turns one broken boot into a fork bomb with a log. The budget is five
+# per boot, not five in a row -- it is deliberately not reset by a successful
+# revive, because a counter that resets itself cannot tell "the link hiccuped
+# once" from "the interface is being recreated in a loop".
+DAEMON_REVIVE_MAX=5
+revive_daemon() {
+    pidof awdld >/dev/null 2>&1 && return 0
+    # Nothing to revive against: `stop` ran, the phone rebooted, or the stack was
+    # never built. The interface is the test, not the pid file -- `stop` removes
+    # it first, so a link that is already down cannot be resurrected into one.
+    [ -e "$PCI/wondertap0" ] || return 0
+    same_boot "$STATE/stack-boot" || return 0
+    if [ "$revive_n" -ge "$DAEMON_REVIVE_MAX" ]; then
+        # Said once. Repeating it every tick would bury the line that matters --
+        # and the daemon's own reason is still on the last line of its log.
+        if [ "$revive_n" -eq "$DAEMON_REVIVE_MAX" ]; then
+            say "DAEMON_REVIVE_GAVEUP tries=$revive_n why=$(tail -n 1 "$STATE/awdld.log" 2>/dev/null)"
+        fi
+        revive_n=$((revive_n + 1))
+        return 0
+    fi
+    revive_n=$((revive_n + 1))
+    say "DAEMON_REVIVE try=$revive_n the link is up and nothing is reading it"
+    if start_daemon ''; then
+        say "DAEMON_REVIVED pid=$DAEMON_PID tun=$DAEMON_TUN"
+        # The receipt in `files/stack-state` names the pid it was published for,
+        # and the app reads it to decide whether the stack is up. Left alone it
+        # goes on naming the daemon that died, which is the one thing the app
+        # cannot check for itself -- it has no business calling `pidof`.
+        boot_receipt 0
+    else
+        say "DAEMON_REVIVE failed: $(tail -n 1 "$STATE/awdld.log" 2>/dev/null)"
+    fi
+}
+
 # The loop itself.
 #
 # Its lifetime is the person's intent, not the stack's. While `receive.manual` is
@@ -1467,6 +1736,7 @@ cmd_guard() {
     echo $$ > "$GUARD_PID"
     born=$(date +%s)
     quiet=
+    revive_n=0
     while :; do
         now=$(date +%s)
         if listening; then
@@ -1476,6 +1746,10 @@ cmd_guard() {
             # only this tick, never the loop: "in front now" says nothing about the
             # next tick, and whoever presses home does not come back to warn us.
             [ -e "$FRONT_FLAG" ] || keep_unfrozen
+            # After the unfreeze, because the revive blocks for as long as it
+            # takes to get a pid and a tunnel -- up to 30 s in the bad case, which
+            # is 30 s of the app being freezable if this ran the other way round.
+            revive_daemon
         else
             [ -n "$quiet" ] || quiet=$now
             if [ $((now - quiet)) -ge 180 ]; then
@@ -1563,6 +1837,13 @@ boot_receipt() {
     fi
     say "BOOT_RESULT $line"
     publish "$line"
+    # Only on a real link: `ratewatch` moves a fixed rate that only exists once
+    # the tap is up, and starting it over a failed bring-up would just log
+    # switch failures against a vif that is not there.
+    if [ "$rc" = 0 ] && [ "$word" = 'stack up' ]; then
+        pkill -f "$0 ratewatch" 2>/dev/null
+        ( nohup "$0" ratewatch >/dev/null 2>&1 & )
+    fi
 }
 
 # `start`, for the app to run on itself.
@@ -1912,6 +2193,65 @@ cmd_exclusive() {
     return $rc
 }
 
+# Two-phase data rate -- the one lever this whole day found that pays.
+#
+# Discovery has to stay at HT20 / 1 SS / MCS7. A peer in its non-transfer state
+# holds a 20 MHz receiver: an 80 MHz PPDU is undecodable to it, and on
+# 2026-11-22 05:30 fixing the vdev width without keeping the rate narrow is what
+# made the two phones disappear from each other entirely.
+#
+# Its slot map is the tell. 8x149 + 1x6 (or sparser) is "not transferring";
+# 15x149 + 1x6 is "transferring". So watch that one field and move the tap's
+# fixed rate only while it is full:
+#
+#   full  -> wonder-ven rate 2 2 1 2 9   VHT / 80 MHz / SGI / 2 SS / MCS9
+#   empty -> wonder-ven rate 1 0 1 1 7   back to the feed default
+#
+# Measured 2026-11-22 22:25 on the shipped `152b93ad` bytes, same iPhone, same
+# ko, only this switch moving: 0.46 MB/s -> 2.09 MB/s average over the transfer
+# with a 3.68 MB/s peak. The reverting half is not politeness -- if the wide
+# rate turns out to be undecodable the map goes sparse by itself and this drops
+# back within a few seconds instead of stranding the link.
+#
+# It reads the daemon's own STAT line rather than asking the driver, because
+# that line is the only place the peer map is decoded, and it costs one grep.
+RATE_WIDE='2 2 1 2 9'
+RATE_NARROW='1 0 1 1 7'
+
+cmd_ratewatch() {
+    [ "$(id -u)" = 0 ] || die 'must run as root'
+    log=$STATE/rate2phase.txt
+    cur=narrow
+    low=0
+    say "RATEWATCH_START cur=$cur wide='$RATE_WIDE' narrow='$RATE_NARROW'"
+    while [ -e "$PCI/$AWDL_IF" ] || [ -e "$STATE/stack-boot" ]; do
+        # `|| true` on both: this file runs under `set -eo pipefail`, and `grep`
+        # exits 1 when the map has no 149 at all -- which is exactly the
+        # discovery state this loop is supposed to wait through. Without it the
+        # watcher dies on its first sample instead of idling.
+        map=$(grep -o 'peer_map=[0-9,]*' "$STATE/awdld.log" 2>/dev/null | tail -1 | cut -d= -f2) || true
+        n=$(printf '%s\n' "$map" | tr ',' '\n' | grep -c '^149$') || true
+        if [ "$cur" = narrow ] && [ "$n" -ge 14 ]; then
+            # Retry once: `rc=2` was seen when the tap is mid-rebuild.
+            "$BASE/wonder-ven" "$AWDL_IF" rate $RATE_WIDE >/dev/null 2>&1 || \
+                { sleep 1; "$BASE/wonder-ven" "$AWDL_IF" rate $RATE_WIDE >/dev/null 2>&1; }
+            rc=$?
+            if [ "$rc" = 0 ]; then cur=wide; low=0; fi
+            printf '%s SWITCH_WIDE rc=%s slots=%s pm=%s\n' "$(date +%s)" "$rc" "$n" "$map" >> "$log"
+        elif [ "$cur" = wide ]; then
+            if [ "$n" -le 8 ]; then low=$((low + 1)); else low=0; fi
+            if [ "$low" -ge 6 ]; then
+                "$BASE/wonder-ven" "$AWDL_IF" rate $RATE_NARROW >/dev/null 2>&1
+                rc=$?
+                if [ "$rc" = 0 ]; then cur=narrow; low=0; fi
+                printf '%s SWITCH_NARROW rc=%s slots=%s pm=%s\n' "$(date +%s)" "$rc" "$n" "$map" >> "$log"
+            fi
+        fi
+        sleep 1
+    done
+    say 'RATEWATCH_STOP link gone'
+}
+
 case "${1:-status}" in
     start) cmd_start ;;
     # The arguments are passed on: `cmd_boot` reads `$2` as the name the app wants
@@ -1928,6 +2268,7 @@ case "${1:-status}" in
     exclusive) cmd_exclusive ;;
     status) cmd_status ;;
     guard) cmd_guard ;;
+    ratewatch) cmd_ratewatch ;;
     watch) cmd_watch ;;
     *)
         echo 'Usage: awdl-stack.sh start|boot|stop|link|share|exclusive|status|guard|watch'

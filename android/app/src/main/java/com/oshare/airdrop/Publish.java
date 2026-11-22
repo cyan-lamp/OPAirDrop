@@ -44,6 +44,19 @@ import java.util.concurrent.atomic.AtomicLong;
  * 会让人打开一个长度不对的文件。{@code IS_PENDING = 1} 把它们藏起来，整份拷完并核对过
  * 字节数才置 0，也就是「要么看不见，要么就是完整的一份」。
  *
+ * <p># 重名不让这一份消失
+ *
+ * <p>插入时把名字交给媒体库去重是不够的。它自己会在重名时试 {@code name (1).ext} 到
+ * {@code name (32).ext}，全占满就抛 {@code Failed to build unique file}；更要紧的是它
+ * 的「这个名字空着吗」是一次查询，而门口现在同时站着好几条连接（见 {@code Listener}
+ * 的类注释）——两条连接对同一个名字各查一次，都得到「空着」，然后一起去建同一个文件。
+ * 2026-11-21 的日志正是这个形状：四条失败落在 {@code 26.080} 到 {@code 26.156} 的
+ * 七十六毫秒里，而单份 5.7 MB 的串行拷贝要几百毫秒，它们只能是并发撞的。
+ *
+ * <p>所以这里自己负责这件事：撞上了就换一个号再插（见 {@link #numbered}）。序号从 1
+ * 顺次试，不是从计数器取，因为需要的是「最小可用名」，不是「下一个没用过的数」——
+ * 目录里的 {@code (1)} 可能早就被上一轮占了。
+ *
  * <p># 失败怎么算
  *
  * <p>一个文件存不下不牵连别的：这一批里成功的留在公共目录，失败的记在 {@link Result}
@@ -144,7 +157,18 @@ final class Publish {
         List<String> skipped = new ArrayList<>();
         String reason = "";
         long landed = 0;
+        // 同一个名字在一次 offer 里出现多遍是常见形状：对端把一张照片加进选择两次、或者
+        // 在「转换后再发」的流程里把原图和转换结果列在一起（见 2026-11-21 那条 10 项、
+        // 只有 2 个唯一名的 offer）。库里按名字落盘，所以那 5 个同名成员写到的是暂存区里
+        // 的同一个文件——搬第 2 遍开始就是同一份字节的重复拷贝，而每一次都要在公共目录里
+        // 再抢一次同一个名字，撞车的次数随重复数平方上涨。
+        //
+        // 这里按名字收一次。丢掉的不是内容：那些成员本来就是同一份。
+        java.util.Set<String> seen = new java.util.LinkedHashSet<>();
         for (String name : report.names()) {
+            if (!seen.add(name)) {
+                continue;
+            }
             File source = new File(staged, name);
             // 成员的另一种形态是目录（cpio 里的 TYPE_DIRECTORY），它没有字节可搬；而
             // 「名字在报告里、文件却不在」只可能是库里中途放弃了这个成员，两种情况都不该
@@ -191,15 +215,7 @@ final class Publish {
             replace(resolver, collection, name, directory);
         }
 
-        ContentValues values = new ContentValues();
-        values.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
-        values.put(MediaStore.MediaColumns.MIME_TYPE, mime);
-        values.put(MediaStore.MediaColumns.RELATIVE_PATH, directory);
-        values.put(MediaStore.MediaColumns.IS_PENDING, 1);
-        Uri uri = resolver.insert(collection, values);
-        if (uri == null) {
-            throw new IOException("无法在「" + directory + "」里创建文件");
-        }
+        Uri uri = insert(resolver, collection, name, mime, directory);
 
         long copied = 0;
         try {
@@ -248,6 +264,65 @@ final class Publish {
             }
         }
         return new Entry(finalName, strip(finalDirectory), copied, uri);
+    }
+
+    /**
+     * 在公共目录里要一行，重名就让号。
+     *
+     * <p>媒体库给的名字只在插入那一刻核对一次，而我们门口同时站着好几条连接，所以
+     * 「名字空着」这个答案随时可能过期。撞上了它抛 {@link IllegalStateException}
+     * （消息是 {@code Failed to build unique file}），这里接住、改一个号、再要一次。
+     *
+     * <p>只接这一种失败。其它 {@code RuntimeException}——没有权限、卷卸了、列不存在——
+     * 换成别的名字也一样过不去，重试只会把真正的原因埋到第三十二次之后。
+     */
+    private static Uri insert(ContentResolver resolver, Uri collection, String name, String mime,
+                              String directory) throws IOException {
+        RuntimeException refusal = null;
+        for (String candidate : numbered(name)) {
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.MediaColumns.DISPLAY_NAME, candidate);
+            values.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+            values.put(MediaStore.MediaColumns.RELATIVE_PATH, directory);
+            values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+            try {
+                Uri uri = resolver.insert(collection, values);
+                if (uri == null) {
+                    // 不是「名字被占」的形态（那是抛异常），而是这一卷根本不给建行。
+                    throw new IOException("无法在「" + directory + "」里创建文件");
+                }
+                return uri;
+            } catch (IllegalStateException taken) {
+                String message = taken.getMessage();
+                if (message == null || !message.contains("unique file")) {
+                    throw taken;
+                }
+                refusal = taken;
+            }
+        }
+        throw new IOException("「" + name + "」在「" + directory + "」里连着三十二个名字都被占了",
+                refusal);
+    }
+
+    /**
+     * 一轮候选名：原名，然后 {@code name (1).ext} 到 {@code name (32).ext}。
+     *
+     * <p>三十二是媒体库自己的上限（它内部就是这个数），这里不比它少也不比它多：少一个
+     * 就可能在它还能成的地方先失败，多一个则它一定先抛。
+     *
+     * <p>序号插在扩展名前面而不是末尾：{@code clip.mp4 (1)} 不是视频，相册按扩展名认
+     * 类型，那样存下去就是一个打不开的条目。
+     */
+    private static Iterable<String> numbered(String name) {
+        List<String> candidates = new ArrayList<>(33);
+        candidates.add(name);
+        int dot = name.lastIndexOf('.');
+        String stem = dot < 0 || dot == name.length() - 1 ? name : name.substring(0, dot);
+        String suffix = dot < 0 || dot == name.length() - 1 ? "" : name.substring(dot);
+        for (int number = 1; number <= 32; number++) {
+            candidates.add(stem + " (" + number + ")" + suffix);
+        }
+        return candidates;
     }
 
     /**
