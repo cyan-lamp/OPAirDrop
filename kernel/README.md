@@ -1,4 +1,4 @@
-# kernel-assets：随包内核载荷与驱动源码
+# kernel：随包内核载荷与驱动源码
 
 ## 这个目录是干什么的（先读这一段）
 
@@ -15,7 +15,7 @@ passthru / monitor 混杂收帧、NDI vdev 身份、AWDL 目标过滤这些能�
   链路起不来时 `awdl-stack.sh stop` 也能恢复。
 
 载荷与源码必须一起看，否则这些二进制只是一堆黑盒。目录位于**仓库根目录**
-`repo-src/kernel-assets/`（2026-11-22 从 `android/kernel-assets/` 移上来）；Gradle 的
+`repo-src/kernel/`（2026-11-22 从 `android/kernel/` 移上来）；Gradle 的
 `stageKernelAssets` 任务从这里读取，编译期 gunzip 进 APK 的 `assets/kernel/`。
 
 ## 载荷
@@ -149,7 +149,7 @@ bash tools/kernel/build-wlan-baseline.sh
 #   用源码树自带的 llvm-strip（绝对路径，避免 wsl.exe bash -lc 吞 $VAR）：
 STRIP=/mnt/opairshare-build/opairshare/kernel_platform/prebuilts/clang/host/linux-x86/clang-r510928/bin/llvm-strip
 "$STRIP" --strip-debug qca_cld3_peach_v2.ko -o stripped.ko   # → 约 20 MB
-gzip -9 -n -c stripped.ko > kernel-assets/qca_cld3_peach_v2.ko.gz   # -n 保证可复现
+gzip -9 -n -c stripped.ko > kernel/qca_cld3_peach_v2.ko.gz   # -n 保证可复现
 #   同步更新本 README 载荷表的字节数与 sha256（tools/make-kernel-assets.sh 会打印这张表）
 ```
 
@@ -177,7 +177,7 @@ gzip -9 -n -c stripped.ko > kernel-assets/qca_cld3_peach_v2.ko.gz   # -n 保证�
 ```bash
 bash tools/kernel/verify-reproduce.sh
 # total 115  same 113  diff 0  missing 0  expected-absent 2   （EXIT=0 才算过）
-python3 kernel-assets/check-map.py
+python3 kernel/check-map.py
 # .c listed: 22   .c dead: 0
 ```
 
@@ -301,7 +301,7 @@ qcacld-3.0/<x>         ->  <x>
 现在 `check-map.py` 就是照这条规则查的，改完覆盖层或映射都跑一遍（在 WSL 里，因为 bzl 在构建树）：
 
 ```bash
-python3 android/kernel-assets/check-map.py     # 期望：.c listed: 22   .c dead: 0
+python3 android/kernel/check-map.py     # 期望：.c listed: 22   .c dead: 0
 ```
 
 同一类错误对 `.h` 不适用——头文件跟着包含它的那个 .c 走，单独查没意义，脚本只报数不判定。

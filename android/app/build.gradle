@@ -10,15 +10,15 @@ def rustTarget = 'aarch64-linux-android'
 def rustSo = new File(repoRoot, "target/${rustTarget}/release/libopairdrop_ffi.so")
 
 // The kernel payload: four modules that are not ours, one vendor helper, and the bring-up
-// script. They are checked in gzipped (11 MB instead of 38) under `kernel-assets/` at the
+// script. They are checked in gzipped (11 MB instead of 38) under `kernel/` at the
 // repository root, and staged into an asset root at build time so the APK carries them
 // uncompressed-in-name but deflated-in-zip, which is what `AssetManager.open` gives back
 // as the original bytes.
 //
 // Generated into a build directory rather than kept in `src/main/assets` for the same reason
 // as the Rust library: they are artefacts, and a 38 MB copy in the source tree is a copy
-// nobody refreshes. `kernel-assets/README.md` says where each byte came from.
-def kernelSrc = new File(repoRoot, 'kernel-assets')
+// nobody refreshes. `kernel/README.md` says where each byte came from.
+def kernelSrc = new File(repoRoot, 'kernel')
 def kernelAssetDir = layout.buildDirectory.dir('kernelAssets')
 def awdld = new File(repoRoot, "target/${rustTarget}/release/awdld")
 def stackScript = new File(repoRoot, 'tools/awdl-stack.sh')
@@ -201,7 +201,7 @@ def stageKernelAssets = tasks.register('stageKernelAssets') {
         if (gz.isEmpty()) {
             throw new GradleException(
                     "no module payloads in ${kernelSrc}\n" +
-                    "see kernel-assets/README.md for where they come from")
+                    "see kernel/README.md for where they come from")
         }
         gz.each { File source ->
             String name = source.name.substring(0, source.name.length() - '.gz'.length())

@@ -168,7 +168,7 @@ if [ -f "$STATE/wide" ]; then
     # Overridable because the two numbers are a *build* property, not a profile
     # one: `passthru_awdl_amsdu_bytes` is range-checked by the module itself and
     # its ceiling is `OPAIRSHARE_AMSDU_BYTES_MAX`. The overlay source raised that
-    # to 11454, but the shipped bytes in `kernel-assets/*.ko.gz.bak` still carry
+    # to 11454, but the shipped bytes in `kernel/*.ko.gz.bak` still carry
     # the 7935 HT ceiling, and passing 11454 to them fails `insmod` outright
     # (`failed to load …: Invalid argument`, rc=12 at `driver-swap`).
     # So a wide-join test on shipped bytes must pin these two to the values the

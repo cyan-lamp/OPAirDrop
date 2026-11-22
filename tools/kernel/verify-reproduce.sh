@@ -8,7 +8,7 @@
 #   3. sha256-compare every file the build tree changed against the real tree
 #
 # A clean run prints `same == total` and exits 0. Anything else is a gap in
-# kernel-assets/source, not a flaw in this script.
+# kernel/source, not a flaw in this script.
 #
 # Note the two-repo shape: the root workspace repo covers vendor/ and
 # kernel_platform/oplus/, while kernel_platform/msm-kernel/ is its own git
@@ -21,7 +21,7 @@ V=$ROOT/verify-clean
 HERE=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 # HERE is repo-src/tools/kernel; the repo is two levels up.
 REPO=$(cd "$HERE/../.." && pwd)
-SRC=$REPO/kernel-assets/source
+SRC=$REPO/kernel/source
 # The 114-file list ships in the repo so a third party can run this without our scratch
 # directory. OPAIRSHARE_EXPECT_LIST overrides it for local experiments.
 LIST=${OPAIRSHARE_EXPECT_LIST:-$SRC/expected-files.txt}

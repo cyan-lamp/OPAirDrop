@@ -2,7 +2,7 @@
 # tolerates CRLF. A Makefile with CRLF fails on the first variable assignment,
 # and a patch with CRLF is rejected as corrupt. Store these bytes verbatim,
 # whatever core.autocrlf says.
-android/kernel-assets/source/** -text
+android/kernel/source/** -text
 
 # Shell scripts are pushed to the device and run there, where a trailing CR
 # becomes part of the command name. Keep them LF everywhere.

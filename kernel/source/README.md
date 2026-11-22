@@ -69,7 +69,7 @@ bash tools/kernel/verify-reproduce.sh
 完整流程见仓库根 [README.md](../../README.md)，本目录所属载荷的说明见
 [上级 README.md](../README.md)。迁移到其他 SoC 或 WLAN 驱动版本时，
 先在 `source-map.json` 里把 `kernel_path` 换到新树的位置，再跑
-`python3 kernel-assets/check-map.py` 确认每个覆盖层 `.c` 都被 `*.bzl` 登记
+`python3 kernel/check-map.py` 确认每个覆盖层 `.c` 都被 `*.bzl` 登记
 （期望 `.c listed: 22   .c dead: 0`）——判据是 bzl 清单，不是目录名像不像。
 
 注意 `check-map.py` 读的是**构建树里的 bzl**，所以要在 WSL/构建卷里跑，不能只拷仓库。

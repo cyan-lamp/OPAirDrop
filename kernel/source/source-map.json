@@ -78,7 +78,7 @@
   },
   "kernel/driver/wlan_hdd_opairshare_aux_rx.h": {
     "kernel_path": "vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_opairshare_aux_rx.h",
-    "sha256": "de49a75d7b4c36ab24b575cf6df714453f3b3011b3848df89716ab4b66b15172"
+    "sha256": "263538591b8c790f4caf44bcf53dad5d648becba4fcd717c817caf56d3a3ba6b"
   },
   "kernel/driver/wlan_hdd_opairshare_awdl_rx_dedup.h": {
     "kernel_path": "vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_opairshare_awdl_rx_dedup.h",

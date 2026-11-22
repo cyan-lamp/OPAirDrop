@@ -6,13 +6,13 @@
 # that ran. Hand-copying is how a rebuild gets picked up half-way and the app loads a driver
 # one build behind — which does not fail, it loads and behaves like the older code.
 #
-# The hash table it prints is the one in `kernel-assets/README.md`; if the two
+# The hash table it prints is the one in `kernel/README.md`; if the two
 # disagree, one of them is wrong and the diff says which file changed.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$here/.." && pwd)
-out=$root/kernel-assets
+out=$root/kernel
 
 source_root=${1:-}
 if [ -z "$source_root" ]; then
@@ -43,5 +43,5 @@ done
 cp "$helper" "$out/wonder-ven"
 
 echo
-echo "SHA-256 of what went in (compare with kernel-assets/README.md):"
+echo "SHA-256 of what went in (compare with kernel/README.md):"
 (cd "$out" && sha256sum ./*.gz wonder-ven)

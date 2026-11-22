@@ -12,7 +12,7 @@ module_param(passthru_aux_monitor, bool, 0644);
 MODULE_PARM_DESC(passthru_aux_monitor, "Opt-in native monitor RX companion for PAS/NDI");
 
 /* Runtime-writable on purpose (2026-11-22): the shipped bytes kept in the
- * "gz.bak" payload under kernel-assets deliver AWDL data through the DP raw
+ * "gz.bak" payload under kernel deliver AWDL data through the DP raw
  * path, not through this monitor -- measured over one boot, the monitor moved
  * 3.2 MB in 8 099 packets while `wonder0` moved 88.3 MB in 71 825, a 27x
  * difference on the same traffic.  The overlay build depends on the monitor

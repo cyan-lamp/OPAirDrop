@@ -22,7 +22,7 @@ set -euo pipefail
 ROOT=${OPAIRSHARE_BUILD_ROOT:-/mnt/opairshare-build}
 TREE=$ROOT/opairshare
 HERE=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-SRC=$(cd "$HERE/../../kernel-assets/source" && pwd)
+SRC=$(cd "$HERE/../../kernel/source" && pwd)
 
 CHECK_ONLY=0
 OVERLAY_ONLY=0
