@@ -229,29 +229,8 @@ final class ReceiveHost {
         private final long id;
         private final String session;
 
-        /** 问一次并等答案。{@link #decided} 落下来之后才读。 */
-        private final CountDownLatch decided = new CountDownLatch(1);
-        private volatile boolean accepted;
-
-        /**
-         * 有人真的回答过。
-         *
-         * <p>和 {@link #accepted} 不是一件事：两者都为假时，「人说了不行」和「一直没人理」
-         * 长得一模一样，而它们该被说成两句不同的话——一句进日志，另一句决定连接断了之后要不要
-         * 留一张失败卡（见 {@link #abandon}）。过去两种情况共用一句「已拒绝」，于是超时被读成
-         * 「它自己拒的」；这不是猜错，是我们从来没把这件事记下来。
-         */
-        private volatile boolean answered;
-
-        /**
-         * 人在哪个表面上回答的：{@code "card"} 或 {@code "notification"}，没人回答时是
-         * {@code null}。
-         *
-         * <p>记它的理由只有一条：卡片会不会出现，是这台机器上最不可观测的一件事。别处也没有
-         * 能推出它的东西（那个 binder 桥 2026-11-19 一并删了），所以「这次到底是怎么被回答的」
-         * 只可能是事实，不能是推断。
-         */
-        private volatile String answeredFrom;
+        /** 这次邀请的答案，以及它是怎么来的。五个状态的关系只写在那里。 */
+        private final Decision decision = new Decision();
 
         /**
          * 这次邀请是在云端卡上问的（{@link LiveCard}），不是本应用的通知。
@@ -263,9 +242,6 @@ final class ReceiveHost {
 
         /** 这条连接。人说取消时关掉它，读字节的那条线程会从这里出来。 */
         private final Socket peer;
-
-        /** 人按过取消。收尾时用它把日志写成 {@code cancelled}，而不是 {@code unanswered}。 */
-        private volatile boolean cancelled;
 
         /**
          * 进度卡上【取消接收】那颗按钮，第一次画进度时造一次。
@@ -342,7 +318,7 @@ final class ReceiveHost {
          * 收掉连接时的 {@code ECONNABORTED} 说成「连接被系统切断，检查后台限网」。
          */
         boolean answered() {
-            return answered;
+            return decision.answered();
         }
 
         /**
@@ -356,7 +332,7 @@ final class ReceiveHost {
          * 那条判据同源。
          */
         boolean cancelled() {
-            return cancelled;
+            return decision.cancelled();
         }
 
         /**
@@ -368,7 +344,7 @@ final class ReceiveHost {
          * 限网」。人明明点了拒绝，屏幕上却劝他查路由器。
          */
         boolean declined() {
-            return answered && !accepted;
+            return decision.declined();
         }
 
         /**
@@ -464,13 +440,14 @@ final class ReceiveHost {
             // 这一行把两者分开，也把耗时写下来——超时这个数只有在拒绝之后才看得见，
             // 而人看到的是一张很久之前就弹出来的卡片。
             Log.i(TAG, "invitation " + session
-                    + (wanted ? " accepted" : answered ? " refused" : " unanswered")
+                    + " " + decision.verdict()
                     + " after " + (System.currentTimeMillis() - askedAt) + " ms"
                     // 前半句是「问在哪」，后半句是「答在哪」。它们可以不同：卡片先问、三秒后
                     // 兜底通知接手，人是从通知进来的——这正是那段兜底存在的理由，日志必须能
                     // 把它和「卡片画出来了」区分开。
                     + " asked=" + asked
-                    + " answered=" + (answered && answeredFrom != null ? answeredFrom : "nobody"));
+                    + " answered=" + (decision.answered() && decision.from() != null
+                            ? decision.from() : "nobody"));
             if (!wanted) {
                 // 「人说了不行」和「一直没人理」的分别只在上一条日志里：对发送端是同一个 401，
                 // 对人也一样——这张卡撤掉，不留话。要分得清就得去看那一行。
@@ -675,16 +652,16 @@ final class ReceiveHost {
             // 21:01–21:03 连收七次，六次停在 64 / 192 / 576 KiB，卡片上什么都不留、日志里也
             // 分不出「人按了取消」和「对面走了」——而这两件事在下一步该改哪儿上，答案相反。
             Log.i(TAG, "receive " + session + " ended "
-                    + (cancelled ? "cancelled" : accepted ? "accepted" : "unanswered")
+                    + decision.ending()
                     + " at " + percent + "%");
-            if (cancelled) {
+            if (decision.cancelled()) {
                 // 人自己按的【取消接收】：这不是失败，是**他要的**结果。
                 //
                 // 过去这里先看 accepted，于是「人点了接收、传到一半按了取消」照样走
                 // {@code failed("连接意外断开")}，胶囊上弹一条说对面断了的红字——因果整个
                 // 说反了：对面没有断，是我们把它掐了。取消只有一个下场：撤卡，不留话。
                 end();
-            } else if (accepted) {
+            } else if (decision.accepted()) {
                 failed("连接意外断开");
             } else {
                 // 人按了取消、或者一直没人应答——在这边是同一个收尾：撤卡，不留话。过去这两者
@@ -696,10 +673,7 @@ final class ReceiveHost {
 
         /** 人说收，或者说不收。两个表面最后都落到这里。 */
         void answer(boolean yes, String from) {
-            accepted = yes;
-            answered = true;
-            answeredFrom = from;
-            decided.countDown();
+            decision.answer(yes, from);
             // 通知那条路可能正在等：通知按钮和卡片按钮回答的是同一件事，所以两边都叫醒。
             // 没有人在等的时候它什么也不做。
             Confirmation.answer(session, yes);
@@ -714,7 +688,7 @@ final class ReceiveHost {
          * <p>真正关连接那一步不在这里做，见 {@link #abort}。
          */
         void cancel() {
-            cancelled = true;
+            decision.cancel();
             // 先把屏幕上这张卡收掉，再去动连接。
             //
             // 昨晚那次顺序反了：写 400 之后要停一会儿（不停就是 RST，400 会跟着丢），而
@@ -724,7 +698,7 @@ final class ReceiveHost {
             // 与 HangUp 里那一行配对：这一行是「广播到了、决定取消」，那一行是「RST 交给内核」。
             // 两行相减就是我们的反应时间；再和对面说失败的时刻比，才知道延迟在谁那儿。
             Log.i(TAG, "cancel requested at " + percent + "%");
-            if (decided.getCount() > 0) {
+            if (!decision.answered()) {
                 // 人是从卡片上的取消进来的，所以来源记 card；日志里那一句要知道是谁按的。
                 answer(false, "card");
                 return;
@@ -744,7 +718,7 @@ final class ReceiveHost {
             // 已经在收（人点过接收）时走「先回 400 再关」：对面正在上传，等的是一个响应。
             // 还在等人应答时走 RST —— 那一步 Rust 自己会回 401，我们再塞一段 400 只会让
             // 协议里出现两句互相矛盾的话。
-            if (accepted) {
+            if (decision.accepted()) {
                 HangUp.refuse(peer);
             } else {
                 HangUp.now(peer);
@@ -788,12 +762,7 @@ final class ReceiveHost {
             int total = (int) ((decisionMs + 999) / 1000);
             Thread ticker = new Thread(() -> {
                 for (int left = total - 1; left >= 1; left--) {
-                    try {
-                        if (decided.await(1, TimeUnit.SECONDS)) {
-                            return;
-                        }
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
+                    if (decision.tick()) {
                         return;
                     }
                     try {
@@ -809,14 +778,7 @@ final class ReceiveHost {
         }
 
         private boolean await(long timeoutMs) {
-            try {
-                decided.await(timeoutMs, TimeUnit.MILLISECONDS);
-            } catch (InterruptedException interrupted) {
-                // 接收端正在被关掉。把中断还回去，让上层知道它该退出。
-                Thread.currentThread().interrupt();
-                return false;
-            }
-            return accepted;
+            return decision.await(timeoutMs);
         }
     }
 }
