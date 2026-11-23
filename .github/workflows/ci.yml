@@ -35,7 +35,10 @@ jobs:
         run: |
           # android-37 平台不在 runner 预装里；P1-25 的正式修法（支持 minor level 的
           # AGP）落地前，这里用 sdkmanager 钉版本装齐三件套。
-          sdkmanager --install "platforms;android-37" "build-tools;37.0.0" "ndk;27.3.13750724" > /dev/null
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKMANAGER" ] || SDKMANAGER=$(find "$ANDROID_HOME" -name sdkmanager -type f | head -1)
+          yes | "$SDKMANAGER" --licenses > /dev/null
+          "$SDKMANAGER" --install "platforms;android-37" "build-tools;37.0.0" "ndk;27.3.13750724" > /dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.3.13750724" >> "$GITHUB_ENV"
 
       - name: clippy（0 警告门禁）
