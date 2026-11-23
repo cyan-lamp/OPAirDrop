@@ -76,7 +76,9 @@ public final class StackCheck {
     private static void aFullBringUpReadsAsReady(File dir) throws IOException {
         write(dir, "stack up iface=wonder0 freq=5745 ll=fe80::80ca:efff:fe94:508b"
                 + " wifi=0 daemon=28854 tun=up");
-        StackState.State state = StackState.read(dir);
+        // 这条回执不带 boot= 字段：显式桌面语义读它，否则 Linux 上（/proc 有 boot id）
+        // 会被判 stale，"ready" 的断言全反（评审 P1-23 的 CI 教训）。
+        StackState.State state = StackState.read(dir, "");
         check("a full line is up", state.up(), state.standing().toString());
         check("the interface is read", "wonder0".equals(state.iface()), state.iface());
         check("the interface is present", state.ifacePresent(), state.iface());

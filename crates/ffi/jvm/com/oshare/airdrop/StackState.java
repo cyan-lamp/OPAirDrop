@@ -353,7 +353,13 @@ public final class StackState {
 
     /** Reads the receipt. A missing file is not an error: it is "the script never ran". */
     public static State read(File dir) {
-        return parse(firstLine(new File(dir, RECEIPT)));
+        return read(dir, currentBoot());
+    }
+
+    /** Same, with the boot named by the caller — the checks drive both outcomes on a
+     *  machine that may or may not have {@code /proc} (评审 P1-23 的 CI 教训). */
+    public static State read(File dir, String currentBoot) {
+        return parse(firstLine(new File(dir, RECEIPT)), currentBoot);
     }
 
     /** Reads a receipt from text, for a caller that already has it. */
