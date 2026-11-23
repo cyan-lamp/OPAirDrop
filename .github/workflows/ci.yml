@@ -46,6 +46,10 @@ jobs:
               d=$(find "$ANDROID_HOME/platforms" -maxdepth 1 -type d -name 'android-37*' | head -1)
               mv "$d" "$ANDROID_HOME/platforms/android-37"
             fi
+            # package.xml 里的 <localPackage path="platforms;android-37.2"> 与目录名必须
+            # 一致，AGP 的 SDK handler 按它对账——本机的手工步骤（P1-25）也是这么改的。
+            sed -i 's#platforms;android-37\.[0-9]*#platforms;android-37#' \
+                "$ANDROID_HOME/platforms/android-37/package.xml"
           fi
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           [ -x "$SDKMANAGER" ] || SDKMANAGER=$(find "$ANDROID_HOME" -name sdkmanager -type f | head -1)
