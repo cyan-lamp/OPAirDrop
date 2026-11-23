@@ -1476,7 +1476,7 @@ final class Peers {
     private void collectOwnAddresses() {        try {
             for (NetworkInterface nic : Collections.list(NetworkInterface.getNetworkInterfaces())) {
                 for (InetAddress address : Collections.list(nic.getInetAddresses())) {
-                    own.add(bare(address.getHostAddress()));
+                    own.add(Addresses.bare(address.getHostAddress()));
                 }
             }
         } catch (Exception ignored) {
@@ -1485,12 +1485,7 @@ final class Peers {
     }
 
     /** 去掉 {@code %wlan0} 这样的 scope 后缀再比：同一条链路本地地址在两块网卡上写法不同。 */
-    private static String bare(String address) {
-        int percent = address.indexOf('%');
-        String bare = percent < 0 ? address : address.substring(0, percent);
-        return bare.toLowerCase(java.util.Locale.ROOT);
-    }
-
+    
     /** 这块网卡上有没有 IPv4。只有 IPv6 链路本地时，组播组必须换成 ff02::fb。 */
     private static boolean hasIPv4(NetworkInterface nic) {
         for (InetAddress address : Collections.list(nic.getInetAddresses())) {
@@ -1613,7 +1608,7 @@ final class Peers {
         }
         String rows = lines.trim().replace('\n', '|');
         trace("rx " + data.length + "B " + (question ? "Q" : "A") + " from "
-                + (from == null ? "?" : bare(from.getHostAddress()))
+                + (from == null ? "?" : Addresses.bare(from.getHostAddress()))
                 + (rows.isEmpty() ? "" : " :: " + rows)
                 + " :: " + hex);
     }
@@ -1641,12 +1636,12 @@ final class Peers {
         if (source == null) {
             return;
         }
-        String from = bare(source.getHostAddress());
+        String from = Addresses.bare(source.getHostAddress());
         long now = System.currentTimeMillis();
         synchronized (peers) {
             for (Peer peer : peers.values()) {
                 // 地址还没到（只收到 SRV）的这台认不出来，它会走 absorb 里 seenAt 那条路。
-                if (peer.address.isEmpty() || !bare(peer.address).equals(from)) {
+                if (peer.address.isEmpty() || !Addresses.bare(peer.address).equals(from)) {
                     continue;
                 }
                 if (question) {
@@ -1740,7 +1735,7 @@ final class Peers {
                         changed = true;
                     }
                     case "addr" -> {
-                        if (own.contains(bare(field[2]))) {
+                        if (own.contains(Addresses.bare(field[2]))) {
                             // 自己的宣告绕回来了。这里原来只做「不填地址」，于是这个实例会一直
                             // 挂在表里：地址永远空（所以永远 partial）、记录又一直刷新（所以永远
                             // 不过期），最后变成一行常驻的
@@ -1775,7 +1770,7 @@ final class Peers {
                                 // 在应答的设备删掉，过一秒又被下一条 SRV 加回来。
                                 touch(peer);
                                 String address = field[2];
-                                if (betterAddress(address, peer.address)) {
+                                if (Addresses.better(address, peer.address)) {
                                     peer.address = address;
                                     changed = true;
                                 }
@@ -1816,7 +1811,7 @@ final class Peers {
                 // 等一次验证。AirDrop 关掉之后 iOS 会拿缓存继续答 mDNS，记录和端口会给出相反
                 // 的答案，而这里只信端口。
                 if (!peer.unproven && peer.connectable()) {
-                    Grave dead = buried.get(bare(peer.address));
+                    Grave dead = buried.get(Addresses.bare(peer.address));
                     if (dead != null && now - dead.when < BURIED_MS) {
                         peer.unproven = true;
                         peer.reported = false;
@@ -1955,7 +1950,7 @@ final class Peers {
         if (peer.address.isEmpty() || peer.port == 0) {
             return;
         }
-        String key = bare(peer.address);
+        String key = Addresses.bare(peer.address);
         Long last = warmed.get(key);
         if (last != null && now - last < WARM_EVERY_MS) {
             return;
@@ -2006,26 +2001,8 @@ final class Peers {
      * 越好用：{@code fe80::} 上连着的那台 iPhone 是唯一能收文件的路径，而 {@code 192.168}
      * 上那台多半是另一个人。
      */
-    private static boolean betterAddress(String candidate, String current) {
-        if (current.isEmpty()) {
-            return true;
-        }
-        return rank(candidate) > rank(current);
-    }
-
-    private static int rank(String address) {
-        if (address.startsWith("fe80:")) {
-            return 3;
-        }
-        if (address.contains(":")) {
-            return 2;
-        }
-        if (address.startsWith("169.254.")) {
-            return 0;
-        }
-        return 1;
-    }
-
+    
+    
     /** 取出（或建出）一台对端。实例名去掉服务后缀才是名字。 */
     private Peer peer(String instance) {
         String name = instance.endsWith(SUFFIX)
@@ -2090,7 +2067,7 @@ final class Peers {
                     // 先把墓碑立上再删。删掉之后表里再没有一件事记得「这个地址刚被验过」，
                     // 而下一包缓存应答一两秒就到——没有这块碑，它原样就回来了，见 #BURIED_MS。
                     if (!peer.address.isEmpty()) {
-                        buried.put(bare(peer.address), new Grave(peer, now));
+                        buried.put(Addresses.bare(peer.address), new Grave(peer, now));
                     }
                     // 措辞改了：这条路现在也要安静满 QUIET_BEFORE_GONE_MS 才删，所以它不是
                     // 「不靠沉默、只看端口」，而是两件事同时成立——端口回绝，沉默又过了地板。
@@ -2143,7 +2120,7 @@ final class Peers {
                     // 可疑的那一个不能顶掉能看见的那一个：同一台设备换名字时，新名字要是还没
                     // 验明正身，收掉旧名字的结果就是「屏幕上唯一那台也一起没了」。
                     if (newer == older || newer.unproven
-                            || !bare(newer.address).equals(bare(older.address))) {
+                            || !Addresses.bare(newer.address).equals(Addresses.bare(older.address))) {
                         continue;
                     }
                     if (newer.seenAt > older.seenAt) {
@@ -2224,7 +2201,7 @@ final class Peers {
                 boolean doubt = peer.unproven;
                 peer.unproven = false;
                 if (!peer.address.isEmpty()) {
-                    buried.remove(bare(peer.address));
+                    buried.remove(Addresses.bare(peer.address));
                 }
                 if (doubt) {
                     peer.reported = false;
@@ -2251,7 +2228,7 @@ final class Peers {
                 if (doubt) {
                     peer.unproven = false;
                     if (!peer.address.isEmpty()) {
-                        buried.remove(bare(peer.address));
+                        buried.remove(Addresses.bare(peer.address));
                     }
                 }
                 trace("knock: " + peer.name + " at port " + peer.port + " did not even leave"
@@ -2288,7 +2265,7 @@ final class Peers {
                     break;
                 }
                 // 可疑的不记：它此刻正被怀疑已经走了，记下来等于把怀疑变成下一次的默认。
-                if (!peer.connectable() || peer.unproven || own.contains(bare(peer.address))) {
+                if (!peer.connectable() || peer.unproven || own.contains(Addresses.bare(peer.address))) {
                     continue;
                 }
                 if (list.length() > 0) {
@@ -2329,7 +2306,7 @@ final class Peers {
             String address = field[1].trim();
             int port = parseInt(field[2]);
             if (name.isEmpty() || address.isEmpty() || port <= 0
-                    || own.contains(bare(address))) {
+                    || own.contains(Addresses.bare(address))) {
                 continue;
             }
             Peer probe = new Peer(name);
