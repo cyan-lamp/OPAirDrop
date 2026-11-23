@@ -184,6 +184,8 @@ pub enum Error {
     BadExtendedLength,
     /// The root object is a dictionary was required but it was not one.
     NotADictionary,
+    /// The shared-reference DAG expands past the decode budget.
+    TooManyNodes,
 }
 
 impl fmt::Display for Error {
@@ -203,6 +205,7 @@ impl fmt::Display for Error {
             Error::Cyclic(i) => write!(f, "cyclic object reference at {i}"),
             Error::BadExtendedLength => write!(f, "malformed extended length"),
             Error::NotADictionary => write!(f, "root object is not a dictionary"),
+            Error::TooManyNodes => write!(f, "shared references expand past the decode budget"),
         }
     }
 }
@@ -240,6 +243,9 @@ struct Reader<'a> {
     ref_size: usize,
     top: u32,
     visiting: Vec<bool>,
+    /// 剩余可解码节点数。`visiting` 只防环不防 DAG：一份 184 字节、33 层共享引用的
+    /// 报文能展开 2^33 个 `Value`（评审 P0-2/P1-3），预算把展开总量钉死。
+    budget: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -269,9 +275,12 @@ impl<'a> Reader<'a> {
             }
         }
 
-        let count = read_unsigned(data, trailer + 8, 8);
-        let top = read_unsigned(data, trailer + 16, 8);
-        let table = read_unsigned(data, trailer + 24, 8) as usize;
+        let count = read_unsigned(data, trailer + 8, 8)
+            .ok_or(Error::Truncated)?;
+        let top = read_unsigned(data, trailer + 16, 8)
+            .ok_or(Error::Truncated)?;
+        let table = read_unsigned(data, trailer + 24, 8)
+            .ok_or(Error::Truncated)? as usize;
 
         if count == 0 || count > MAX_OBJECTS {
             return Err(Error::BadCount(count));
@@ -279,13 +288,21 @@ impl<'a> Reader<'a> {
         if top >= count {
             return Err(Error::BadTopObject(top));
         }
-        if table < MAGIC.len() || table + (count as usize) * offset_width > trailer {
+        // 全程 checked：三个数都是对端从报文尾部塞进来的，`table + count * width`
+        // 在 usize 上会回绕（评审 P0-2：`table = u64::MAX, count = 1, width = 8`
+        // 时 release 下 `table + 8` 回绕成 7，旧检查放行，随后越界 panic）。
+        let table_end = table
+            .checked_add((count as usize).checked_mul(offset_width).ok_or(Error::BadOffsetTable)?)
+            .ok_or(Error::BadOffsetTable)?;
+        if table < MAGIC.len() || table_end > trailer {
             return Err(Error::BadOffsetTable);
         }
 
-        let mut offsets = Vec::with_capacity(count as usize);
+        // 容量按表的真实跨度钳制，不按对端声称的 count 预分配。
+        let mut offsets = Vec::with_capacity(((trailer - table) / offset_width).min(count as usize));
         for i in 0..count as usize {
-            let offset = read_unsigned(data, table + i * offset_width, offset_width) as usize;
+            let offset = read_unsigned(data, table + i * offset_width, offset_width)
+                .ok_or(Error::BadObjectOffset(i as u32))? as usize;
             if offset < MAGIC.len() || offset >= trailer {
                 return Err(Error::BadObjectOffset(i as u32));
             }
@@ -299,6 +316,7 @@ impl<'a> Reader<'a> {
             ref_size: ref_width,
             top: top as u32,
             visiting,
+            budget: MAX_OBJECTS as usize,
         })
     }
 
@@ -313,6 +331,10 @@ impl<'a> Reader<'a> {
         if self.visiting[index_usize] {
             return Err(Error::Cyclic(index));
         }
+        if self.budget == 0 {
+            return Err(Error::TooManyNodes);
+        }
+        self.budget -= 1;
         self.visiting[index_usize] = true;
 
         let offset = self.offsets[index_usize];
@@ -346,17 +368,21 @@ impl<'a> Reader<'a> {
                 } else {
                     (offset + 1, width)
                 };
-                Value::Integer(read_unsigned(self.data, start, take) as i64)
+                Value::Integer(read_unsigned(self.data, start, take)
+                    .ok_or(Error::Truncated)? as i64)
             }
             0x2 => match info {
                 0x2 => {
                     self.need(offset + 1, 4)?;
-                    let bits = read_unsigned(self.data, offset + 1, 4) as u32;
+                    let bits = read_unsigned(self.data, offset + 1, 4)
+                        .ok_or(Error::Truncated)? as u32;
                     Value::Real(f32::from_bits(bits) as f64)
                 }
                 0x3 => {
                     self.need(offset + 1, 8)?;
-                    Value::Real(f64::from_bits(read_unsigned(self.data, offset + 1, 8)))
+                    Value::Real(f64::from_bits(
+                        read_unsigned(self.data, offset + 1, 8).ok_or(Error::Truncated)?,
+                    ))
                 }
                 _ => return Err(Error::UnsupportedMarker(marker)),
             },
@@ -365,7 +391,9 @@ impl<'a> Reader<'a> {
                     return Err(Error::UnsupportedMarker(marker));
                 }
                 self.need(offset + 1, 8)?;
-                let seconds = f64::from_bits(read_unsigned(self.data, offset + 1, 8));
+                let seconds = f64::from_bits(
+                    read_unsigned(self.data, offset + 1, 8).ok_or(Error::Truncated)?,
+                );
                 Value::Date(seconds + APPLE_EPOCH)
             }
             0x4 => {
@@ -381,8 +409,11 @@ impl<'a> Reader<'a> {
             }
             0x6 => {
                 let (start, count) = self.length(offset, info)?;
-                self.need(start, count * 2)?;
-                Value::String(decode_utf16be(&self.data[start..start + count * 2]))
+                // count 是对端给的扩展长度，count*2 在 usize 上会回绕成 0（评审 P1-4），
+                // 回绕后 need 放行、切片拿到空串——比 panic 更难查。
+                let bytes = count.checked_mul(2).ok_or(Error::Truncated)?;
+                self.need(start, bytes)?;
+                Value::String(decode_utf16be(&self.data[start..start + bytes]))
             }
             0x7 => {
                 let (start, count) = self.length(offset, info)?;
@@ -392,7 +423,8 @@ impl<'a> Reader<'a> {
             0x8 => {
                 let width = info + 1;
                 self.need(offset + 1, width)?;
-                Value::Integer(read_unsigned(self.data, offset + 1, width) as i64)
+                Value::Integer(read_unsigned(self.data, offset + 1, width)
+                    .ok_or(Error::Truncated)? as i64)
             }
             0xa | 0xc => {
                 let (start, count) = self.length(offset, info)?;
@@ -402,8 +434,8 @@ impl<'a> Reader<'a> {
                 self.need(start, count * self.ref_size)?;
                 let mut items = Vec::with_capacity(count);
                 for i in 0..count {
-                    let reference =
-                        read_unsigned(self.data, start + i * self.ref_size, self.ref_size) as u32;
+                    let reference = read_unsigned(self.data, start + i * self.ref_size, self.ref_size)
+                        .ok_or(Error::Truncated)? as u32;
                     items.push(self.object(reference, depth + 1)?);
                 }
                 Value::Array(items)
@@ -416,13 +448,14 @@ impl<'a> Reader<'a> {
                 self.need(start, count * self.ref_size * 2)?;
                 let mut pairs = Vec::with_capacity(count);
                 for i in 0..count {
-                    let key_ref =
-                        read_unsigned(self.data, start + i * self.ref_size, self.ref_size) as u32;
+                    let key_ref = read_unsigned(self.data, start + i * self.ref_size, self.ref_size)
+                        .ok_or(Error::Truncated)? as u32;
                     let value_ref = read_unsigned(
                         self.data,
                         start + (count + i) * self.ref_size,
                         self.ref_size,
-                    ) as u32;
+                    )
+                    .ok_or(Error::Truncated)? as u32;
                     let key = self.object(key_ref, depth + 1)?;
                     let value = self.object(value_ref, depth + 1)?;
                     let key = match key {
@@ -458,7 +491,7 @@ impl<'a> Reader<'a> {
             return Err(Error::BadExtendedLength);
         }
         self.need(offset + 2, width)?;
-        let count = read_unsigned(self.data, offset + 2, width);
+        let count = read_unsigned(self.data, offset + 2, width).ok_or(Error::Truncated)?;
         if count > usize::MAX as u64 {
             return Err(Error::BadExtendedLength);
         }
@@ -474,12 +507,18 @@ impl<'a> Reader<'a> {
 }
 
 /// Reads a big-endian unsigned integer of `width` bytes.
-fn read_unsigned(data: &[u8], offset: usize, width: usize) -> u64 {
+///
+/// Returns `None` when `offset + width` runs past `data` — callers turn that
+/// into their own error. The bounds check lives here so no call site can
+/// re-derive it wrong (评审 P0-2：旧实现无边界检查，`read_unsigned(data, table +
+/// i * width, width)` 在回绕后的 table 上直接越界 panic)。
+fn read_unsigned(data: &[u8], offset: usize, width: usize) -> Option<u64> {
+    let bytes = data.get(offset..offset.checked_add(width)?)?;
     let mut value = 0u64;
-    for i in 0..width {
-        value = (value << 8) | data[offset + i] as u64;
+    for &b in bytes {
+        value = (value << 8) | b as u64;
     }
-    value
+    Some(value)
 }
 
 fn decode_utf16be(bytes: &[u8]) -> String {
@@ -920,5 +959,79 @@ mod tests {
         let first = encode(&payload);
         let second = encode(&parse(&first).unwrap());
         assert_eq!(first, second, "encoding is deterministic");
+    }
+
+    // ---------------------------------------------------------------- P0-2 回归
+    // 三个用例都出自 2026-11-23 评审：对端完全可控的报文尾部，旧代码在 release 下
+    // 直接越界 panic（panic="abort" 时等于整个接收进程死亡）。
+
+    /// 把报文尾部的表偏移写成 u64::MAX：`table + count * width` 在 usize 上回绕成
+    /// 小数，旧检查放行后 `read_unsigned` 越界 panic。现在必须是干净的 BadOffsetTable。
+    #[test]
+    fn wrapped_table_offset_is_rejected_not_panic() {
+        let mut bytes = encode(&ask_payload());
+        // trailer 是最后 32 字节，表偏移在其中第 24..32 字节，即整个报文的最后 8 字节。
+        let n = bytes.len();
+        bytes[n - 8..].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(
+            parse(&bytes),
+            Err(Error::BadOffsetTable),
+            "wrapped table offset must be rejected without any arithmetic wrap"
+        );
+    }
+
+    /// UTF-16 字符串的扩展长度声明 count = 2^63：`count * 2` 回绕成 0，旧代码
+    /// need 放行、切片拿到空串——畸形输入被当成功（评审 P1-4）。
+    #[test]
+    fn utf16_length_that_overflows_when_doubled_is_rejected() {
+        // 一个 0x6f 对象（UTF-16 字符串，扩展长度 8 字节）加最小 trailer。
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&[0x6f, 0x13]); // extended-length marker, width 8
+        bytes.extend_from_slice(&0x8000_0000_0000_0000u64.to_be_bytes()); // count = 2^63
+        // offset 表单独放（表里存的是"对象的偏移"，不是对象本身）：
+        bytes.push(8); // 表只有一项，值 8 = 对象起点
+        let table = bytes.len() as u64 - 1;
+        // trailer: 6 个保留字节 + offset_width(1) + ref_width(1) + count(8) + top(8) + table(8)
+        bytes.extend_from_slice(&[0u8; 6]);
+        bytes.push(1); // offset_width
+        bytes.push(1); // ref_width
+        bytes.extend_from_slice(&1u64.to_be_bytes()); // count
+        bytes.extend_from_slice(&0u64.to_be_bytes()); // top object
+        bytes.extend_from_slice(&table.to_be_bytes());
+        assert_eq!(
+            parse(&bytes),
+            Err(Error::Truncated),
+            "count*2 wrapping to zero must not be mistaken for an empty string"
+        );
+    }
+
+    /// 共享引用 DAG：33 层、每层两个引用指向下一层，展开 2^32 个节点。
+    /// `visiting` 只防环防不了这个；解码预算把它变成 TooManyNodes 而不是
+    /// 1M 次展开后内存爆炸。
+    #[test]
+    fn shared_reference_dag_hits_the_decode_budget() {
+        const LEVELS: usize = 33;
+        let mut bytes = MAGIC.to_vec();
+        let mut offsets = Vec::new();
+        for i in 0..LEVELS {
+            offsets.push(bytes.len() as u64);
+            if i + 1 == LEVELS {
+                bytes.extend_from_slice(&[0x10, 0x00]); // int 0：叶子
+            } else {
+                // 0xa2 = 两元素数组，ref_size 1，两个引用都指向下一层
+                bytes.extend_from_slice(&[0xa2, (i + 1) as u8, (i + 1) as u8]);
+            }
+        }
+        let table = bytes.len() as u64;
+        for off in &offsets {
+            bytes.push(*off as u8);
+        }
+        bytes.extend_from_slice(&[0u8; 6]);
+        bytes.push(1); // offset_width
+        bytes.push(1); // ref_width
+        bytes.extend_from_slice(&(LEVELS as u64).to_be_bytes()); // count
+        bytes.extend_from_slice(&0u64.to_be_bytes()); // top
+        bytes.extend_from_slice(&table.to_be_bytes());
+        assert_eq!(parse(&bytes), Err(Error::TooManyNodes));
     }
 }

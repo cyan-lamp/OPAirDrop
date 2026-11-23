@@ -244,9 +244,19 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_serve(
     };
 
     // SAFETY: both are live streams and `env` outlives this call.
-    let (Ok(reader), Ok(sink)) = (unsafe { Stream::new(env, input) }, unsafe {
-        Sink::new(env, output)
-    }) else {
+    // 评审 P0-3：Stream::new 失败（异常挂起）后不再发 Sink::new 的 JNI 调用。
+    let reader = match unsafe { Stream::new(env, input) } {
+        Ok(reader) => reader,
+        Err(_) => return ptr::null_mut(),
+    };
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
+    let sink = match unsafe { Sink::new(env, output) } {
+        Ok(sink) => sink,
+        Err(_) => return ptr::null_mut(),
+    };
+    if unsafe { pending(env) } {
         return ptr::null_mut();
     };
     // Nothing on the receiving side renews: a receiver answers a connection, it does not
@@ -380,17 +390,31 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_mdnsAnnounce(
         return ptr::null_mut();
     }
 
-    // SAFETY: the arguments are live references of the declared types.
-    let (Some(instance), Some(host), Some(txt), Some(addresses)) = (unsafe {
-        (
-            read_string(env, instance),
-            read_string(env, host),
-            read_lines(env, txt),
-            read_lines(env, addresses),
-        )
-    }) else {
+    // 同型修复，见 mdnsReply 里评审 P0-3 的注释：一次一个，失败即退。
+    let Some(instance) = (unsafe { read_string(env, instance) }) else {
         return ptr::null_mut();
     };
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
+    let Some(host) = (unsafe { read_string(env, host) }) else {
+        return ptr::null_mut();
+    };
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
+    let Some(txt) = (unsafe { read_lines(env, txt) }) else {
+        return ptr::null_mut();
+    };
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
+    let Some(addresses) = (unsafe { read_lines(env, addresses) }) else {
+        return ptr::null_mut();
+    };
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
 
     let (txt_pointer, txt_len) = region(&txt);
     let (addresses_pointer, addresses_len) = region(&addresses);
@@ -454,18 +478,40 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_mdnsReply(
         return ptr::null_mut();
     }
 
-    // SAFETY: the arguments are live references of the declared types.
-    let (Some(packet), Some(instance), Some(host), Some(txt), Some(addresses)) = (unsafe {
-        (
-            read_bytes(env, packet),
-            read_string(env, instance),
-            read_string(env, host),
-            read_lines(env, txt),
-            read_lines(env, addresses),
-        )
-    }) else {
+    // 评审 P0-3：参数必须一次解一个，任一步失败或异常挂起就立即退出。Rust 的元组
+    // 表达式不短路——旧写法在 read_bytes 抛出 IllegalArgumentException 并挂起异常后
+    // 仍把后面四次 JNI 调用全发了，Android CheckJNI 对「异常挂起时调 JNI」是 abort，
+    // 未开 CheckJNI 也是未定义行为。5353 上一个零长度 UDP 包即可触发。
+    let Some(packet) = (unsafe { read_bytes(env, packet) }) else {
         return ptr::null_mut();
     };
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
+    let Some(instance) = (unsafe { read_string(env, instance) }) else {
+        return ptr::null_mut();
+    };
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
+    let Some(host) = (unsafe { read_string(env, host) }) else {
+        return ptr::null_mut();
+    };
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
+    let Some(txt) = (unsafe { read_lines(env, txt) }) else {
+        return ptr::null_mut();
+    };
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
+    let Some(addresses) = (unsafe { read_lines(env, addresses) }) else {
+        return ptr::null_mut();
+    };
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
 
     let (txt_pointer, txt_len) = region(&txt);
     let (addresses_pointer, addresses_len) = region(&addresses);
@@ -617,9 +663,19 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_send(
     };
 
     // SAFETY: both are live streams and `env` outlives this call.
-    let (Ok(reader), Ok(sink)) = (unsafe { Stream::new(env, input) }, unsafe {
-        Sink::new(env, output)
-    }) else {
+    // 评审 P0-3：Stream::new 失败（异常挂起）后不再发 Sink::new 的 JNI 调用。
+    let reader = match unsafe { Stream::new(env, input) } {
+        Ok(reader) => reader,
+        Err(_) => return ptr::null_mut(),
+    };
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
+    let sink = match unsafe { Sink::new(env, output) } {
+        Ok(sink) => sink,
+        Err(_) => return ptr::null_mut(),
+    };
+    if unsafe { pending(env) } {
         return ptr::null_mut();
     };
     // A null `Link` means the caller asked for a single-connection transfer, which is a
@@ -771,9 +827,19 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_sendWithProgress(
     };
 
     // SAFETY: both are live streams and `env` outlives this call.
-    let (Ok(reader), Ok(sink)) = (unsafe { Stream::new(env, input) }, unsafe {
-        Sink::new(env, output)
-    }) else {
+    // 评审 P0-3：Stream::new 失败（异常挂起）后不再发 Sink::new 的 JNI 调用。
+    let reader = match unsafe { Stream::new(env, input) } {
+        Ok(reader) => reader,
+        Err(_) => return ptr::null_mut(),
+    };
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
+    let sink = match unsafe { Sink::new(env, output) } {
+        Ok(sink) => sink,
+        Err(_) => return ptr::null_mut(),
+    };
+    if unsafe { pending(env) } {
         return ptr::null_mut();
     };
     // A null `Link` means the caller asked for a single-connection transfer, which is a
@@ -886,21 +952,56 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_discoverName(
     let Some(host) = (unsafe { read_string(env, host) }) else {
         return ptr::null_mut();
     };
-    // SAFETY: null means "not supplied"; a non-null value must be a live string. A failed
-    // read leaves an exception pending, which is the caller's answer, so return at once.
-    let optional = |value: jstring| -> Option<String> {
-        if value.is_null() { None } else { unsafe { read_string(env, value) } }
+    // 同型修复，见 mdnsReply 里评审 P0-3 的注释：optional 的 None 有两种来历
+    // （null 参数是合法默认值；读取失败是异常挂起），所以这里逐个解、失败即退，
+    // 而不是四连发之后才看一眼 pending。
+    let settings = if settings.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, settings) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
     };
-    let (settings, sender, model, sender_id) =
-        (optional(settings), optional(sender), optional(model), optional(sender_id));
+    let sender = if sender.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, sender) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
+    };
+    let model = if model.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, model) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
+    };
+    let sender_id = if sender_id.is_null() {
+        None
+    } else {
+        match unsafe { read_string(env, sender_id) } {
+            Some(text) => Some(text),
+            None => return ptr::null_mut(),
+        }
+    };
+
+    // SAFETY: both are live streams and `env` outlives this call.
+    // 评审 P0-3：见 mdnsReply 注释——流构造一次一个，失败即退。
+    let reader = match unsafe { Stream::new(env, input) } {
+        Ok(reader) => reader,
+        Err(_) => return ptr::null_mut(),
+    };
     if unsafe { pending(env) } {
         return ptr::null_mut();
     }
-
-    // SAFETY: both are live streams and `env` outlives this call.
-    let (Ok(reader), Ok(sink)) =
-        (unsafe { Stream::new(env, input) }, unsafe { Sink::new(env, output) })
-    else {
+    let sink = match unsafe { Sink::new(env, output) } {
+        Ok(sink) => sink,
+        Err(_) => return ptr::null_mut(),
+    };
+    if unsafe { pending(env) } {
         return ptr::null_mut();
     };
     // No Link: `/Discover` is one request on one connection.
@@ -1087,9 +1188,19 @@ unsafe fn serve_for_java(
     };
 
     // SAFETY: both are live streams and `env` outlives this call.
-    let (Ok(reader), Ok(sink)) = (unsafe { Stream::new(env, input) }, unsafe {
-        Sink::new(env, output)
-    }) else {
+    // 评审 P0-3：Stream::new 失败（异常挂起）后不再发 Sink::new 的 JNI 调用。
+    let reader = match unsafe { Stream::new(env, input) } {
+        Ok(reader) => reader,
+        Err(_) => return ptr::null_mut(),
+    };
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
+    let sink = match unsafe { Sink::new(env, output) } {
+        Ok(sink) => sink,
+        Err(_) => return ptr::null_mut(),
+    };
+    if unsafe { pending(env) } {
         return ptr::null_mut();
     };
     // Nothing on the receiving side renews: a receiver answers a connection, it does not
@@ -1234,11 +1345,19 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_saveSettings(
         return ptr::null_mut();
     }
     // SAFETY: both are live `java.lang.String`s, per the JVM's call.
-    let (Some(path), Some(text)) = (unsafe { read_string(env, path) }, unsafe {
-        read_string(env, text)
-    }) else {
+    // 同型修复，见 mdnsReply 里评审 P0-3 的注释：一次一个，失败即退。
+    let Some(path) = (unsafe { read_string(env, path) }) else {
         return ptr::null_mut();
     };
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
+    let Some(text) = (unsafe { read_string(env, text) }) else {
+        return ptr::null_mut();
+    };
+    if unsafe { pending(env) } {
+        return ptr::null_mut();
+    }
 
     let mut out = OpairdropBuffer::EMPTY;
     // SAFETY: `out` is a zeroed buffer and both strings outlive the call.
@@ -2273,12 +2392,16 @@ impl Link {
         }
 
         // SAFETY: both are live streams made by the call above, and `env` outlives them.
-        let reader = unsafe { Stream::new(self.env, input) };
-        let sink = unsafe { Sink::new(self.env, output) };
-        match (reader, sink) {
-            (Ok(reader), Ok(sink)) => Ok((reader, sink)),
-            _ => Err(()),
-        }
+        // 评审 P0-3：一次一个，失败即退。
+        let reader = match unsafe { Stream::new(self.env, input) } {
+            Ok(reader) => reader,
+            Err(_) => return Err(()),
+        };
+        let sink = match unsafe { Sink::new(self.env, output) } {
+            Ok(sink) => sink,
+            Err(_) => return Err(()),
+        };
+        Ok((reader, sink))
     }
 }
 

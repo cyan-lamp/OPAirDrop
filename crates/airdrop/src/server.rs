@@ -260,6 +260,7 @@ impl<R: Receiver> Server<R> {
         // The offer carried over from `/Ask`, for the `TransferID` promise the upload has
         // to keep. One slot, because one conversation carries one offer before one upload.
         let mut offer: Option<Ask> = None;
+        let mut accepted = false;
         loop {
             let request = match Request::read(input) {
                 Ok(Some(request)) => request,
@@ -283,8 +284,8 @@ impl<R: Receiver> Server<R> {
             } else {
                 match request.path() {
                     PATH_DISCOVER => self.discover(&request, input, output)?,
-                    PATH_ASK => self.ask(&request, input, output, &mut offer)?,
-                    PATH_UPLOAD => self.upload(&request, input, output, offer.as_ref())?,
+                    PATH_ASK => self.ask(&request, input, output, &mut offer, &mut accepted)?,
+                    PATH_UPLOAD => self.upload(&request, input, output, offer.as_ref(), accepted)?,
                     _ => {
                         send(output, &Response::new(404).with_keep_alive(false))?;
                         false
@@ -333,6 +334,7 @@ impl<R: Receiver> Server<R> {
         input: &mut In,
         output: &mut Out,
         offer: &mut Option<Ask>,
+        accepted: &mut bool,
     ) -> Result<bool, Error> {
         *offer = None;
         let keep = request.keep_alive();
@@ -342,6 +344,8 @@ impl<R: Receiver> Server<R> {
                 send_continue(output)?;
             }
             let answer = self.receiver.ask(None);
+            // 早答式接收器按契约无条件接受（它不提示人），接受即此刻成立。
+            *accepted = true;
             send(output, &plist_response(answer.encode(), keep))?;
             let (body, complete) = self.read_control(request, input);
             if !complete {
@@ -432,6 +436,8 @@ impl<R: Receiver> Server<R> {
             drain(input, self.drain_limit);
             return Ok(false);
         }
+        // 走到这里 = 人说了收。评审 P0-1 的闸门状态：本条连接上的 /Upload 只在这之后放行。
+        *accepted = true;
         let answer = self.receiver.ask(Some(&parsed));
         // An offer that names no files is over the moment it is accepted. `Files` empty
         // means no `/Upload` follows, so there is no next request on this connection — only
@@ -458,13 +464,24 @@ impl<R: Receiver> Server<R> {
     }
 
     /// Accepts `/Upload`, or refuses it before a byte of archive is read.
+    ///
+    /// 评审 P0-1：`/Upload` 必须经过这条连接上 `/Ask` 的用户接受。TLS 不认证客户端
+    /// （`Listener` 是 `setNeedClientAuth(false)`），「问人」是唯一的通行控制；旧代码
+    /// 对没有 `/Ask` 的连接照单全收，等于同链路任何人都能静默写收件箱。
     fn upload<In: Read, Out: Write>(
         &mut self,
         request: &Request,
         input: &mut In,
         output: &mut Out,
         offer: Option<&Ask>,
+        accepted: bool,
     ) -> Result<bool, Error> {
+        // 没有 offer、或者这条连接上没人说过"收"：401 拒绝，一个字节的 body 都不读。
+        // `close`，因为 body 还在流里，这条连接到此为止。
+        if !accepted {
+            send(output, &Response::new(401).with_keep_alive(false))?;
+            return Ok(false);
+        }
         let content_type = request.header("content-type").unwrap_or("");
         if !is_archive_type(content_type) {
             // `406`, before `100 Continue`: saying "carry on" and then refusing the body
@@ -482,6 +499,12 @@ impl<R: Receiver> Server<R> {
             (Some(promised), Some(sent)) => Some(promised == sent),
             _ => None,
         };
+        // 账对不上就别传：TransferID 是 offer 对这次传输的点名，对不上说明这条
+        // /Upload 不是 offer 描述的那一笔。旧代码只统计不强制（评审 P0-1 建议 2）。
+        if matches_offer == Some(false) {
+            send(output, &Response::new(409).with_keep_alive(false))?;
+            return Ok(false);
+        }
         let upload = Upload {
             content_type,
             transfer_id,
@@ -915,30 +938,39 @@ mod tests {
 
     #[test]
     fn upload_without_an_archive_type_is_refused_before_a_byte_is_read() {
-        let raw = post(
+        let ask = crate::ask_request(&Sender::new("Mac", "Mac", "id"), &id(), &[Item::new("a")], &[]);
+        let mut raw = post(PATH_ASK, "", &ask);
+        raw.extend_from_slice(&post(
             PATH_UPLOAD,
             "Content-Type: text/plain\r\nExpect: 100-continue\r\n",
             b"not an archive",
-        );
+        ));
         let (receiver, output) = run(Recorder::default(), &raw);
-        assert_eq!(statuses(&output), [406], "no 100-continue before a refusal");
+        assert_eq!(statuses(&output), [200, 406], "no 100-continue before a refusal");
         assert!(receiver.uploads.is_empty());
     }
 
     #[test]
     fn continue_precedes_the_upload_answer_and_the_bytes_reach_the_receiver() {
         let archive = b"070701 trailer";
-        let raw = post(
+        let ask = crate::ask_request(&Sender::new("Mac", "Mac", "id"), &id(), &[Item::new("a")], &[]);
+        let mut raw = post(PATH_ASK, "", &ask);
+        raw.extend_from_slice(&post(
             PATH_UPLOAD,
             "Content-Type: application/x-cpio\r\nExpect: 100-continue\r\n",
             archive,
-        );
+        ));
         let (receiver, output) = run(Recorder::default(), &raw);
 
-        assert_eq!(statuses(&output), [100, 200]);
+        assert_eq!(statuses(&output), [200, 100, 200]);
+        let continue_at = output.windows(CONTINUE.len()).position(|w| w == CONTINUE)
+            .expect("the continue has to be there");
+        let upload_answer_at = output.windows(b"HTTP/1.1 200".len())
+            .rposition(|w| w == b"HTTP/1.1 200")
+            .expect("the upload answer has to be there");
         assert!(
-            output.starts_with(CONTINUE),
-            "the continue has to be the first thing the peer reads"
+            continue_at < upload_answer_at,
+            "the continue has to precede the upload answer"
         );
         assert_eq!(receiver.uploads.len(), 1);
         assert_eq!(receiver.uploads[0].content_type, "application/x-cpio");
@@ -966,7 +998,8 @@ mod tests {
     }
 
     #[test]
-    fn an_upload_that_breaks_the_promise_is_reported_but_not_refused() {
+    fn an_upload_that_breaks_the_promise_is_refused() {
+        // 评审 P0-1：TransferID 对不上 offer 的点名，这笔 /Upload 不是被统计、是被拒。
         let ask = crate::ask_request(&Sender::new("Mac", "Mac", "id"), &id(), &[Item::new("a")], &[]);
         let mut raw = post(PATH_ASK, "", &ask);
         raw.extend_from_slice(&post(
@@ -976,19 +1009,23 @@ mod tests {
         ));
 
         let (receiver, output) = run(Recorder::default(), &raw);
-        assert_eq!(statuses(&output), [200, 200], "the file still gets stored");
-        assert_eq!(receiver.uploads[0].matches_offer, Some(false));
+        assert_eq!(statuses(&output), [200, 409]);
+        assert!(receiver.uploads.is_empty(), "nothing is stored");
     }
 
     #[test]
-    fn an_upload_with_no_offer_to_compare_against_is_unjudged() {
+    fn an_upload_without_an_accepted_offer_is_refused() {
+        // 评审 P0-1：跳过 /Ask 直接 /Upload 的新连接，必须在读 body 之前被 401 拒绝。
+        // 旧代码对这种连接照单全收（同链路任何人可静默写收件箱），这条测试把漏洞
+        // 的旧预期反过来钉死。
         let raw = post(
             PATH_UPLOAD,
             "Content-Type: application/x-cpio\r\nTransferID: ABC\r\n",
             b"archive",
         );
-        let (receiver, _) = run(Recorder::default(), &raw);
-        assert_eq!(receiver.uploads[0].matches_offer, None);
+        let (receiver, output) = run(Recorder::default(), &raw);
+        assert_eq!(statuses(&output), [401]);
+        assert!(receiver.uploads.is_empty(), "nothing is stored without asking");
     }
 
     #[test]
@@ -997,13 +1034,21 @@ mod tests {
             refuse_upload: true,
             ..Recorder::default()
         };
-        let raw = post(PATH_UPLOAD, "Content-Type: application/x-cpio\r\n", b"garbage");
+        // 先 /Ask 拿到人的接受（评审 P0-1 之后裸 /Upload 会被 401 拒掉），
+        // 再送一个读不出来的 archive，看 500 的诚实判决。
+        let ask = crate::ask_request(&Sender::new("Mac", "Mac", "id"), &id(), &[Item::new("a")], &[]);
+        let mut raw = post(PATH_ASK, "", &ask);
+        raw.extend_from_slice(&post(
+            PATH_UPLOAD,
+            "Content-Type: application/x-cpio\r\n",
+            b"garbage",
+        ));
         let mut server = Server::new(recorder);
         let mut input: &[u8] = &raw;
         let mut output = Vec::new();
         let error = server.serve(&mut input, &mut output).unwrap_err();
         assert!(matches!(error, Error::Io(_)), "{error}");
-        assert_eq!(statuses(&output), [500]);
+        assert_eq!(statuses(&output), [200, 500]);
     }
 
     #[test]

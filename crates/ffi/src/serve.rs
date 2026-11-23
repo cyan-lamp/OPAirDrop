@@ -697,6 +697,7 @@ mod tests {
     use std::io::{Cursor, Read as _};
 
     use super::*;
+    use opairdrop_airdrop::{ask_request, Sender};
 
     /// A connection held in memory: requests go in, answers come out.
     ///
@@ -1054,7 +1055,17 @@ mod tests {
         request
     }
 
-    /// A one-file archive holding `name`, as the sender would frame it.
+    /// 一条会被接受的 /Ask（评审 P0-1 之后，/Upload 必须跟在同一条连接的接受之后）。
+    fn accepted_ask() -> Vec<u8> {
+        let sender = Sender::new("iPhone von Ada", "iPhone", "8A2B:1F:9C");
+        ask_request(
+            &sender,
+            &opairdrop_airdrop::TransferId::from_bytes16(&[0x5c; 16]),
+            &[Item::new("note.txt")],
+            &[],
+        )
+    }
+
     fn archive(name: &str, payload: &[u8]) -> Vec<u8> {
         opairdrop_cpio::to_vec(
             &[opairdrop_cpio::Entry::file(name, payload.to_vec())],
@@ -1156,11 +1167,13 @@ mod tests {
         let payload = vec![7u8; 4096];
         let body = archive("note.txt", &payload);
 
+        let mut requests = post("/Ask", "application/x-apple-binary-plist", &accepted_ask());
+        requests.extend(post("/Upload", "application/x-cpio", &body));
         let (code, report, answers) = serve(
             root.to_str().expect("UTF-8"),
             "",
             "OPPO PJZ110",
-            post("/Upload", "application/x-cpio", &body),
+            requests,
         );
 
         assert_eq!(code, status::OK);
@@ -1180,12 +1193,14 @@ mod tests {
         let payload = vec![7u8; 4096];
         let body = archive("note.txt", &payload);
 
+        let mut requests = post("/Ask", "application/x-apple-binary-plist", &accepted_ask());
+        requests.extend(post("/Upload", "application/x-cpio", &body));
         let (code, report, answers, seen) = serve_watched(
             root.to_str().expect("UTF-8"),
             "",
             "OPPO PJZ110",
             "",
-            post("/Upload", "application/x-cpio", &body),
+            requests,
             true,
         );
 
@@ -1248,7 +1263,8 @@ mod tests {
     #[test]
     fn an_upload_ends_the_connection_so_a_second_one_is_not_read() {
         let root = scratch("twice");
-        let mut requests = post("/Upload", "application/x-cpio", &archive("a.txt", b"one"));
+        let mut requests = post("/Ask", "application/x-apple-binary-plist", &accepted_ask());
+        requests.extend(post("/Upload", "application/x-cpio", &archive("a.txt", b"one")));
         requests.extend(post("/Upload", "application/x-cpio", &archive("b.txt", b"two")));
 
         let (code, report, _) = serve(root.to_str().expect("UTF-8"), "", "", requests);
@@ -1271,15 +1287,20 @@ mod tests {
 
         // Not cpio, not gzip, not DVZip: the inbox refuses it, the endpoint answers `500`,
         // and the refusal has to survive being wrapped in an I/O error.
+        let mut requests = post("/Ask", "application/x-apple-binary-plist", &accepted_ask());
+        requests.extend(post("/Upload", "application/x-cpio", b"this is not an archive"));
         let (code, message, answers) = serve(
             root.to_str().expect("UTF-8"),
             "",
             "",
-            post("/Upload", "application/x-cpio", b"this is not an archive"),
+            requests,
         );
 
         assert_eq!(code, status::ARCHIVE, "{}", String::from_utf8_lossy(&message));
-        assert!(String::from_utf8_lossy(&answers).starts_with("HTTP/1.1 500"));
+        // 先是 /Ask 的 200（评审 P0-1 之后上传必须跟在接受后面），500 只属于 upload。
+        let answers = String::from_utf8_lossy(&answers);
+        assert!(answers.starts_with("HTTP/1.1 200"));
+        assert!(answers.contains("HTTP/1.1 500"));
     }
 
     #[test]

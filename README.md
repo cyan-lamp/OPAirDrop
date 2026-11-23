@@ -134,7 +134,7 @@ bash android/build.sh assembleDebug
 bash android/build.sh clean
 
 # 全量测试
-cargo test --workspace          # 431 passed / 0 failed（1 ignored）
+cargo test --workspace          # 434 passed / 0 failed（1 ignored）
 bash crates/ffi/jvm/check.sh    # 394 条 ok，桌面 JVM + -Xcheck:jni
 ```
 

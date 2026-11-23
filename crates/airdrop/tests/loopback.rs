@@ -352,6 +352,19 @@ fn three_megabytes_and_seventeen_bytes_arrive_whole() {
     let (listener, handle) = listen();
     let mut stream = connect(&listener);
 
+    // 评审 P0-1 之后 /Upload 必须先有 /Ask 的接受，这条连接才能送 archive。
+    let sender = Sender::new("iPhone von Ada", "iPhone", "8A2B:1F:9C");
+    let ask = ask_request(&sender, &id(), &[Item::new("a.jpg").with_size(3_147_017)], &[]);
+    write!(
+        stream,
+        "POST /Ask HTTP/1.1\r\nHost: air\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+        ask.len()
+    )
+    .expect("writes the head");
+    stream.write_all(&ask).expect("writes the offer");
+    let reply = read_reply(&mut stream);
+    assert_eq!(reply.status, 200, "the offer is accepted");
+
     let payload: Vec<u8> = (0..3 * 1024 * 1024 + 17)
         .map(|index| (index % 251) as u8)
         .collect();

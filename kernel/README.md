@@ -22,7 +22,7 @@ passthru / monitor 混杂收帧、NDI vdev 身份、AWDL 目标过滤这些能�
 
 | 文件 | 原始字节 | gz | sha256（原始字节） | 是什么 |
 | --- | --- | --- | --- | --- |
-| `qca_cld3_peach_v2.ko.gz` | 20 037 200 | 5 280 202 | `449d6915af6a540176f9e29b2b88c786fe19e5dd368874e377819b0f68496c3a` | qcacld-3.0，**自建修复版（裸 ko sha256 `eac00ca0…`，11-22 09:41 编译）**——BA 响应里宣告 A-MSDU Supported（`passthru_awdl_ba_amsdu`），是**接收 4.25 MB/s 的那颗**。`152b93ad…`（旧随包字节，`.gz.bak`）bit0 恒 0 → 对端永不聚合 → 只有 443 kB/s。详见下方演进链 |
+| `qca_cld3_peach_v2.ko.gz` | 20 050 688 | 5 282 983 | `152b93ad51c093be8ea54154121c4070573277f1711bb7d85deeb132b750c7a4` | qcacld-3.0，**随包供应商驱动（现役，2026-11-22 定案回装）**。TX 3.24 MB/s 稳态；接收 309 KB/s 均值 / 3.68 MB/s 峰值——峰值来自 `ratewatch` 两阶段速率切换（VHT80/2SS/MCS9），不是驱动本身。曾自建 A-MSDU 实验 ko（裸 sha `eac00ca0…`）已退役：受控 A/B 三轮实测其 RX 只有随包的 1/12–1/20，任何用自建 ko 做的 RX 数字不作数。gz sha256 `d773d67660b0fe74c5224f902a0d35043803c90ff489227ecd4d2fbf515ffd07`。此行 2026-11-24 按「仓库实际载荷 = 设备在跑 = APK 内 SHA256SUMS」三方一致重写（评审 P1-22：旧行登记的是退役自建 ko，且把快慢说反了） |
 | `mac80211.ko.gz` | 17 659 760 | 5 932 779 | `5fb77cc711c94b344be691a5f06d8dc0d382df7aff9b37d42beb024382da9645` | mac80211，把 minstrel_ht 编进模块本身 |
 | `wonder.ko.gz` | 78 432 | 21 694 | `f06bf8f1db32226a6f7be79af035c097cdace372bf77097daef7a03de8a6184f` | `wonder0` 的驱动，一个 mac80211 驱动 |
 | `opairshare_wonder_provider.ko.gz` | 271 472 | 95 401 | `b13eb6e1497611cec6f0c8724e7aef2b19ea2e151b9b202d06f3da94fdb6d6f2` | 把上面两颗绑到一起的 provider |
