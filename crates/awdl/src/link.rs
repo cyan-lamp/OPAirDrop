@@ -193,8 +193,7 @@ impl fmt::Display for Stats {
         )?;
         // Silent until something has actually been sent: a link that has never carried a
         // packet should not print a row of zeroes that reads like a measurement.
-        if self.tx_wait_n > 0 {
-            let avg = self.tx_wait_sum_us / self.tx_wait_n;
+        if let Some(avg) = self.tx_wait_sum_us.checked_div(self.tx_wait_n) {
             let buckets: Vec<_> = self.tx_wait_buckets.iter().map(u64::to_string).collect();
             write!(
                 f,

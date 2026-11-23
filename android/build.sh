@@ -19,6 +19,18 @@ java_home=${JAVA_HOME:-/d/Downloads/project/tools/jdk-17.0.20.1+1}
 gradle_bin=${GRADLE_BIN:-/d/Downloads/project/tools/gradle-9.6.0/bin/gradle}
 task=${1:-assembleDebug}
 
+# 评审 P1-21：NDK linker 按环境派生，写死的路径只作这台机器的兜底。三个环境变量
+# 的优先级：显式 NDK 目录 > SDK 目录下的 ndk/<版本> > 本机 tools/ 的兜底值。
+ndk_dir=${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${ANDROID_HOME:-${ANDROID_SDK_ROOT:-D:/Downloads/project/tools/android-sdk}}/ndk/27.3.13750724}}
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) prebuilt=windows-x86_64; cc_ext=.cmd; ar_ext=.exe ;;
+    Darwin)               prebuilt=darwin-x86_64;   cc_ext="";    ar_ext="" ;;
+    *)                    prebuilt=linux-x86_64;    cc_ext="";    ar_ext="" ;;
+esac
+toolchain="$ndk_dir/toolchains/llvm/prebuilt/$prebuilt/bin"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$toolchain/aarch64-linux-android35-clang$cc_ext"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_AR="$toolchain/llvm-ar$ar_ext"
+
 echo "== rust: aarch64-linux-android =="
 # `cd` and not only --manifest-path: cargo finds `.cargo/config.toml` by walking up from the
 # working directory, so running this script from somewhere else would build without the

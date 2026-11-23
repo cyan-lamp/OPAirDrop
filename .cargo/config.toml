@@ -16,9 +16,11 @@
 # objects (any dependency with a `build.rs` producing one) silently uses the host's `ar`
 # and produces a library the device cannot read.
 
+# 评审 P1-21：linker 与 ar 不再写死在这里——绝对路径带着一台机器的系统类型
+# （windows-x86_64 的 .cmd），换一台机器/CI 直接构建不了。它们改由 `android/build.sh`
+# 按 NDK 位置与宿主系统派生后经 cargo 的目标环境变量传入
+# （`CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER/AR`），本文件只留与机器无关的部分：
 [target.aarch64-linux-android]
-linker = "D:/Downloads/project/tools/android-sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd"
-ar = "D:/Downloads/project/tools/android-sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
 # 16 KB pages. Android 15 and later can boot with a 16 KB page size, and the loader refuses a
 # library whose LOAD segments are only 4 KB-aligned before any of its code runs: the app dies
 # with "unsatisfied link" and a compatibility dialog naming this file. NDK r27 still links this

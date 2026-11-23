@@ -39,3 +39,6 @@ __pycache__/
 # sha256 does not. The one payload that ships (assets/kernel in the APK) is the
 # un-suffixed `*.ko.gz`, which stays tracked.
 kernel/*.ko.gz.*
+
+# 本机的 SDK 位置（P1-21）：每台机器自己写，不进仓库。构建从 ANDROID_HOME 派生。
+android/local.properties
