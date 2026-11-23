@@ -1610,6 +1610,27 @@ keep_unfrozen() {
     return 0
 }
 
+# 应用进程整个不在了（从最近任务划掉 = force-stop）时，把接收服务拉起来。
+#
+# 为什么非要这一支：`Force stopping <pkg> ... o-stop(40)` 不只是杀进程，它把包置成
+# stopped 状态——之后系统不会因为粘性服务、广播或闹钟把它拉回来，直到用户自己点开。
+# 2026-11-23 18:49 实测：划掉之后 iPhone 发文件，这边什么都不弹；18:51 才因别的原因
+# 重新 announce，中间两分钟机身是"AirDrop 开着但没人接"。
+#
+# 守护进程是 root，显式启动组件可以清掉那个 stopped 状态，这是应用自己做不到的事。
+#
+# 节流六十秒：guard 每 20 秒一轮，拉起失败时（用户禁了自启动之类）不该每轮都敲系统。
+revive_app_at=0
+revive_app() {
+    [ -n "$(pidof "$APP" 2>/dev/null)" ] && return 0
+    now=$(date +%s)
+    [ $((now - revive_app_at)) -ge 60 ] || return 0
+    revive_app_at=$now
+    say "REVIVE_APP process gone; starting ReceiveService"
+    am start-foreground-service -n "$APP/.ReceiveService" >/dev/null 2>&1
+    return 0
+}
+
 stop_guard() {
     guard_alive || { rm -f "$GUARD_PID"; return 0; }
     kill "$(cat "$GUARD_PID")" 2>/dev/null
@@ -1750,6 +1771,9 @@ cmd_guard() {
             # takes to get a pid and a tunnel -- up to 30 s in the bad case, which
             # is 30 s of the app being freezable if this ran the other way round.
             revive_daemon
+            # 最后再看一眼进程还在不在：前两步都假定它还在（unfreeze 要 pid，
+            # revive_daemon 拉的是守护进程），而人被划掉之后这两步都无事可做。
+            revive_app
         else
             [ -n "$quiet" ] || quiet=$now
             if [ $((now - quiet)) -ge 180 ]; then
