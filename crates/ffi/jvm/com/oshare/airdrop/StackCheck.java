@@ -166,7 +166,6 @@ public final class StackCheck {
         // otherwise a successful install would be reported as stale by its own fallback.
         StackState.State couldNotTell = StackState.parse(
                 "stack up boot=unknown iface=wonder0 freq=5745 ll=none wifi=0 daemon=7 tun=up",
-                "",
                 "9f3c77e1");
         check("boot=unknown is not evidence of an older boot", !couldNotTell.stale(),
                 couldNotTell.boot());
