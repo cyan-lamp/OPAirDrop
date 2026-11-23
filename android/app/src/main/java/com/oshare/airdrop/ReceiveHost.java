@@ -109,6 +109,9 @@ final class ReceiveHost {
     /** 人按了取消。传到正在读字节的那条线程上，是关掉连接。 */
     static boolean cancel(String session) {
         Attempt attempt = find(session);
+        // 这一行是为了分开两种「按了取消没反应」：广播没到这里（卡片那颗按钮带的是旧
+        // session），还是到了但表里已经没有这条连接。两者修法完全不同。
+        Log.i(TAG, "cancel(" + session + ") -> " + (attempt != null ? "found" : "no such session"));
         if (attempt == null) {
             return false;
         }
@@ -354,6 +357,18 @@ final class ReceiveHost {
          */
         boolean cancelled() {
             return cancelled;
+        }
+
+        /**
+         * 人明确说了「不」（不是超时、也不是取消传送）。
+         *
+         * <p>这一位要单独问，是因为它和 {@link #accepted} 不一样：{@code accepted=false} 也
+         * 包含「一直没人回答」。而这两种收尾在 {@link Listener} 那里的下场相反——没人回答是
+         * 安静的，人拒绝了则会被后面那句 {@code because(...)} 说成「连接被系统切断，检查后台
+         * 限网」。人明明点了拒绝，屏幕上却劝他查路由器。
+         */
+        boolean declined() {
+            return answered && !accepted;
         }
 
         /**
@@ -700,6 +715,12 @@ final class ReceiveHost {
          */
         void cancel() {
             cancelled = true;
+            // 先把屏幕上这张卡收掉，再去动连接。
+            //
+            // 昨晚那次顺序反了：写 400 之后要停一会儿（不停就是 RST，400 会跟着丢），而
+            // 卡片要等读循环断开、走到 {@link #abandon} 才撤——于是「按了取消没反应，连点
+            // 几次才消失」。撤卡是本地的事，与连接怎么收尾无关，先做掉。
+            end();
             // 与 HangUp 里那一行配对：这一行是「广播到了、决定取消」，那一行是「RST 交给内核」。
             // 两行相减就是我们的反应时间；再和对面说失败的时刻比，才知道延迟在谁那儿。
             Log.i(TAG, "cancel requested at " + percent + "%");
@@ -720,7 +741,14 @@ final class ReceiveHost {
          * 只有一条路可走：把这条连接弄没。
          */
         private void abort() {
-            HangUp.now(peer);
+            // 已经在收（人点过接收）时走「先回 400 再关」：对面正在上传，等的是一个响应。
+            // 还在等人应答时走 RST —— 那一步 Rust 自己会回 401，我们再塞一段 400 只会让
+            // 协议里出现两句互相矛盾的话。
+            if (accepted) {
+                HangUp.refuse(peer);
+            } else {
+                HangUp.now(peer);
+            }
         }
 
         private void end() {
@@ -780,7 +808,8 @@ final class ReceiveHost {
             ticker.start();
         }
 
-        private boolean await(long timeoutMs) {            try {
+        private boolean await(long timeoutMs) {
+            try {
                 decided.await(timeoutMs, TimeUnit.MILLISECONDS);
             } catch (InterruptedException interrupted) {
                 // 接收端正在被关掉。把中断还回去，让上层知道它该退出。

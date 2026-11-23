@@ -1210,6 +1210,13 @@ final class Listener {
                         + describe(refused));
                 return;
             }
+            // 人明确拒绝了：接下来这个中断是我们自己造成的（Rust 回完 401 就关连接），
+            // 不是失败。原来这里会走到下面那句 because(ECONNABORTED) -> 「连接被系统切断，
+            // 检查后台限网」——人刚点了拒绝，屏幕上却在劝他查路由器。
+            if (attempt.declined()) {
+                Log.i(TAG, "connection from " + where(peer) + " closed after the person declined");
+                return;
+            }
             // 人自己按的取消，和「对面走了」在异常这一层完全同形：{@link ReceiveHost.Attempt}
             // 的 cancel() 走 HangUp 发 RST，读字节的线程照样从 read 里抛出来。差别只在人做
             // 过什么，所以判据用 attempt.cancelled() 而不是异常类型。

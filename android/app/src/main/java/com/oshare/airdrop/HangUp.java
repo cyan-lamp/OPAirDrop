@@ -33,6 +33,50 @@ import java.net.Socket;
  */
 final class HangUp {
 
+    /**
+     * 中途取消：先告诉对方「剩下的我不收了」，再关。
+     *
+     * <p>为什么不再只用 RST：实测本机 2 ms 就把 RST 交给内核，而 iPhone 那边要等 6-7 秒
+     * 才显示失败——那个量级正是它自己的重传超时。RST 是一句话都不说的断线，对端没有
+     * 「响应」可对应，只能等。
+     *
+     * <p>HTTP 允许在请求体没读完时就回答，所以这里写一段完整的 400。用 400 而不是 401：
+     * 401 在这个协议里是「人拒绝了邀请」，而这里说的是另一件事——邀请被接受了、我不打算
+     * 收完。
+     *
+     * <p>写完**不能立刻关**：接收缓冲里只要还有对端没被读走的字节，close 就是 RST，而 RST
+     * 会把对端还没读走的字节一起丢掉，包括刚写出去的这段。所以留一小段时间让它自己关；
+     * 卡片早就由 {@link ReceiveHost.Attempt#cancel} 撤掉了，这里的等待不会让人等。
+     */
+    static void refuse(Socket peer) {
+        if (peer == null) {
+            return;
+        }
+        Thread cutting = new Thread(() -> {
+            long asked = android.os.SystemClock.elapsedRealtime();
+            try {
+                java.io.OutputStream out = peer.getOutputStream();
+                out.write(RESPONSE.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                out.flush();
+                Thread.sleep(1500);
+            } catch (Throwable ignored) {
+                // 对面已经走了、或者流已经关了：那就只剩"关掉"这一个动作。
+            }
+            try {
+                peer.close();
+            } catch (IOException ignored) {
+                // 幂等。
+            }
+            Log.i("OPAirDrop", "refuse: 400 handed to the kernel after "
+                    + (android.os.SystemClock.elapsedRealtime() - asked) + " ms");
+        }, "opairdrop-refuse");
+        cutting.setDaemon(true);
+        cutting.start();
+    }
+
+    private static final String RESPONSE =
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
     private HangUp() {}
 
     /**

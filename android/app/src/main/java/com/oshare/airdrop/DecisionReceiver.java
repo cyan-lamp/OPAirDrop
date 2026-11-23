@@ -3,6 +3,7 @@ package com.oshare.airdrop;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.util.Log;
 
 /**
  * 通知上那几颗按钮的回调。
@@ -28,6 +29,7 @@ public final class DecisionReceiver extends BroadcastReceiver {
         // 【取消接收】不是一次回答：人已经说过「收」了，这一次说的是「收到一半不要了」。
         // 它不能走下面的 answer(false)：那会把这次接收改写成「已拒绝」，而拒绝是另一件事
         // ——那时对面还在问，还有一个 401 可以回；现在对面已经在传，能给的只有关连接。
+        Log.i("OPAirDrop", "decision receiver: action=" + intent.getAction() + " id=" + id);
         if (ReceiveHost.CANCEL.equals(intent.getAction())) {
             ReceiveHost.cancel(id);
             return;
