@@ -1781,7 +1781,18 @@ cmd_guard() {
                 break
             fi
         fi
-        if [ $((now - born)) -lt 60 ]; then sleep 2; else sleep 20; fi
+        # 进程不在时每 3 秒看一次，而不是 20 秒。
+        #
+        # 3 秒不是拍出来的：人被划掉之后再发文件，等的就是这一段。20 秒的轮询意味着
+        # 「AirDrop 开着，但对面发过来要等半分钟」——实测比杀进程本身还让人以为坏了。
+        # 代价只是多几次 pidof（读 /proc，微秒级），而这段时间本来也只在异常态。
+        if ! pidof "$APP" >/dev/null 2>&1; then
+            sleep 3
+        elif [ $((now - born)) -lt 60 ]; then
+            sleep 2
+        else
+            sleep 20
+        fi
     done
     # Only if the file still names us: a newer guard may have claimed it while this
     # one was on its way out, and deleting its pid would leave an orphan nobody can
