@@ -618,6 +618,9 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         if (!sending) {
             SendHost.unregister(cardCancel);
         }
+        // 评审 P1-14：销毁时把静态侧的回调摘干净（有传输在跑的那一段由 settle() 收尾时
+        // 自己清，见上面那条 if）。detach 里刻意不动 replay——卡片上的【重试】要靠它。
+        SendHost.detach(this);
         super.onDestroy();
     }
 

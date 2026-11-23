@@ -733,6 +733,8 @@ final class RealtimeBlurView extends View {
         /** set by the root's PreDraw (any content change) and by refresh();
          *  cleared once the scratch is re-drawn */
         boolean dirty = true;
+        /** 上一次重拍时根的尺寸：尺寸变化也是一次重拍的理由（评审 P1-17）。 */
+        int lastW = -1, lastH = -1;
         /** re-entrancy guard: true while root.draw() is traversing INSIDE a
          *  capture. A pane that lives under the capture root (e.g. the
          *  history sheet's card blur, whose captureRoot IS that root) gets
@@ -932,7 +934,6 @@ final class RealtimeBlurView extends View {
                         any = true;
                 }
                 if (!any) return true;
-                dirty = true;
                 // Capture NOW, at PreDraw: preDraw listeners are dispatched
                 // at the TOP of performDraw, before the framework records
                 // ANY view's RenderNode for the live pass — the offscreen
@@ -946,12 +947,23 @@ final class RealtimeBlurView extends View {
                 // After this record the panes' onDraw in the SAME frame
                 // finds a valid node and draws the GPU frost 1:1.
                 int w = root.getWidth(), h = root.getHeight();
-                if (w != 0 && h != 0) record(w, h);
-                for (int i = 0; i < views.size(); i++) {
-                    RealtimeBlurView v = views.get(i).get();
-                    if (v != null && v.isAttachedToWindow()
-                        && v.getVisibility() == VISIBLE) {
-                        v.postInvalidateOnAnimation();
+                if (w == 0 || h == 0) return true;
+                // 评审 P1-17：只在这三件事真的发生时才重拍——有人标了 dirty
+                // （refresh()/setFill/尺寸变化），或者根的尺寸变了。旧写法每帧无条件
+                // dirty=true + 重拍 + 叫醒所有可见 pane，pane 的下一帧又触发 PreDraw：
+                // 自激成常驻 60 Hz 全屏软件重录，什么都不动也在烧电。
+                // 内容变化的驱动靠显式 refresh()——replacePage 每次都会调 refreshGlass()。
+                if (dirty || w != lastW || h != lastH) {
+                    dirty = true;
+                    record(w, h);
+                    lastW = w;
+                    lastH = h;
+                    for (int i = 0; i < views.size(); i++) {
+                        RealtimeBlurView v = views.get(i).get();
+                        if (v != null && v.isAttachedToWindow()
+                            && v.getVisibility() == VISIBLE) {
+                            v.postInvalidateOnAnimation();
+                        }
                     }
                 }
                 return true;

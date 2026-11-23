@@ -255,6 +255,13 @@ final class Listener {
     private volatile boolean stopping;
 
     /**
+     * 评审 P1-12 的启停竞态收口：{@code loop} 收尾时只清「自己」——{@code worker} 与
+     * 当前线程一致才置空。否则快速「关→开」时，旧线程的 finally 会在新线程建好之后
+     * 把它清掉：{@code running()} 说在收、端口却已经没人听。（用代际计数也对，但
+     * 「线程自证」少一个要同步的字段。）
+     */
+
+    /**
      * 此刻正在被接待的连接数：握着 socket、握着线程的那些。
      *
      * <p>只用来判 {@link #PEERS}。用它而不是一个池对象，是因为这里要的只有一件事——「手里
@@ -1792,7 +1799,11 @@ final class Listener {
     /** Clears the fields {@link #running()} reads, so the page draws 开始接收 again. */
     private void end() {
         synchronized (lock) {
-            worker = null;
+            // 评审 P1-12：只清「自己」。worker 不是当前线程，说明本次 start 已被下一次
+            // start() 盖过（快速关→开），新 worker 不许被旧线程的收尾清掉。
+            if (worker == Thread.currentThread()) {
+                worker = null;
+            }
         }
     }
 

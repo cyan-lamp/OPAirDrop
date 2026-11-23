@@ -122,7 +122,15 @@ final class SendHost {
 
     /** 通道断开的旧签名，仍然被调用方用着：这里没有通道，只有一张卡。 */
     static void detach(Object ignored) {
-        // 有意留空。
+        synchronized (LOCK) {
+            // 评审 P1-14：页面销毁时把「取消发送」的回调摘掉——{@code canceller} 是静态
+            // 的，页面销毁而不清就等于把一个已销毁的 Activity 永久留在进程里。传输还在
+            // 跑的时候不能清（卡片上那颗【取消发送】必须活着），那一段由 {@code settle()}
+            // 在传输收尾时自己清；这里清的是「销毁时已经没有传输在跑」的常态。
+            canceller = null;
+            // {@code replay} 有意保留：卡片上那颗【重试】要在页面被回收之后还能把人
+            // 带回「再发一遍」，清了它重试就是一颗死按钮。它的持有期到下一次发送覆盖为止。
+        }
     }
 
     static boolean linked() {

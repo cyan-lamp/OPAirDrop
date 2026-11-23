@@ -901,6 +901,22 @@ final class Peers {
         return worker;
     });
 
+    /**
+     * 往执行器上排一件事，stop() 之后到来的排队安静丢弃。
+     *
+     * <p>评审 P1-15 让 stop() 会 {@code shutdownNow()} 执行器——而 {@code loop} 的最后一拍
+     * 可能正好在关门之后还想排一次敲门（{@code RejectedExecutionException} 在普通线程上
+     * 就是进程死亡）。这里的语义是：面板已经关了，任何迟到的排队都没有意义。
+     */
+    private void submit(ExecutorService executor, Runnable task) {
+        try {
+            executor.execute(task);
+        } catch (java.util.concurrent.RejectedExecutionException closed) {
+            // 停了的实例不再收活。
+        }
+    }
+
+
     private volatile boolean running;
     /**
      * 上一包把表改到了没有。浏览线程自己写自己读；{@link #receive} 置位，{@link #loop} 清位。
@@ -1115,6 +1131,11 @@ final class Peers {
         if (held != null) {
             held.close();
         }
+        // 评审 P1-15：这两个执行器是每次进发送页 new Peers 时建的，不停的话每次进
+        // 出页面都漏两条常驻线程（探针最长阻塞 KNOCK_TIMEOUT_MS，shutdownNow 让它们
+        // 从下一次阻塞里被打断出来）。
+        knocker.shutdownNow();
+        watchdog.shutdownNow();
     }
 
     /**
@@ -1167,9 +1188,9 @@ final class Peers {
             startedAt = System.currentTimeMillis();
             // 冷启动先按上一次的名单敲一遍门：mDNS 得等对方开口，敲门不用。见 {@link #recall}。
             // 交给敲门线程，浏览线程的查询节奏一秒都不能被它拖慢。
-            knocker.execute(this::recall);
+            submit(knocker, this::recall);
             // 守望和询问同时起步：mDNS 那两个沿看不见的部分全靠它，见 {@link #watch}。
-            watchdog.execute(this::watch);
+            submit(watchdog, this::watch);
             // 一次浏览一套账。这两个是字段而不是局部变量，因为它们要跨 socket 活下来；但跨
             // 「关掉面板再打开」就没有意义了——那时候链路、对端、我们绑的 socket 全是新的。
             heardEver = false;
@@ -1961,7 +1982,7 @@ final class Peers {
             warmed.clear();
         }
         warmed.put(key, now);
-        knocker.execute(() -> sendWarm(peer));
+        submit(knocker, () -> sendWarm(peer));
     }
 
     /** {@link #warm} 的活儿。跑在 {@link #knocker} 上：send 不阻塞，三个包是一瞬间的事。 */
@@ -2157,7 +2178,7 @@ final class Peers {
         }
         peer.knockedAt = now;
         peer.knocking = true;
-        knocker.execute(() -> knock(peer));
+        submit(knocker, () -> knock(peer));
     }
 
     /**
@@ -2173,7 +2194,7 @@ final class Peers {
         }
         peer.knockedAt = now;
         peer.knocking = true;
-        knocker.execute(() -> knock(peer));
+        submit(knocker, () -> knock(peer));
     }
 
     /**

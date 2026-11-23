@@ -311,6 +311,23 @@ mod device {
             .as_deref()
             .and_then(|dir| radio::Radio::open(dir, args.uid, now_us()));
 
+        // 评审 P1-11：socket 读错误不再一刀切退出。脚本注释记录过 ENETDOWN 实测
+        // （awdl-stack.sh:1688），ifindex 还会从 286 变 303——一次接口抖动就把守护
+        // 杀掉，等于断网后永远连不回来。分级：瞬时（EINTR/EAGAIN/ENOBUFS）小睡后
+        // 继续；接口没了（ENETDOWN/ENODEV）大睡等接口回来（脚本自己的 guard 会在
+        // 链路变化时重建环境）；只有 EPERM/EBADF 这类"描述符本身坏了"才退出。
+        fn survivable(err: &std::io::Error) -> bool {
+            match err.kind() {
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => return true,
+                _ => {}
+            }
+            matches!(err.raw_os_error(), Some(code) if matches!(
+                code,
+                libc::EINTR | libc::EAGAIN | libc::ENOBUFS
+                    | libc::ENETDOWN | libc::ENODEV | libc::ENETRESET
+            ))
+        }
+
         loop {
             // Both timers, and the wakeup is whichever comes first. A link that only
             // woke for presence frames would sit on a queued packet for up to a period.
@@ -322,6 +339,14 @@ mod device {
             let ready = match poll_readable(&[radio_fd, tun_fd], wait.clamp(0, 1000)) {
                 Ok(ready) => ready,
                 Err(err) => {
+                    if survivable(&err) {
+                        eprintln!("awdld: poll survived: {err}");
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            if err.raw_os_error() == Some(libc::ENETDOWN)
+                                || err.raw_os_error() == Some(libc::ENODEV) { 2000 } else { 10 },
+                        ));
+                        continue;
+                    }
                     eprintln!("awdld: poll failed: {err}");
                     return Err(1);
                 }
@@ -338,6 +363,14 @@ mod device {
                         Ok(true) => {}
                         Ok(false) => break,
                         Err(err) => {
+                            if survivable(&err) {
+                                eprintln!("awdld: radio read survived: {err}");
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    if err.raw_os_error() == Some(libc::ENETDOWN)
+                                        || err.raw_os_error() == Some(libc::ENODEV) { 2000 } else { 10 },
+                                ));
+                                break;
+                            }
                             eprintln!("awdld: reading the radio failed: {err}");
                             return Err(1);
                         }
@@ -354,6 +387,14 @@ mod device {
                         Ok(true) => {}
                         Ok(false) => break,
                         Err(err) => {
+                            if survivable(&err) {
+                                eprintln!("awdld: tunnel read survived: {err}");
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    if err.raw_os_error() == Some(libc::ENETDOWN)
+                                        || err.raw_os_error() == Some(libc::ENODEV) { 2000 } else { 10 },
+                                ));
+                                break;
+                            }
                             eprintln!("awdld: reading the tunnel failed: {err}");
                             return Err(1);
                         }
