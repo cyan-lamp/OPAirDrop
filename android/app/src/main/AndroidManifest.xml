@@ -94,7 +94,20 @@
             android:theme="@style/SendPanelTheme"
             android:excludeFromRecents="true"
             android:resizeableActivity="false"
+            android:maxAspectRatio="2.22"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|uiMode">
+            <!-- 分享面板呼出时被塞进小窗的 fix，三轮实测（2026-11-24）：
+                 ①只有 resizeableActivity=false（Android 16+ 默认忽略）→ ColorOS 浮窗分享
+                   直接用 bounds 框成小窗；
+                 ②加官方豁免属性（恢复 false 的效力）→ 任务 nonResizable，系统 letterbox
+                   到 16:9 居中（1440×3168 的屏被裁成 1440×2560）——还是小窗；
+                 ③②再加 maxAspectRatio=2.22（本机原生比例 3168/1440≈2.2）：letterbox 的
+                   比例跟着声明走，铺满整块屏——「小窗」即消失。
+                 依据：OPPO 开放平台《Android 16 应用兼容性适配指导》第 5 节（声明豁免属性后
+                 resizeableActivity/min/maxAspectRatio 恢复生效）。 -->
+            <property
+                android:name="android.app.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY"
+                android:value="true" />
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
