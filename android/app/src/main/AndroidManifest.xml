@@ -93,8 +93,10 @@
             android:launchMode="singleTop"
             android:theme="@style/SendPanelTheme"
             android:excludeFromRecents="true"
-            android:resizeableActivity="false"
-            android:maxAspectRatio="2.22"
+            android:resizeableActivity="true"
+            android:documentLaunchMode="never"
+            android:relinquishTaskIdentity="true"
+            android:finishOnCloseSystemDialogs="true"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|uiMode">
             <!-- 分享面板呼出时被塞进小窗的 fix，三轮实测（2026-11-24）：
                  ①只有 resizeableActivity=false（Android 16+ 默认忽略）→ ColorOS 浮窗分享
