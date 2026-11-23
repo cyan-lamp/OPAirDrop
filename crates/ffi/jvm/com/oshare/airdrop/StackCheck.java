@@ -17,6 +17,11 @@ import java.util.List;
  * the empty slots ({@code ll=none}, {@code daemon=none}, {@code tun=absent}).
  *
  * <p>Run: {@code java com.oshare.airdrop.StackCheck <scratch directory>}
+ *
+ * <p>回执用例一律 {@code parse(text, "")}（桌面语义：本机不报 boot id）。CI 的 runner 是
+ * Linux、有 {@code /proc/.../boot_id}——单参 {@code parse(text)} 会拿真实 boot id 对账，
+ * 没有 {@code boot=} 字段的回执被判 stale，断言的句子全部换成「上次开机」。本地 Windows
+ * 没有 /proc，同样的用例全绿——这就是「本机绿、CI 红」差一个操作系统的全部原因。
  */
 public final class StackCheck {
     private static final List<String> failures = new ArrayList<>();
@@ -161,6 +166,7 @@ public final class StackCheck {
         // otherwise a successful install would be reported as stale by its own fallback.
         StackState.State couldNotTell = StackState.parse(
                 "stack up boot=unknown iface=wonder0 freq=5745 ll=none wifi=0 daemon=7 tun=up",
+                "",
                 "9f3c77e1");
         check("boot=unknown is not evidence of an older boot", !couldNotTell.stale(),
                 couldNotTell.boot());
@@ -171,7 +177,8 @@ public final class StackCheck {
     private static void aLinkWithoutADaemonIsNotReady() {
         StackState.State state = StackState.parse(
                 "stack partial iface=wonder0 freq=5745 ll=fe80::80ca:efff:fe94:508b"
-                        + " wifi=1 daemon=none tun=absent");
+                        + " wifi=1 daemon=none tun=absent",
+                "");
         check("a partial line is not up", !state.up(), state.standing().toString());
         check("a partial line is not a failure either", !state.failed(),
                 state.standing().toString());
@@ -186,7 +193,8 @@ public final class StackCheck {
     /** No interface at all: the first thing that goes wrong on a cold boot. */
     private static void anAbsentInterfaceSaysSo() {
         StackState.State state = StackState.parse(
-                "stack partial iface=absent freq=? ll=none wifi=1 daemon=none tun=absent");
+                "stack partial iface=absent freq=? ll=none wifi=1 daemon=none tun=absent",
+                "");
         check("iface=absent is not present", !state.ifacePresent(), state.iface());
         check("an absent interface is what is missing", "link".equals(state.missing()),
                 state.missing());
@@ -199,7 +207,8 @@ public final class StackCheck {
     /** The rc=16 this week's debugging was about: named, and explained rather than numbered. */
     private static void aDriverSwapFailureNamesTheCause() {
         StackState.State state = StackState.parse("stack failed rc=16 stage=driver-swap"
-                + " detail=wonder.ko loaded but registered no wiphy; see dmesg for wonder_probe");
+                + " detail=wonder.ko loaded but registered no wiphy; see dmesg for wonder_probe",
+                "");
         check("a failed line is a failure", state.failed(), state.standing().toString());
         check("a failed line is not up", !state.up(), state.standing().toString());
         check("the stage is read", "driver-swap".equals(state.stage()), state.stage());
@@ -217,7 +226,8 @@ public final class StackCheck {
     /** Wi-Fi would not turn off: the stage before the swap, and a different cure. */
     private static void aWifiFailureIsItsOwnStage() {
         StackState.State wifiOff = StackState.parse("stack failed rc=4 stage=wifi"
-                + " detail=Wi-Fi did not disable");
+                + " detail=Wi-Fi did not disable",
+                "");
         check("the wifi stage is its own", "wifi".equals(wifiOff.stage()), wifiOff.stage());
         check("the sentence names Wi-Fi", wifiOff.subtitle().contains("Wi-Fi"),
                 wifiOff.subtitle());
@@ -226,7 +236,8 @@ public final class StackCheck {
 
         StackState.State precondition = StackState.parse(
                 "stack failed rc=3 stage=precondition"
-                        + " detail=module wonder is live and there is no marker for this boot");
+                        + " detail=module wonder is live and there is no marker for this boot",
+                "");
         check("the precondition stage is explained",
                 precondition.stageInWords().contains("本轮标记"), precondition.stageInWords());
         check("a precondition is not blamed on the drivers",
@@ -235,7 +246,7 @@ public final class StackCheck {
 
     /** An older or newer script: shown as written, never as a success. */
     private static void anUnknownLineIsNeitherSuccessNorFailure() {
-        StackState.State state = StackState.parse("link ready iface=wonder0");
+        StackState.State state = StackState.parse("link ready iface=wonder0", "");
         check("an unknown line is not up", !state.up(), state.standing().toString());
         check("an unknown line is not a failure", !state.failed(), state.standing().toString());
         check("an unknown line is quoted, not summarised",
@@ -245,7 +256,8 @@ public final class StackCheck {
     /** `detail=` is the only field with spaces; it must not eat the fields before it. */
     private static void detailWithSpacesIsKeptWhole() {
         StackState.State state = StackState.parse("stack failed rc=2 stage=wifi"
-                + " detail=cannot read the Wi-Fi state");
+                + " detail=cannot read the Wi-Fi state",
+                "");
         check("a spaced detail is kept whole",
                 "cannot read the Wi-Fi state".equals(state.detail()), state.detail());
         check("a spaced detail does not break the fields before it",
@@ -256,7 +268,8 @@ public final class StackCheck {
     /** A trailing newline, leading spaces, and an empty file: the three easy ones to get wrong. */
     private static void paddingAndBlankLinesAreTolerated(File dir) throws IOException {
         StackState.State padded = StackState.parse("  stack up iface=wonder0 freq=5745"
-                + " ll=none wifi=unknown daemon=12 tun=up\n");
+                + " ll=none wifi=unknown daemon=12 tun=up\n",
+                "");
         check("surrounding whitespace is trimmed", padded.up(), padded.standing().toString());
         check("wifi=unknown is three-valued, not off", padded.wifiOn() == null,
                 "" + padded.wifiOn());
@@ -267,7 +280,7 @@ public final class StackCheck {
         check("an empty file is not present", !blank.present(), blank.line());
         check("an empty file is not a failure", !blank.failed(), blank.standing().toString());
 
-        blank = StackState.parse(null);
+        blank = StackState.parse(null, "");
         check("null is not present", !blank.present(), blank.line());
     }
 
