@@ -55,8 +55,12 @@ public final class FluidModule extends XposedModule {
     private static final String TAG = "OPAirDrop";
 
     private static final String SYSTEM_UI = "com.android.systemui";
-    /** 系统框架自己的包名。LSPosed 里显示为「系统框架」，scope.list 里写 {@code android}。 */
-    private static final String ANDROID = "android";
+    /**
+     * system_server 的作用域名。日志里 LSPosed 打的前缀是 {@code (system)}，但它交给模块的
+     * {@code getPackageName()} 到底是不是这两个字，只有真机日志能回答 —— 两种情况都在
+     * {@link #onPackageReady} 里按 {@code system} 判，同时把真值打进日志。
+     */
+    private static final String SYSTEM_SERVER = "system";
     private static final String SELF = "com.oshare.airdrop";
 
     private static final String REPOSITORY =
@@ -110,15 +114,44 @@ public final class FluidModule extends XposedModule {
      */
     private static java.lang.reflect.Field sCardState;
 
+    /**
+     * system_server 那一支：划掉不再强停进程，见 {@link KeepAlive}。
+     *
+     * <p>它和流体云共用一个模块入口，只是作用域不同。**不能用 {@code onPackageReady} 接**：
+     * 那个回调在 system_server 里根本不会来（它只对普通应用进程发包名），
+     * 2026-11-23 19:37 那次重启就是这么白等一轮的 —— system_server 的日志里没有一行
+     * {@code OPAirDrop}，而 SystemUI 的三刀全都在。这个回调的签名里只有一个 classLoader，
+     * 也正是「还没开始跑、只知道拿哪把加载器」的意思。
+     */
+    /*
+     * 诊断用：静态初始化一跑就留痕。2026-11-23 那一轮，system_server 里连一行 OPAirDrop 都没有，
+     * 单靠这一条就能分辨「类根本没被加载」和「加载了但回调没来」——其余两种可能各自有日志，
+     * 唯独「压根没加载」是静默的。
+     */
+    static {
+        Log.i(TAG, "FluidModule 类已加载");
+    }
+
+    @Override
+    public void onSystemServerStarting(XposedModuleInterface.SystemServerStartingParam param) {
+        try {
+            log(Log.INFO, TAG, "收到 onSystemServerStarting，开始装划掉不强停那一刀");
+            KeepAlive.install(this, param.getClassLoader());
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "划掉不再强停那一刀没装上：" + t, t);
+        }
+    }
+
     @Override
     public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
-        // 系统框架那一支与流体云无关，只是共用一个模块入口：划掉不再强停进程，见 KeepAlive。
-        // 它跑在 system_server 里，所以必须最先分出去 —— 下面所有代码都假定自己在 SystemUI。
-        if (ANDROID.equals(param.getPackageName())) {
+        // system_server 里也走一遍这个回调（现代 API 在 system 作用域下同样回调），
+        // 顺手在这里补装，两条入口互为备份。
+        log(Log.INFO, TAG, "onPackageReady 进程=" + param.getPackageName());
+        if (SYSTEM_SERVER.equals(param.getPackageName())) {
             try {
                 KeepAlive.install(this, param.getClassLoader());
             } catch (Throwable t) {
-                log(Log.ERROR, TAG, "划掉不再强停那一刀没装上：" + t, t);
+                log(Log.ERROR, TAG, "划掉不再强停那一刀没装上（onPackageReady 入口）：" + t, t);
             }
             return;
         }

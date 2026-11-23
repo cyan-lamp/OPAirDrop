@@ -10,13 +10,8 @@ android/app/build/
 # the one question a log cannot. Never worth a commit.
 .workbuddy/
 
-# The engineering log: 250 KB of protocol notes, measurements, dead ends and
-# half-decided plans, written alongside the code and only useful next to it. A
-# changelog records what shipped; this records what was being thought about.
-# Kept on disk, kept out of the tree. It is the only one of its kind now: the
-# Task-archive snapshots it used to be splintered from were merged back in and
-# deleted on 2026-11-18, so there is nothing left to grow a second copy of.
-Plan.md
+# Plan.md 进仓库（2026-11-24 用户拍板）：它不只是工程日志，还是唯一能把
+# 「为什么是这个设计、哪些结论被实测证伪过」讲清楚的文档，丢了不可再生。
 
 # Release signing. The key already lives outside the tree; this keeps its password
 # and any stray keystore that gets dropped in here from reaching the archive, where
