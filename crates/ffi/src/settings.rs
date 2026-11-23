@@ -219,6 +219,8 @@ pub(crate) fn values_from(text: &[u8]) -> Result<Values, String> {
 pub(crate) fn limits(values: &Values) -> Limits {
     Limits {
         byte_limit: values.number(BYTE_LIMIT).unwrap_or(0).max(0) as u64,
+        // 成员数暂不进设置表（评审 P1-9）：它是一道防滥用上限，不是用户偏好。
+        member_limit: opairdrop_airdrop::inbox::DEFAULT_MEMBER_LIMIT,
         overwrite: values.switch(OVERWRITE).unwrap_or(false),
     }
 }
@@ -466,6 +468,7 @@ mod tests {
             limits(&values),
             Limits {
                 byte_limit: 8 * 1024 * 1024 * 1024,
+                member_limit: opairdrop_airdrop::inbox::DEFAULT_MEMBER_LIMIT,
                 overwrite: false,
             }
         );
@@ -476,6 +479,7 @@ mod tests {
             limits(&values),
             Limits {
                 byte_limit: 134_217_728,
+                member_limit: opairdrop_airdrop::inbox::DEFAULT_MEMBER_LIMIT,
                 overwrite: true,
             }
         );

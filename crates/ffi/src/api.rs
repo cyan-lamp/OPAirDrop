@@ -375,6 +375,7 @@ pub(crate) fn classify(error: &InboxError) -> i32 {
         InboxError::Archive(_) => status::ARCHIVE,
         InboxError::Io(_) => status::IO,
         InboxError::OverBudget { .. } => status::OVER_BUDGET,
+        InboxError::TooManyMembers(_) => status::OVER_BUDGET,
         InboxError::NoFreeName { .. } => status::NO_FREE_NAME,
         InboxError::Outside { .. } => status::OUTSIDE,
     }

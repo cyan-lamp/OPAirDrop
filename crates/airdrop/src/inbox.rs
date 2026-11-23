@@ -66,14 +66,22 @@ pub const DEFAULT_BYTE_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
 pub struct Limits {
     /// Most payload bytes one transfer may write.
     pub byte_limit: u64,
+    /// Most members one transfer may carry (评审 P1-9)。字节预算只算 payload：
+    /// 一个 0 字节成员在线上只有约 110 B 的头部开销，没有成员数上限的话，
+    /// 对端可以落数千万个空文件并把内存撑爆。目录成员同样计数。
+    pub member_limit: u32,
     /// Whether a member may replace a file that is already there.
     pub overwrite: bool,
 }
+
+/// The member-count ceiling a transfer carries unless the caller says otherwise.
+pub const DEFAULT_MEMBER_LIMIT: u32 = 65_536;
 
 impl Default for Limits {
     fn default() -> Limits {
         Limits {
             byte_limit: DEFAULT_BYTE_LIMIT,
+            member_limit: DEFAULT_MEMBER_LIMIT,
             overwrite: false,
         }
     }
@@ -96,6 +104,8 @@ pub enum Error {
     OverBudget { limit: u64 },
     /// Every ` (n)` variant of a member's name was already taken.
     NoFreeName { name: String },
+    /// The transfer carried more members than [`Limits::member_limit`] allows.
+    TooManyMembers(u32),
     /// A member resolved outside the inbox, so it was refused.
     Outside { name: String },
 }
@@ -107,6 +117,9 @@ impl fmt::Display for Error {
             Error::Io(error) => write!(out, "the inbox could not be written: {error}"),
             Error::OverBudget { limit } => {
                 write!(out, "the transfer exceeds the inbox budget of {limit} bytes")
+            }
+            Error::TooManyMembers(n) => {
+                write!(out, "more than {n} members in one transfer")
             }
             Error::NoFreeName { name } => write!(out, "no free name for {name}"),
             Error::Outside { name } => write!(out, "refusing {name}: it resolves outside the inbox"),
@@ -295,6 +308,10 @@ pub struct Inbox {
     limit: u64,
     /// Whether a member may replace a file that is already there.
     overwrite: bool,
+    /// 一个传输最多落多少个成员（评审 P1-9）。
+    member_limit: u32,
+    /// 已经落地的成员数。
+    members: u32,
     total: u64,
     names: Vec<String>,
     /// Names this transfer has handed out, so two members cannot collide with each other
@@ -331,6 +348,8 @@ impl Inbox {
                 limits.byte_limit
             },
             overwrite: limits.overwrite,
+            member_limit: limits.member_limit.max(1),
+            members: 0,
             total: 0,
             names: Vec::new(),
             taken: HashSet::new(),
@@ -448,6 +467,15 @@ impl Sink for Inbox {
                 self.failure.get_or_insert(failure);
             }
         }
+
+        // 评审 P1-9：字节预算只算 payload，挡不住"数千万个 0 字节成员"。
+        // 成员数单独设闸，目录与文件一视同仁；超限按预算超限同一语义处理
+        // （记一次失败、后面成员不再落盘，archive 照旧排干）。
+        if self.members >= self.member_limit {
+            self.failure.get_or_insert(Error::TooManyMembers(self.member_limit));
+            return None;
+        }
+        self.members += 1;
 
         let kind = opairdrop_cpio::type_of(mode);
         if kind == opairdrop_cpio::TYPE_SYMLINK {
@@ -778,10 +806,7 @@ mod tests {
 
         let received = receive_with(
             &root,
-            Limits {
-                byte_limit: DEFAULT_BYTE_LIMIT,
-                overwrite: true,
-            },
+            Limits { byte_limit: DEFAULT_BYTE_LIMIT, member_limit: DEFAULT_MEMBER_LIMIT, overwrite: true, },
             archive(&[Entry::file("note.txt", b"newer".to_vec())]).as_slice(),
         )
         .expect("the archive is accepted");
@@ -801,10 +826,7 @@ mod tests {
 
         let received = receive_with(
             &root,
-            Limits {
-                byte_limit: DEFAULT_BYTE_LIMIT,
-                overwrite: true,
-            },
+            Limits { byte_limit: DEFAULT_BYTE_LIMIT, member_limit: DEFAULT_MEMBER_LIMIT, overwrite: true, },
             bytes.as_slice(),
         )
         .expect("both members are stored");
@@ -819,10 +841,7 @@ mod tests {
         let root = scratch("overwrite-budget");
         let mut inbox = Inbox::with_limits(
             &root,
-            Limits {
-                byte_limit: 10,
-                overwrite: true,
-            },
+            Limits { byte_limit: 10, member_limit: DEFAULT_MEMBER_LIMIT, overwrite: true, },
         )
         .expect("the inbox opens");
 
@@ -852,7 +871,7 @@ mod tests {
     #[test]
     fn a_transfer_that_outgrows_the_budget_leaves_no_partial_file() {
         let root = scratch("budget");
-        let mut inbox = Inbox::with_limits(&root, Limits { byte_limit: 10, overwrite: false }).expect("the inbox opens");
+        let mut inbox = Inbox::with_limits(&root, Limits { byte_limit: 10, member_limit: DEFAULT_MEMBER_LIMIT, overwrite: false }).expect("the inbox opens");
         let bytes = archive(&[Entry::file("big.bin", vec![7u8; 64])]);
 
         let failure = inbox
@@ -867,7 +886,7 @@ mod tests {
     #[test]
     fn the_budget_is_spent_across_members_not_per_member() {
         let root = scratch("budget-across");
-        let mut inbox = Inbox::with_limits(&root, Limits { byte_limit: 10, overwrite: false }).expect("the inbox opens");
+        let mut inbox = Inbox::with_limits(&root, Limits { byte_limit: 10, member_limit: DEFAULT_MEMBER_LIMIT, overwrite: false }).expect("the inbox opens");
         let bytes = archive(&[
             Entry::file("first.bin", vec![1u8; 8]),
             Entry::file("second.bin", vec![2u8; 8]),

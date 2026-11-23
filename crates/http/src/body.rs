@@ -179,7 +179,19 @@ fn next_chunk<R: Read>(input: &mut R, state: &mut ChunkState) -> Result<bool, Er
         // Trailer section: header lines, then a blank line that may be the end of the
         // stream rather than an empty line — a peer closing right after the last chunk
         // has still delivered a complete body.
-        while read_line(input, &mut state.line)? && !state.line.is_empty() {}
+        //
+        // 评审 P1-6：trailer 逐行读没有上限的话，对端可以一直滴灌合法的
+        // "头一行 + 非空" 序列让这个循环永不返回。行数用 MAX_HEADERS 同款上限，
+        // 字节数一并计入。
+        let mut trailer_lines = 0usize;
+        let mut trailer_bytes = 0usize;
+        while read_line(input, &mut state.line)? && !state.line.is_empty() {
+            trailer_lines += 1;
+            trailer_bytes += state.line.len();
+            if trailer_lines > crate::MAX_HEADERS || trailer_bytes > crate::MAX_HEADERS * 1024 {
+                return Err(Error::TrailerOverrun);
+            }
+        }
         state.finished = true;
         return Ok(false);
     }

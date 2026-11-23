@@ -287,7 +287,12 @@ impl<'a> Message<'a> {
         let additional_count = u16::from_be_bytes([data[10], data[11]]) as usize;
 
         let mut cursor = 12;
-        let mut questions = Vec::with_capacity(question_count);
+        // 容量按报文实际长度钳制（评审 P1-2）：四个计数都在报文头里、完全由对端控制，
+        // 一条 17 字节的报文可以声称 0xffff 条记录，直接按计数预分配就是 12.58 MB 的
+        // 放大。每条记录在线上最少 5 字节（name 压缩指针 2 + type 2 + class 1 是理想
+        // 下界，取 5 更保守），按它定容量上界即可；计数本身仍按原逻辑消费，多出来的
+        // 会在循环里自然走到 ShortHeader。
+        let mut questions = Vec::with_capacity(question_count.min(data.len() / 5));
         for _ in 0..question_count {
             let name = read_name(data, &mut cursor)?;
             need(data, cursor, 4)?;
@@ -303,7 +308,9 @@ impl<'a> Message<'a> {
         }
 
         let total = answer_count + authority_count + additional_count;
-        let mut records = Vec::with_capacity(total);
+        // 同上：容量按报文长度钳制，不按对端声称的计数预分配（评审 P1-2）。
+        // 每条记录线上最少 11 字节（name 2 + type 2 + class 2 + ttl 4 + rdlength 1）。
+        let mut records = Vec::with_capacity(total.min(data.len() / 11));
         for _ in 0..total {
             let name = read_name(data, &mut cursor)?;
             need(data, cursor, 10)?;
@@ -523,10 +530,17 @@ pub fn read_name(data: &[u8], cursor: &mut usize) -> Result<String, Error> {
         if at + 1 + len > data.len() {
             return Err(Error::LabelOverrun);
         }
+        // 评审 P1-7：mDNS 名字会被 HTTP 头引用（SRV target → `Host:`），带控制字符的
+        // label 能把 CRLF 塞进一个头值里（响应拆分）。来源在此拒收，写头的地方就不必
+        // 每一处都防。
+        let label = &data[at + 1..at + 1 + len];
+        if label.iter().any(|&b| b < 0x20 || b == 0x7f) {
+            return Err(Error::UnsupportedLabelType);
+        }
         if !name.is_empty() {
             name.push('.');
         }
-        name.push_str(&String::from_utf8_lossy(&data[at + 1..at + 1 + len]));
+        name.push_str(&String::from_utf8_lossy(label));
         at += 1 + len;
     }
     Ok(name)

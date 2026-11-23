@@ -401,9 +401,24 @@ impl<R: Read> Read for Decoder<R> {
 ///
 /// The initial guess is twice the compressed size, which covers the usual case (a
 /// block is a slice of a file, and slices of files compress) in one allocation.
+/// The largest output one compressed block may inflate to (评审 P1-1)。
+///
+/// zlib 的极限压缩比约 1000:1：`MAX_BLOCK` 只限压缩后 1 MiB，一个合法块可解出
+/// 约 1 GiB，而 `read_to_end` 会照单全收。原始块本来就是文件切片（≤ [`MAX_BLOCK`]），
+/// 所以输出上限取 [`MAX_BLOCK`] 的两倍——既给重整路径留了余量，又把放大钉在 2 MiB。
+const MAX_INFLATED: usize = 2 * MAX_BLOCK;
+
 fn inflate(payload: &[u8]) -> io::Result<Vec<u8>> {
     let mut out = Vec::with_capacity((payload.len() * 2).max(1024));
-    flate2::read::ZlibDecoder::new(payload).read_to_end(&mut out)?;
+    let mut decoder = flate2::read::ZlibDecoder::new(payload).take(MAX_INFLATED as u64 + 1);
+    decoder.read_to_end(&mut out)?;
+    if out.len() > MAX_INFLATED {
+        // take 留了 1 字节余量：读满即说明对端声明的块远超任何合法文件切片。
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inflated block exceeds the output ceiling",
+        ));
+    }
     Ok(out)
 }
 

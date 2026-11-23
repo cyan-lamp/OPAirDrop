@@ -1941,9 +1941,10 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * 连接是两次独立的交换，中间谁都可以插进来先答查询、再拿自己的证书完成握手。钉住之后，
      * 答查询的那台机器必须同时握着那张证书的私钥。
      *
-     * <p>指纹是空的时候照常连（{@code clientContext(null)} 接受任意自签链）：TXT 分几条记录
-     * 到达，型号到了指纹可能还没到，此时拒绝发送等于把「记录还没收全」判成「对端有问题」。
-     * 代价是这一条连接没有任何东西可钉，日志里会记一行。
+     * <p>指纹是空的时候，承载文件的连接拒绝发送（评审 P1-18：接受任意自签链等于让冒充者
+     * 靠"不发 h="绕过钉住）；只有 /Discover 名字探测允许无指纹连接，调用点显式写成
+     * {@code requirePin=false}。TXT 分几条记录到达、指纹晚到的窗口里，发送会失败一次——
+     * 这是把「记录还没收全」从安全债换成了可重试的失败。
      */
     /**
      * 开一条到对方的连接，并把它登记成「当前这条可以被取消」。
@@ -1958,7 +1959,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         live.add(raw);
         SSLSocket tls = null;
         try {
-            tls = connectTls(peer, raw);
+            tls = connectTls(peer, raw, true);
             // 换成 TLS 那一层。同一个描述符，但取消时要关的是会写 {@code close_notify} 的那个。
             // 先加新的再摘旧的：反过来的话，两步之间取消会两手空空（见 {@link #live} 第三点）。
             live.add(tls);
@@ -2006,10 +2007,22 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         return raw;
     }
 
-    /** TLS 握手 + 证书钉住。{@code raw} 由调用方拥有，失败时由调用方关。 */
-    private static SSLSocket connectTls(Peers.Peer peer, Socket raw) throws IOException {
+    /**
+     * TLS 握手 + 证书钉住。{@code raw} 由调用方拥有，失败时由调用方关。
+     *
+     * <p>评审 P1-18：{@code requirePin} 把两种连接分开。承载文件的连接（{@link #open}）
+     * 必须有指纹可钉——TXT 里没有 {@code h=} 的话，接受任意自签链等于让冒充者靠
+     * "不发指纹"绕过钉住；允许无指纹的只有 {@link #probeName} 的 /Discover 探测
+     * （不碰文件，且在调用点显式命名）。
+     */
+    private static SSLSocket connectTls(Peers.Peer peer, Socket raw, boolean requirePin)
+            throws IOException {
         if (peer.fingerprint.isEmpty()) {
-            Log.i(TAG, "no fingerprint for " + peer.name + ": the certificate cannot be pinned");
+            if (requirePin) {
+                throw new IOException("no fingerprint for " + peer.name
+                        + ": refusing to carry files on an unpinned connection");
+            }
+            Log.i(TAG, "no fingerprint for " + peer.name + ": probing without a pin");
         }
         try {
             SSLSocket tls = (SSLSocket) Identity.clientContext(peer.fingerprint).getSocketFactory()
@@ -2052,7 +2065,8 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             SSLSocket tls = null;
             try {
                 raw = rawSocket(peer, connectMs, readMs);
-                tls = connectTls(peer, raw);
+                // /Discover 不碰文件：无指纹可以探，但这是显式选择（评审 P1-18）。
+                tls = connectTls(peer, raw, false);
                 byte[] answer = Native.discoverName(
                         peer.host.isEmpty() ? peer.address : peer.host,
                         settingsText(), senderName(), modelName(), senderId(),

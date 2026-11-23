@@ -94,6 +94,9 @@ pub enum Error {
     BadChunkFrame(String),
     /// The body grew past the caller's limit.
     BodyTooLarge { limit: usize },
+    /// The chunked trailer carried more lines or bytes than the head limits allow
+    /// (评审 P1-6)。
+    TrailerOverrun,
 }
 
 impl PartialEq for Error {
@@ -128,6 +131,7 @@ impl fmt::Display for Error {
             Error::LineTooLong => write!(f, "line longer than {MAX_LINE} bytes"),
             Error::TruncatedHead => f.write_str("headers truncated"),
             Error::TooManyHeaders => write!(f, "more than {MAX_HEADERS} headers"),
+            Error::TrailerOverrun => write!(f, "chunked trailer exceeds the header limits"),
             Error::TruncatedBody { missing } => {
                 write!(f, "body truncated, {missing} bytes missing")
             }
@@ -213,15 +217,32 @@ impl Headers {
     /// Declared body length, or `None` when absent, unparseable, or negative.
     ///
     /// AirDrop sends no length on some control requests, and the body is then empty.
+    /// **不要用这个值做分帧决策**——重复头与解析失败的值都会落进 `None`，而"没有
+    /// body"和"分帧不可信"是两件事；分帧请走 [`Self::content_length_conflicting`]。
     pub(crate) fn content_length(&self) -> Option<u64> {
         self.get("content-length")
             .and_then(|raw| raw.trim().parse::<u64>().ok())
     }
 
+    /// A `Content-Length` that cannot be trusted for framing (评审 P1-5)。
+    ///
+    /// 重复头会被 [`Self::append`] 合并成 `"5, 5"`，解析失败的值也会落进
+    /// `content_length()` 的 `None`——两者都被当成"没有 body"的话，body 就留在流里，
+    /// 被下一个请求头吃掉（请求走私/失同步）。必须整条连接拒绝。
+    pub fn content_length_conflicting(&self) -> bool {
+        self.get("content-length")
+            .is_some_and(|raw| raw.contains(',') || raw.trim().parse::<u64>().is_err())
+    }
+
     /// Whether the body uses chunked transfer coding.
+    ///
+    /// 按 RFC 9112 的列表语义逐项比较（评审 P1-8）：`chunkedNOT` 是一个不同的
+    /// token，不是 chunked。
     pub(crate) fn is_chunked(&self) -> bool {
         self.get("transfer-encoding")
-            .is_some_and(|value| contains_token(value, "chunked"))
+            .is_some_and(|value| {
+                value.split(',').any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+            })
     }
 
     /// Opens the body these headers describe.
@@ -421,6 +442,11 @@ impl Request {
     /// Whether the body uses chunked transfer coding.
     pub fn is_chunked(&self) -> bool {
         self.headers.is_chunked()
+    }
+
+    /// 评审 P1-5：这条请求的 `Content-Length` 不可信（重复头或解析失败）。
+    pub fn content_length_conflicting(&self) -> bool {
+        self.headers.content_length_conflicting()
     }
 
     /// Whether the peer is waiting for `100 Continue` before sending the body.

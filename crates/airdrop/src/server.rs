@@ -273,6 +273,13 @@ impl<R: Receiver> Server<R> {
                 // do not know what it was a request for.
                 Err(error) => return Err(Error::Http(error)),
             };
+            // 评审 P1-5：重复/畸形的 Content-Length 意味着分帧不可信。继续按空 body
+            // 读会把 body 留在流里、被下一个请求头吃掉（请求走私/失同步）。
+            // 400 + close：宁可少收，不误收。
+            if request.method() == "POST" && request.content_length_conflicting() {
+                send(output, &Response::new(400).with_keep_alive(false))?;
+                return Ok(());
+            }
             let keep = if request.method() != "POST" {
                 // `405` and close: the body of a request we refuse is still in the stream,
                 // and framing it as the next head is how a refusal becomes a parse error.
