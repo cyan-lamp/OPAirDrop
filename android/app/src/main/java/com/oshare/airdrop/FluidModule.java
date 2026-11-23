@@ -62,13 +62,6 @@ public final class FluidModule extends XposedModule {
                     + ".OplusLiveAlertNotificationsRepository";
     private static final String ENTRY_TO_REMIND_TYPE = "access$entryToReminderType";
 
-    /** 前置抑制：包名等于前台应用就把整张卡丢掉的那个拦截器。 */
-    private static final String FRONT_INTERCEPTOR =
-            "com.oplus.systemui.plugins.seedling.data.interceptor.a";
-    /** 它动手的那个模型（{@code livealert.lib.m} 的包装，多了一个「要不要丢」的布尔）。 */
-    private static final String MODEL =
-            "com.oplus.systemui.plugins.seedling.data.interactor.n";
-
     /**
      * 卡片那一层的 ViewModel：{@code handleDataTimeout} 在里面，也就是「三秒到了，收回去」。
      *
@@ -100,16 +93,6 @@ public final class FluidModule extends XposedModule {
      * 装不上就是 null —— 那时 {@link #packageOf} 返回 null，钩子等于什么都没做。
      */
     private static Method sbnGetter;
-
-    /** {@code model.e}：拦截器算出来的「要不要丢掉这张卡」。 */
-    private static java.lang.reflect.Field sFrontFlag;
-    /** {@code model.e()}：通知的包名（转发给里面那个 {@code livealert.lib.m}）。 */
-    private static Method sModelPackage;
-    /**
-     * 拦截器链的下一环 {@code chain.g(model)}。我们替它接管以后必须自己调这一步，
-     * 否则后面的拦截器全都不跑了。
-     */
-    private static Method sNextLink;
 
     /** 插件的两刀都装完了没有。装完后 {@link #onLoadClass} 立刻让路。 */
     private static volatile boolean sPluginHooked;
@@ -378,110 +361,11 @@ public final class FluidModule extends XposedModule {
         return null;
     }
 
-    private void hookFrontBypass(ClassLoader loader) throws Exception {
-        Class<?> interceptor = Class.forName(FRONT_INTERCEPTOR, false, loader);
-        Class<?> model = Class.forName(MODEL, false, loader);
-        sFrontFlag = model.getField("e");
-        sModelPackage = model.getMethod("e");
-
-        // 同一个类里叫 a 的方法不止一个（都混淆成 a 了），靠「第一个参数就是那个模型」认出来。
-        Method target = null;
-        for (Method method : interceptor.getDeclaredMethods()) {
-            if (!"a".equals(method.getName()) || method.getReturnType() != boolean.class) {
-                continue;
-            }
-            Class<?>[] params = method.getParameterTypes();
-            if (params.length == 2 && params[0] == model) {
-                target = method;
-                break;
-            }
-        }
-        if (target == null) {
-            log(Log.ERROR, TAG, FRONT_INTERCEPTOR + " 里找不到 (模型, 链) -> boolean，这一版改了实现");
-            return;
-        }
-
-        hook(target)
-                .setPriority(PRIORITY_DEFAULT)
-                .setExceptionMode(XposedInterface.ExceptionMode.PASSTHROUGH)
-                .setId("opairdrop-front-bypass")
-                .intercept(this::keepWhenFront);
-        log(Log.INFO, TAG, "已钩住前台抑制 " + target);
-    }
-
-    /**
-     * 我们自己在前台时也把卡留下。
-     *
-     * <p>原方法体只有两件事：算一个「要不要丢」的布尔写进 {@code model.e}，然后把模型交给下一环
-     * {@code chain.g(model)}。对自家的模型我们跳过第一步、直接做第二步——{@code e} 已经是 false
-     * 了（拦截器刚构造出来时就是这个初值），下一环读到的就是「没命中前置抑制」。
-     *
-     * <p>别家的模型原样 {@code proceed()}，一个字节都不改。
-     */
-    private Object keepWhenFront(XposedInterface.Chain chain) throws Throwable {
-        Object model = chain.getArg(0);
-        if (model == null || !SELF.equals(packageOfModel(model))) {
-            return chain.proceed();
-        }
-        if (sFrontFlag == null) {
-            return chain.proceed();
-        }
-        Method link = nextLink(chain);
-        if (link == null) {
-            return chain.proceed();
-        }
-        sFrontFlag.setBoolean(model, false);
-        log(Log.INFO, TAG, "我们自己在前台，这张卡也照常放行");
-        return link.invoke(chain.getArg(1), model);
-    }
-
-    /**
-     * 找到拦截器链的下一环 —— 原方法体最后一句 {@code chain.g(model)}。
-     *
-     * <p>不按参数类型写死去找：那个位置既可能是模型类 {@code n}，也可能是它实现的接口
-     * {@code livealert.lib.m}，反编译看不出来（Kotlin 的桥方法）。按「只有一个参数、并且能收下
-     * 这个模型」认，两种都命中。找到一次就缓存，它每个通知都会跑。
-     */
-    private Method nextLink(XposedInterface.Chain chain) {
-        if (sNextLink != null) {
-            return sNextLink;
-        }
-        Object link = chain.getArg(1);
-        Object model = chain.getArg(0);
-        if (link == null || model == null) {
-            return null;
-        }
-        for (Method method : link.getClass().getMethods()) {
-            if (!"g".equals(method.getName()) || method.getParameterCount() != 1) {
-                continue;
-            }
-            if (!method.getParameterTypes()[0].isInstance(model)) {
-                continue;
-            }
-            if (method.getReturnType() != boolean.class) {
-                log(Log.ERROR, TAG, "链的下一环返回值不是布尔，放弃：" + method);
-                return null;
-            }
-            sNextLink = method;
-            log(Log.INFO, TAG, "接管前置抑制后往下走的那一环是 " + method);
-            return sNextLink;
-        }
-        log(Log.ERROR, TAG, "链上找不到 g(模型)，这一版改了实现：" + link.getClass().getName());
-        return null;
-    }
-
-    private static String packageOfModel(Object model) {
-        if (sModelPackage == null) {
-            return null;
-        }
-        try {
-            Object name = sModelPackage.invoke(model);
-            return name instanceof String ? (String) name : null;
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
+    // 这里原本还有第三刀：把「我们自己在前台就不弹卡」那个前置抑制绕过去。2026-11-19
+    // 01:43 实测它有害——装上之后状态机反而判 REFUSED（cardLiveSize=1 / capsuleLiveSize=1 /
+    // transientReminderSize=0 / cardsLevel=-1），比不装还差；而 01:37 那轮证明
+    // remindType=11 本身就已经越过那道闸。取证留在 Plan 的 2026-11-19 条目里，代码删掉：
+    // 一段没有调用点的钩子不是证据，它是每次读这个文件都要重新判断一次的噪声。
     private Object lift(XposedInterface.Chain chain) throws Throwable {
         Object original = chain.proceed();
         if (!(original instanceof Integer) || (Integer) original != 0) {
