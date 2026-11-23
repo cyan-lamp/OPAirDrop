@@ -31,12 +31,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: 安装 NDK r27c
-        id: ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r27c
-          add-to-path: false
+      - name: 装 SDK 组件（platform 37 / build-tools 37 / NDK r27.3，全部钉版本）
+        run: |
+          # android-37 平台不在 runner 预装里；P1-25 的正式修法（支持 minor level 的
+          # AGP）落地前，这里用 sdkmanager 钉版本装齐三件套。
+          sdkmanager --install "platforms;android-37" "build-tools;37.0.0" "ndk;27.3.13750724" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.3.13750724" >> "$GITHUB_ENV"
 
       - name: clippy（0 警告门禁）
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -52,7 +52,6 @@ jobs:
 
       - name: JVM 往返（394 条）
         env:
-          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: bash crates/ffi/jvm/check.sh
 
       - name: Gradle 9.6.0
