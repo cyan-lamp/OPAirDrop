@@ -55,6 +55,8 @@ public final class FluidModule extends XposedModule {
     private static final String TAG = "OPAirDrop";
 
     private static final String SYSTEM_UI = "com.android.systemui";
+    /** 系统框架自己的包名。LSPosed 里显示为「系统框架」，scope.list 里写 {@code android}。 */
+    private static final String ANDROID = "android";
     private static final String SELF = "com.oshare.airdrop";
 
     private static final String REPOSITORY =
@@ -110,6 +112,16 @@ public final class FluidModule extends XposedModule {
 
     @Override
     public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
+        // 系统框架那一支与流体云无关，只是共用一个模块入口：划掉不再强停进程，见 KeepAlive。
+        // 它跑在 system_server 里，所以必须最先分出去 —— 下面所有代码都假定自己在 SystemUI。
+        if (ANDROID.equals(param.getPackageName())) {
+            try {
+                KeepAlive.install(this, param.getClassLoader());
+            } catch (Throwable t) {
+                log(Log.ERROR, TAG, "划掉不再强停那一刀没装上：" + t, t);
+            }
+            return;
+        }
         if (!SYSTEM_UI.equals(param.getPackageName())) {
             return;
         }
