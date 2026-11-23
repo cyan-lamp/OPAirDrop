@@ -51,7 +51,6 @@ jobs:
         run: ./tools/verify-payload.sh
 
       - name: JVM 往返（394 条）
-        env:
         run: bash crates/ffi/jvm/check.sh
 
       - name: Gradle 9.6.0
@@ -59,8 +58,6 @@ jobs:
         with:
           gradle-version: 9.6.0
       - name: 组装 APK（android/build.sh：cargo + gradle 一条龙）
-        env:
-          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: bash android/build.sh assembleDebug
 
       - name: APK 必须带着 .so
