@@ -237,6 +237,11 @@ public final class FluidModule extends XposedModule {
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "卡片不收回那一刀没装上：" + t, t);
         }
+        try {
+            hookShrinkTimer(pluginLoader);
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "缩回定时器那一刀没装上：" + t, t);
+        }
         sPluginHooked = true;
         XposedInterface.HookHandle watch = sLoaderWatch;
         sLoaderWatch = null;
@@ -342,6 +347,76 @@ public final class FluidModule extends XposedModule {
                 .setId("opairdrop-card-keep")
                 .intercept(this::keepCard);
         log(Log.INFO, TAG, "已钩住卡片超时 " + target);
+    }
+
+    /**
+     * 「三秒到了，缩回胶囊」的**现行**路径：{@code com.heytap.log.collect.auto.d.I(key, delay, int, task)}。
+     *
+     * <p>2026-11-24 00:56 现场取证：卡片展开后整 3 秒 {@code onHide-capsule}，而旧路径的
+     * {@code handleDataTimeout}/{@code EVENT_CARD_TIME_OUT} 自启动以来 0 命中——11-21 系统更新
+     * 之后，收回不再走卡片 ViewModel 的超时回调，改由插件里这个通用定时调度器执行。
+     * 时长在 {@code data/interactor/m} 里按 remindType 二选一：**11（STRONG_SHORT，正是
+     * {@link #lift} 强推的那个「能自动展开」的级别）→ 3000 ms，其余 → 5000 ms**。
+     * 也就是说「自动展开」和「3 秒就缩」在这个 ROM 里是同一个常量绑死的，没有先展开又耐久的级别。
+     *
+     * <p>为什么钩调度器而不是钩 {@code onHide} 的执行者（{@code interactor/m.G()}）：G() 同时被
+     * 「通知撤除」的正规路径复用（2026-11-24 00:48:36 removeLiveAlert 那轮实测它也在调 G()），
+     * 跳过它会让正规撤除也失效。而 {@code I()} 的第一个参数就是 livealert 的 key
+     * （形如 {@code 0|com.oshare.airdrop|2816|null|10409}），按 key 放行/跳过，其它应用的卡不受影响；
+     * 我们的卡靠数据事件（列表增删）照样能被正常撤掉。
+     *
+     * <p>9 个调用方（notification/j / capsule strategy / A·B·F·r·card-q 各 viewmodel）全都
+     * 汇进这一个方法，所以这是唯一需要动的咽喉。
+     */
+    private void hookShrinkTimer(ClassLoader pluginLoader) throws Exception {
+        Class<?> scheduler;
+        try {
+            scheduler = Class.forName("com.heytap.log.collect.auto.d", false, pluginLoader);
+        } catch (ClassNotFoundException e) {
+            log(Log.ERROR, TAG, "调度器类 com.heytap.log.collect.auto.d 不存在，这一版改了实现");
+            return;
+        }
+
+        Method target = null;
+        for (Method method : scheduler.getDeclaredMethods()) {
+            if ("I".equals(method.getName())
+                    && method.getParameterCount() == 4
+                    && method.getParameterTypes()[0] == String.class
+                    && method.getParameterTypes()[1] == long.class
+                    && method.getParameterTypes()[2] == int.class
+                    && method.getReturnType() == void.class) {
+                target = method;
+                break;
+            }
+        }
+        if (target == null) {
+            log(Log.ERROR, TAG, scheduler.getName() + " 里找不到 I(String,long,int,…)，这一版改了实现");
+            return;
+        }
+
+        hook(target)
+                .setPriority(PRIORITY_DEFAULT)
+                // 出任何意外都放行原逻辑：宁可卡缩回，不能让 SystemUI 的定时器哑掉。
+                .setExceptionMode(XposedInterface.ExceptionMode.PASSTHROUGH)
+                .setId("opairdrop-shrink-timer")
+                .intercept(this::skipShrinkTimer);
+        log(Log.INFO, TAG, "已钩住缩回定时器 " + target);
+    }
+
+    /** 跳过计数：日志只在第 1 次和此后每 25 次打一条，进度卡每秒刷新好几轮，别刷屏。 */
+    private static int sSkipCount;
+
+    private Object skipShrinkTimer(XposedInterface.Chain chain) throws Throwable {
+        Object key = chain.getArg(0);
+        if (key instanceof String && ((String) key).contains(SELF)) {
+            sSkipCount++;
+            if (sSkipCount == 1 || sSkipCount % 25 == 0) {
+                log(Log.INFO, TAG, "第 " + sSkipCount + " 次跳过自家的缩回定时器（key=" + key + "）");
+            }
+            // 不调 proceed()：这个定时任务根本不排。
+            return null;
+        }
+        return chain.proceed();
     }
 
     /**
