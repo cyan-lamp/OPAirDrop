@@ -33,12 +33,17 @@ jobs:
 
       - name: 装 SDK 组件（platform 37 / build-tools 37 / NDK r27.3，全部钉版本）
         run: |
-          # android-37 平台不在 runner 预装里；P1-25 的正式修法（支持 minor level 的
-          # AGP）落地前，这里用 sdkmanager 钉版本装齐三件套。
+          # android-37 平台在 sdkmanager 的仓库里以 minor 级目录（platform-37.2_r02.zip）
+          # 发布，按名字装会 "Failed to find package"。直接下官方 zip 解到 platforms/ 并
+          # 改名 android-37——与本机 tools/android-sdk 的手工步骤一致（评审 P1-25）。
+          curl -fsSLO https://dl.google.com/android/repository/platform-37.2_r02.zip
+          unzip -q platform-37.2_r02.zip -d "$ANDROID_HOME/platforms/"
+          d=$(find "$ANDROID_HOME/platforms" -maxdepth 1 -type d -name 'android-37*' | head -1)
+          [ "$d" != "$ANDROID_HOME/platforms/android-37" ] && mv "$d" "$ANDROID_HOME/platforms/android-37"
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           [ -x "$SDKMANAGER" ] || SDKMANAGER=$(find "$ANDROID_HOME" -name sdkmanager -type f | head -1)
           yes | "$SDKMANAGER" --licenses > /dev/null
-          "$SDKMANAGER" --install "platforms;android-37" "build-tools;37.0.0" "ndk;27.3.13750724" > /dev/null
+          "$SDKMANAGER" --install "build-tools;37.0.0" "ndk;27.3.13750724" > /dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.3.13750724" >> "$GITHUB_ENV"
 
       - name: clippy（0 警告门禁）
