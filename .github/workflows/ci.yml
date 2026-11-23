@@ -55,6 +55,10 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: bash crates/ffi/jvm/check.sh
 
+      - name: Gradle 9.6.0
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.6.0
       - name: 组装 APK（android/build.sh：cargo + gradle 一条龙）
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}

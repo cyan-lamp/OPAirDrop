@@ -16,7 +16,16 @@ root=$(cd "$here/.." && pwd)
 
 cargo_bin=${CARGO_BIN:-$HOME/.cargo/bin/cargo}
 java_home=${JAVA_HOME:-/d/Downloads/project/tools/jdk-17.0.20.1+1}
-gradle_bin=${GRADLE_BIN:-/d/Downloads/project/tools/gradle-9.6.0/bin/gradle}
+# gradle 先看 PATH（CI 与装了 gradle 的机器），再落回本机的固定版本（评审 P1-26
+# 的另一半：版本本身由 setup-gradle 钉住，兜底路径只是这台机器的现状）。
+gradle_bin=${GRADLE_BIN:-}
+if [ -z "$gradle_bin" ]; then
+    if command -v gradle >/dev/null 2>&1; then
+        gradle_bin=gradle
+    else
+        gradle_bin=/d/Downloads/project/tools/gradle-9.6.0/bin/gradle
+    fi
+fi
 task=${1:-assembleDebug}
 
 # 评审 P1-21：NDK linker 按环境派生，写死的路径只作这台机器的兜底。三个环境变量
