@@ -36,10 +36,17 @@ jobs:
           # android-37 平台在 sdkmanager 的仓库里以 minor 级目录（platform-37.2_r02.zip）
           # 发布，按名字装会 "Failed to find package"。直接下官方 zip 解到 platforms/ 并
           # 改名 android-37——与本机 tools/android-sdk 的手工步骤一致（评审 P1-25）。
-          curl -fsSLO https://dl.google.com/android/repository/platform-37.2_r02.zip
-          unzip -q platform-37.2_r02.zip -d "$ANDROID_HOME/platforms/"
-          d=$(find "$ANDROID_HOME/platforms" -maxdepth 1 -type d -name 'android-37*' | head -1)
-          [ "$d" != "$ANDROID_HOME/platforms/android-37" ] && mv "$d" "$ANDROID_HOME/platforms/android-37"
+          # 新镜像可能已带 android-37.2（名字带 minor，AGP 认的 android-37 找不到）
+          if [ ! -d "$ANDROID_HOME/platforms/android-37" ]; then
+            if [ -d "$ANDROID_HOME/platforms/android-37.2" ]; then
+              mv "$ANDROID_HOME/platforms/android-37.2" "$ANDROID_HOME/platforms/android-37"
+            else
+              curl -fsSLO https://dl.google.com/android/repository/platform-37.2_r02.zip
+              unzip -q platform-37.2_r02.zip -d "$ANDROID_HOME/platforms/"
+              d=$(find "$ANDROID_HOME/platforms" -maxdepth 1 -type d -name 'android-37*' | head -1)
+              mv "$d" "$ANDROID_HOME/platforms/android-37"
+            fi
+          fi
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           [ -x "$SDKMANAGER" ] || SDKMANAGER=$(find "$ANDROID_HOME" -name sdkmanager -type f | head -1)
           yes | "$SDKMANAGER" --licenses > /dev/null
