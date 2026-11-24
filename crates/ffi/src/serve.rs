@@ -352,14 +352,21 @@ impl Receiver for Store {
         }
     }
 
-    fn upload(&mut self, body: &mut dyn std::io::Read, _upload: &Upload<'_>) -> io::Result<()> {
+    fn upload(&mut self, body: &mut dyn std::io::Read, upload: &Upload<'_>) -> io::Result<()> {
         // The body is de-chunked but still wrapped — gzip or DVZip blocks — and the inbox
         // sniffs and unwraps it. Doing that here would mean two places that know what an
         // upload looks like.
         let received = match self.watcher {
             None => inbox::receive_with(&self.directory, self.limits, body),
             Some(watcher) => {
-                let total = self.declared;
+                // offer 不带 size 时（iPhone 发实况照片），用 /Upload 头里的 Content-Length
+                // 兜底：那是线上压缩字节的总数，media 本就压不动，payload 进度≈真实进度。
+                // 2026-11-24 实测：实况照片全程 -1%，流体云不渲染不定态轨道（评审后用户报告）。
+                let total = if self.declared > 0 {
+                    self.declared
+                } else {
+                    upload.content_length.unwrap_or(0)
+                };
                 let hook: inbox::Progress = Arc::new(move |done| watcher.say(done, total));
                 inbox::receive_watched(&self.directory, self.limits, body, hook)
             }
@@ -1188,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn a_watched_endpoint_counts_what_it_lands_and_says_nothing_was_declared() {
+    fn a_watched_endpoint_falls_back_to_the_head_s_length_for_its_denominator() {
         let root = scratch("watched");
         let payload = vec![7u8; 4096];
         let body = archive("note.txt", &payload);
@@ -1218,13 +1225,19 @@ mod tests {
             "the last number a watcher sees is what actually landed: {seen:?}"
         );
         // No `/Ask` came first, so the offer this hook would have taken its denominator from
-        // never existed. Zero is the honest answer — and the caller's cue to show motion
-        // rather than a fraction, which is the whole reason both numbers are passed through
-        // a zero total. Inventing a denominator from the archive that is still arriving
-        // would be a lie the caller cannot detect.
+        // never existed. The denominator falls back to the head's `Content-Length`
+        // （2026-11-24：iPhone 发实况照片时 offer 不带 size，旧做法全程 -1% 让流体云不画
+        // 轨道；线上字节数就是传输总量，误差由调用方 clamp）。每个回调的 total 都相同，
+        // 且是这条请求声明过的数——不是编出来的。
+        let total = seen[0].1;
+        assert!(total > 0, "the head promised a body, so the fallback total is its length");
         assert!(
-            seen.iter().all(|&(_, total)| total == 0),
-            "nothing was declared, so nothing may be claimed: {seen:?}"
+            seen.iter().all(|&(_, t)| t == total),
+            "the denominator must not drift mid-transfer: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|&(done, _)| done <= total),
+            "payload must never claim more than the promised body: {seen:?}"
         );
     }
 

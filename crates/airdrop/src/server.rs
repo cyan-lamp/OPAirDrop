@@ -159,6 +159,11 @@ pub trait Receiver {
 pub struct Upload<'a> {
     /// The `Content-Type` the peer declared, verbatim.
     pub content_type: &'a str,
+    /// The body length the head promised, when framed by `Content-Length` (评审 P1-9 之外的
+    /// 进度兜底，2026-11-24：iPhone 发实况照片时 offer 不带 size，`declared` 为零，进度卡
+    /// 只能报 -1%——不定态在流体云上不渲染轨道。线上压缩字节数就是传输总量，media 本就
+    /// 压不动，用它兜底后 payload 进度≈真实进度；Java 侧 clamp 100 兜住误差。)
+    pub content_length: Option<u64>,
     /// The `TransferID` header, when the peer sent one.
     pub transfer_id: Option<&'a str>,
     /// Whether that header equals the `TransferID` the preceding `/Ask` promised, or
@@ -514,6 +519,7 @@ impl<R: Receiver> Server<R> {
         }
         let upload = Upload {
             content_type,
+            content_length: request.content_length(),
             transfer_id,
             matches_offer,
         };

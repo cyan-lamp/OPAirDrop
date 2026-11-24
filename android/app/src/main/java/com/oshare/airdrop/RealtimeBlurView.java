@@ -735,6 +735,8 @@ final class RealtimeBlurView extends View {
         boolean dirty = true;
         /** 上一次重拍时根的尺寸：尺寸变化也是一次重拍的理由（评审 P1-17）。 */
         int lastW = -1, lastH = -1;
+        /** 跟帧窗口的截止时刻（uptimeMillis）：窗口内逐帧重拍，见 PreDraw 里的注释。 */
+        long captureUntil;
         /** re-entrancy guard: true while root.draw() is traversing INSIDE a
          *  capture. A pane that lives under the capture root (e.g. the
          *  history sheet's card blur, whose captureRoot IS that root) gets
@@ -953,11 +955,18 @@ final class RealtimeBlurView extends View {
                 // dirty=true + 重拍 + 叫醒所有可见 pane，pane 的下一帧又触发 PreDraw：
                 // 自激成常驻 60 Hz 全屏软件重录，什么都不动也在烧电。
                 // 内容变化的驱动靠显式 refresh()——replacePage 每次都会调 refreshGlass()。
-                if (dirty || w != lastW || h != lastH) {
+                // 跟帧窗口（评审 P1-17 的修正，2026-11-24 浮窗圆角跳变）：重拍之后的
+                // 600 毫秒里逐帧跟拍。浮窗/页面的开场动画里底层内容每帧都在变，只在
+                // dirty 时拍会冻在动画的中间帧上——用户看到的就是「模糊圆角一直跳变」
+                // （冻着的帧与实际内容错位，偶尔一次重拍又跳到别的帧）。窗口一过回到
+                // 只按 dirty 拍，稳态零成本不变。
+                boolean follow = android.os.SystemClock.uptimeMillis() < captureUntil;
+                if (dirty || w != lastW || h != lastH || follow) {
                     dirty = true;
                     record(w, h);
                     lastW = w;
                     lastH = h;
+                    captureUntil = android.os.SystemClock.uptimeMillis() + 600;
                     for (int i = 0; i < views.size(); i++) {
                         RealtimeBlurView v = views.get(i).get();
                         if (v != null && v.isAttachedToWindow()

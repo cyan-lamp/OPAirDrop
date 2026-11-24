@@ -519,6 +519,11 @@ final class ReceiveHost {
             if (total > 0) {
                 // 封顶到 total：对端可以多发，而一条写着「112%」的卡只会让人以为哪里坏了。
                 parts.add(Listener.bytes(Math.min(done, total)) + " / " + Listener.bytes(total));
+            } else if (done > 0) {
+                // 总数未知（iPhone 发实况照片时 offer 不带 size、上传还走 chunked 分帧，
+                // 连 /Upload 的 Content-Length 都没有——2026-11-24 实测）：没有分母就没有
+                // 百分比，但「已经到了多少」是事实，写上去比一行光秃秃的「1 个文件」有用。
+                parts.add("已收 " + Listener.bytes(done));
             }
             return parts.isEmpty() ? "准备中" : String.join(" · ", parts);
         }
