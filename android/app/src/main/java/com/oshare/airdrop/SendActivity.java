@@ -321,8 +321,8 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      */
     private final Set<Socket> live = Collections.synchronizedSet(new LinkedHashSet<>());
 
-    /** 这一次停是用户点的，不是出故障。catch 里靠它决定说「已取消」还是说原因。 */
-    private volatile boolean cancelling;
+    /** 一次发送的生命周期（评审拆分路线：取代 sending/cancelling 两个布尔）。 */
+    private volatile SendPhase phase = SendPhase.IDLE;
     /** 面板的窗口。它不参与任务栈，也就不会被系统摆成小窗、不会在最近任务里留一张卡。 */
     private Dialog panel;
 
@@ -346,7 +346,6 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     private PanelGlass glass;
     /** 盖在模糊之上的染色层。模糊只给「看到背后」，可读性由它保证。 */
     private View tint;
-    private volatile boolean sending;
 
     /**
      * 这一次投送的名字，卡片期间不变。
@@ -376,7 +375,8 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * 一样，只有那个随机串分得开。
      */
     private final SendHost.Canceller cardCancel = session -> {
-        if (!sending || !session.equals(sendSession)) {
+        if ((phase != SendPhase.SENDING && phase != SendPhase.CANCELLING)
+                || !session.equals(sendSession)) {
             return false;
         }
         cancelSend();
@@ -599,7 +599,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     protected void onDestroy() {
         SendSession.closed();
         pageGone = true;
-        if (!sending) {
+        if (phase == SendPhase.IDLE) {
             SendHost.unregister(cardCancel);
         }
         // 评审 P1-14：销毁时把静态侧的回调摘干净（有传输在跑的那一段由 settle() 收尾时
@@ -1380,7 +1380,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         // 点的时候回表里取一次这一台：对端可能已经被清掉又加回来了（一次广播空白就够了），
         // 而这个格子抓着的是旧对象，地址端口都可能是上一轮的。
         cell.setOnClickListener(view -> {
-            if (sending) {
+            if (phase != SendPhase.IDLE) {
                 cancelSend();
                 return;
             }
@@ -1421,10 +1421,10 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * <p>**四、多流并行之后要关的是全部。** 见 {@link #live} 的类注释。
      */
     private void cancelSend() {
-        if (!sending) {
+        if (phase == SendPhase.IDLE) {
             return;
         }
-        cancelling = true;
+        phase = SendPhase.CANCELLING;
         Log.i(TAG, "send cancelled by the person");
         hangUpAll();
     }
@@ -1455,9 +1455,8 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * 这一刻来做，否则 {@link SendHost} 会一直握着一个已销毁的页面。
      */
     private void settle() {
-        sending = false;
+        phase = SendPhase.IDLE;
         live.clear();
-        cancelling = false;
         if (pageGone) {
             SendHost.unregister(cardCancel);
         }
@@ -1520,7 +1519,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     }
 
     private void send(Peers.Peer peer) {
-        if (sending) {
+        if (phase != SendPhase.IDLE) {
             return;
         }
         if (files.isEmpty()) {
@@ -1530,12 +1529,9 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         // 先起名字，再置 {@link #sending}：反过来的话，中间那一瞬 sending 已经是 true 而键
         // 还是上一次那个，卡片上的取消会越过 cardCancel 里「是不是这一次」的判断。
         sendSession = UUID.randomUUID().toString();
-        sending = true;
-        // 上一次按过取消、而那一次又没能走到收尾（线程卡在握手、页面被系统收回），
-        // {@code cancelling} 就会留着 true。不在这里清掉，这一趟刚起跑就会在
-        // {@link #open} 里被自己判成「人已经取消了」——一次无辜的秒失败，而且看起来
-        // 像「点发送完全没反应」。
-        cancelling = false;
+        phase = SendPhase.SENDING;
+        // 上一趟的取消残留不需要清：phase 赋 SENDING 已把它覆盖——枚举只有一个值，
+        // 不存在「两个位一真一假」的组合（这正是取代两个布尔的理由）。
         SendSession.began();
         Log.i(TAG, "send to " + peer.name + " — " + peer.address + ":" + peer.port
                 + " host=" + peer.host + ", " + files.size() + " file(s)");
@@ -1592,9 +1588,9 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                             files.size() + " 个文件 · " + size(moved));
                 });
             } catch (Exception failed) {
-                // 先把这个决定记下来：下面那段 lambda 里 cancelling 会被清掉，那时再问就
+                // 先把这个决定记下来：下面那段 lambda 里 phase 会被清回 IDLE，那时再问就
                 // 只会得到 false，标题永远是「发送失败」。
-                boolean stopped = cancelling;
+                boolean stopped = phase == SendPhase.CANCELLING;
                 if (stopped) {
                     // 人按下的停不是故障。这条走 I 而不是 W：日志是要拿去读的，一个 W 会把
                     // 「他说不要了」读成一次事故。异常名照留——它是「确实断在这条 socket 上」
@@ -1696,7 +1692,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         // 人可能在连上之前就把这一趟取消了（卡片上的【取消发送】从「准备中」就在）。这时
         // 还去建连接，是拿几秒钟的握手换一次立刻作废——对面手机上会白弹一次邀请。
         // 另一条流先倒下时同理：{@code abort} 一置，剩下的流不该再让对面多弹一次窗。
-        if (cancelling || flight.abort.get()) {
+        if (phase == SendPhase.CANCELLING || flight.abort.get()) {
             throw new IOException("cancelled before connecting");
         }
         int connectMs = (int) Tuning.ms(tuned, "client.connect_timeout_ms", CONNECT_TIMEOUT_MS);
@@ -1714,7 +1710,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         // socket 还开着，于是写进同一条连接的 /Ask 换回来的不是 401、不是 reset、不是关闭，
         // 是什么都没有。本仓为此白等了整整一个读超时，界面停在「正在请求发送…」。
         Native.Link second = () -> {
-            if (cancelling || flight.abort.get()) {
+            if (phase == SendPhase.CANCELLING || flight.abort.get()) {
                 // 人已经点了取消。再连一条只会让取消慢一步，所以让传输就地从这里失败。
                 throw new IOException("cancelled before the second connection");
             }
@@ -1955,7 +1951,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             live.remove(raw);
             // 真取消了就抛出去，由下面那个 catch 把刚建成的这条关掉，别让传输白跑一趟
             // /Discover。/Ask 之前那一条同理由 {@code second} 里的检查兜住。
-            if (cancelling || flight.abort.get()) {
+            if (phase == SendPhase.CANCELLING || flight.abort.get()) {
                 throw new IOException("cancelled during the connection");
             }
             return tls;
