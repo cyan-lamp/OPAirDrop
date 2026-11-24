@@ -1681,107 +1681,44 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     }
 
     /**
-     * 一条流：一趟完整的「发现、请求、发档案」，两条连接。
+     * 一条流的界面侧：读表、开连接的账目（{@link #open}）与进度回执，协议侧全在
+     * {@link SendPipeline#transfer}。
      *
-     * @param paths 这一条流要送的**那几份**文件——不是全部。分给谁由 {@link #share} 定
-     * @param flight 各条流共用的那块记账板；{@code lane} 是这一条在里面占的格子
-     * @param lane 这是第几条流，用自己的格子，不碰别人的
+     * <p>{@code paths} 是这一条流要送的**那几份**文件——不是全部；{@code lane} 是它在
+     * {@link SendPipeline.Flight} 里占的格子。
      */
     private byte[] transfer(Peers.Peer peer, List<String> paths, SendPipeline.Flight flight, int lane,
-                            SettingsScreen tuned) throws Exception {
-        // 人可能在连上之前就把这一趟取消了（卡片上的【取消发送】从「准备中」就在）。这时
-        // 还去建连接，是拿几秒钟的握手换一次立刻作废——对面手机上会白弹一次邀请。
-        // 另一条流先倒下时同理：{@code abort} 一置，剩下的流不该再让对面多弹一次窗。
-        if (phase == SendPhase.CANCELLING || flight.abort.get()) {
-            throw new IOException("cancelled before connecting");
-        }
+            SettingsScreen tuned) throws Exception {
+        // 表读不出来就是 null，下面每个取数都会回落到常量——握手这个界不该因为设置文件坏了而
+        // 从「等 12 秒」变成「不等」。
         int connectMs = (int) Tuning.ms(tuned, "client.connect_timeout_ms", CONNECT_TIMEOUT_MS);
         int readMs = (int) Tuning.ms(tuned, "client.read_timeout_ms", READ_TIMEOUT_MS);
         int uploadReadMs =
                 (int) Tuning.ms(tuned, "client.upload_read_timeout_ms", UPLOAD_READ_TIMEOUT_MS);
 
-        // 第一条：/Discover 走这里，答完就作废。
-        SSLSocket[] held = {open(peer, connectMs, readMs, flight)};
+        return SendPipeline.transfer(peer, paths, lane, flight, live,
+                // 两个取消源合成一个判定：人按的停，或者另一条流先倒下（abort 一置，剩下的
+                // 流不该再让对面多弹一次窗）。
+                () -> phase == SendPhase.CANCELLING || flight.abort.get(),
+                connectMs, readMs, uploadReadMs,
+                settingsText(), senderName(), modelName(), senderId(), totalBytes,
+                this::open,
+                new SendPipeline.LaneWatch() {
+                    @Override public void name(String peerName) {
+                        // Rust 在发送线程上回调；改视图必须回到主线程。
+                        runOnUiThread(() -> showRealName(peer, peerName));
+                    }
 
-        // 第二条：/Ask 和 /Upload 走这里。谁来换、什么时候换由 Rust 定——它在 /Discover
-        // 与 /Ask 之间调一次 {@code connect}——这里只负责「再连一次」这件事本身。
-        //
-        // 为什么非换不可：iPhone 一条连接只读一个请求。答完 /Discover 之后它就不读了，而
-        // socket 还开着，于是写进同一条连接的 /Ask 换回来的不是 401、不是 reset、不是关闭，
-        // 是什么都没有。本仓为此白等了整整一个读超时，界面停在「正在请求发送…」。
-        Native.Link second = () -> {
-            if (phase == SendPhase.CANCELLING || flight.abort.get()) {
-                // 人已经点了取消。再连一条只会让取消慢一步，所以让传输就地从这里失败。
-                throw new IOException("cancelled before the second connection");
-            }
-            Log.i(TAG, "lane " + lane + ": second connection for /Ask");
-            SendPipeline.closeQuietly(held[0]);
-            live.remove(held[0]);
-            held[0] = null;
-            SSLSocket next = open(peer, connectMs, readMs, flight);
-            held[0] = next;
-            return next;
-        };
-
-        try {
-            return Native.sendWithProgress(
-                    peer.host.isEmpty() ? peer.address : peer.host,
-                    settingsText(),
-                    senderName(),
-                    modelName(),
-                    senderId(),
-                    UUID.randomUUID().toString(),
-                    paths.toArray(new String[0]),
-                    held[0].getInputStream(),
-                    held[0].getOutputStream(),
-                    second,
-                    new Native.Progress() {
-                        @Override public void name(String peerName) {
-                            // Rust 在发送线程上回调；改视图必须回到主线程。
-                            runOnUiThread(() -> showRealName(peer, peerName));
-                        }
-
-                        @Override public void report(int phase, long sent, long total) {
-                        if (phase == Native.Progress.SENDING) {
-                            // 从这一刻起等的不再是「对方要不要」，而是「那个档案收完没有」
-                            // ——人要先在对面手机上点接受，档案才可能开始落地。两个等待
-                            // 该给的耐心不一样：弹窗十五秒内就该有结果，点了接受之后不设
-                            // 上限会让人以为卡住。
-                            //
-                            // 这一句必须**每条流各做一次**，不能拿 {@code moving} 当门闩：
-                            // 那是四块格子共用的一面旗，只让第一条流改自己那条 socket 的话，
-                            // 另外三条会拿着 15 秒的短超时去等接受，然后准时炸掉整趟发送。
-                            // 2026-11-19 23:29 就是这么死的（lane 1 在 15.005 s 报 Read timed out）。
-                            // 超时是每条连接各自一份的，改的也是这条流自己的 {@code held[0]}。
-                            flight.moving.set(true);
-                            try {
-                                held[0].setSoTimeout(uploadReadMs);
-                            } catch (Exception noTimeout) {
-                                Log.w(TAG, "cannot lengthen the read timeout for the archive",
-                                        noTimeout);
-                            }
-                        }
-                        // 只往后两个相位记字节数：等待相位送进来的 0 会把已经走过的量抹掉，
-                        // 而这两个相位是单调的，后来的值不会比先前小。各流记各流的格子，
-                        // 分母用整件事的总字节（{@code totalBytes}，从点发送那一刻就定死了），
-                        // 所以后面几条流陆续起跑时百分比不会往回跳。
-                        if (phase == Native.Progress.SENDING || phase == Native.Progress.DONE) {
-                            flight.sent.set(lane, sent);
-                        }
-                        // DONE 每条流各来一次，只有最后一条该让界面说「等待确认」。
-                        boolean last = phase == Native.Progress.DONE
-                                && flight.finished.incrementAndGet() >= flight.lanes;
-                        long done = flight.sentBytes();
-                        long whole = totalBytes;
+                    @Override public void phase(int p, int ln, long done, long whole, boolean last) {
                         runOnUiThread(() -> {
-                            switch (phase) {
+                            switch (p) {
                                 case Native.Progress.READY -> {
                                     // 几条流各自握手，但界面只有一行字。已经有别的流在发字节了，
                                     // 就不能把「发送中 45%」退回「正在请求发送…」。
                                     if (flight.moving.get()) {
                                         return;
                                     }
-                                    Log.i(TAG, "lane " + lane + ": ready (handshake done, asking)");
+                                    Log.i(TAG, "lane " + ln + ": ready (handshake done, asking)");
                                     status(peer, "已连接，正在请求发送…");
                                     SendHost.waiting(sendSession, peer.name, "已连接，正在请求发送…");
                                 }
@@ -1789,7 +1726,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                                     if (flight.moving.get()) {
                                         return;
                                     }
-                                    Log.i(TAG, "lane " + lane + ": waiting (the person has been asked)");
+                                    Log.i(TAG, "lane " + ln + ": waiting (the person has been asked)");
                                     status(peer, "等待对方接受…");
                                     SendHost.waiting(sendSession, peer.name, "等待对方接受…");
                                 }
@@ -1806,23 +1743,12 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                                             whole == 0 ? -1 : (int) (done * 100 / whole),
                                             files.size() + " 个文件" + (whole == 0 ? ""
                                                     : " · " + size(done) + " / " + size(whole)));
-                                    // 回调每秒来几十上百次。只在一成、两成……这些整点上留痕，
-                                    // 否则一个 200 MB 的文件能把整段日志冲掉。这条十分位是
-                                    // **整件事**的，不是某条流的：多流并行的加速度就要靠它读，
-                                    // 按流各记一份会得到 N 条分辨率很低的曲线。
-                                    int step = whole == 0 ? -1 : (int) (done * 10 / whole);
-                                    if (step != flight.decile.getAndSet(step)) {
-                                        Log.i(TAG, "phase sending "
-                                                + (whole == 0 ? "?" : done * 100 / whole + "%")
-                                                + " (" + done + "/" + whole + " bytes, lane "
-                                                + lane + " at " + sent + ")");
-                                    }
                                 }
                                 case Native.Progress.DONE -> {
                                     if (!last) {
                                         return;
                                     }
-                                    Log.i(TAG, "lane " + lane + ": done (all bytes written, "
+                                    Log.i(TAG, "lane " + ln + ": done (all bytes written, "
                                             + "waiting for the reports)");
                                     progressOf.put(peer.name, 1f);
                                     redrawProgress(peer.name);
@@ -1832,17 +1758,9 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                                 }
                             }
                         });
-                        }
-                    });
-        } finally {
-            // 关最后那一条。中途换过连接的话，前一条已经在 second 里关掉了——那条连接上
-            // 已经答过一个请求，留着它没有任何用处。
-            SendPipeline.closeQuietly(held[0]);
-            live.remove(held[0]);
-            held[0] = null;
-        }
+                    }
+                });
     }
-
     /*
      * 这里原来有两个方法：`streamCount()`（读 `client.streams`，再按文件数封顶）和
      * `share()`（大文件优先的贪心装箱，把文件摊成 N 组、各组字节数尽量接近）。

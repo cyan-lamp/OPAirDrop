@@ -6,6 +6,8 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketException;
+import java.util.List;
+import java.util.Set;
 
 import javax.net.ssl.SSLSocket;
 
@@ -206,6 +208,130 @@ final class SendPipeline {
             return new String(answer, java.nio.charset.StandardCharsets.UTF_8);
         } finally {
             closeQuietly(tls != null ? tls : raw);
+        }
+    }
+
+    /** 一条流的界面回执：pipeline 只报事实（相位与字节），说什么话是调用方的事。 */
+    interface LaneWatch {
+
+        /** /Discover 带回了真名。 */
+        void name(String peerName);
+
+        /**
+         * 一个相位到了。`phase` 是 {@code Native.Progress} 的四个常量；`done`/`whole` 是
+         * **整件事**的字节数（多流共用一个分母）；`last` 表示这是不是最后一条流的 DONE。
+         */
+        void phase(int phase, int lane, long done, long whole, boolean last);
+    }
+
+    /** 开一条可以收发的连接；live 登记与取消检查是调用方的账目。 */
+    interface Opener {
+
+        SSLSocket open(Peers.Peer peer, int connectMs, int readMs, Flight flight) throws IOException;
+    }
+
+    /**
+     * 一条流：一趟完整的「发现、请求、发档案」，两条连接。
+     *
+     * <p>协议侧全部收在这里：取消检查、连接的建立与更换（{@code /Discover} 一条、
+     * {@code /Ask}+{@code /Upload} 另一条——iPhone 一条连接只读一个请求，不换线的话写进
+     * 同一条连接的 /Ask 换回来的不是 401 不是 reset，是**什么都没有**，本仓为此白等过
+     * 整整一个读超时）、字节的记账、进度的上报。界面说什么（状态行、卡片、百分比）由
+     * {@link LaneWatch} 决定。
+     *
+     * @param cancelled 两个取消源（人按的停、另一条流先倒下）合成的当前判定
+     * @param whole    这一次投送的总字节数（点发送那一刻就定死了），进度分母
+     */
+    static byte[] transfer(Peers.Peer peer, List<String> paths, int lane, Flight flight,
+            Set<Socket> live, java.util.function.BooleanSupplier cancelled,
+            int connectMs, int readMs, int uploadReadMs,
+            String settings, String sender, String model, String id, long whole,
+            Opener opener, LaneWatch watch) throws Exception {
+        if (cancelled.getAsBoolean()) {
+            throw new IOException("cancelled before connecting");
+        }
+
+        // 第一条：/Discover 走这里，答完就作废。
+        SSLSocket[] held = {opener.open(peer, connectMs, readMs, flight)};
+
+        // 第二条：/Ask 和 /Upload 走这里。谁来换、什么时候换由 Rust 定——它在 /Discover
+        // 与 /Ask 之间调一次 connect——这里只负责「再连一次」这件事本身。
+        Native.Link second = () -> {
+            if (cancelled.getAsBoolean()) {
+                // 人已经点了取消。再连一条只会让取消慢一步，所以让传输就地从这里失败。
+                throw new IOException("cancelled before the second connection");
+            }
+            Log.i(TAG, "lane " + lane + ": second connection for /Ask");
+            closeQuietly(held[0]);
+            live.remove(held[0]);
+            held[0] = null;
+            SSLSocket next = opener.open(peer, connectMs, readMs, flight);
+            held[0] = next;
+            return next;
+        };
+
+        try {
+            return Native.sendWithProgress(
+                    peer.host.isEmpty() ? peer.address : peer.host,
+                    settings,
+                    sender,
+                    model,
+                    id,
+                    java.util.UUID.randomUUID().toString(),
+                    paths.toArray(new String[0]),
+                    held[0].getInputStream(),
+                    held[0].getOutputStream(),
+                    second,
+                    new Native.Progress() {
+                        @Override public void name(String peerName) {
+                            watch.name(peerName);
+                        }
+
+                        @Override public void report(int phaseSent, long sent, long total) {
+                            if (phaseSent == Native.Progress.SENDING) {
+                                // 从这一刻起等的不再是「对方要不要」，而是「那个档案收完没有」。
+                                // 这一句必须**每条流各做一次**，不能拿 moving 当门闩：那是四块
+                                // 格子共用的一面旗，只让第一条流改自己那条 socket 的话，另外
+                                // 三条会拿着 15 秒的短超时去等接受，然后准时炸掉整趟发送
+                                // （2026-11-19 23:29，lane 1 在 15.005 s 报 Read timed out）。
+                                // 超时是每条连接各自一份的，改的也是这条流自己的 held[0]。
+                                flight.moving.set(true);
+                                try {
+                                    held[0].setSoTimeout(uploadReadMs);
+                                } catch (Exception noTimeout) {
+                                    Log.w(TAG, "cannot lengthen the read timeout for the archive",
+                                            noTimeout);
+                                }
+                            }
+                            // 只往后两个相位记字节数：等待相位送进来的 0 会把已经走过的量抹掉。
+                            // 各流记各流的格子，分母是整件事的总字节，后面几条流陆续起跑时
+                            // 百分比不会往回跳。
+                            if (phaseSent == Native.Progress.SENDING || phaseSent == Native.Progress.DONE) {
+                                flight.sent.set(lane, sent);
+                            }
+                            // DONE 每条流各来一次，只有最后一条该让界面说「等待确认」。
+                            boolean last = phaseSent == Native.Progress.DONE
+                                    && flight.finished.incrementAndGet() >= flight.lanes;
+                            long done = flight.sentBytes();
+                            // 回调每秒来几十上百次。只在一成、两成……这些整点上留痕，
+                            // 否则一个 200 MB 的文件能把整段日志冲掉。这条十分位是**整件事**的，
+                            // 不是某条流的：多流并行的加速度就要靠它读。
+                            int step = whole == 0 ? -1 : (int) (done * 10 / whole);
+                            if (step != flight.decile.getAndSet(step)) {
+                                Log.i(TAG, "phase sending "
+                                        + (whole == 0 ? "?" : done * 100 / whole + "%")
+                                        + " (" + done + "/" + whole + " bytes, lane "
+                                        + lane + " at " + sent + ")");
+                            }
+                            watch.phase(phaseSent, lane, done, whole, last);
+                        }
+                    });
+        } finally {
+            // 关最后那一条。中途换过连接的话，前一条已经在 second 里关掉了——那条连接上
+            // 已经答过一个请求，留着它没有任何用处。
+            closeQuietly(held[0]);
+            live.remove(held[0]);
+            held[0] = null;
         }
     }
 }
