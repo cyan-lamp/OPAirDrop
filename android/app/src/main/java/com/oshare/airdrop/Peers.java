@@ -80,174 +80,12 @@ final class Peers {
     private static final long ASK_EAGER_MS = 300;
 
     /**
-     * 一台上一包之后多久算消失——**凑不齐地址端口时的兜底值**，不是唯一判据。
-     *
-     * <p># 「快速消失靠 goodbye」这个说法被真机推翻了
-     *
-     * <p>这里原来写着「iOS 关掉 AirDrop 时会发 TTL=0 的记录」，于是这一档只当兜底，
-     * 6 秒也心安理得。2026-11-18 21:10 的真机把前提否掉了：iPhone 关掉 AirDrop 之后
-     * **一包都没再发**，{@link #absorb} 的 {@code gone} 分支一次都没走到，日志里只有
-     * {@code after 6065 ms of silence (threshold 6000)}。也就是说对它而言，
-     * 这个常数就是全部——六秒的延迟直接落在人眼里。能连的那一档因此有了自己的
-     * {@link #CONNECTABLE_MS}。
-     *
-     * <p>goodbye 那条路仍然在，仍然比任何计时器都快；只是不能指望它一定会来。
-     *
-     * <p># 为什么整体从 2.5 秒放宽到 6 秒，以及后来为什么又能分开
-     *
-     * <p>2.5 秒是拍的，真机把它否掉了。08:00 那一轮抓到的是这个：
-     * <pre>
-     * dropped e9bed2a41703 after 2567 ms of silence (threshold 2500, rhythm 1320 ms)
-     * 1 connectable — e9bed2a41703          ← 一秒后同一台又回来了
-     * dropped e9bed2a41703 after 1379 ms of silence (threshold 1200, rhythm 528 ms)
-     * </pre>
-     * 设备一直在，是我们删了又加。原因是 mDNS 的重复应答抑制：同一份记录不会答得太勤，所以
-     * 一台**活着的** iPhone 合法地安静过 2.6 秒。而 50 秒的采样里（{@code probe:} 那些行）
-     * 健康时的安静最多 752 毫秒——两者相差三倍，说明 2.5 秒正好落在「健康」和「真走了」之间
-     * 那条模糊带里，谁划在那都会闪。
-     *
-     * <p>6 秒是「比健康时长出一个数量级」的位置：健康时安静不到 1 秒，6 秒还没声音就真的
-     * 不是抑制了。慢的这 3.5 秒只影响「对方一声不响地消失」这种本来就没有时间点的情况。
-     *
-     * <p>**2026-11-18 起这一档只留给「还不完整」的对端**：能连的那一档曾经有自己的、短得多的
-     * {@link #CONNECTABLE_MS}（2.2 秒）。上面那两次闪烁都发生在没有可连对端、查询提到 300 毫秒
-     * 一次的时候，这个条件现在被写进了判断里，而不是靠一个对所有人生效的大数来回避。
-     *
-     * <p>**2026-11-19 起两档曾短暂同值（都是 6 秒），当天 17:16 之后又分开了**：能连那一档继续
-     * 往上走到 20 秒（理由见 {@link #CONNECTABLE_MS} 最后一段——对面是成段休眠，六秒必闪），
-     * 这一档留在 6 秒，只负责「还不完整」的对端。合并的方向从一开始就是反的：不是把这一档压短，
-     * 是把能连那一档放长。短阈值要换来的「关掉后快两秒消失」根本不值得——对端不讲 goodbye
-     * （见上），那两秒也只能靠猜。
-     */
-    private static final long EXPIRE_MS = 6_000;
-
-    /**
-     * 一台**能连**的对端上一包之后多久算消失。
-     *
-     * <p># 这个数被真机改了三回，最后一次和 {@link #EXPIRE_MS} 合流
-     *
-     * <p>第一版 2.2 秒，理由很硬：列表里只要有一台能连的，我们就以 1 秒一次问它，而它是
-     * **一问一答**的（21:10 那轮 {@code q=0 a=14}，十四个应答全是我们问出来的），所以沉默
-     * 满两个周期就是它真的不答了。
-     *
-     * <p>2026-11-19 这个理由被推翻两次。先是一台一直在说话的 iPhone 被反复删掉（间隔
-     * 879–1638 ms，丢一包就静 2.2–3.3 秒，而死阈值是 2.2）；于是阈值改成由实测节奏算
-     * （见 {@link #timeout}）。改完 15:57 和 16:16 又各删了一次，这两行是关键：
-     * <pre>
-     * dropped 3fa87792be9a@… after 2727 ms of silence (threshold 2608, gaps 29,  max 1054)
-     * dropped 9ba49b54ddbb@… after 4134 ms of silence (threshold 4080, gaps 242, max 1640)
-     * </pre>
-     * 下面这台已经**稳定说了 242 个间隔**——好几分钟里一包没丢过——然后突然静了四秒多。
-     *
-     * <p># 那「只差 54 毫秒」是误读
-     *
-     * <p>2727 对 2608、4134 对 4080，看着都像「差一点点就救回去了」，于是很容易得出「把余量
-     * 再加两百毫秒就好」。不对。{@link #expire} 每 250 毫秒才跑一次，所以删除时刻必然落在
-     * {@code [阈值, 阈值+250]} 里——这两个数正好都在这个区间，它们只证明检查粒度是 250 毫秒，
-     * 不证明设备是踩线走的。真相是：**它到底会静多久我们不知道，因为我们在第一个检查点就把它
-     * 删了。**
-     *
-     * <p># 于是这个判据的毛病不在数值，在它想回答的问题
-     *
-     * <p>「它静了 N 秒」在我们这边分不清两件事：它走了，和这条链路抖了一下（AWDL 的时隙调度
-     * 在两端不同步时会周期性丢包，四秒足够连丢三四个包）。而 242 个间隔里它一次都没丢过，说明
-     * 后者随时可能发生。判据必须偏向前者，也就是**容得下抖动**，而不是贴着理论周期。
-     *
-     * <p>所以这一档的下限抬到 6 秒，和 {@link #EXPIRE_MS} 同值。两个数同值不是巧合，是同一个
-     * 结论抵达了两次：**在我们能拿到的信号里，「沉默」的最小可信单位就是六秒**。代价是对方
-     * 关掉 AirDrop 之后要等六秒才消失——比 2.2 秒慢，但那一次等待换来的是「活着的设备不再每秒
-     * 消失一次」，这个交换每次都是划算的。
-     *
-     * <p>真正的解法不在这里，在 {@link #prompt}：把「它静了」这件事本身变少，而不是在事后
-     * 猜它静得够不够久。
-     *
-     * <p># 2026-11-19 17:16：六秒也不够，因为对面是**成段休眠**，不是丢包
-     *
-     * <p>那一轮旁边一直有一台 iPad 在说话（{@code foreign} 每半秒涨），所以链路是活的、
-     * {@link #LINK_QUIET_MS} 那道门根本没关上。iPhone 的轨迹是这样的：
-     * <pre>
-     * 17:16:09.642 ready   ac064e658d14 after 1394 ms of browsing
-     * 17:16:12.521 prompted … after 1949 ms of silence      ← 单播叫了一次
-     * 17:16:16.632 dropped … after 6060 ms (threshold 6000, rhythm 420 ms, gaps 2)
-     * 17:16:30.683 ready   … after 2197 ms                  ← 十四秒后原样回来
-     * 17:16:32.901 prompted … after 1828 ms                 ← 连续三次单播，全无应答
-     * 17:16:36.298 prompted … after 2078 ms
-     * 17:16:41.881 prompted … after 1760 ms
-     * 17:16:46.240 dropped … after 6119 ms (threshold 6000, rhythm 1216 ms, gaps 2)
-     * </pre>
-     * 两次删除都是踩在第一个检查点上，说明它真实的安静比六秒更长；而三次单播一次都没回来，
-     * 说明这段时间它不是「漏听了一个包」——它的应答器整段没在工作。同一时刻
-     * {@code iw dev wonder0 station dump} 里它的站点条目 {@code connected time} 一路涨、
-     * {@code signal −26 dBm}，**802.11 是通的，只有 AirDrop 那层在睡**。它答几包、睡六到八秒、
-     * 再答几包，任何小于八秒的门槛都必然闪。
-     *
-     * <p>所以下限抬到 **20 秒**，也就是 {@link #LINK_DEAD_MS} 那条天花板。两个数合成一个不是
-     * 省事：它们回答的是同一个问题——「沉默多久之后我们才有资格说它走了」。在我们能拿到的
-     * 信号里，答案已经明确是「很久，而且我们分不清它是在睡还是走了」，那就只有一条路：**容得
-     * 下，直到容不下为止**。
-     *
-     * <p># 那笔代价后来被 {@link #KNOCK_AFTER_MS} 收走了
-     *
-     * <p>「对方真关掉 AirDrop，这个格子会多留十几秒」当时只能认下来，因为 5353 上分不出「睡」
-     * 和「走」。现在分得出——敲门量的是 8770 那个端口，跟应答器醒不醒没关系。所以 20 秒退回
-     * 它本来的身份：**只有敲不出结论时才走的兜底**（{@link #knock} 那条路遇到自有路由故障、
-     * 或者对端压根没给端口）。正常情况下关掉 AirDrop 的 iPhone 两秒出头就从列表里消失，
-     * 这个常数根本走不到。
-     * 那比「活着的设备每六秒消失一次」划算，因为后者会让人以为功能坏了。
-     */
-    private static final long CONNECTABLE_MS = 20_000;
-
-    /**
-     * 安静多久之后，值得单独去敲一次它的门。
-     *
-     * <p># 敲的是什么
-     *
-     * <p>一条 TCP 连接，打到它 SRV 记录里那个端口（AirDrop 用 8770）。**判据不在 mDNS 那一层**，
-     * 这是它全部的意义：{@link #CONNECTABLE_MS} 之所以要 20 秒，是因为「应答器在睡」和「AirDrop
-     * 关了」在 5353 上长得一模一样——两者都是一句话不说。而端口不一样：
-     *
-     * <pre>
-     * AirDrop 开着     nc -6 …:8770 → exit=0，握手完成（内核回 SYN-ACK，不需要应用醒着）
-     * AirDrop 关着     nc -6 …:8770 → 超时；顺带确认过未监听端口回的是 Timeout 而不是
-     *                  Connection refused（iOS 静默丢弃，不生成 RST）
-     * </pre>
-     *
-     * <p>所以「连得上」是硬证据：那台设备还在，只是 mDNS 那层不想说话。「连不上」是软证据，
-     * 所以 {@link #KNOCK_FAILS} 不止一次。
-     *
-     * <p># 为什么从 2.5 秒降到 1.2 秒
-     *
-     * <p>2.5 秒原本的理由是「早于此敲门是白敲」——实测这台 iPhone 的应答节奏是 794 ms
-     * （10 gaps, 511–2708 ms），2.7 秒的间隔是合法波动，敲门得等过它。**那个理由是错的**，
-     * 因为敲空一次的代价根本不值一提：2026-11-19 18:09 那一轮在 AirDrop 开着的情况下连敲
-     * 240 次（每 100 毫秒一次，连敲 42 秒），**240/240 全连上，最慢 471 ms，中位约 70 ms**。
-     * 也就是说「多敲一次」只花几十毫秒，而「敲通」的收益是当场确认它还在并且给它续命。
-     *
-     * <p>约束于是换了：不再是「不能早于最长合法沉默」，而是「不能早于一次正常握手」。
-     * 1.2 秒是那个中位数的十几倍，留足了 AWDL 时隙被抢的空档。剩下的交给
-     * {@link #KNOCK_EVERY_MS} 和 {@link #KNOCK_FAILS}：一次敲通则这台继续留在表里，
-     * 两次敲空才认它走了。真正被压掉的是「关 AirDrop 之后那段干等」——
-     * 实测 2.5 秒那一档是 3.9 秒才消失，1.2 秒这一档应该在 2 秒出头。
-     */
-    private static final long KNOCK_AFTER_MS = 1_200;
-
-    /**
      * 一次敲门等多久。
      *
      * <p>同一条链路上 {@code ping6} 实测 RTT min 9.6 / avg 213.9 / max 302.1 ms，900 是最大值的
      * 三倍，够容一次重传。再长就只是让「走了」这件事晚一点被发现。
      */
     private static final int KNOCK_TIMEOUT_MS = 2_500;
-
-    /**
-     * 两次敲门之间隔多久。这个数只防手滑刷屏，不是判据。
-     *
-     * <p>跟着 {@link #KNOCK_AFTER_MS} 一起从 900 收到 600：判死要两次样本，间隔就是「走没走」
-     * 这件事的取样周期。第一下已经打进去了，第二下再拖 900 毫秒只是让列表多留一个空格子——
-     * 1.2 秒等待 + 两次敲门（实测一次 20 毫秒、一次 164 毫秒）= 两秒出头就能删掉一台关了
-     * AirDrop 的 iPhone，而它在 {@link #CONNECTABLE_MS} 那条路上要 20 秒。
-     */
-    private static final long KNOCK_EVERY_MS = 600;
 
     /**
      * 连着几次敲不通才认它走了。
@@ -261,45 +99,6 @@ final class Peers {
      * 一台不停宣告的 iPhone 可以让 8770 关着而自己一直在，那时按敲空删除就是纯粹的闪烁。
      */
     private static final int KNOCK_FAILS = 2;
-
-    /**
-     * 敲空之后，还要它安静多久才真的删。
-     *
-     * <p># 2026-11-19 19:50 的现场
-     *
-     * <p>那 15 秒里同一台 iPhone 被删了四次、放回来四次，每次隔约 2 秒：
-     * <pre>
-     * 19:50:04.814  knock 拒绝 7 ms    ← miss 1
-     * 19:50:05.548  knock 拒绝 23 ms   ← miss 2，判它走了
-     * 19:50:05.701  dropped（报的沉默是 1435 ms）
-     * 19:50:06.967  revived（端口又通了）
-     * 19:50:07.777  knock 又拒绝 11 ms
-     * </pre>
-     *
-     * <p>四次 {@code dropped} 报的沉默是 1435 / 1510 / 1740 / 2257 毫秒——**没有一路涨上去**，
-     * 这是关键：它的宣告一直在来，走的只是那个 8770。
-     *
-     * <p># 那个 RST 是真的，来自对面
-     *
-     * <p>同一天从设备侧量过（{@code ping6} 秒回 38 ms；{@code nc -z …%193 8770} 当场
-     * {@code Connection refused}，拒绝耗时 26–464 ms，与 RTT 同量级；再连量 120 拍 0 次成功）。
-     * 所以「它自己的端口关着」是一个真实状态，不是我们量错、也不是路由故障——**一台手机完全
-     * 可以在旁边、在宣告、却暂时不接受连接**。端口回答的是「现在能不能发」，不是「在不在」。
-     *
-     * <p>于是判死要两件事同时成立：敲空到 {@link #KNOCK_FAILS} 次，**并且**它已经安静了这么久。
-     * 沉默是「它不在了」的证据，端口不是。墓碑和 {@link Peer#unproven} 那套机制防的是
-     * 「刚走、缓存应答还在冒充」，那种冒充撑不过一两秒，和这里要放的 2.3 秒不冲突。
-     *
-     * <p># 为什么是 3 秒
-     *
-     * <p>要比一个宣告节拍宽（实测中位 794 ms、最长 2.7 秒），于是 19:50 那 1.4–2.3 秒的抖动
-     * 不够格；又要明显短于 {@link #CONNECTABLE_MS} 的 20 秒，否则敲门就白加了。真走了的设备
-     * 宣告会停，3 秒后照删，与按沉默阈值删（约 2.6–6 秒）同一量级，比 20 秒快得多。
-     *
-     * <p>代价写在明处：关掉 AirDrop 之后，那台设备从「2 秒出头消失」变成「3 秒出头消失」。
-     * 拿 1 秒的离场速度，换掉每秒一次的上屏／下屏。
-     */
-    private static final long QUIET_BEFORE_GONE_MS = 3_000;
 
     /**
      * 端口守望多久问一次 8770。
@@ -416,36 +215,6 @@ final class Peers {
     private static final long WARM_EVERY_MS = 20_000;
 
     /**
-     * 能连的对端，在「丢两包要多久」之上再留多少毫秒。
-     *
-     * <p>两段最长间隔是丢一包的理论上限，余量留给取整、平滑和收到包的时间戳粒度。
-     *
-     * <p># 为什么从 500 抬到 800
-     *
-     * <p>2026-11-19 15:57 的真机，一台节奏稳定的 iPhone 被删掉了：
-     * <pre>
-     * browse: rhythm: 3fa87792be9a speaks every 1021 ms (10 gaps, 464–1054 ms, q=0 a=11)
-     * browse: dropped 3fa87792be9a@… after 2727 ms of silence (threshold 2608, gaps 29, max 1054)
-     * </pre>
-     * 同一窗口 19 个间隔用了 22 秒，平均 1.16 秒——它一直在说话，最后安静了三秒多。500 的余量
-     * 只够「两段都落在高端」，不够真实链路上多丢一包，所以抬到 800。
-     *
-     * <p>**注意别把这个数当成「只差一点点」的补丁**：{@link #expire} 的检查粒度是 250 毫秒，
-     * 删除时刻永远落在阈值过后的第一个检查点上，所以「2727 对 2608」说明不了余量差 119
-     * 毫秒。抬高的真正理由是「余量要容得下多丢一包」，不是「把那条线往右挪一点点就能救回来」。
-     * 兜底的量级由 {@link #CONNECTABLE_MS} 负责，这里只调抖动那一段。
-     */
-    private static final long CONNECTABLE_SLACK_MS = 800;
-
-    /**
-     * 攒够几个间隔，才敢用它们去放宽阈值。
-     *
-     * <p>少于这个数时量到的可能只有两帧「正好一样快」的样本，也可能一帧都没有（新实例）。
-     * 那种时候用 {@link #CONNECTABLE_MS} 兜底——它本身就是从几千帧真机数据里挑出来的位置。
-     */
-    private static final int CONNECTABLE_GAPS = 3;
-
-    /**
      * 静默超过多久，就对这台对端单独问一句（单播）。
      *
      * <p>1.5 秒：它健康时约每秒说一次话，1.5 秒还没声音说明至少漏了一包，这时候叫它一声最
@@ -453,68 +222,6 @@ final class Peers {
      * 见 {@link #prompt}。
      */
     private static final long PROMPT_AFTER_MS = 1_500;
-
-    /**
-     * 整条链路安静超过多久，就认为「我们现在什么都不知道」。
-     *
-     * <p>2026-11-19 16:50 抓到的现场：{@code prompted … after 1509 ms} → {@code dropped … after
-     * 6079 ms (threshold 6000, rhythm 1049 ms, gaps 262, max 1745 ms)} → 紧接着
-     * {@code pulse: 0 peer(s), foreign 270 (last 7844 ms ago)} → **4.5 秒后同一个实例名原样回来**
-     * （{@code ready 38de3d7e83f4 … after 276735 ms of browsing}）。也就是说那段沉默不属于这台
-     * 设备，属于链路：**7.8 秒里我们一个外部包都没收到**，连别的地址记录都没有。
-     *
-     * <p>这两种沉默必须分开，因为它们要求相反的处置：
-     * <ul>
-     *   <li>链路活着、只有它在安静 → 它是真走了，删掉（{@link #timeout}）；</li>
-     *   <li>链路自己也安静了 → **我们聋了**，这时候「它沉默多久」量的是我们自己的听筒，
-     *       拿它判设备走没走等于用「没听见」冒充「它没说话」。</li>
-     * </ul>
-     *
-     * <p>4 秒。两个实测数夹出来的：
-     * <ul>
-     *   <li>健康链路的最大间隔 **3144 ms**（{@code rhythm 1281 ms, gaps 10, max 3144}）——
-     *       {@link #LINK_QUIET_MS} 必须在它之上，否则健康时也会把自己判成聋子，6 秒那条路
-     *       就永远轮不到；</li>
-     *   <li>真停顿是 **7844 ms**、真离开是 **20000 ms 以上**。</li>
-     * </ul>
-     *
-     * <p>它原来还必须落在 {@link #CONNECTABLE_MS} 之下（「4 秒对 6 秒，留了两秒」），因为那时
-     * 「聋了」是唯一能救一台即将被 6 秒删掉的设备的理由。现在 {@link #CONNECTABLE_MS} 自己就是
-     * 20 秒，比它长得多，这层关系没了：能连的对端两个分支拿到同一个阈值（{@link #timeout}
-     * 兜出来也是 20 秒）。剩下真正靠它的只有「还不完整」的对端，它们仍按 {@link #EXPIRE_MS}
-     * 的 6 秒走。
-     *
-     * <p>**这条规矩解决不了的情况，说清楚**：链路如果「静 3 秒、响半秒、再静 3 秒」地闪，
-     * 每次响都把它重置回「活着」，而设备的沉默是一路涨上去的。要挡住那种情况得按「链路活着的
-     * 时间」累计而不是看瞬时状态，但那会引入第二套时钟（`pulse` 里的 `quiet=` 和 `prompt()`
-     * 用的都是墙上时间），把日志搅乱。等真抓到闪的场景再说。
-     *
-     * <p>**现在只有 {@link #expire} 用它**。浏览循环曾经也拿它决定「该不该重开 socket」，那样
-     * 是错的：同一个误差，「先别删」的代价是零，「拆掉重开」的代价是把路上的应答全丢掉。重开
-     * 那一侧已经分开成 {@link #DEAF_SILENCE_MS}（20 秒），理由和 17:20 的现场都在那里。
-     */
-    private static final long LINK_QUIET_MS = 4_000;
-
-    /**
-     * 链路一直不回来时，最多留它多久。
-     *
-     * <p>{@link #LINK_QUIET_MS} 那条规矩是「不知道就先别删」，但没有上限就成了「永远不删」：
-     * 对端真的走了、链路跟着死掉，两者在计时器眼里和一次 8 秒停顿长得一模一样。所以给一个
-     * 天花板——20 秒。取这个数的理由：真机上量到的停顿是 7.8 秒，取两倍多一点留出二次停顿的
-     * 余量；而人对着一个空了 20 秒的格子，早就自己重开面板了，再早删也只是把同一件事做早。
-     *
-     * <p>**这不是「把阈值调大」**。正常路径仍然是 6 秒；只有在我们一个字都听不见、根本没法
-     * 判断的时候，才退到这条线。
-     *
-     * <p>**20 秒会误删一种情况，说清楚**：2026-11-19 17:10 这一轮，同一台 iPhone 静了 **130 秒**
-     * 才回来，而这 130 秒不是「我们聋了」——`/proc/net/dev` 上 `awdltun0` 的 RX 字节与包数
-     * 20 秒里一个没动、TX 涨了 55 个包，说明对面真的一个字都没发。同一时刻
-     * `iw dev wonder0 station dump` 里它的站点条目已经没了，回来时 `connected time` 从头计
-     * （{@code 4 seconds}，而信号是 −26 dBm，不是距离问题）。把天花板抬到 130 秒以上能保证
-     * 「不误删」，代价是留一个点下去连不上的格子两分多钟——比空着更糟。所以这条线是**取舍**，
-     * 不是测量结果；真凶在 802.11 那条关联上，不在这张表里。
-     */
-    private static final long LINK_DEAD_MS = 20_000;
 
     /**
      * 量节奏时，短于这个的间隔不采样。
@@ -1369,7 +1076,7 @@ private Thread thread;
     private void prompt(byte[] query) {
         long now = System.currentTimeMillis();
         for (Peer peer : snapshot()) {
-            if (!peer.connectable() || now - lastHeard(peer) < PROMPT_AFTER_MS) {
+            if (!peer.connectable() || now - LivenessState.lastHeard(peer) < PROMPT_AFTER_MS) {
                 // 它刚说过话，下一次静默重新算起。
                 peer.prompted = false;
                 continue;
@@ -1381,7 +1088,7 @@ private Thread thread;
                     // 这一行是「单播到底管不管用」唯一的证据：它之后要紧跟一条 quiet 归零的
                     // pulse，或者紧跟一个 dropped——两者都说明这次叫醒了没有。
                     trace("prompted " + peer.name + " by unicast after "
-                            + (now - lastHeard(peer)) + " ms of silence");
+                            + (now - LivenessState.lastHeard(peer)) + " ms of silence");
                 }
             } catch (Exception unreachable) {
                 // 它可能真的走了，也可能这个地址暂时不可用。等下一轮再叫，这里不是判断的地方。
@@ -1860,7 +1567,7 @@ private Thread thread;
         // 我们这侧还听得见吗？`lastForeign` 是「最后一条**别人的**地址记录」的时刻，自己的宣告
         // 绕回来不算（那一条在上面被 own 挡掉了）。它一停，表里每一台的「沉默」就同时开始涨，
         // 因为它们量的是同一件事：这条 socket 上还有没有声音。
-        boolean deaf = lastForeign == 0 || now - lastForeign > LINK_QUIET_MS;
+        boolean deaf = LivenessState.deaf(lastForeign, now);
         synchronized (peers) {
             // 先办「回来了」，再办「走了」。这一步必须在浏览线程上：守望量到了就写在碑上，
             // 表的改动集中在这里，{@link #absorb} 那些不加锁的遍历才不会撞上并发修改。
@@ -1871,59 +1578,55 @@ private Thread thread;
             // iPhone，会因为「没答出我们能解析的记录」被删掉——手机就在手边、AirDrop 开着，
             // 列表里却是空的，过一秒它又被下一帧查询带回列表。这就是「闪烁」。
             peers.values().removeIf(peer -> {
-                // 敲过门了，而且它没应。这条路比下面那条短得多，因为它的证据不在 mDNS 上：
-                // 一台关掉 AirDrop 的 iPhone 会话全静，但它的 8770 也一起不接了——那个「不接」
-                // 是 {@link #knock} 量出来的，和「睡了几秒」这种时间猜测没关系。见 {@link #KNOCK_AFTER_MS}。
-                if (peer.gone) {
-                    // 端口说过「不接」了，但它还在这儿说话——那它没走，只是这一刻发不出去。
-                    // 这一步放在立碑之前：删掉再放回来，屏幕上就是一次闪烁，见
-                    // {@link #QUIET_BEFORE_GONE_MS} 里 19:50 那四次一删一放。
-                    if (now - lastHeard(peer) < QUIET_BEFORE_GONE_MS) {
-                        // gone 留着不清：端口那笔账是真的，只是还没到能删的时候。它一旦开口，
-                        // {@link #watch} 那侧会走 {@link #alive} 把这一位翻回去。
+                // 判定在 LivenessState（锁内零 IO 的状态机），这里只执行它的决定：立碑、
+                // 留日志、投递敲门。谁、沉默多久、按什么阈值这些数字下面用得到。
+                long silence = now - LivenessState.lastHeard(peer);
+                switch (LivenessState.decide(peer, now, deaf)) {
+                    case KEEP:
                         return false;
-                    }
-                    // 先把墓碑立上再删。删掉之后表里再没有一件事记得「这个地址刚被验过」，
-                    // 而下一包缓存应答一两秒就到——没有这块碑，它原样就回来了，见 #BURIED_MS。
-                    if (!peer.address.isEmpty()) {
-                        buried.put(Addresses.bare(peer.address), new Grave(peer, now));
-                    }
-                    // 措辞改了：这条路现在也要安静满 QUIET_BEFORE_GONE_MS 才删，所以它不是
-                    // 「不靠沉默、只看端口」，而是两件事同时成立——端口回绝，沉默又过了地板。
-                    // 和下面那条按 timeout 删的区别，只在于这里的阈值是常数，不按节奏放大。
-                    trace("dropped " + peer.name + "@" + peer.address + " after " + peer.knocks
-                            + " unanswered knocks at port " + peer.port + ", once its silence passed "
-                            + QUIET_BEFORE_GONE_MS + " ms (" + (now - lastHeard(peer))
-                            + " ms) — the port said no and the quiet outlasted the floor");
-                    return true;
+                    case KNOCK_NOW:
+                        // 冒出来的可疑对端不等阈值：它本来就不是靠沉默被发现的，是「记录说有、
+                        // 端口说没有」这对矛盾。等到期只会在屏幕上多挂几秒假的格子。
+                        knockNow(peer, now);
+                        return false;
+                    case KNOCK:
+                        // 还没到期，但已经静得够久了：敲一下门，把「它在睡」和「它走了」分开。
+                        // 这一句是 20 秒门槛的解药——两条路（deaf 与 timeout）都要等 20 秒，
+                        // 而敲门只要 1.2 + 0.6 + 0.6 秒就能给出答案。
+                        knockIfDue(peer, silence, now);
+                        return false;
+                    case DROP_GONE:
+                        // 敲过门了，而且它没应。这条路比按沉默删短得多，因为它的证据不在 mDNS 上：
+                        // 一台关掉 AirDrop 的 iPhone 会话全静，但它的 8770 也一起不接了——那个
+                        // 「不接」是 knock 量出来的，和「睡了几秒」这种时间猜测没关系。
+                        //
+                        // 先把墓碑立上再删。删掉之后表里再没有一件事记得「这个地址刚被验过」，
+                        // 而下一包缓存应答一两秒就到——没有这块碑，它原样就回来了，见 #BURIED_MS。
+                        if (!peer.address.isEmpty()) {
+                            buried.put(Addresses.bare(peer.address), new Grave(peer, now));
+                        }
+                        // 措辞改了：这条路也要安静满 QUIET_BEFORE_GONE_MS 才删，所以它不是
+                        // 「不靠沉默、只看端口」，而是两件事同时成立——端口回绝，沉默又过了地板。
+                        // 和按沉默删的区别，只在于这里的阈值是常数，不按节奏放大。
+                        trace("dropped " + peer.name + "@" + peer.address + " after " + peer.knocks
+                                + " unanswered knocks at port " + peer.port + ", once its silence passed "
+                                + LivenessState.QUIET_BEFORE_GONE_MS + " ms (" + silence
+                                + " ms) — the port said no and the quiet outlasted the floor");
+                        return true;
+                    case DROP_SILENT:
+                        // 删掉的那一刻必须写清楚：谁、沉默多久、按什么阈值、节奏是多少、样本几个。
+                        // 只看到「列表空了」是调不动阈值的——而这条路径的每个数都只能用真机上的
+                        // 行为来定。后两个数（gaps / max）是阈值里唯一可变的那个来源，不写下来就
+                        // 分不清「按 2.2 秒兜底删的」和「按实测的丢包宽度删的」。
+                        trace("dropped " + peer.name + "@" + peer.address + " after " + silence
+                                + " ms of silence (threshold " + LivenessState.timeout(peer)
+                                + ", rhythm " + peer.period
+                                + " ms, gaps " + peer.gaps + ", max " + peer.gapMax + " ms"
+                                + (deaf ? ", link silent " + (lastForeign == 0
+                                        ? "since open" : "for " + (now - lastForeign) + " ms") : "") + ")");
+                        return true;
                 }
-                long silence = now - lastHeard(peer);
-                // 冒出来的可疑对端不等阈值：它本来就不是靠沉默被发现的，是「记录说有、端口说没有」
-                // 这对矛盾。等到期只会在屏幕上多挂几秒假的格子。
-                if (peer.unproven) {
-                    knockNow(peer, now);
-                    return false;
-                }
-                // 链路自己也安静的时候不用 timeout()，见 LINK_QUIET_MS：那一段沉默量的是我们
-                // 自己的听筒，不是这台设备。只留一个天花板，免得「不知道就先别删」变成「永不删」。
-                long threshold = deaf ? LINK_DEAD_MS : timeout(peer);
-                if (silence < threshold) {
-                    // 还没到期，但已经静得够久了：敲一下门，把「它在睡」和「它走了」分开。
-                    // 这一句是 20 秒门槛的解药——两条路（deaf 与 timeout）都要等 20 秒，而敲门
-                    // 只要 1.2 + 0.6 + 0.6 秒就能给出答案。
-                    knockIfDue(peer, silence, now);
-                    return false;
-                }
-                // 删掉的那一刻必须写清楚：谁、沉默多久、按什么阈值、节奏是多少、样本几个。
-                // 只看到「列表空了」是调不动阈值的——而这条路径的每个数都只能用真机上的行为来定。
-                // 后两个数（gaps / max）是阈值里唯一可变的那个来源，不写下来就分不清「按 2.2 秒
-                // 兜底删的」和「按实测的丢包宽度删的」。
-                trace("dropped " + peer.name + "@" + peer.address + " after " + silence
-                        + " ms of silence (threshold " + threshold + ", rhythm " + peer.period
-                        + " ms, gaps " + peer.gaps + ", max " + peer.gapMax + " ms"
-                        + (deaf ? ", link silent " + (lastForeign == 0
-                                ? "since open" : "for " + (now - lastForeign) + " ms") : "") + ")");
-                return true;
+                throw new AssertionError("unreachable");
             });
             // 一台设备只有一个当前实例，但实例名每分钟换一次（Apple 的隐私设计）。
             //
@@ -1956,11 +1659,6 @@ private Thread thread;
         }
     }
 
-    /** 最后一次「有证据说明它还在」的时刻：答了记录，或者发了任意一包。 */
-    private static long lastHeard(Peer peer) {
-        return Math.max(peer.seenAt, peer.heardFrom);
-    }
-
     /**
      * 该敲就敲：安静够久、没在敲、间隔也到了。
      *
@@ -1968,10 +1666,7 @@ private Thread thread;
      * 判死在 {@link #knock} 拿到结果之后。
      */
     private void knockIfDue(Peer peer, long silence, long now) {
-        if (!peer.connectable() || peer.knocking) {
-            return;
-        }
-        if (silence < KNOCK_AFTER_MS || now - peer.knockedAt < KNOCK_EVERY_MS) {
+        if (!LivenessState.knockDue(peer, silence, now)) {
             return;
         }
         peer.knockedAt = now;
@@ -1987,7 +1682,7 @@ private Thread thread;
      * 出结果，等它毫无收益。
      */
     private void knockNow(Peer peer, long now) {
-        if (!peer.connectable() || peer.knocking || now - peer.knockedAt < KNOCK_EVERY_MS) {
+        if (!LivenessState.knockOverdue(peer, now)) {
             return;
         }
         peer.knockedAt = now;
@@ -2273,14 +1968,14 @@ private Thread thread;
             }
             // 别人全都不说话了，先别敲谁的门：那量的是我们自己的听筒，不是它们走没走。
             // 这条和 {@link #expire} 里 LINK_DEAD_MS 的用法是同一个道理。
-            if (lastForeign == 0 || now - lastForeign > LINK_QUIET_MS) {
+            if (LivenessState.deaf(lastForeign, now)) {
                 continue;
             }
             for (Peer peer : snapshot()) {
                 if (!peer.connectable() || peer.unproven || peer.knocking) {
                     continue;
                 }
-                if (now - peer.knockedAt < KNOCK_EVERY_MS) {
+                if (now - peer.knockedAt < LivenessState.KNOCK_EVERY_MS) {
                     continue;
                 }
                 // 守望用短超时（{@link #WATCH_TIMEOUT_MS}）：它只负责「该问了」，量得准不准由
@@ -2474,48 +2169,6 @@ private Thread thread;
                 // 已经废了。
             }
         }
-    }
-
-    /**
-     * 这台设备沉默多久算走了。
-     *
-     * <p>两档，分界线是「能连」：能连的那一档知道我们正以 1 秒一次的节奏问它（见
-     * {@link #CONNECTABLE_MS}）；凑不齐地址端口的那些还在 {@link #ASK_EAGER_MS} 的 300 毫秒档上，
-     * 那时 Apple 会压应答，只能退回 {@link #EXPIRE_MS}。
-     *
-     * <p># 为什么这里现在看节奏，而 2026-11-18 那一次不看
-     *
-     * <p>那一次「按每台设备自己的节奏算」被否掉，否的是**平均值**：{@code period} 是所有间隔的
-     * 平滑，一台每秒一帧的设备它就是 1 秒，两倍才 2 秒——比健康时最长的沉默还短，跟着它算只会
-     * 更会闪。那个结论没错，错在把「平均」当成了「最坏」。
-     *
-     * <p>要判的是「它是不是丢了一包」，那么最坏情况是**连续两段都落在抖动的高端**，上限是
-     * {@code 2 × gapMax}（{@link #CONNECTABLE_GAPS} 挡着样本太少的情况）。2026-11-19 的现场就是
-     * 这个数：间隔 879–1638，丢一包安静 2.2–3.3 秒，而死阈值是 2.2 秒——一半的丢包都会删掉一台
-     * 活着的设备。这段仍然在说「我们问了一次而它没答」，只是把「没答」算成两段而不是一段。
-     *
-     * <p>真正的「快」仍然在别处：{@link #absorb} 的 {@code gone} 分支。只是 2026-11-18 的
-     * 真机证明 iPhone 关 AirDrop 时并不发那个告别，所以这一档不能只当兜底。
-     */
-    private long timeout(Peer peer) {
-        if (!peer.connectable()) {
-            return EXPIRE_MS;
-        }
-        // 量到的节奏只往上放宽，不往下收：CONNECTABLE_MS 是真机样本给出的下限。
-        return Math.max(CONNECTABLE_MS, lost(peer) + CONNECTABLE_SLACK_MS);
-    }
-
-    /**
-     * 它丢一包的时候会安静多久，毫秒；样本不够时返回 0（也就是不必放宽）。
-     *
-     * <p>取 {@link Peer#gapMax} 而不是 {@link Peer#period}：同一个窗口里，平均回答的是「它通常
-     * 多快说话」，最大值才回答「它最慢能拖到多久」，而丢包这件事只跟后者有关。
-     */
-    private static long lost(Peer peer) {
-        if (peer.gaps < CONNECTABLE_GAPS || peer.gapMax <= 0) {
-            return 0;
-        }
-        return 2 * peer.gapMax;
     }
 
     private static int parseInt(String text) {
