@@ -78,18 +78,11 @@ final class FeaturePage {
     private static final float SHEET_RADIUS_DP = 22f;
 
     /**
-     * 浮窗霜面的模糊半径，单位是 {@link RealtimeBlurView} 的「scratch 像素」（屏幕上看到
-     * 的扩散约是这个数的两倍，见它里面的 {@code FACTOR}）。
+     * 弹窗玻璃的模糊半径，dp——交给 {@link PanelGlass#radius}（收物理像素，过 dp()）。
      *
-     * <p># 为什么从 5 改成 20
-     *
-     * <p>5 是这条玻璃原来的值，和导航胶囊、顶部霜面一样。那三块都是**窄条**（高度不到 60dp），
-     * 背后露出来的内容只是「一条边」，5 已经够糊。浮窗不一样：它是 86% 屏宽、一两百 dp 高的一
-     * 整块，背后是整页的文字。同样 5 的半径，在这么大片面积上只够把字糊成灰色轮廓——人眼仍
-     * 然认得出那是哪一行，于是读起来是「卡片是透明的」。
-     *
-     * <p>20 是 5 的四倍，屏幕上约 40px 的扩散。到这个程度，背后那页只剩色块与明暗，卡片才
-     * 真的是一张卡，而不是一块盖在字上的玻璃。
+     * <p>20 这档原来在 RealtimeBlurView 上是 5 的四倍：浮窗是 86% 屏宽、一两百 dp 高的一
+     * 整块，背后是整页文字，太浅的半径只够把字糊成灰色轮廓，人眼仍认得出哪一行。换成系统
+     * 模糊之后单位不同了，但「这一张卡要够糊才算一张卡」的结论不变，20dp 起步。
      */
     private static final float SHEET_BLUR_RADIUS = 20f;
 
@@ -756,8 +749,8 @@ final class FeaturePage {
      * 走的 {@link RealtimeBlurView}，也就是一个我们能往里放子视图的容器。
      *
      * <p>所以换成自绘的 {@link Dialog}：窗口背景设成全透明，卡片自己长成什么样就是什么样。
-     * 卡片里面是一层霜面 + 一层内容，霜面与导航胶囊同一套参数（同一个类、同一个捕获根、
-     * 同一档半径与色调），所以它读起来就是「胶囊那种玻璃」，而不是另一种玻璃。
+     * 卡片里面是一层系统模糊 + 一层内容，玻璃与发送面板同一套（{@link PanelGlass}、同一档
+     * 半径与染色），所以它读起来就是「面板那种玻璃」，而不是另一种玻璃。
      *
      * @param key      设置表的键
      * @param title    对话框标题
@@ -809,15 +802,15 @@ final class FeaturePage {
     }
 
     /**
-     * 浮窗那张卡：霜面打底，内容压在上面。
+     * 浮窗那张卡：玻璃打底，内容压在上面。
      *
-     * <p>霜面是**压在底下一层**而不是给卡片设背景：{@link RealtimeBlurView} 要自己 onDraw 才能
-     * 把背后的内容糊出来，设成背景就只剩一张静态图。所以卡片本体是一块圆角实底（拿不到模糊时
-     * 它就是卡片本身，读得清），上面盖一层同圆角的玻璃，再上面才是标题、输入框和按钮。
+     * <p>模糊与 SendActivity 的面板同一套（{@link PanelGlass}，系统 GPU 合成，评审 4.2
+     * 的「两套模糊圆角弹窗」在此合并）。卡片本体先是一块圆角实底——拿不到系统玻璃时它
+     * 就是卡片本身，读得清；拿到玻璃后 background 被模糊 Drawable 顶掉，再叠一层圆角
+     * 半透明染色保可读性（见 {@link #installSheetGlass}）。
      */
     private View sheet(String title, EditText field, String key, Runnable onSaved, Dialog dialog) {
         int radius = chrome.dp(SHEET_RADIUS_DP);
-        int width = sheetWidth();
 
         LinearLayout content = chrome.column();
         content.setPadding(chrome.dp(22), chrome.dp(20), chrome.dp(22), chrome.dp(18));
@@ -844,56 +837,25 @@ final class FeaturePage {
         actions.addView(save, chrome.mm(0, chrome.dp(46), 1f));
         content.addView(actions, chrome.margins(18, 0));
 
-        // 先把内容量一遍，才知道玻璃该多高。理由见下面那段注释——这一步不是优化，是必需的。
-        content.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
-                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
-        int height = content.getMeasuredHeight();
-
+        // 卡片本体：圆角实底打底——拿不到系统玻璃时它就是卡片本身，读得清。拿到玻璃后
+        // 这张底会被模糊 Drawable 顶掉（见 installSheetGlass），所以两条路都读得清。
         FrameLayout card = new FrameLayout(host);
         GradientDrawable base = new GradientDrawable();
         base.setCornerRadius(radius);
         base.setColor(S.card);
         card.setBackground(base);
 
-        RealtimeBlurView glass = new RealtimeBlurView(host);
-        glass.setCaptureRoot(captureRoot());
-        glass.setCornerRadius(radius);
-        glass.setFill(S.card);
-        glass.setLiquidGlass(true);
-        glass.setBlurRadius(SHEET_BLUR_RADIUS);
-        // 完全不透明地画那层糊过的东西。原来给的是 240（94%），剩下那 6% 足够让背后的字露出
-        // 笔画，于是整张卡看着是「蒙了一层」而不是「一块材料」。
-        glass.setOpacity(255);
-        glass.setTint((S.navTint & 0x00FFFFFF) | 0x4D << 24);
-        // 下面三样是这颗玻璃原来挂着的「立体感」，现在一律不挂：
-        //
-        //   setRim(...)        —— 沿卡片内缘的一圈渐变描边。它在窄条胶囊上是「轮廓」，在这么
-        //                         大一张卡上就是一圈发白的框，四角尤其明显。
-        //   setSheen(...)      —— 一条斜穿的白色高光带，12% 白。卡片一大，它就从「一道反光」
-        //                         变成「一块斜着贴上去的亮片」。
-        //   setGlassLift(...)  —— 整体提亮 8 级。提亮是为了让玻璃比页面「亮一档」，可这一页的
-        //                         卡片本来就比页底亮，再提就是发灰。
-        //
-        // 三样都不设，也就是它们各自的默认值（无描边、无高光、不提亮）。
+        // 玻璃在卡片 attach 出自己的 ViewRootImpl 之后装（PanelGlass 从 ViewRootManager
+        // 拿模糊 Drawable，而那要等窗口挂上）——attach 回调里再 post 一拍，窗口就绪。
+        card.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override
+            public void onViewAttachedToWindow(View v) {
+                card.removeOnAttachStateChangeListener(this);
+                card.post(() -> installSheetGlass(card));
+            }
 
-        // 玻璃的高度是算出来的，不是 MATCH_PARENT——这一条是这张卡片能不能贴合内容的关键。
-        //
-        // RealtimeBlurView 没有自己的 onMeasure，用的是 View 的默认实现：给 AT_MOST 的可用
-        // 高度，它就把那个高度原样返回。它躺在 WRAP_CONTENT 的 FrameLayout 里、又要 MATCH_PARENT
-        // 时，父容器递过去的正是 AT_MOST(整块可用高度)，于是这一层完全透明的玻璃把卡片撑成了
-        // 满屏：圆角只剩最上面和最下面各一段，中间一大片空霜面，看起来像"卡片没画出来"。
-        // 量出内容的真实高度再钉死，父容器量到的就是内容高度。
-        final FrameLayout.LayoutParams glassLp =
-                new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, height);
-        card.addView(glass, glassLp);
-
-        // 横竖屏、字体大小变化之后宽度会变，内容的高度跟着变，玻璃要跟上。高度变回去不会影响
-        // 内容的高度（内容只吃宽度），所以这里不会来回抖。
-        card.addOnLayoutChangeListener((view, left, top, right, bottom, ol, ot, or, ob) -> {
-            int now = bottom - top;
-            if (now > 0 && glassLp.height != now) {
-                glassLp.height = now;
-                glass.setLayoutParams(glassLp);
+            @Override
+            public void onViewDetachedFromWindow(View v) {
             }
         });
 
@@ -902,15 +864,41 @@ final class FeaturePage {
         return card;
     }
 
+    /**
+     * 给弹窗卡片装系统级模糊（评审 4.2 的「两套模糊圆角弹窗」合并：与 SendActivity 的
+     * 面板同一套 {@link PanelGlass}，模糊走 GPU 合成，不再是 {@link RealtimeBlurView} 的
+     * 应用层逐帧采样）。
+     *
+     * <p>必须在窗口真正 show 之后调用——{@link PanelGlass} 要从 {@code ViewRootManager} 拿
+     * 模糊 Drawable，而那要等卡片 attach 出自己的 ViewRootImpl。拿不到就什么都不做：卡片
+     * 留在圆角实底上，读得清，只是不是玻璃。
+     */
+    private void installSheetGlass(FrameLayout card) {
+        int radius = chrome.dp(SHEET_RADIUS_DP);
+        PanelGlass glass = PanelGlass.attach(card);
+        if (glass == null) {
+            Log.i(TAG, "sheet glass: unavailable, solid background");
+            return;
+        }
+        boolean round = glass.corners(radius, radius);
+        boolean blur = glass.radius(chrome.dp(SHEET_BLUR_RADIUS));
+        card.setBackground(glass.drawable());
+        // 可读性染色：玻璃是透的，标题和按钮之间的空隙会直接露出桌面。叠一层圆角半透明
+        // （与原来 RealtimeBlurView 那层 tint 同色同值），放在 setForeground 上——背景位
+        // 已经被模糊 Drawable 占了。
+        GradientDrawable tint = new GradientDrawable();
+        tint.setCornerRadius(radius);
+        tint.setColor((S.navTint & 0x00FFFFFF) | 0x4D << 24);
+        card.setForeground(tint);
+        Log.i(TAG, "sheet glass: " + glass.source() + " radius=" + chrome.dp(SHEET_BLUR_RADIUS)
+                + (blur ? "" : "(rejected)") + " corner=" + radius + (round ? "" : "(rejected)"));
+    }
+
     /** 浮窗的宽度：屏宽的 86%。窗口和内容测量必须用同一个数，差一点量出来的高度就是错的。 */
     private int sheetWidth() {
         return (int) (host.getResources().getDisplayMetrics().widthPixels * 0.86f);
     }
 
-    /** 霜面要糊的那一层。功能页只持有 Activity，读口在 {@link MainActivity#blurRoot}。 */
-    private View captureRoot() {
-        return host instanceof MainActivity ? ((MainActivity) host).blurRoot() : null;
-    }
 
     /**
      * 把浮窗里一件控件的实底换成 75% 不透明的同色底，圆角不变。
