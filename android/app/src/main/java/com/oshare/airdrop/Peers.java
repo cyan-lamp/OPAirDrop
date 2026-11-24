@@ -55,14 +55,8 @@ final class Peers {
 
     private static final String TAG = "OPAirDrop";
 
-    /** mDNS 的端口。 */
-    private static final int PORT = 5353;
-
-    /** 局域网上的 mDNS 组：连着同一个路由器的 Mac 走这个。 */
-    private static final String GROUP4 = "224.0.0.251";
-
-    /** 链路本地 IPv6 的 mDNS 组：AWDL 上只有它。 */
-    private static final String GROUP6 = "ff02::fb";
+    /** mDNS 的端口。数字本体在 {@link MdnsLink.Channel#PORT}。 */
+    private static final int PORT = MdnsLink.Channel.PORT;
 
 
     /** 服务类型后缀：实例名去掉它才是给人看的名字。 */
@@ -874,20 +868,13 @@ final class Peers {
     private volatile String lastSeen;
     /** 这一次浏览是什么时候开始的，用来量「对端多久出现在列表里」。 */
     private long startedAt;
-    private Thread thread;
-    private MulticastSocket socket;
-    private WifiManager.MulticastLock lock;
-    /** 组播是从哪块网卡进来的，同时也是连对端时该从哪块出去。0 表示系统默认。 */
-    private volatile int nicIndex;
-
+private Thread thread;
     /**
-     * 现在绑在哪块网卡上，名字；没有走系统默认路由时为 {@code null}。
-     *
-     * <p>只在 {@link #rebind} 里读，答案不同结论就不同：本来就在 {@code awdltun0} 上，它一消失
-     * 就只能**等**——换到旁边任何一块都是换到一条 iPhone 不在的路上；本来在 Wi-Fi 或
-     * {@code wonder0} 上，{@code awdltun0} 一出现就该**搬**过去。
+     * 链路侧的有状态部分：socket、组播锁、绑定的网卡（{@link MdnsLink.Channel}）。
+     * 「这块 socket 听得见吗」的判定账目（foreign/deafWait/nextRebind 那一组）还在这里——
+     * 那是重开策略的活，不是链路的活。
      */
-    private volatile String bound;
+    private final MdnsLink.Channel channel = new MdnsLink.Channel();
 
     /**
      * 还在不在原来那块网卡上——每 {@link #REBIND_CHECK_MS} 核一次。
@@ -1040,9 +1027,6 @@ final class Peers {
      */
     private static final long DEAF_CEIL_MS = 60_000;
 
-    /** 这一次浏览问的是哪个组。地址族跟着网卡走，见 {@link #open()}。 */
-    private volatile InetAddress group;
-
     /**
      * 本机所有网卡上的地址。
      *
@@ -1070,7 +1054,7 @@ final class Peers {
     /** 停止浏览并放掉组播锁。可以在任何线程调用。 */
     void stop() {
         running = false;
-        MulticastSocket held = socket;
+        MulticastSocket held = channel.socket();
         if (held != null) {
             held.close();
         }
@@ -1252,72 +1236,29 @@ final class Peers {
         }
     }
 
+
+
+
     /**
-     * 挑一块网卡，加入组播组。
+     * 重开一块 socket，并把「这块 socket 自己」的账目归零。
      *
-     * <p>{@code wonder0} 优先：它是 iPhone 唯一认得的那条链路，而 {@code wlan0} 上的多播
-     * 在一台连着 Wi-Fi 6 路由的手机上会被省电策略滤掉大半。两块都没有时用系统默认——比
-     * 直接失败好，因为一块都没有通常意味着 Wi-Fi 关着，那条路本来也没戏。
+     * <p>链路侧（挑网卡、建 socket、加组、拿锁）在 {@link MdnsLink.Channel#open}；这里只管
+     * 账目：这块 socket 得自己证明听得见——上一次听到的别人的地址不算数，那可能来自上一个
+     * socket；但「本次浏览听见过没有」（{@code heardEver}）不能跟着清零，重开之后的沉默和
+     * 启动时的沉默是两件事，前者有底、后者没有。
      */
     private void open() throws Exception {
-        NetworkInterface nic = MdnsLink.link();
-        // awdltun0 只带链路本地 IPv6，连 A 记录都不会有；其余网卡按有没有 IPv4 判。
-        boolean v6 = nic != null && (!hasIPv4(nic) || MdnsLink.AWDL_TUN.equals(nic.getName()));
-        InetAddress target = InetAddress.getByName(v6 ? GROUP6 : GROUP4);
-        if (v6 && nic != null) {
-            // ff02::fb 是链路本地组播：不带 scope，内核不知道从哪块网卡发出去。
-            target = Inet6Address.getByAddress(null, target.getAddress(), nic.getIndex());
-        }
-        group = target;
-
-        socket = new MulticastSocket(null);
-        socket.setReuseAddress(true);
-        // 250ms 而不是 1s：一次响应常被拆成 PTR/SRV/TXT 几个包，收包越勤，一台设备凑齐
-        // connectable（地址+端口）越快，开 AirDrop 后显示得越及时。这一档同时是过期检查的
-        // 节奏——每轮循环都查一次 expire()，所以 2.5 秒的阈值真正精确到 2.5 秒。
-        socket.setSoTimeout(250);
-        // 绑 IPv4 通配的 socket 收不到 ff02::fb，绑 IPv6 通配的又发不出 224.0.0.251：
-        // 地址族要跟着上面选的组走，而不是跟着习惯走。
-        socket.bind(new InetSocketAddress(
-                InetAddress.getByName(v6 ? "::" : "0.0.0.0"), PORT));
-        if (nic != null) {
-            socket.setNetworkInterface(nic);
-        }
-        // 0 = 系统默认。写成 0 而不是留着上一次的值：网卡真的没了的时候，下一条有效网卡
-        // 一定与它不同，{@link #rebind} 就会把我们搬过去。
-        nicIndex = nic == null ? 0 : nic.getIndex();
-        bound = nic == null ? null : nic.getName();
-        // 这一块 socket 得自己证明听得见。上一次听到的别人的地址不算数——那可能来自上一个 socket。
+        trace(channel.open(context));
+        collectOwnAddresses();
         foreign = 0;
         lastForeign = 0;
-        // 但「本次浏览听见过没有」不能跟着清零，见 {@link #heardEver}：重开之后的沉默和启动时的
-        // 沉默是两件事，前者有底、后者没有。
         openedAt = System.currentTimeMillis();
         askedSinceOpen = 0;
-        try {
-            socket.setTimeToLive(255);
-        } catch (Exception ignored) {
-            // IPv6 的跳数是另一个字段，下面那句才是这条链路上起作用的那次设置。
-        }
-        // mDNS 要求跳数 255，iPhone 收到低于这个值的包直接丢——不报错，看起来就是没人应答。
-        boolean hops = MulticastHop.raise(socket, MulticastHop.MDNS);
-        collectOwnAddresses();
-        socket.joinGroup(new InetSocketAddress(target, PORT), nic);
-
-        // 没有这把锁，屏幕一黑，内核就把组播包丢了：系统的省电策略认为没人要。
-        WifiManager wifi = (WifiManager) context.getSystemService(Context.WIFI_SERVICE);
-        if (wifi != null) {
-            lock = wifi.createMulticastLock("opairdrop-browse");
-            lock.setReferenceCounted(false);
-            lock.acquire();
-        }
-        trace("joined " + (v6 ? GROUP6 : GROUP4) + ":" + PORT + " on "
-                + (nic == null ? "the default route" : nic.getName())
-                + (lock == null ? ", no multicast lock" : ", multicast lock held")
-                + (hops ? ", hop limit 255" : ", hop limit NOT raised"));
     }
 
-
+    private void close() {
+        channel.close();
+    }
     /**
      * 网卡换了就把 socket 搬到新那块上。
      *
@@ -1338,21 +1279,21 @@ final class Peers {
         //
         // 所以绑在 awdltun0 上时就只认 awdltun0，它没了就原地等（链路回来时 index 一定是新的，
         // 下一次检查自然会搬过去——实测 1.3 秒）；绑在别处时才贪心，见到 awdltun0 就搬。
-        NetworkInterface nic = MdnsLink.AWDL_TUN.equals(bound) ? MdnsLink.named(MdnsLink.AWDL_TUN) : MdnsLink.link(true);
-        if (nic == null && MdnsLink.AWDL_TUN.equals(bound)) {
+        NetworkInterface nic = MdnsLink.AWDL_TUN.equals(channel.bound()) ? MdnsLink.named(MdnsLink.AWDL_TUN) : MdnsLink.link(true);
+        if (nic == null && MdnsLink.AWDL_TUN.equals(channel.bound())) {
             // 不是 socket 哑了，是整条链路不在。sendFails 一起归零：留着它只会在链路回来时
             // 白白多触发一次重开。
             sendFails = 0;
             return;
         }
         int index = nic == null ? 0 : nic.getIndex();
-        boolean moved = index != nicIndex;
+        boolean moved = index != channel.nicIndex();
         boolean deaf = sendFails >= REBIND_FAILS;
         if (!moved && !deaf) {
             return;
         }
         trace("rebinding: " + (moved
-                ? "link moved to " + nic.getName() + " (" + nicIndex + " → " + index + ")"
+                ? "link moved to " + nic.getName() + " (" + channel.nicIndex() + " → " + index + ")"
                 : sendFails + " sends in a row went nowhere"));
         sendFails = 0;
         reopen();
@@ -1392,19 +1333,10 @@ final class Peers {
 
     /** 去掉 {@code %wlan0} 这样的 scope 后缀再比：同一条链路本地地址在两块网卡上写法不同。 */
     
-    /** 这块网卡上有没有 IPv4。只有 IPv6 链路本地时，组播组必须换成 ff02::fb。 */
-    private static boolean hasIPv4(NetworkInterface nic) {
-        for (InetAddress address : Collections.list(nic.getInetAddresses())) {
-            if (address instanceof Inet4Address) {
-                return true;
-            }
-        }
-        return false;
-    }
 
     private void send(byte[] query) {
         try {
-            socket.send(new DatagramPacket(query, query.length, group, PORT));
+            channel.socket().send(new DatagramPacket(query, query.length, channel.group(), PORT));
             sendFails = 0;
         } catch (Exception ignored) {
             // 一次发不出去就等下一轮：组播本来就不保证送达，把一次失败当失败会误报。
@@ -1443,7 +1375,7 @@ final class Peers {
                 continue;
             }
             try {
-                socket.send(new DatagramPacket(query, query.length, address(peer), PORT));
+                channel.socket().send(new DatagramPacket(query, query.length, address(peer), PORT));
                 if (!peer.prompted) {
                     peer.prompted = true;
                     // 这一行是「单播到底管不管用」唯一的证据：它之后要紧跟一条 quiet 归零的
@@ -1467,7 +1399,7 @@ final class Peers {
         byte[] buffer = new byte[1500];
         DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
         try {
-            socket.receive(packet);
+            channel.socket().receive(packet);
         } catch (java.net.SocketTimeoutException idle) {
             // 超时不再是过期检查的唯一入口，见 {@link #loop}。
             return false;
@@ -1899,7 +1831,7 @@ final class Peers {
         if (peer == null) {
             peer = new Peer(name);
             touch(peer);
-            peer.scope = nicIndex;
+            peer.scope = channel.nicIndex();
             peers.put(name, peer);
         }
         return peer;
@@ -2199,7 +2131,7 @@ final class Peers {
             Peer probe = new Peer(name);
             probe.address = address;
             probe.port = port;
-            probe.scope = nicIndex;
+            probe.scope = channel.nicIndex();
             // 先解邻居，再敲门。这条路径上的等待最贵：`reachable` 的每一次 connect 都可能
             // 撞上一整个 NS 重传周期，而 `KNOCK_TIMEOUT_MS` 只有 2.5 秒——冷启动时对端还没
             // 出现在 mDNS 里，这一下既是首次建连，也常常是唯一一次机会。
@@ -2220,7 +2152,7 @@ final class Peers {
                 Peer peer = peers.get(name);
                 if (peer == null) {
                     peer = new Peer(name);
-                    peer.scope = nicIndex;
+                    peer.scope = channel.nicIndex();
                     peers.put(name, peer);
                 }
                 // 地址和端口照旧以记录为准：这条旧名单只是在记录到之前顶一会儿。
@@ -2326,8 +2258,8 @@ final class Peers {
                     continue;
                 }
                 // scope 现取：AirDrop 一开一关就把 awdltun0 换成另一块网卡，碑里那份可能已经过期。
-                if (nicIndex != 0) {
-                    grave.peer.scope = nicIndex;
+                if (channel.nicIndex() != 0) {
+                    grave.peer.scope = channel.nicIndex();
                 }
                 if (reachable(grave.peer, WATCH_TIMEOUT_MS) != null) {
                     continue;
@@ -2437,8 +2369,8 @@ final class Peers {
             if (back.port <= 0) {
                 back.port = grave.peer.port;
             }
-            if (nicIndex != 0) {
-                back.scope = nicIndex;
+            if (channel.nicIndex() != 0) {
+                back.scope = channel.nicIndex();
             }
             back.unproven = false;
             back.gone = false;
@@ -2488,7 +2420,7 @@ final class Peers {
      * 早一两百毫秒对齐。
      */
     private void ask(Peer peer) {
-        MulticastSocket open = socket;
+        MulticastSocket open = channel.socket();
         if (open == null || open.isClosed()) {
             return;
         }
@@ -2642,22 +2574,4 @@ final class Peers {
         Log.i(TAG, "browse: " + line);
     }
 
-    private void close() {
-        if (socket != null) {
-            try {
-                socket.close();
-            } catch (Exception ignored) {
-                // 已经关了。
-            }
-            socket = null;
-        }
-        if (lock != null) {
-            try {
-                lock.release();
-            } catch (Exception ignored) {
-                // 没拿到或者已经放了。
-            }
-            lock = null;
-        }
-    }
 }
