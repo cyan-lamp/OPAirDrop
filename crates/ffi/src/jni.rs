@@ -619,95 +619,23 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_send(
 
     // SAFETY: all four are live `java.lang.String`s, per the JVM's call, and null is taken
     // before `read_string`, which would refuse it.
-    let Some(host) = (unsafe { read_string(env, host) }) else {
+    let Some((host, transfer_id, settings, sender, model, sender_id)) =
+        (unsafe { read_send_strings(env, host, settings, sender, model, sender_id, transfer_id) })
+    else {
         return ptr::null_mut();
-    };
-    let Some(transfer_id) = (unsafe { read_string(env, transfer_id) }) else {
-        return ptr::null_mut();
-    };
-    let settings = if settings.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, settings) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
-    };
-    let sender = if sender.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, sender) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
-    };
-    let model = if model.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, model) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
-    };
-    let sender_id = if sender_id.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, sender_id) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
     };
     // SAFETY: `paths` is a live `java.lang.String[]`.
     let Some(paths) = (unsafe { read_paths(env, paths) }) else {
         return ptr::null_mut();
     };
-
-    // SAFETY: both are live streams and `env` outlives this call.
-    // 评审 P0-3：Stream::new 失败（异常挂起）后不再发 Sink::new 的 JNI 调用。
-    let reader = match unsafe { Stream::new(env, input) } {
-        Ok(reader) => reader,
-        Err(_) => return ptr::null_mut(),
-    };
-    if unsafe { pending(env) } {
-        return ptr::null_mut();
-    }
-    let sink = match unsafe { Sink::new(env, output) } {
-        Ok(sink) => sink,
-        Err(_) => return ptr::null_mut(),
-    };
-    if unsafe { pending(env) } {
+    let Some(mut connection) = (unsafe { build_connection(env, input, output, link) }) else {
         return ptr::null_mut();
     };
-    // A null `Link` means the caller asked for a single-connection transfer, which is a
-    // request the receiver will not answer — so the library reports it rather than waiting
-    // out a read timeout. See `dial_connection`.
-    let link = if link.is_null() {
-        None
-    } else {
-        // SAFETY: `link` is a live object and `env` outlives this call.
-        match unsafe { Link::new(env, link) } {
-            Ok(link) => Some(link),
-            Err(()) => return ptr::null_mut(),
-        }
-    };
-    let mut connection = Connection { reader, sink, link };
 
-    let (sender_pointer, sender_len) = match &sender {
-        Some(text) => (text.as_ptr(), text.len()),
-        None => (ptr::null(), 0),
-    };
-    let (model_pointer, model_len) = match &model {
-        Some(text) => (text.as_ptr(), text.len()),
-        None => (ptr::null(), 0),
-    };
-    let (sender_id_pointer, sender_id_len) = match &sender_id {
-        Some(text) => (text.as_ptr(), text.len()),
-        None => (ptr::null(), 0),
-    };
-    let (settings_pointer, settings_len) = match &settings {
-        Some(text) => (text.as_ptr(), text.len()),
-        None => (ptr::null(), 0),
-    };
+    let (settings_pointer, settings_len) = slice_of(&settings);
+    let (sender_pointer, sender_len) = slice_of(&sender);
+    let (model_pointer, model_len) = slice_of(&model);
+    let (sender_id_pointer, sender_id_len) = slice_of(&sender_id);
 
     let mut report = OpairdropBuffer::EMPTY;
     // SAFETY: every byte slice outlives the call or is null, each callback is paired with
@@ -783,99 +711,27 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_sendWithProgress(
     }
 
     // SAFETY: all four are live `java.lang.String`s, and null is taken before `read_string`.
-    let Some(host) = (unsafe { read_string(env, host) }) else {
+    let Some((host, transfer_id, settings, sender, model, sender_id)) =
+        (unsafe { read_send_strings(env, host, settings, sender, model, sender_id, transfer_id) })
+    else {
         return ptr::null_mut();
-    };
-    let Some(transfer_id) = (unsafe { read_string(env, transfer_id) }) else {
-        return ptr::null_mut();
-    };
-    let settings = if settings.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, settings) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
-    };
-    let sender = if sender.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, sender) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
-    };
-    let model = if model.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, model) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
-    };
-    let sender_id = if sender_id.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, sender_id) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
     };
     // SAFETY: `paths` is a live `java.lang.String[]`.
     let Some(paths) = (unsafe { read_paths(env, paths) }) else {
         return ptr::null_mut();
     };
-
-    // SAFETY: both are live streams and `env` outlives this call.
-    // 评审 P0-3：Stream::new 失败（异常挂起）后不再发 Sink::new 的 JNI 调用。
-    let reader = match unsafe { Stream::new(env, input) } {
-        Ok(reader) => reader,
-        Err(_) => return ptr::null_mut(),
-    };
-    if unsafe { pending(env) } {
-        return ptr::null_mut();
-    }
-    let sink = match unsafe { Sink::new(env, output) } {
-        Ok(sink) => sink,
-        Err(_) => return ptr::null_mut(),
-    };
-    if unsafe { pending(env) } {
+    let Some(mut connection) = (unsafe { build_connection(env, input, output, link) }) else {
         return ptr::null_mut();
     };
-    // A null `Link` means the caller asked for a single-connection transfer, which is a
-    // request the receiver will not answer — so the library reports it rather than waiting
-    // out a read timeout. See `dial_connection`.
-    let link = if link.is_null() {
-        None
-    } else {
-        // SAFETY: `link` is a live object and `env` outlives this call.
-        match unsafe { Link::new(env, link) } {
-            Ok(link) => Some(link),
-            Err(()) => return ptr::null_mut(),
-        }
-    };
-    let mut connection = Connection { reader, sink, link };
     // SAFETY: `progress` is a live object; the method id is looked up on its own class.
     let Ok(mut gauge) = (unsafe { Gauge::new(env, progress) }) else {
         return ptr::null_mut();
     };
 
-    let (sender_pointer, sender_len) = match &sender {
-        Some(text) => (text.as_ptr(), text.len()),
-        None => (ptr::null(), 0),
-    };
-    let (model_pointer, model_len) = match &model {
-        Some(text) => (text.as_ptr(), text.len()),
-        None => (ptr::null(), 0),
-    };
-    let (sender_id_pointer, sender_id_len) = match &sender_id {
-        Some(text) => (text.as_ptr(), text.len()),
-        None => (ptr::null(), 0),
-    };
-    let (settings_pointer, settings_len) = match &settings {
-        Some(text) => (text.as_ptr(), text.len()),
-        None => (ptr::null(), 0),
-    };
+    let (settings_pointer, settings_len) = slice_of(&settings);
+    let (sender_pointer, sender_len) = slice_of(&sender);
+    let (model_pointer, model_len) = slice_of(&model);
+    let (sender_id_pointer, sender_id_len) = slice_of(&sender_id);
 
     let mut report = OpairdropBuffer::EMPTY;
     // SAFETY: every byte slice outlives the call or is null, each callback is paired with the
@@ -2462,6 +2318,103 @@ unsafe extern "C" fn write_connection(context: *mut c_void, buf: *const u8, len:
     let connection = unsafe { &mut *(context as *mut Connection) };
     // SAFETY: as above, for the sink.
     unsafe { write_sink(&mut connection.sink as *mut Sink as *mut c_void, buf, len) }
+}
+
+/// 解两个必填串与四个可空串：`host`/`transfer_id` 必填，其余 `None` 即省略。
+///
+/// 返回 `None` 表示已经向 JVM 抛了异常，入口直接返回空指针。两个 send 入口的
+/// 前六段参数解码逐字相同（评审 4.1：约 90 行重复），收在这里。
+///
+/// # Safety
+///
+/// `env` 与各 jstring 必须是 JVM 传进来的有效引用；`value` 为 null 时会先被拦下。
+/// [`read_send_strings`] 的返回形状：两个必填串加四个可空串。
+type SendStrings = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+unsafe fn read_send_strings(
+    env: *mut JNIEnv,
+    host: jstring,
+    settings: jstring,
+    sender: jstring,
+    model: jstring,
+    sender_id: jstring,
+    transfer_id: jstring,
+) -> Option<SendStrings> {
+    // SAFETY: both are live `java.lang.String`s, per the JVM's call, and null is taken
+    // before `read_string`, which would refuse it.
+    let host = unsafe { read_string(env, host) }?;
+    let transfer_id = unsafe { read_string(env, transfer_id) }?;
+    let optional = |value: jstring| -> Option<Option<String>> {
+        if value.is_null() {
+            return Some(None);
+        }
+        // SAFETY: `value` is a live `java.lang.String` and `env` outlives the call.
+        Some(unsafe { read_string(env, value) })
+    };
+    let settings = optional(settings)?;
+    let sender = optional(sender)?;
+    let model = optional(model)?;
+    let sender_id = optional(sender_id)?;
+    Some((host, transfer_id, settings, sender, model, sender_id))
+}
+
+/// 可空串的指针与长度：`None` 传 null/0，`opairdrop_send` 那一层认这个形状。
+fn slice_of(text: &Option<String>) -> (*const u8, usize) {
+    match text {
+        Some(text) => (text.as_ptr(), text.len()),
+        None => (ptr::null(), 0),
+    }
+}
+
+/// 建两条流与可选的换线器，包成 [`Connection`]。返回 `None` 表示已经向 JVM 抛了异常。
+///
+/// 评审 P0-3 的顺序在这里：`Stream::new` 失败（异常挂起）后不再发 `Sink::new` 的
+/// JNI 调用。两个 send 入口逐字相同，收在这里。
+///
+/// # Safety
+///
+/// `env` 与 `input`/`output`/`link` 必须是 JVM 传进来的有效引用。
+unsafe fn build_connection(
+    env: *mut JNIEnv,
+    input: jobject,
+    output: jobject,
+    link: jobject,
+) -> Option<Connection> {
+    // SAFETY: both are live streams and `env` outlives this call.
+    let reader = match unsafe { Stream::new(env, input) } {
+        Ok(reader) => reader,
+        Err(_) => return None,
+    };
+    if unsafe { pending(env) } {
+        return None;
+    }
+    let sink = match unsafe { Sink::new(env, output) } {
+        Ok(sink) => sink,
+        Err(_) => return None,
+    };
+    if unsafe { pending(env) } {
+        return None;
+    };
+    // A null `Link` means the caller asked for a single-connection transfer, which is a
+    // request the receiver will not answer — so the library reports it rather than waiting
+    // out a read timeout. See `dial_connection`.
+    let link = if link.is_null() {
+        None
+    } else {
+        // SAFETY: `link` is a live object and `env` outlives this call.
+        match unsafe { Link::new(env, link) } {
+            Ok(link) => Some(link),
+            Err(()) => return None,
+        }
+    };
+    Some(Connection { reader, sink, link })
 }
 
 /// Reads a `java.lang.String` as UTF-16 and converts it, throwing if it is not a string.
