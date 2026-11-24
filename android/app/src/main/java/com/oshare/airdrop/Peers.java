@@ -64,11 +64,6 @@ final class Peers {
     /** 链路本地 IPv6 的 mDNS 组：AWDL 上只有它。 */
     private static final String GROUP6 = "ff02::fb";
 
-    /** {@code awdld} 建的那张网卡，iPhone 唯一在的那条链路。 */
-    private static final String AWDL = "awdltun0";
-
-    /** 同一条链路的无线电那一侧。回包几乎全被驱动吞掉，只当兜底，见 {@link Responder}。 */
-    private static final String AWDL_RADIO = "wonder0";
 
     /** 服务类型后缀：实例名去掉它才是给人看的名字。 */
     private static final String SUFFIX = "._airdrop._tcp.local";
@@ -1265,9 +1260,9 @@ final class Peers {
      * 直接失败好，因为一块都没有通常意味着 Wi-Fi 关着，那条路本来也没戏。
      */
     private void open() throws Exception {
-        NetworkInterface nic = link();
+        NetworkInterface nic = MdnsLink.link();
         // awdltun0 只带链路本地 IPv6，连 A 记录都不会有；其余网卡按有没有 IPv4 判。
-        boolean v6 = nic != null && (!hasIPv4(nic) || AWDL.equals(nic.getName()));
+        boolean v6 = nic != null && (!hasIPv4(nic) || MdnsLink.AWDL_TUN.equals(nic.getName()));
         InetAddress target = InetAddress.getByName(v6 ? GROUP6 : GROUP4);
         if (v6 && nic != null) {
             // ff02::fb 是链路本地组播：不带 scope，内核不知道从哪块网卡发出去。
@@ -1322,56 +1317,6 @@ final class Peers {
                 + (hops ? ", hop limit 255" : ", hop limit NOT raised"));
     }
 
-    /**
-     * 在哪块网卡上问。
-     *
-     * <p>{@code awdltun0} 第一，因为 iPhone 只在那条链路上，而它是这一页唯一的对手盘。
-     * {@code wonder0} 是同一条链路的无线电侧，驱动几乎不把回包交上来（35 秒里收到 9295 帧，
-     * 它的收包计数只动了 8），所以只当兜底。两块都没有才退回 Wi-Fi：那时能找到的是连着同一个
-     * 路由器的 Mac，不是手机。
-     */
-    private NetworkInterface link() {
-        return link(true);
-    }
-
-    /**
-     * 同上，但可以拒绝兜底。
-     *
-     * <p>{@code fallback=false} 时只认 AWDL 那两块，没有就返回 {@code null}——把「这条路不在」
-     * 当成一个正当答案交给调用方，而不是硬塞一块能开却不通的网卡。
-     */
-    private NetworkInterface link(boolean fallback) {
-        try {
-            for (String name : new String[]{AWDL, AWDL_RADIO}) {
-                NetworkInterface nic = named(name);
-                if (nic != null) {
-                    return nic;
-                }
-            }
-            if (!fallback) {
-                return null;
-            }
-            for (NetworkInterface candidate : Collections.list(NetworkInterface.getNetworkInterfaces())) {
-                String name = candidate.getName();
-                if (candidate.isUp() && (name.startsWith("wlan") || name.startsWith("ap"))) {
-                    return candidate;
-                }
-            }
-        } catch (Exception ignored) {
-            // 拿不到网卡列表就交给系统默认路由，下面返回 null。
-        }
-        return null;
-    }
-
-    /** 按名字取一块正在用的网卡；不存在或者没起来都算没有。 */
-    private static NetworkInterface named(String name) {
-        try {
-            NetworkInterface nic = NetworkInterface.getByName(name);
-            return nic != null && nic.isUp() ? nic : null;
-        } catch (Exception gone) {
-            return null;
-        }
-    }
 
     /**
      * 网卡换了就把 socket 搬到新那块上。
@@ -1393,8 +1338,8 @@ final class Peers {
         //
         // 所以绑在 awdltun0 上时就只认 awdltun0，它没了就原地等（链路回来时 index 一定是新的，
         // 下一次检查自然会搬过去——实测 1.3 秒）；绑在别处时才贪心，见到 awdltun0 就搬。
-        NetworkInterface nic = AWDL.equals(bound) ? named(AWDL) : link(true);
-        if (nic == null && AWDL.equals(bound)) {
+        NetworkInterface nic = MdnsLink.AWDL_TUN.equals(bound) ? MdnsLink.named(MdnsLink.AWDL_TUN) : MdnsLink.link(true);
+        if (nic == null && MdnsLink.AWDL_TUN.equals(bound)) {
             // 不是 socket 哑了，是整条链路不在。sendFails 一起归零：留着它只会在链路回来时
             // 白白多触发一次重开。
             sendFails = 0;
