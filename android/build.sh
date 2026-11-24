@@ -57,7 +57,9 @@ echo "== rust: aarch64-linux-android =="
 echo "== app: $task =="
 JAVA_HOME=$java_home "$gradle_bin" -p "$here" --no-daemon --console=plain "$task"
 
-apk=$(find "$here/app/build/outputs/apk" -name '*.apk' -newer "$root/target/aarch64-linux-android/release/libopairdrop_ffi.so" | head -1)
+# `-print -quit` 而不是 `| head -1`（评审 4.4）：pipefail 下 find 被 head 关掉
+# 输出管道会吃 SIGPIPE，脚本整体退出；目录不存在也会直接失败。
+apk=$(find "$here/app/build/outputs/apk" -name '*.apk' -newer "$root/target/aarch64-linux-android/release/libopairdrop_ffi.so" -print -quit 2>/dev/null || true)
 if [ -n "$apk" ]; then
     echo "== built =="
     echo "$apk"

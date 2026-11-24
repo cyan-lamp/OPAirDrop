@@ -7,3 +7,9 @@ kernel/source/** -text
 # Shell scripts are pushed to the device and run there, where a trailing CR
 # becomes part of the command name. Keep them LF everywhere.
 *.sh text eol=lf
+
+# 随包载荷与音频是二进制，行尾转换会把字节改掉。
+*.ko.gz binary
+*.wav binary
+# Python 脚本在 CI 与本机之间来回，统一 LF。
+*.py text eol=lf

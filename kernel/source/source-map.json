@@ -1,7 +1,7 @@
 {
   "kernel/driver/agg-core.h": {
     "role": "host-test helper; already inlined into bridge headers",
-    "sha256": "d69d9ebac0194d05d9c22b2ded83569f81507ebb49e121fefc337ff9c7c8131a"
+    "sha256": "99ff9e4cfce1231dd8bdd5c10034c4950ef758d57e036ebccde46a40e4c941db"
   },
   "kernel/driver/cdp_txrx_mob_def.h": {
     "kernel_path": "vendor/qcom/opensource/wlan/qca-wifi-host-cmn/dp/inc/cdp_txrx_mob_def.h",
@@ -90,7 +90,7 @@
   },
   "kernel/driver/wlan_hdd_opairshare_rx_order.h": {
     "kernel_path": "vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_opairshare_rx_order.h",
-    "sha256": "c0e4ee22e1a376aef13b95bf8407d6f5fdbcd99392d755347e5ea8c512b38ec5"
+    "sha256": "e85303f8bbee819c0f42f8f66f2e0e367e3d520e2ee23f681b9ae06ccc862c69"
   },
   "kernel/driver/wlan_hdd_opairshare_rx_ring_switch.h": {
     "kernel_path": "vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_opairshare_rx_ring_switch.h",
@@ -102,7 +102,7 @@
   },
   "kernel/driver/wlan_hdd_tx_rx.c": {
     "kernel_path": "vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c",
-    "sha256": "1c564ee2a6425792ba6ef8564178d1c07ea7f915dda978b5d9209f58818ec340"
+    "sha256": "4656699e746d7bbd5653d477e6ff93e6ca2dd3d82d47c55c719772ef68f82a3e"
   },
   "kernel/driver/wlan_hdd_wmm.c": {
     "kernel_path": "vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_wmm.c",
@@ -110,7 +110,7 @@
   },
   "kernel/driver/wlan_hdd_wondertap.c": {
     "kernel_path": "vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_wondertap.c",
-    "sha256": "c7f6a99d70ca7d7495194e2d8b7809fe3d24ea56bca41b22087cb87efb037fed"
+    "sha256": "5b30369e159b341c6b2c2c5a9529db8fe661069574e3cd8abf331750167e5862"
   },
   "kernel/driver/wlan_mlme_vdev_mgr_interface.c": {
     "kernel_path": "vendor/qcom/opensource/wlan/qcacld-3.0/components/mlme/core/src/wlan_mlme_vdev_mgr_interface.c",
@@ -142,7 +142,7 @@
   },
   "kernel/driver/wma_opairshare_awdl_ba.h": {
     "kernel_path": "vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_opairshare_awdl_ba.h",
-    "sha256": "116767b5594e9ce58d6f86ff5f9165ac2da468723cb9f0d24c7392b99a9b7fcd"
+    "sha256": "071018e8126eeb95d9f0bb281cfd287488b4d9b7f3e04964e0d5491ac9894122"
   },
   "kernel/driver/wma_opairshare_awdl_rx_mac_filter.h": {
     "kernel_path": "vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_opairshare_awdl_rx_mac_filter.h",
@@ -166,7 +166,7 @@
   },
   "kernel/driver/wma_opairshare_flow_control.h": {
     "kernel_path": "vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_opairshare_flow_control.h",
-    "sha256": "ff96d17e6b5da0e459b16683962c7268b9d3c7b341dfac5c9838f6b79bc35074"
+    "sha256": "5b80bc625cbd6a948af5036376f745ca23dbea675e8de00b28f5116af4a16a43"
   },
   "kernel/driver/wma_opairshare_metrics.h": {
     "kernel_path": "vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_opairshare_metrics.h",
@@ -178,7 +178,7 @@
   },
   "kernel/driver/wma_opairshare_pas_mgmt.h": {
     "kernel_path": "vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_opairshare_pas_mgmt.h",
-    "sha256": "f5fea715ade6d116a071c5daead027c5de7b1afef247d1313e39cb6cb8d33ff5"
+    "sha256": "0a7191f75affaa0844a5d07b50bbef34f687869042b1d48777a1a0cbb9e712ec"
   },
   "kernel/driver/wma_utils.c": {
     "kernel_path": "vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_utils.c",
