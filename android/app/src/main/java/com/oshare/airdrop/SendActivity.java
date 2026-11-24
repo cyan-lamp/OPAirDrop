@@ -731,6 +731,10 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     @Override
     public void onConfigurationChanged(Configuration next) {
         super.onConfigurationChanged(next);
+        // 密度缓存在这里刷新（评审 4.4）：manifest 声明了 configChanges="density"，
+        // 改字体/显示大小不会重建 Activity——缓存不刷新的话，之后所有的 dp() 都按
+        // 旧密度算。scheme 只在明暗变化时重建，密度是每次都跟着系统走。
+        density = getResources().getDisplayMetrics().density;
         Scheme fresh = schemeOf(next);
         if (fresh.light == S.light) {
             return;
