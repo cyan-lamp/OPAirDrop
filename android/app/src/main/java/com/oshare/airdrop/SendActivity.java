@@ -139,20 +139,6 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      */
     private static final int UPLOAD_READ_TIMEOUT_MS = 90_000;
 
-    /**
-     * 发送缓冲区的上限，六十四 KB。
-     *
-     * <p>不设的时候平台会把它长到一兆以上，于是「写完了」这句话就不再是「发出去了」：整份
-     * 档案落进内核队列时调用就返回了，界面上那一圈立刻走到 100%，而线路上一块还没走完。
-     * 留在这里的数字与参考实现相同（{@code HttpCall.SEND_BUFFER}），它的日志里记着代价：
-     * 24 MB 的视频在 50 ms 内报「已写 1.06 MB」，然后是 7.24 秒的静默。
-     *
-     * <p>这个尺寸仍然远大于这条链路的带宽时延积，所以它限制的是「最多能抢跑多少」，不是
-     * 吞吐。必须在下 {@code connect} 之前设：平台在建 socket 的时候就把队列定好，事后再设
-     * 只是给一个尺寸已经错了的队列换个标签。
-     */
-    private static final int SEND_BUFFER = 64 * 1024;
-
     /** 上滑进来的时长。比系统对话框略慢：它是整块面板在动，不是一个小窗在淡入。 */
     private static final int ENTER_MS = 340;
     /** 下滑走人的时长。要短：手指已经做了决定，动画只是收尾。 */
@@ -1731,7 +1717,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                 throw new IOException("cancelled before the second connection");
             }
             Log.i(TAG, "lane " + lane + ": second connection for /Ask");
-            closeQuietly(held[0]);
+            SendPipeline.closeQuietly(held[0]);
             live.remove(held[0]);
             held[0] = null;
             SSLSocket next = open(peer, connectMs, readMs, flight);
@@ -1853,7 +1839,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         } finally {
             // 关最后那一条。中途换过连接的话，前一条已经在 second 里关掉了——那条连接上
             // 已经答过一个请求，留着它没有任何用处。
-            closeQuietly(held[0]);
+            SendPipeline.closeQuietly(held[0]);
             live.remove(held[0]);
             held[0] = null;
         }
@@ -1955,12 +1941,12 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      */
     private SSLSocket open(Peers.Peer peer, int connectMs, int readMs, Flight flight)
             throws IOException {
-        Socket raw = rawSocket(peer, connectMs, readMs);
+        Socket raw = SendPipeline.rawSocket(peer, connectMs, readMs);
         // 裸 socket 先登记：握手要几百毫秒，人在那期间点取消，能关的只有这一条。
         live.add(raw);
         SSLSocket tls = null;
         try {
-            tls = connectTls(peer, raw);
+            tls = SendPipeline.connectTls(peer, raw);
             // 换成 TLS 那一层。同一个描述符，但取消时要关的是会写 {@code close_notify} 的那个。
             // 先加新的再摘旧的：反过来的话，两步之间取消会两手空空（见 {@link #live} 第三点）。
             live.add(tls);
@@ -1976,69 +1962,8 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             if (tls != null) {
                 live.remove(tls);
             }
-            closeQuietly(tls != null ? tls : raw);
+            SendPipeline.closeQuietly(tls != null ? tls : raw);
             throw failed;
-        }
-    }
-
-    /** TCP 连接：选项在 connect 之前设，地址带 scope。预查询也用这条，不登记 live。 */
-    private static Socket rawSocket(Peers.Peer peer, int connectMs, int readMs) throws IOException {
-        Socket raw = new Socket();
-        // 两个选项都要在 connect 之前设，理由见 {@link #SEND_BUFFER}：队列的尺寸是建 socket
-        // 时定的。失败不算致命——不设也能传，只是进度会变成「写进队列了多少」。
-        try {
-            raw.setTcpNoDelay(true);
-        } catch (SocketException refused) {
-            Log.i(TAG, "tcp nodelay refused: " + refused);
-        }
-        try {
-            raw.setSendBufferSize(SEND_BUFFER);
-        } catch (SocketException refused) {
-            Log.i(TAG, "send buffer " + SEND_BUFFER + " refused: " + refused);
-        }
-        // 地址不能直接当字符串用：链路本地 IPv6 少了 scope，connect 会立刻回 EINVAL。
-        raw.connect(new InetSocketAddress(Peers.address(peer), peer.port), connectMs);
-        raw.setSoTimeout(readMs);
-        // 关掉 linger：对端先走的时候，本端已经写下去、还没被确认的那一段不该让 close 卡住。
-        try {
-            raw.setSoLinger(false, 0);
-        } catch (SocketException refused) {
-            Log.i(TAG, "so_linger refused: " + refused);
-        }
-        return raw;
-    }
-
-    /**
-     * TLS 握手 + 证书钉住。{@code raw} 由调用方拥有，失败时由调用方关。
-     *
-     * <p>指纹为空时照常连接（接受任意自签链）：评审 P1-18 曾试图在这里拒发，2026-11-24
-     * 04:18 实测推翻——真实 iPhone 在「隔空投送=所有人」模式下本来就不带 {@code h=}
-     * 指纹（联系人未匹配时 iOS 省略它），硬拒发把正常传输全拒了。指纹在场时钉住
-     * 照旧生效；不在场是真实协议的常态，不是攻击信号，记一行日志即可。
-     */
-    private static SSLSocket connectTls(Peers.Peer peer, Socket raw) throws IOException {
-        if (peer.fingerprint.isEmpty()) {
-            Log.i(TAG, "no fingerprint for " + peer.name + ": the certificate cannot be pinned");
-        }
-        try {
-            SSLSocket tls = (SSLSocket) Identity.clientContext(peer.fingerprint).getSocketFactory()
-                    .createSocket(raw, peer.host.isEmpty() ? peer.address : peer.host, peer.port, true);
-            tls.setUseClientMode(true);
-            tls.startHandshake();
-            Log.i(TAG, "connected to " + peer.name + ", sndbuf " + raw.getSendBufferSize()
-                    + ", nodelay " + raw.getTcpNoDelay());
-            return tls;
-        } catch (Exception failed) {
-            // 指纹不符是这条链上唯一一种「对方不是它说的那台机器」的失败，而且它到这一层已经
-            // 被 JSSE 套了两三层。先把它捞出来换成自己的类型，界面上才不会说成「发送失败」。
-            PeerMismatch mismatch = PeerMismatch.of(failed);
-            if (mismatch != null) {
-                throw mismatch;
-            }
-            if (failed instanceof IOException) {
-                throw (IOException) failed;
-            }
-            throw new IOException("TLS did not start: " + failed, failed);
         }
     }
 
@@ -2060,8 +1985,8 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             Socket raw = null;
             SSLSocket tls = null;
             try {
-                raw = rawSocket(peer, connectMs, readMs);
-                tls = connectTls(peer, raw);
+                raw = SendPipeline.rawSocket(peer, connectMs, readMs);
+                tls = SendPipeline.connectTls(peer, raw);
                 byte[] answer = Native.discoverName(
                         peer.host.isEmpty() ? peer.address : peer.host,
                         settingsText(), senderName(), modelName(), senderId(),
@@ -2076,21 +2001,9 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                 // 问不到很正常：对面锁屏、AirDrop 关了、或者还没答完。留着 hash，下一次
                 // 广播会再试。不记日志——每台设备每两秒一次，会把日志冲掉。
             } finally {
-                closeQuietly(tls != null ? tls : raw);
+                SendPipeline.closeQuietly(tls != null ? tls : raw);
             }
         }, "opairdrop-name-" + peer.name).start();
-    }
-
-    /** 关掉一条连接，关不掉也只是记一笔——它本来就可能是对面先关的。 */
-    private static void closeQuietly(Socket socket) {
-        if (socket == null) {
-            return;
-        }
-        try {
-            socket.close();
-        } catch (Exception alreadyGone) {
-            Log.i(TAG, "closing a connection that was already gone", alreadyGone);
-        }
     }
 
     /** 写一句状态。存进表里，重建之后还能重放。 */
