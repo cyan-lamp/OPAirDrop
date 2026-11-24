@@ -518,7 +518,7 @@ final class Listener {
             // handshake, and the failure would appear on the sender's screen where there is
             // nothing to read. This is the only place a person can be told.
             end();
-            setState("无法建立本机证书：" + describe(failed), true);
+            setState("无法建立本机证书：" + Explains.describe(failed), true);
             return;
         }
 
@@ -552,7 +552,7 @@ final class Listener {
         } catch (IOException | GeneralSecurityException refused) {
             closeQuietly(bound);
             end();
-            setState("无法监听 " + PORT + "：" + describe(refused), true);
+            setState("无法监听 " + PORT + "：" + Explains.describe(refused), true);
             return;
         }
 
@@ -584,7 +584,7 @@ final class Listener {
                     // A bound socket that can no longer accept is not going to start: the
                     // descriptor is gone or the interface it bound to is. Ending here with
                     // the reason on the page beats spinning on a socket that always fails.
-                    setState("接受连接失败：" + describe(broken), true);
+                    setState("接受连接失败：" + Explains.describe(broken), true);
                     break;
                 }
                 // 绝不在这条线程上 serve：见类注释「Where the door is」。接待一条连接里最慢的
@@ -600,7 +600,7 @@ final class Listener {
                 // 量不到），以及本机从接受到问人（就在这里到 {@code serve} 里 decide 之间）。
                 // 打上这个时刻，两段就能分开算——如果两次 accept 相隔十几秒，那慢在门口；
                 // 如果 accept 很早而 decide 很晚，那慢在读取或解析。
-                Log.i(TAG, "accepted #" + accepted.incrementAndGet() + " from " + where(peer)
+                Log.i(TAG, "accepted #" + accepted.incrementAndGet() + " from " + Explains.where(peer)
                         + " at " + System.currentTimeMillis());
                 handOver((SSLSocket) peer);
             }
@@ -672,8 +672,8 @@ final class Listener {
         try {
             serve(peer);
         } catch (RuntimeException unexpected) {
-            Log.w(TAG, "connection from " + where(peer) + " broke the server: "
-                    + describe(unexpected));
+            Log.w(TAG, "connection from " + Explains.where(peer) + " broke the server: "
+                    + Explains.describe(unexpected));
         } finally {
             hangUp(peer);
         }
@@ -798,8 +798,8 @@ final class Listener {
             // connection until its first request dies, and by then the handshake is long gone
             // from anywhere it could be inspected.
             javax.net.ssl.SSLSession session = peer.getSession();
-            Log.i(TAG, "handshake from " + where(peer) + ": " + session.getProtocol() + " "
-                    + session.getCipherSuite() + " in " + millis(openedAt) + " ms");
+            Log.i(TAG, "handshake from " + Explains.where(peer) + ": " + session.getProtocol() + " "
+                    + session.getCipherSuite() + " in " + Explains.millis(openedAt) + " ms");
             // Handshake done, so the request bound takes over: see REQUEST_TIMEOUT_MS for why
             // this one is the bound that matters when there is only one serving thread.
             peer.setSoTimeout(REQUEST_TIMEOUT_MS);
@@ -814,8 +814,8 @@ final class Listener {
             // holding the phone, the log is for the case nobody can reproduce. A failed
             // handshake is invisible everywhere else — the sender sees its own screen, and
             // this side had nothing to say until this line existed.
-            Log.i(TAG, "handshake from " + where(peer) + " failed after " + millis(openedAt)
-                    + " ms: " + describe(failed));
+            Log.i(TAG, "handshake from " + Explains.where(peer) + " failed after " + Explains.millis(openedAt)
+                    + " ms: " + Explains.describe(failed));
             return;
         }
 
@@ -833,7 +833,7 @@ final class Listener {
             //
             // 设置页仍然照常报这个错、仍然给删除按钮，所以人还是能把它修好；这一句留在
             // 页面上，是让人知道现在用的是默认值而不是他设过的那些。
-            Log.i(TAG, "settings unreadable, receiving with defaults: " + describe(unreadable));
+            Log.i(TAG, "settings unreadable, receiving with defaults: " + Explains.describe(unreadable));
             setState("设置读不出来，正在用默认值接收", false);
             screen = SettingsScreen.defaults(file);
         }
@@ -854,7 +854,7 @@ final class Listener {
         Stall stall = null;
         try {
             staged = Publish.stage(context);
-            stall = new Stall(meter, where(peer));
+            stall = new Stall(meter, Explains.where(peer));
             stall.start();
             // 有人要发东西过来时问一次。问的是人，所以这条线程会停在这里等——它只服务这一个
             // 连接，等的时候确实没有别的事该做；但别的连接各有各的线程，门不会因此关上。
@@ -867,7 +867,7 @@ final class Listener {
                     systemName(context),
                     // 包一层只为记下「它什么时候开口、第一句是什么」。见 {@link Spoken}：它不改
                     // 字节、不改时机，只是把读到的抄一份。
-                    new Spoken(peer.getInputStream(), where(peer), System.currentTimeMillis()),
+                    new Spoken(peer.getInputStream(), Explains.where(peer), System.currentTimeMillis()),
                     peer.getOutputStream(),
                     summary -> {
                         // The one moment a serving thread can tell a request from a body: the
@@ -890,7 +890,7 @@ final class Listener {
                         // 是发送方读完 /Discover 之后自己想了多久才发 /Ask——「十秒才弹窗」到底
                         // 是哪一段，这两个数一比就知道，而在此之前只有「感觉很久」。
                         Log.i(TAG, "offer from " + summary.replace('\t', ' ') + " at "
-                                + System.currentTimeMillis() + ", " + millis(openedAt)
+                                + System.currentTimeMillis() + ", " + Explains.millis(openedAt)
                                 + " ms after accept");
                         // 门在这里才关上，而且只关到这一步为止（见 {@link #card}）：一台设备
                         // 只有一张流体云卡，两条邀请同时在场会互相盖掉对方的按钮；接受之后的
@@ -953,11 +953,11 @@ final class Listener {
             // 打出来：异常到底是哪一类、这条 socket 在**本进程里**有没有被 close 过、断之前线
             // 安静了多久。三样凑齐了，{@code closed=true} 且安静几秒，那就是人在等一个卡住的
             // 传输，而不是网络把人踢了；`false` 且只安静几十毫秒，才是对面先撒手。
-            Log.i(TAG, "connection from " + where(peer) + " broke after " + millis(openedAt)
+            Log.i(TAG, "connection from " + Explains.where(peer) + " broke after " + Explains.millis(openedAt)
                     + " ms: " + refused.getClass().getName() + ", closed=" + peer.isClosed()
-                    + ", " + meter.quiet() + ", " + bytes(meter.bytes()) + " landed");
-            if (routine(refused)) {
-                Log.i(TAG, "connection from " + where(peer) + " ended: " + describe(refused));
+                    + ", " + meter.quiet() + ", " + Explains.bytes(meter.bytes()) + " landed");
+            if (Explains.routine(refused)) {
+                Log.i(TAG, "connection from " + Explains.where(peer) + " ended: " + Explains.describe(refused));
                 return;
             }
             // 没人回答过的连接断了，同样不上报。
@@ -965,7 +965,7 @@ final class Listener {
             // 这一支是为 2026-11-19 15:18 抓到的那一条加的：邀请挂了 30 秒没人应答，是我们
             // 自己把这次邀请判成 expired、自己把连接收掉的，内核于是回 ECONNABORTED——它从
             // 上面 {@link #routine} 里漏了出来（abort 本来就不该算「对端走掉」），一路走到
-            // {@code because(…, 0)}，得到「连接被系统切断，检查后台限网」。网络一点问题都没有，
+            // {@code Explains.because(…, 0)}，得到「连接被系统切断，检查后台限网」。网络一点问题都没有，
             // 只是没人点那一下。卡片那一层恰好侥幸没事（{@code Attempt.failed} 有 {@code if
             // (cloud)} 把关，没人回答就没有 cloud），但页面那行是红的，还劝人去查路由器。
             //
@@ -973,15 +973,15 @@ final class Listener {
             // 落地量分不出「一直没人理」和「人点了、三秒后才断」。11-17 那次后台限网不受影响
             // ——那次人**点了**接收，只是 socket 早就死了，answered 为真，仍按失败上报。
             if (!attempt.answered()) {
-                Log.i(TAG, "connection from " + where(peer) + " ended unanswered: "
-                        + describe(refused));
+                Log.i(TAG, "connection from " + Explains.where(peer) + " ended unanswered: "
+                        + Explains.describe(refused));
                 return;
             }
             // 人明确拒绝了：接下来这个中断是我们自己造成的（Rust 回完 401 就关连接），
-            // 不是失败。原来这里会走到下面那句 because(ECONNABORTED) -> 「连接被系统切断，
+            // 不是失败。原来这里会走到下面那句 Explains.because(ECONNABORTED) -> 「连接被系统切断，
             // 检查后台限网」——人刚点了拒绝，屏幕上却在劝他查路由器。
             if (attempt.declined()) {
-                Log.i(TAG, "connection from " + where(peer) + " closed after the person declined");
+                Log.i(TAG, "connection from " + Explains.where(peer) + " closed after the person declined");
                 return;
             }
             // 人自己按的取消，和「对面走了」在异常这一层完全同形：{@link ReceiveHost.Attempt}
@@ -991,16 +991,16 @@ final class Listener {
             // 不在这里让开的代价是屏幕上说反话：人主动掐掉一次传输，胶囊却弹一条「接收失败：
             // 连接意外断开」——对面没断，是我们掐的。取消只有一个下场：撤卡，不留话。
             if (attempt.cancelled()) {
-                Log.i(TAG, "connection from " + where(peer) + " cancelled by the user: "
-                        + describe(refused));
+                Log.i(TAG, "connection from " + Explains.where(peer) + " cancelled by the user: "
+                        + Explains.describe(refused));
                 return;
             }
             // 先把投递停掉再往卡上写失败：否则一条还在飞的「正在接收」会落在失败那句后面，
             // 屏幕上就只剩一张停在半路、再也不会动的进度卡。上面那两处 {@code return} 由
             // {@code finally} 兜住——它们本来就不许碰卡。
             meter.close();
-            String because = because(refused, meter.bytes());
-            Log.w(TAG, "receive from " + where(peer) + " failed: " + describe(refused));
+            String because = Explains.because(refused, meter.bytes());
+            Log.w(TAG, "receive from " + Explains.where(peer) + " failed: " + Explains.describe(refused));
             setState("接收失败：" + because, true);
             // 页面、卡片、日志说的是同一句话，但页面可能是关着的——而人刚刚是从胶囊上点的
             // 「接收」，那颗胶囊才是他此刻还在看的东西。所以失败必须推到卡片上，而且不能
@@ -1097,56 +1097,6 @@ final class Listener {
     }
 
     /**
-     * Whether a connection failure is the routine kind: the peer went away.
-     *
-     * <p>Two of the three ways out of a transfer are not failures by this device, and they
-     * arrive as the same unchecked {@link IOException} a broken disk would: a reset after the
-     * sender closed its share sheet, and a pipe closed under a reply nobody is left to read.
-     * Telling them apart here is what keeps the state line meaning "something is wrong with
-     * this receiver" rather than "somebody's phone changed its mind".
-     *
-     * <p>Checked through the cause chain because the reset surfaces wrapped: an
-     * {@link SSLException} is a normal part of the path, and its cause is the socket one.
-     */
-    private static boolean routine(Throwable failed) {
-        for (Throwable cause = failed; cause != null; cause = cause.getCause()) {
-            if (cause instanceof SocketException) {
-                // Reset by peer, broken pipe, socket closed: all "the other end stopped
-                // listening", which is what a closed share sheet looks like from here.
-                //
-                // 一个例外：「Software caused connection abort」（ECONNABORTED）。它不是对端
-                // 发来的 RST，而是**本机内核**中止了这条连接——和上面那几种恰好相反。归纳进
-                // 「对端走掉」的代价在 2026-11-17 付过一次：ColorOS 的后台限网（nwpower）在
-                // 应用离开前台的同一毫秒掐掉 socket，人点「接收」时已经晚了三秒，这里把
-                // 它当成别人自己走了，于是屏幕上什么都没有。
-                return !aborted(cause);
-            }
-            if (cause.getCause() == cause) {
-                break;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * 这条连接是不是被本机掐断的（{@code ECONNABORTED}）。
-     *
-     * <p>Java 把 errno 丢在异常消息里，所以只能读那句话。选消息而不是选异常类型，是因为
-     * {@code SocketException} 在这一层已经把 reset、broken pipe、closed 全都收进了同一个类，
-     * 而这三句是 libcore 的固定译文、Android 每个版本都这么写。
-     *
-     * <p>为什么不把 ECONNABORTED 归成「对端走掉」：两个 errno 的方向不一样。reset 一定是
-     * **对面**发了 RST（分享面板关了）；abort 是本机这条连接被中止——后台限网、VPN 掉了、
-     * 息屏断网，或者，如 2026-11-19 实测的那样，**对端在 AWDL 这条隧道上收手**，我们这边的
-     * 内核跟着把 fd 收了。前者不该打扰人，后者要看情况，所以它单独判一次，具体说法见
-     * {@link #because(Throwable, long)}。
-     */
-    private static boolean aborted(Throwable socket) {
-        String message = socket.getMessage();
-        return message != null && message.contains("Software caused connection abort");
-    }
-
-    /**
      * 这个人指定的接收目录，没指定就是空。
      *
      * <p>空不再翻译成一个默认路径，而是交给 {@link Publish}：那里按扩展名分五桶。填了值
@@ -1173,173 +1123,11 @@ final class Listener {
                 ? "" : "，另有 " + published.skipped().size() + " 个没存下";
         if (entries.size() == 1) {
             Publish.Entry entry = entries.get(0);
-            return "收到「" + entry.name + "」，" + bytes(entry.size)
+            return "收到「" + entry.name + "」，" + Explains.bytes(entry.size)
                     + "，存到 " + entry.directory + "/" + lost;
         }
-        return "收到 " + entries.size() + " 个文件，共 " + bytes(published.bytes())
-                + "，存到 " + where(entries) + lost;
-    }
-
-    /**
-     * 这一批落在哪几处。
-     *
-     * <p>五类分开存之后，「存到 X/」这句话可能同时有五个答案，而通知只有一行。一处就把
-     * 整个相对路径说出来（{@code Pictures/OPAirDrop/}）；两处点名；三处以上点名前三个加
-     * 总数——再多就不是一句话，而是一张表了。
-     */
-    private static String where(List<Publish.Entry> entries) {
-        Set<String> roots = new LinkedHashSet<>();
-        for (Publish.Entry entry : entries) {
-            // 只取第一段：五个桶共用一个 OPAirDrop 子目录，能区分它们的是前面那一层。
-            String directory = entry.directory;
-            int slash = directory.indexOf('/');
-            roots.add(slash < 0 ? directory : directory.substring(0, slash));
-        }
-        if (roots.size() == 1) {
-            return entries.get(0).directory + "/";
-        }
-        List<String> names = new ArrayList<>(roots);
-        if (names.size() == 2) {
-            return names.get(0) + "、" + names.get(1) + " 两处";
-        }
-        return names.get(0) + "、" + names.get(1) + "、" + names.get(2)
-                + " 等 " + names.size() + " 处";
-    }
-
-    /**
-     * A byte count in the largest unit that keeps it readable.
-     *
-     * <p>Package-private because the transfer notification prints the same numbers: one rule
-     * for how a byte count reads, not two — the same reason the name chain above is not
-     * duplicated in the view that shows it.
-     */
-    static String bytes(long total) {
-        if (total < 1024) {
-            return total + " B";
-        }
-        String[] units = {"KiB", "MiB", "GiB", "TiB"};
-        double value = total;
-        for (String unit : units) {
-            value /= 1024;
-            if (value < 1024 || unit.equals(units[units.length - 1])) {
-                return String.format(java.util.Locale.US, "%.1f %s", value, unit);
-            }
-        }
-        return total + " B";
-    }
-
-    /**
-     * A failure's own words, or its class when it has none.
-     *
-     * <p>只给日志用。屏幕上那句走 {@link #readable}：这里的原文可以是一整段英文加十六进制
-     * （见 {@code dvzip.rs} 的诊断），那是拿来搜和拿来读证据的，不是拿来给人看的。
-     */
-    private static String describe(Throwable failed) {
-        String message = failed.getMessage();
-        return message == null || message.isEmpty() ? failed.toString() : message;
-    }
-
-    /**
-     * 同一件事给人看的说法。
-     *
-     * <p>{@link #describe} 是给日志的：异常原文，能拿去搜。这一句是给拿着手机的人的——他
-     * 不知道 socket 是什么，他要的是「刚才那一下为什么没成、下回该改哪里」。
-     *
-     * <p>只有 ECONNABORTED 需要翻译。其余非例行的失败（目录写不进去、设置读不出来）原文
-     * 本来就带着人能看懂的那半句，比如文件名和路径。
-     *
-     * <p># ECONNABORTED 要看「断了之前走过字节没有」
-     *
-     * <p>这个 errno 原来是**一律**翻成「检查后台限网」的，依据是 2026-11-17 那次：ColorOS 的
-     * nwpower 在应用离开前台时掐掉 socket，那时确实一个字节都没走。
-     *
-     * <p>2026-11-19 14:55 的实测推翻了「一律」：iPhone 发一个 15.5 MB 的视频过来，传到 2.3 MB
-     * 时那边按了取消，我们这一侧抛的是
-     *
-     * <pre>
-     * 14:55:18.287 W/OPAirDrop: receive from fe80::704d:92ff:fe08:dd2%awdltun0 failed:
-     *                            Software caused connection abort
-     * </pre>
-     *
-     * <p>——同一个 errno，意思却相反：这次是**对面**停的。按原来那句话去查后台限网，人会在
-     * 一个没有问题的设置上打转。
-     *
-     * <p>所以判据换成「有没有字节真的落地」：{@code /Upload} 一个字节都没开始就走完的连接，
-     * 只可能是本机这边先没了（限网、息屏、接口掉了）；走了几兆才断的，是传到一半被停下——
-     * 而这一次是谁停的，从我们这一侧分不出来（对面取消、和对面手机息屏断网，留下的都是这一句），
-     * 所以那句话不点名，只说发生了什么、丢了多少。
-     *
-     * @param landed 断之前已经落地的字节数
-     */
-    private static String because(Throwable failed, long landed) {
-        // 兜底那一句走 {@link #readable} 而不是 {@link #describe}：原因见那边。这一处是**唯一**
-        // 会把这句送到屏幕上的地方（{@code setState} 与 {@code attempt.failed} 都用它）。
-        for (Throwable cause = failed; cause != null; cause = cause.getCause()) {
-            if (aborted(cause)) {
-                if (landed > 0) {
-                    return "传输在中途被中断，已收到 " + bytes(landed) + "，没有存下";
-                }
-                // 把可行动的那一步一起说出来。措辞与首屏那条提示条、设置页同一个说法对齐
-                // （见 Notices.gap 的「后台被限网」），否则人会以为是两件事。
-                return "连接被系统切断，检查后台限网";
-            }
-            if (cause.getCause() == cause) {
-                break;
-            }
-        }
-        return readable(failed);
-    }
-
-    /**
-     * 一句人能读的失败原因。原文只进日志。
-     *
-     * <p>这里原来直接把 {@link #describe} 的返回值交出去，理由是「目录写不进去、设置读不出来
-     * 这类原文本来就带着人能看懂的那半句」。2026-11-19 20:57 那张卡把这个理由推翻了：人看到的是
-     *
-     * <pre>
-     * 接收失败 · transport: the archive could not be read:
-     *            implausible DVZip block length 0 (header 0x00000000 at offset 115)
-     * </pre>
-     *
-     * <p>——英文、术语、十六进制，三样他都不知道该怎么读。而那时这段原文还只有一句；随后
-     * {@code dvzip.rs} 为了查清那一次的成因又往里加了「读过几块、body 起始字节、首块解出什么」，
-     * 加起来上百个字符的十六进制。那些字节是**给日志的**：{@link #describe} 原样进 logcat
-     * （见 {@code serve} 里那句 {@code Log.w(… failed: …)}），屏幕上不该出现它们。
-     *
-     * <p>所以分成两条出口。认不出来的失败回一句不点名的实话，而不是把英文倒给屏幕：认不出来的
-     * 那些（SSL 握手没谈成、磁盘写满）本来就该去日志里看，屏幕上多编一个字都是猜。
-     */
-    private static String readable(Throwable failed) {
-        String raw = describe(failed);
-        // 这几句都来自 Rust 侧 {@code Display} 的固定措辞（inbox::Error 的五个变体），
-        // 是这条链路上**唯一**稳定的锚点：异常类型一路被 JNI 抹平成 IOException。
-        if (raw.contains("the archive could not be read")) {
-            return "对面发来的文件包读不出来，让他再发一次";
-        }
-        if (raw.contains("the inbox could not be written")) {
-            return "文件没能写到存储上，检查空间够不够";
-        }
-        if (raw.contains("exceeds the inbox budget of")) {
-            return "一次传的超过了单次接收上限，没有存下";
-        }
-        if (raw.contains("no free name for")) {
-            return "同名文件太多，另起一个名字也存不下";
-        }
-        if (raw.contains("resolves outside the inbox")) {
-            return "这一份的文件名不安全，没有存下";
-        }
-        return "连接在中途出了问题，这一份没有存下";
-    }
-
-    /** The peer's address, for a log line; "?" when the socket never had one. */
-    private static String where(Socket peer) {
-        java.net.InetAddress address = peer.getInetAddress();
-        return address == null ? "?" : address.getHostAddress();
-    }
-
-    /** How long something took, in whole milliseconds, for a log line. */
-    private static long millis(long startedAt) {
-        return (System.nanoTime() - startedAt) / 1_000_000L;
+        return "收到 " + entries.size() + " 个文件，共 " + Explains.bytes(published.bytes())
+                + "，存到 " + Explains.where(entries) + lost;
     }
 
     /**
@@ -1527,7 +1315,7 @@ final class Listener {
                 if (silent < LIMIT_MS || meter.bytes() == 0) {
                     continue;
                 }
-                Log.w(TAG, "no byte for " + silent + " ms at " + bytes(meter.bytes())
+                Log.w(TAG, "no byte for " + silent + " ms at " + Explains.bytes(meter.bytes())
                         + " from " + who + "; the reading thread was here:" + stackOf(reader));
                 return;
             }
