@@ -225,22 +225,12 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_serve(
     };
     // SAFETY: as above, for each optional string. Null is the documented way to say "the
     // defaults" / "no model", and is taken before `read_string`, which would refuse it.
-    let settings_text = if settings_text.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, settings_text) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
+    let Some(settings_text) = (unsafe { read_optional_string(env, settings_text) }) else {
+        return ptr::null_mut();
     };
     // SAFETY: as above.
-    let model = if model.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, model) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
+    let Some(model) = (unsafe { read_optional_string(env, model) }) else {
+        return ptr::null_mut();
     };
 
     // SAFETY: both are live streams and `env` outlives this call.
@@ -811,37 +801,17 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_discoverName(
     // 同型修复，见 mdnsReply 里评审 P0-3 的注释：optional 的 None 有两种来历
     // （null 参数是合法默认值；读取失败是异常挂起），所以这里逐个解、失败即退，
     // 而不是四连发之后才看一眼 pending。
-    let settings = if settings.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, settings) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
+    let Some(settings) = (unsafe { read_optional_string(env, settings) }) else {
+        return ptr::null_mut();
     };
-    let sender = if sender.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, sender) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
+    let Some(sender) = (unsafe { read_optional_string(env, sender) }) else {
+        return ptr::null_mut();
     };
-    let model = if model.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, model) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
+    let Some(model) = (unsafe { read_optional_string(env, model) }) else {
+        return ptr::null_mut();
     };
-    let sender_id = if sender_id.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, sender_id) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
+    let Some(sender_id) = (unsafe { read_optional_string(env, sender_id) }) else {
+        return ptr::null_mut();
     };
 
     // SAFETY: both are live streams and `env` outlives this call.
@@ -1015,32 +985,17 @@ unsafe fn serve_for_java(
         return ptr::null_mut();
     };
     // SAFETY: as above, for each optional string.
-    let settings_text = if settings_text.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, settings_text) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
+    let Some(settings_text) = (unsafe { read_optional_string(env, settings_text) }) else {
+        return ptr::null_mut();
     };
-    let model = if model.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, model) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
+    let Some(model) = (unsafe { read_optional_string(env, model) }) else {
+        return ptr::null_mut();
     };
     // The phone's own name — what Settings calls this device, and what Bluetooth advertises.
     // Null is the "caller has nothing to say" case, which falls back to the model.
     // SAFETY: as above.
-    let system_name = if system_name.is_null() {
-        None
-    } else {
-        match unsafe { read_string(env, system_name) } {
-            Some(text) => Some(text),
-            None => return ptr::null_mut(),
-        }
+    let Some(system_name) = (unsafe { read_optional_string(env, system_name) }) else {
+        return ptr::null_mut();
     };
 
     // SAFETY: both are live streams and `env` outlives this call.
@@ -2320,6 +2275,22 @@ unsafe extern "C" fn write_connection(context: *mut c_void, buf: *const u8, len:
     unsafe { write_sink(&mut connection.sink as *mut Sink as *mut c_void, buf, len) }
 }
 
+/// 可空串的读取：null 是文档化的「省略」（默认值 / 不上报机型），不是错误。
+///
+/// 返回 `None` 表示已经向 JVM 抛了异常，入口直接返回空指针。九个入口逐字重复的
+/// 同一段 if/match 收在这里（评审 4.1：`Args::decode` 的种子）。
+///
+/// # Safety
+///
+/// `env` 必须有效，`value` 是 JVM 传来的有效引用或 null。
+unsafe fn read_optional_string(env: *mut JNIEnv, value: jstring) -> Option<Option<String>> {
+    if value.is_null() {
+        return Some(None);
+    }
+    // SAFETY: `value` is a live `java.lang.String` and `env` outlives the call.
+    Some(unsafe { read_string(env, value) })
+}
+
 /// 解两个必填串与四个可空串：`host`/`transfer_id` 必填，其余 `None` 即省略。
 ///
 /// 返回 `None` 表示已经向 JVM 抛了异常，入口直接返回空指针。两个 send 入口的
@@ -2351,13 +2322,7 @@ unsafe fn read_send_strings(
     // before `read_string`, which would refuse it.
     let host = unsafe { read_string(env, host) }?;
     let transfer_id = unsafe { read_string(env, transfer_id) }?;
-    let optional = |value: jstring| -> Option<Option<String>> {
-        if value.is_null() {
-            return Some(None);
-        }
-        // SAFETY: `value` is a live `java.lang.String` and `env` outlives the call.
-        Some(unsafe { read_string(env, value) })
-    };
+    let optional = |value: jstring| unsafe { read_optional_string(env, value) };
     let settings = optional(settings)?;
     let sender = optional(sender)?;
     let model = optional(model)?;
