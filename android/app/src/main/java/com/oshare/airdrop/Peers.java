@@ -427,8 +427,8 @@ final class Peers {
 
     private final Context context;
     private final Watcher watcher;
-    private final Handler main = new Handler(Looper.getMainLooper());
-
+    /** UI 节流推送（评审拆分路线的第 6 刀）：快照的变化推给主线程、节流日志。 */
+    private final PeersFeed feed;
     /** 按实例名归拢，插入顺序就是它们被发现的顺序——列表不该每次刷新都重排。 */
     private final Map<String, Peer> peers = new LinkedHashMap<>();
 
@@ -527,8 +527,6 @@ final class Peers {
      * 上一包把表改到了没有。浏览线程自己写自己读；{@link #receive} 置位，{@link #loop} 清位。
      */
     private boolean dirty;
-    /** 上一次记日志时那一串「谁在、在哪」。 */
-    private volatile String lastSeen;
     /** 这一次浏览是什么时候开始的，用来量「对端多久出现在列表里」。 */
     private long startedAt;
 private Thread thread;
@@ -701,6 +699,7 @@ private Thread thread;
     Peers(Context context, Watcher watcher) {
         this.context = context.getApplicationContext();
         this.watcher = watcher;
+        this.feed = new PeersFeed(watcher);
     }
 
     /** 开始浏览。重复调用没有副作用。 */
@@ -774,7 +773,7 @@ private Thread thread;
             int heard = 0;
             // 先把「此刻还没有对端」记一笔。下面只在收到包时才 announce，缺了这一句，
             // 一台身边什么都没有的手机，在日志里和「根本没开始问」长得一模一样。
-            publish(null);
+            feed.publish(snapshot(), null);
             startedAt = System.currentTimeMillis();
             // 冷启动先按上一次的名单敲一遍门：mDNS 得等对方开口，敲门不用。见 {@link #recall}。
             // 交给敲门线程，浏览线程的查询节奏一秒都不能被它拖慢。
@@ -885,7 +884,7 @@ private Thread thread;
                     reopen();
                 }
                 if (dirty) {
-                    publish(null);
+                    feed.publish(snapshot(), null);
                 }
             }
         } catch (Throwable failure) {
@@ -895,7 +894,7 @@ private Thread thread;
             Log.w(TAG, "browse stopped: " + problem, failure);
         } finally {
             close();
-            publish(problem);
+            feed.publish(snapshot(), problem);
         }
     }
 
@@ -1818,7 +1817,7 @@ private Thread thread;
             }
         }
         if (found) {
-            publish(null);
+            feed.publish(snapshot(), null);
         }
     }
 
@@ -2074,48 +2073,6 @@ private Thread thread;
     }
 
     /** 把当前列表送到主线程。合并成一次回调，避免一屏几十次刷新。 */
-    private void publish(String problem) {
-        List<Peer> copy = snapshot();
-        announce(copy, problem);
-        main.post(() -> watcher.onPeers(copy, problem));
-    }
-
-    /**
-     * 发现到的东西变了才写一行。
-     *
-     * <p>写这一行的理由：「找不到设备」有三种完全不同的原因——组播出不去、对端不答、
-     * 答了但记录凑不齐——而这三者在界面上长得一模一样（都是「正在搜索附近设备……」）。
-     * 唯一能把它们分开的就是这一条：跳过了这一行，就只剩猜。
-     *
-     * <p>只在变化时写，是因为浏览每两秒问一次，每问一次都写会把周围的日志冲掉。
-     */
-    private void announce(List<Peer> copy, String problem) {
-        StringBuilder line = new StringBuilder();
-        int ready = 0;
-        for (Peer peer : copy) {
-            if (!peer.connectable()) {
-                continue;
-            }
-            ready++;
-            if (line.length() > 0) {
-                line.append(", ");
-            }
-            line.append(peer.name).append('@').append(peer.address).append(':').append(peer.port);
-        }
-        String now = ready + "|" + line + "|" + problem;
-        if (now.equals(lastSeen)) {
-            return;
-        }
-        lastSeen = now;
-        if (problem != null) {
-            Log.w(TAG, "browse: stopped with " + ready + " connectable: " + problem);
-        } else if (ready == 0) {
-            trace("nothing connectable yet (" + copy.size() + " instance(s) with partial records)");
-        } else {
-            trace(ready + " connectable — " + line);
-        }
-    }
-
     /** 浏览这一层的状态很少变，变的时候留一行；多了反而看不见。 */
     private static void trace(String line) {
         Log.i(TAG, "browse: " + line);
