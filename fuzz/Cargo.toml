@@ -1,0 +1,71 @@
+# 评审 P1-23 的 fuzz 层：libFuzzer 在 Linux 上跑（本机用 WSL Ubuntu，CI 用 ubuntu runner）。
+#
+# 这是一个**独立 workspace**（[workspace] 表在这里），不进主 workspace 的 members：
+# 1. 主 workspace 的 `[profile.release] panic = "abort"` 会弄坏 libFuzzer 的崩溃
+#    处理器——它需要 unwind 才能把崩溃转成可报告的输入；所以本目录自带
+#    `panic = "unwind"` 的 profile。
+# 2. fuzz 的依赖树（sanitizer 化的全部构建产物）不该拖慢主工程的构建。
+#
+# 用法（需要 nightly + clang，Linux）：
+#   cd fuzz
+#   cargo fuzz run bplist_parse -- -max_total_time=60
+#
+# CI 只跑每个 target 十几秒的冒烟；长跑在本地：
+#   cargo fuzz run cpio_read -- -max_total_time=1800
+[package]
+name = "opairdrop-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.opairdrop-bplist]
+path = "../crates/bplist"
+[dependencies.opairdrop-cpio]
+path = "../crates/cpio"
+[dependencies.opairdrop-mdns]
+path = "../crates/mdns"
+[dependencies.opairdrop-http]
+path = "../crates/http"
+
+# 独立 workspace：见文件头。
+[workspace]
+members = ["."]
+
+# libFuzzer 要求 unwind； PanicStrategy::Abort 下崩溃不落 corpus、不打印最小输入。
+[profile.release]
+panic = "unwind"
+codegen-units = 4
+
+[[bin]]
+name = "bplist_parse"
+path = "fuzz_targets/bplist_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cpio_read"
+path = "fuzz_targets/cpio_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mdns_parse"
+path = "fuzz_targets/mdns_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_request_read"
+path = "fuzz_targets/http_request_read.rs"
+test = false
+doc = false
+bench = false

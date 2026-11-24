@@ -1,0 +1,36 @@
+# 评审 P1-23：CI 上的 fuzz 冒烟——每个 target 只跑 15 秒，目的不是找全 bug，
+# 而是**证明 targets 还能编译、还能跑**（fuzz 最常见的死法是没人跑、悄悄坏掉）。
+# 长跑在本地 WSL（每个 target 40 秒起步，深挖用 -max_total_time=1800）：
+#   cd fuzz && cargo fuzz run bplist_parse -- -max_total_time=1800
+name: fuzz
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Rust 缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      # libFuzzer 的插桩与崩溃处理都靠 clang。
+      - name: clang
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang
+
+      - name: cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: 冒烟（每 target 15 秒）
+        run: |
+          cd fuzz
+          for t in bplist_parse cpio_read mdns_parse http_request_read; do
+            cargo fuzz run "$t" -- -max_total_time=15 -rss_limit_mb=4096
+          done
