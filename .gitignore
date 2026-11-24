@@ -20,24 +20,26 @@ android/keystore.properties
 *.jks
 *.keystore
 
-# Packet captures: 126 MB across seven files, and every question they can answer has
-# already been turned into a number in the notes. The scripts that read them are worth
-# a commit (they are the argument); the bytes underneath are not — GitHub refuses a
-# single file over 100 MB anyway, and `t1-air.pcap` alone is 48.8 MB. Kept on disk,
-# readable by the committed scripts, never in the tree.
+# Packet captures: every question they can answer has already been turned into a
+# number in the notes, and the count keeps growing as new questions show up. The
+# scripts that read them are worth a commit (they are the argument); the bytes
+# underneath are not - GitHub refuses a single file over 100 MB anyway. Kept on
+# disk (now under .workbuddy/tmp), readable by the committed scripts, never in
+# the tree.
 *.pcap
 
 # Python leaves these behind the first time anyone runs a probe.
 __pycache__/
 *.pyc
 
-# Module payload backups: every `*.ko.gz` is a 5 MB gzip of a whole driver build,
-# and each experiment that swapped one left a copy behind (`.bak`, `.prev`,
-# `.selfbuild-backup`, `.eac-keep`, ...). What matters for reproducing a number is
-# *which* fingerprint ran, and that is recorded as text in `kernel/README.md`
-# and in Plan.md — the bytes themselves are 5 MB each and answer nothing the
-# sha256 does not. The one payload that ships (assets/kernel in the APK) is the
-# un-suffixed `*.ko.gz`, which stays tracked.
+# Module payload backups: every `*.ko.gz` is a gzip of a whole driver build (the
+# big ones ~5 MB, the small ones tens of KB), and each experiment that swapped one
+# left a copy behind (`.bak`, `.prev`, `.selfbuild-backup`, `.eac-keep`, ...).
+# What matters for reproducing a number is *which* fingerprint ran, and that is
+# recorded as text in `kernel/README.md` and in Plan.md - the bytes themselves
+# answer nothing the sha256 does not. The payloads that ship (assets/kernel in the
+# APK, registered in kernel/PAYLOAD.sha256) are the un-suffixed `*.ko.gz`, which
+# stay tracked.
 kernel/*.ko.gz.*
 
 # 本机的 SDK 位置（P1-21）：每台机器自己写，不进仓库。构建从 ANDROID_HOME 派生。

@@ -92,10 +92,10 @@ passthru / monitor 混杂收帧、NDI vdev 身份、AWDL 目标过滤这些能�
 | `source/driver/` | 46 个覆盖文件，`source-map.json` 逐条给出它们在平台树里的落点；另有 `driver/legacy/` 两个不参与编译的证据文件（见下） |
 | `source/wonder/` | wonder 驱动与它要的 mac80211 接口（22 个文件） |
 | `source/provider/` | provider 与绑定探针（4 个文件） |
-| `source/patches/` | 9 个编号补丁 + 1 个候选版 `0007-session-dp-candidate.patch`，都是对官方树做的**改动**；新增的头文件靠覆盖层拷进去 |
+| `source/patches/` | 11 个编号补丁（`0001`–`0011`）+ 1 个候选版 `0007-session-dp-candidate.patch`（已废弃，函数体进了 `0010`），都是对官方树做的**改动**；新增的头文件靠覆盖层拷进去 |
 | `source/source-map.json` | 覆盖文件 → `kernel_path` 的映射，附每个文件的 sha256 |
 | `source/expected-absent.txt` | 构建树里有、但我们**故意不复现**的死文件清单（附 sha256），冷验证据此区分「预期缺失」与真缺口 |
-| `source/expected-files.txt` | 构建树相对上游 HEAD 的 114 个改动文件清单，`verify-reproduce.sh` 的比对基准 |
+| `source/expected-files.txt` | 构建树相对上游 HEAD 的 115 个改动文件清单，`verify-reproduce.sh` 的比对基准 |
 | `source/tools/` | 上游那七个脚本：`sync-source.sh`、`build-baseline.sh`、`build-wlan-baseline.sh`、`build-wlan-feature-check.sh`、`build-route-b-provider.sh`、`module_abi.py`、`module_exports.py` |
 | `source/README.md` | 上游原文，保留不动；它引用的 `../docs/*` 与 `ROOT-MOUNT-COMPATIBILITY.md` 不随本仓库，看这份就够 |
 
@@ -198,11 +198,11 @@ python3 kernel/check-map.py
 **2026-11-21：这一步补上了，而且是逐字节意义上的补上。** 判据不是「编出来了能跑」，而是
 
 ```text
-pristine git HEAD  +  overlay  +  9 个补丁   ==   实际构建树   逐字节
-total 114  same 112  diff 0  missing 0  expected-absent 2
+pristine git HEAD  +  overlay  +  11 个补丁   ==   实际构建树   逐字节
+total 115  same 113  diff 0  missing 0  expected-absent 2
 ```
 
-114 是构建树相对 HEAD 的全部改动文件数。112 个逐字节一致；剩 2 个是上表 `driver/legacy/`
+115 是构建树相对 HEAD 的全部改动文件数。113 个逐字节一致；剩 2 个是上表 `driver/legacy/`
 里那两个死文件，按设计不复现。任何第三方拉这个仓库跑 `tools/kernel/verify-reproduce.sh`
 都应该看到同一行数——这就是「跟着官方源码 + 我们的 `source/` 能构建出同一颗驱动」的证明。
 
