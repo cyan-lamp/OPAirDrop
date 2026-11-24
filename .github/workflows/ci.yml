@@ -72,11 +72,7 @@ jobs:
       - name: JVM 往返（394 条）
         run: bash crates/ffi/jvm/check.sh
 
-      - name: Gradle 9.6.0
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 9.6.0
-      - name: 组装 APK（android/build.sh：cargo + gradle 一条龙）
+      - name: 组装 APK（android/build.sh：cargo + gradlew 一条龙）
         run: bash android/build.sh assembleDebug
 
       - name: APK 必须带着 .so

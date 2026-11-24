@@ -16,9 +16,12 @@ root=$(cd "$here/.." && pwd)
 
 cargo_bin=${CARGO_BIN:-$HOME/.cargo/bin/cargo}
 java_home=${JAVA_HOME:-/d/Downloads/project/tools/jdk-17.0.20.1+1}
-# gradle 先看 PATH（CI 与装了 gradle 的机器），再落回本机的固定版本（评审 P1-26
-# 的另一半：版本本身由 setup-gradle 钉住，兜底路径只是这台机器的现状）。
+# gradle 优先用 wrapper（评审 P1-26）：版本钉在 gradle/wrapper/gradle-wrapper.properties，
+# 谁来跑都是同一个 9.6.0，CI 不必再装 Gradle。兜底才看 PATH 与本机固定路径。
 gradle_bin=${GRADLE_BIN:-}
+if [ -z "$gradle_bin" ] && [ -x "$here/gradlew" ]; then
+    gradle_bin="$here/gradlew"
+fi
 if [ -z "$gradle_bin" ]; then
     if command -v gradle >/dev/null 2>&1; then
         gradle_bin=gradle
