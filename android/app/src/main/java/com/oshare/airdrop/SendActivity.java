@@ -2603,7 +2603,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     }
 
     private int dp(float value) {
-        return Math.round(value * density);
+        return Ui.dp(density, value);
     }
 
     private static String modelName() {
@@ -2671,17 +2671,8 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         }
     }
 
+    /** 全项目只有这一种字节读法（评审 4.2 曾有三份）：{@link Explains#bytes}。 */
     private static String size(long bytes) {
-        if (bytes < 1024) {
-            return bytes + " B";
-        }
-        double value = bytes / 1024.0;
-        String[] units = {"KB", "MB", "GB", "TB"};
-        int unit = 0;
-        while (value >= 1024 && unit < units.length - 1) {
-            value /= 1024;
-            unit++;
-        }
-        return String.format(Locale.US, value < 10 ? "%.1f %s" : "%.0f %s", value, units[unit]);
+        return Explains.bytes(bytes);
     }
 }

@@ -106,7 +106,7 @@ final class Chrome {
     }
 
     int dp(float value) {
-        return Math.round(host.getResources().getDisplayMetrics().density * value);
+        return Ui.dp(host.getResources().getDisplayMetrics().density, value);
     }
 
     // -------------------------------------------------------------- 容器

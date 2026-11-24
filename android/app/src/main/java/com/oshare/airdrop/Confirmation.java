@@ -478,17 +478,11 @@ final class Confirmation {
         }
     }
 
+    /**
+     * 全项目只有这一种字节读法（评审 4.2 曾有三份，单位还不统一）：
+     * {@link Explains#bytes}，1024 进制、KiB/MiB、恒一位小数。
+     */
     private static String size(long bytes) {
-        if (bytes < 1024) {
-            return bytes + " B";
-        }
-        double value = bytes / 1024.0;
-        String[] units = {"KB", "MB", "GB", "TB"};
-        int unit = 0;
-        while (value >= 1024 && unit < units.length - 1) {
-            value /= 1024;
-            unit++;
-        }
-        return String.format(java.util.Locale.US, value < 10 ? "%.1f %s" : "%.0f %s", value, units[unit]);
+        return Explains.bytes(bytes);
     }
 }

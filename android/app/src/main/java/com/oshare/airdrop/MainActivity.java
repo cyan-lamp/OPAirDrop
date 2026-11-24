@@ -391,7 +391,7 @@ public final class MainActivity extends Activity {
     }
 
     private int dp(float value) {
-        return Math.round(getResources().getDisplayMetrics().density * value);
+        return Ui.dp(getResources().getDisplayMetrics().density, value);
     }
 
     // ------------------------------------------------------------- 外壳
