@@ -177,7 +177,9 @@ public final class MainActivity extends Activity {
         });
         // 进程里那一个接收端，接到现在这个页面。旋转屏幕时拿到的还是同一个对象，所以正在
         // 进行的传输不会被转一下手机打断。
-        listener = Listener.open(this, () -> runOnUiThread(this::refresh));
+        // 评审 P1-16：listener 的状态变化只画在首页——回调走 refreshHome，不把设置页
+        // 也重建一遍（那要在 UI 线程读一次盘）。一次接收状态变化的 5+ 次回调全都受益。
+        listener = Listener.open(this, () -> runOnUiThread(this::refreshHome));
         setContentView(buildUi());
         // 深色/浅色切换会让这个 Activity 整个重建（uiMode 不在 configChanges 里，也不该在：
         // 颜色、模糊配方、启动资源全都要跟着换）。不记住停在哪一页，人一换主题就被弹回首页。
@@ -359,7 +361,8 @@ public final class MainActivity extends Activity {
         // 落空。补这一下，人才不必为了「刚点过允许」再把开关拨一次。
         Listener.of(this).reannounce();
         // 首页那颗胶囊说的是同一件事，跟着重画一次，不必等下一次进出页面。
-        refresh();
+        // 只重建首页：离开屏幕这一刻没有设置变更可言（评审 P1-16）。
+        refreshHome();
     }
 
     @Override
@@ -427,7 +430,7 @@ public final class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         pager.setOnPage(index -> selectTab(index, false));
 
-        replacePage(0, new HomePage(this, chrome, listener, this::refresh).view());
+        replacePage(0, new HomePage(this, chrome, listener, this::refreshHome).view());
         replacePage(1, featurePage());
 
         root.addView(buildTopCapsule());
@@ -1119,17 +1122,43 @@ public final class MainActivity extends Activity {
         if (pages == null || isFinishing() || isDestroyed()) {
             return;
         }
-        replacePage(0, new HomePage(this, chrome, listener, this::refresh).view());
+        replacePage(0, new HomePage(this, chrome, listener, this::refreshHome).view());
         replacePage(1, featurePage());
+        updateTabs();
+    }
+
+    /**
+     * Listener 状态或 root 授权变了：只重建首页（评审 P1-16）。
+     *
+     * <p>一次接收状态变化 listener 会回调 5+ 次，每次都把两页全量重建（包括在 UI 线程
+     * 读一次设置盘）的旧做法，换来的只有滚动条归零和一次读盘延迟。状态画在首页上，
+     * 首页重建就够了；设置页只有「设置真的变了」时才需要动，那条路走 {@link #refresh()}。
+     */
+    private void refreshHome() {
+        if (pages == null || isFinishing() || isDestroyed()) {
+            return;
+        }
+        replacePage(0, new HomePage(this, chrome, listener, this::refreshHome).view());
         updateTabs();
     }
 
     private void replacePage(int index, View content) {
         FrameLayout page = pages[index];
+        // 评审 P1-16：换页保留滚动位置。listener 状态每拍重建首页，不保留的话人正在
+        // 看的位置直接归零；换页本来就是「同一页换一口气」，不是「翻到顶」。
+        int top = 0;
+        if (page.getChildCount() > 0 && page.getChildAt(0) instanceof android.widget.ScrollView old) {
+            top = old.getScrollY();
+        }
         page.removeAllViews();
         page.addView(content, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         applyPageInsets();
+        if (top > 0 && content instanceof android.widget.ScrollView sc) {
+            // lambda 只能捕获 effectively-final 的局部变量，这里 top 已经被赋过两次。
+            final int restoreTo = top;
+            sc.post(() -> sc.scrollTo(0, restoreTo));
+        }
         refreshGlass();
     }
 
