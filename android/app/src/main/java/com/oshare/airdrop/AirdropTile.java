@@ -205,6 +205,7 @@ public final class AirdropTile extends TileService {
     }
 
     /** 磁贴的样子只反映一件事：现在收不收。 */
+    /** 磁贴的三态判定与副标题，纯函数收在 {@link TileState}（评审 P1-24：可单测）。 */
     private void render() {
         Tile tile = getQsTile();
         if (tile == null) {
@@ -231,18 +232,17 @@ public final class AirdropTile extends TileService {
             // 说「点一下重试」，同时把这一格变成点不动的灰块，于是那句重试永远等不到人。
             //
             // 剩下的两种状态都可点，选灰的那个：ACTIVE 会是一盏假绿灯（服务没起来，却亮着）。
-            tile.setState(Tile.STATE_INACTIVE);
-            tile.setSubtitle(settling ? "正在启动…" : "监听没起来，点一下重试");
+            tile.setState(TileState.stateOf(wanted, live, linked));
+            tile.setSubtitle(TileState.subtitleOf(wanted, live, linked, settling, StackKeeper.note()));
         } else if (live && !linked) {
             // 在听，但没有 awdltun0：mDNS 没有网卡可发。「亮着 = 能被发现」在这台机器上曾经
             // 是假的，所以这里不点绿灯；点它会去功能页，那里才有建链按钮。同样必须是可点的
             // 状态——不可用的一格会把「点这里建链」也一起废掉。
-            tile.setState(Tile.STATE_INACTIVE);
-            String trouble = StackKeeper.note();
-            tile.setSubtitle(trouble.isEmpty() ? "链路未建立，点这里建链" : trouble);
+            tile.setState(TileState.stateOf(wanted, live, linked));
+            tile.setSubtitle(TileState.subtitleOf(wanted, live, linked, settling, StackKeeper.note()));
         } else {
-            tile.setState(live ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
-            tile.setSubtitle(null);
+            tile.setState(TileState.stateOf(wanted, live, linked));
+            tile.setSubtitle(TileState.subtitleOf(wanted, live, linked, settling, StackKeeper.note()));
         }
         Log.i(TAG, "tile| state=" + tile.getState());
         tile.setLabel(getString(R.string.tile_airdrop));
