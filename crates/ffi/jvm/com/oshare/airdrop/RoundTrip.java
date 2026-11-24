@@ -256,8 +256,9 @@ public final class RoundTrip {
      *
      * <p>The numbers are held against the report rather than against a constant, because that
      * is the only promise a watcher gets: its last number is what actually landed, and it never
-     * goes backwards on the way there. {@code total} is zero throughout since no `/Ask` came
-     * first, so nothing declared a size — the honest answer, not a missing one.
+     * goes backwards on the way there. No `/Ask` came first, so nothing declared a size — the
+     * denominator falls back to the head's `Content-Length`（2026-11-24：实况照片的 offer 不带
+     * size，旧做法全程 -1% 让流体云不画轨道），and it must not drift mid-transfer.
      */
     private static void serveWatchedReportsWhatItLands(
             Path archive, Path scratch, List<String> expected) throws Exception {
@@ -294,21 +295,32 @@ public final class RoundTrip {
                 "the callback was never made");
 
         boolean backwards = false;
-        boolean claimedATotal = false;
+        long total = -1;
+        boolean totalDrifted = false;
+        boolean totalTooSmall = false;
         for (int step = 0; step < seen.size(); step++) {
             if (step > 0 && seen.get(step)[0] < seen.get(step - 1)[0]) {
                 backwards = true;
             }
-            if (seen.get(step)[1] != 0) {
-                claimedATotal = true;
+            if (seen.get(step)[1] <= 0) {
+                continue;
+            }
+            if (total == -1) {
+                total = seen.get(step)[1];
+            } else if (seen.get(step)[1] != total) {
+                totalDrifted = true;
+            }
+            if (seen.get(step)[0] > seen.get(step)[1]) {
+                totalTooSmall = true;
             }
         }
         long last = seen.isEmpty() ? -1 : seen.get(seen.size() - 1)[0];
         check("a watcher is never told the transfer went backwards", !backwards, describe(seen));
         check("a watcher's last number is what actually landed", last == report.bytes(),
                 "last " + last + ", landed " + report.bytes());
-        check("nothing declared a size, so nothing may be claimed", !claimedATotal,
-                describe(seen));
+        check("the fallback denominator is the head's content length and never drifts",
+                !totalDrifted && total == body.length, describe(seen));
+        check("payload never claims more than the promised body", !totalTooSmall, describe(seen));
     }
 
     /** A watcher's log as one line, for a failure message: {@code done/total}, in order. */
