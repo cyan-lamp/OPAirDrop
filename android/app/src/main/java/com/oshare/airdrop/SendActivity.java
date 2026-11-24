@@ -226,7 +226,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     private List<Peers.Peer> reachable = new ArrayList<>();
 
     /** 每台设备一句话状态，键是设备名；重扫与换主题时复用，避免文字闪一下。 */
-    private final Map<String, String> statuses = new LinkedHashMap<>();
+
     /**
      * 这一句要不要用告警色（红）说。
      *
@@ -234,19 +234,60 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * 异常类型的比较（{@link RefusedException}），在渲染那边再比对文案就成了第二套判据——改一次
      * 措辞，颜色会悄悄退回蓝。换主题重建时也要能在，所以存在这张表里而不是直接写在视图上。
      */
-    private final Map<String, Boolean> statusAlarms = new LinkedHashMap<>();
+
     /** 每台设备当前的进度 [0..1]。环只认它，所以重建之后环还在原处。 */
-    private final Map<String, Float> progressOf = new LinkedHashMap<>();
+
     /** 当前这一份视图里的头像与状态字。重建时清空重填，进度更新按名字找。 */
-    private final Map<String, SendViews.Nick> nicks = new LinkedHashMap<>();
-    private final Map<String, TextView> stateViews = new LinkedHashMap<>();
+    /**
+     * 设备格的账目与绘制（评审拆分路线：DeviceGrid）。六个账本收进唯一的地方；
+     * {@code realNames}/{@code probed} 不在这里——那是发现域的账，见 {@link #showRealName}。
+     */
+    private final DeviceGrid grid = new DeviceGrid(new DeviceGrid.Host() {
+        @Override public boolean light() {
+            return S.light;
+        }
+
+        @Override public int accent() {
+            return S.accent;
+        }
+
+        @Override public int text() {
+            return S.text;
+        }
+
+        @Override public int red() {
+            return S.red;
+        }
+
+        @Override public float density() {
+            return density;
+        }
+
+        @Override public String label(Peers.Peer peer) {
+            return SendActivity.this.label(peer);
+        }
+
+        @Override public void onCellClick(Peers.Peer peer) {
+            // 一次只跑一个传输，所以「正在传」时点任何一台都当作取消：那时页面上没有第二件
+            // 事可以开始，而人点下去的意思只可能是「停下」。
+            if (phase != SendPhase.IDLE) {
+                cancelSend();
+                return;
+            }
+            // 点的时候回表里取一次这一台：对端可能已经被清掉又加回来了（一次广播空白就够
+            // 了），而这个格子抓着的是旧对象，地址端口都可能是上一轮的。
+            Peers.Peer live = current(peer.name);
+            send(live != null ? live : peer);
+        }
+    }, NICK_DP);
+
     /**
      * 设备格子的名字那一行，键是 mDNS 实例名（hash）。
      *
      * <p>/Discover 回来之前只有 hash，回来之后才换成对方自己起的名字。视图重建时按 hash 找回
      * 来重填，所以这个 map 跟着视图走；真名本身另存在 {@link #realNames} 里，跨重建常在。
      */
-    private final Map<String, TextView> nameViews = new LinkedHashMap<>();
+
     /** hash → 对方在 AirDrop 里设的真名。发现阶段拿不到，/Discover 应答到达后填入。 */
     private final Map<String, String> realNames = new LinkedHashMap<>();
     /**
@@ -895,9 +936,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             return;
         }
         content.removeAllViews();
-        nicks.clear();
-        stateViews.clear();
-        nameViews.clear();
+        grid.clearViews();
 
         LinearLayout column = new LinearLayout(this);
         column.setOrientation(LinearLayout.VERTICAL);
@@ -1094,9 +1133,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         // 上一帧的雷达已经随 removeAllViews 脱离窗口，它的帧循环由 onDetachedFromWindow 停掉；
         // 这里把引用也放掉，免得还回去的时候叫醒一个不在屏上的。
         radarView = null;
-        nicks.clear();
-        stateViews.clear();
-        nameViews.clear();
+        grid.clearViews();
 
         if (found.isEmpty()) {
             // 空态自己居中：外面这一层已经改成顶部对齐，留给设备列表从左上角排。
@@ -1149,7 +1186,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                 rows.addView(row, new LinearLayout.LayoutParams(
                         LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
             }
-            row.addView(deviceCell(found.get(i)), new LinearLayout.LayoutParams(
+            row.addView(grid.cell(this, found.get(i)), new LinearLayout.LayoutParams(
                     cellW, LinearLayout.LayoutParams.WRAP_CONTENT));
         }
 
@@ -1228,14 +1265,14 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         found = usable;
 
         // 设备集合没变就不重建：重建会把正在跑的那圈进度丢掉一帧，而进度每秒来两次。
-        if (!nicks.keySet().equals(namesOf(usable))) {
+        if (!grid.tracked().equals(namesOf(usable))) {
             renderStage();
         }
 
         // 名字可能在这一轮才到（型号、缓存、刚问回来的真名），而设备集合没变——那种情况下
         // 不重建整屏，只把那一行字换掉。
         for (Peers.Peer peer : usable) {
-            setLabel(nameViews.get(peer.name), label(peer));
+            grid.name(peer.name, label(peer));
         }
 
         // 还在等名字的那几台，到点得有人再来算一次：报文不一定来，见 {@link #armSettle}。
@@ -1297,22 +1334,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         return name != null ? name : PeerNames.get(peer);
     }
 
-    /**
-     * 换掉格子上那行名字，换的时候淡一下。
-     *
-     * <p>淡进而不是直接跳：占位变真名是这一屏上唯一会发生的一次字变，跳变看着像掉帧。
-     * 180 毫秒足够看出「它刚刚认出了对方」，又不至于让人等。
-     */
-    private static void setLabel(TextView view, String wanted) {
-        if (view == null || wanted == null || wanted.contentEquals(view.getText())) {
-            return;
-        }
-        view.setText(wanted);
-        view.animate().cancel();
-        view.setAlpha(0.3f);
-        view.animate().alpha(1f).setDuration(180).start();
-    }
-
+    
     /** 表里现在这一台。设备可能被清掉又重新加回来，那时地址、端口都该用新的。 */
     private Peers.Peer current(String name) {
         for (Peers.Peer peer : found) {
@@ -1331,64 +1353,6 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         return names;
     }
 
-    /** 一台设备：圆头像（带进度环）+ 名字 + 状态。 */
-    private View deviceCell(Peers.Peer peer) {
-        LinearLayout cell = new LinearLayout(this);
-        cell.setOrientation(LinearLayout.VERTICAL);
-        cell.setGravity(Gravity.CENTER_HORIZONTAL);
-        cell.setPadding(dp(5), 0, dp(5), dp(14));
-
-        SendViews.Nick nick = new SendViews.Nick(this, S.light, density, S.accent);
-        cell.addView(nick, new LinearLayout.LayoutParams(dp(NICK_DP), dp(NICK_DP)));
-
-        TextView name = new TextView(this);
-        // 真名两条来源：本次会话里 /Discover 刚问到的，或上次存下的（按稳定地址查）。
-        // 都没有就写型号——不写实例名，理由见 {@link #label}。
-        name.setText(label(peer));
-        name.setTextSize(12.5f);
-        name.setTextColor(S.text);
-        name.setGravity(Gravity.CENTER);
-        // 名字换行，不硬截成一行：格子就 106dp 宽，「张三的 iPhone 15 Pro」这类名字截一行只剩
-        // 「张三的 iP…」，认不出是谁。两行封顶，还不下才省略——一台设备不该把下面顶出屏幕。
-        name.setMaxLines(2);
-        name.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        name.setLineSpacing(0, 0.95f);
-        name.setPadding(0, dp(6), 0, 0);
-        cell.addView(name);
-
-        TextView state = new TextView(this);
-        state.setTextSize(10.5f);
-        state.setTextColor(Boolean.TRUE.equals(statusAlarms.get(peer.name)) ? S.red : S.accent);
-        state.setGravity(Gravity.CENTER);
-        state.setPadding(0, dp(2), 0, 0);
-        String known = statuses.get(peer.name);
-        state.setText(known == null ? "" : known);
-        cell.addView(state);
-
-        nicks.put(peer.name, nick);
-        stateViews.put(peer.name, state);
-        nameViews.put(peer.name, name);
-        // 重建之前就已经在传的那台，环要接着上一次的位置画，而不是从 0 开始。
-        Float progress = progressOf.get(peer.name);
-        if (progress != null) {
-            nick.progress(progress);
-        }
-
-        // 一次只跑一个传输，所以「正在传」时点任何一台都当作取消：那时页面上没有第二件事
-        // 可以开始，而人点下去的意思只可能是「停下」。
-        //
-        // 点的时候回表里取一次这一台：对端可能已经被清掉又加回来了（一次广播空白就够了），
-        // 而这个格子抓着的是旧对象，地址端口都可能是上一轮的。
-        cell.setOnClickListener(view -> {
-            if (phase != SendPhase.IDLE) {
-                cancelSend();
-                return;
-            }
-            Peers.Peer live = current(peer.name);
-            send(live != null ? live : peer);
-        });
-        return cell;
-    }
 
     /**
      * 停下正在跑的那一次。
@@ -1580,7 +1544,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     settle();
                     SendSession.ended();
                     // 环褪回未开始：留着满圈会读成「还在跑」，而它已经跑完了。
-                    progressOf.remove(peer.name);
+                    grid.removeProgress(peer.name);
                     redrawProgress(peer.name);
                     status(peer, "已发送 · " + size(moved));
                     // 终态。卡片只在 SUCCESS 上放成功的动画，所以这个码不能换成别的。
@@ -1628,7 +1592,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                 runOnUiThread(() -> {
                     settle();
                     SendSession.ended();
-                    progressOf.remove(peer.name);
+                    grid.removeProgress(peer.name);
                     redrawProgress(peer.name);
                     status(peer, message, refused);
                     String who = label(peer);
@@ -1731,7 +1695,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                                     SendHost.waiting(sendSession, peer.name, "等待对方接受…");
                                 }
                                 case Native.Progress.SENDING -> {
-                                    progressOf.put(peer.name,
+                                    grid.progress(peer.name,
                                             whole == 0 ? 0f : Math.min(1f, (float) done / whole));
                                     redrawProgress(peer.name);
                                     String count = "发送中 " + (whole == 0 ? 0 : done * 100 / whole) + "%";
@@ -1750,7 +1714,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                                     }
                                     Log.i(TAG, "lane " + ln + ": done (all bytes written, "
                                             + "waiting for the reports)");
-                                    progressOf.put(peer.name, 1f);
+                                    grid.progress(peer.name, 1f);
                                     redrawProgress(peer.name);
                                     status(peer, "已发送，等待确认…");
                                 }
@@ -1919,19 +1883,13 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     }
 
     /**
-     * 写一句状态，并决定它是普通色还是告警色。
+     * 写一句状态，并决定它是普通色还是告警色（真话在 {@link DeviceGrid#status}）。
      *
-     * <p>{@code alarm} 传 {@code true} 的只有「对方拒绝」这一种：它不是一个过渡中的进度，而是
-     * 这一轮投送的结论，和其余几行（正在连接…、已发送…）不是一类话，用同一个蓝色会读成同一种事。
+     * <p>{@code alarm} 传 {@code true} 的只有「对方拒绝」这一种：它不是一个过渡中的进度，
+     * 而是这一轮投送的结论，和其余几行（正在连接…、已发送…）不是一类话。
      */
     private void status(Peers.Peer peer, String line, boolean alarm) {
-        statuses.put(peer.name, line);
-        statusAlarms.put(peer.name, alarm);
-        TextView state = stateViews.get(peer.name);
-        if (state != null) {
-            state.setText(line);
-            state.setTextColor(alarm ? S.red : S.accent);
-        }
+        grid.status(peer.name, line, alarm);
     }
 
     /**
@@ -1949,7 +1907,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         PeerNames.put(peer, real);
         // 名字到的那一刻就重算，而不是等下一个报文。
         //
-        // 这一台很可能正压在 {@link #settle} 的「等名字」窗口里、还没上屏：那时 nameViews 里
+        // 这一台很可能正压在 {@link #settle} 的「等名字」窗口里、还没上屏：那时 DeviceGrid 的账本里
         // 没有它，单独去换那一行字什么都不会发生，而它下一次有机会出现要等 mDNS 再来一条——
         // iPhone 重复答同一个地址时那条记录不算「变了」，连重画都不会触发。重算一次，头像和
         // 这个名字就会一起出现，而不是先画个占位再被换掉。
@@ -1957,14 +1915,9 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         Log.i(TAG, "peer name from /Discover: " + peer.name + " -> " + real);
     }
 
-    /** 按 {@link #progressOf} 重画某一台的环。视图可能不在（还没建或已重建）。 */
+    /** 按账本重画某一台的环（真话在 {@link DeviceGrid#redrawProgress}）。视图可能不在。 */
     private void redrawProgress(String name) {
-        SendViews.Nick nick = nicks.get(name);
-        if (nick == null) {
-            return;
-        }
-        Float progress = progressOf.get(name);
-        nick.progress(progress == null ? 0f : progress);
+        grid.redrawProgress(name);
     }
 
     // ------------------------------------------------------------------ 关闭
