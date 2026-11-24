@@ -246,4 +246,8 @@ dependencies {
     // 只有这一条，而且不进包。剩下的都是「框架 Java + Rust 库」：没有 AndroidX、没有 Kotlin、
     // 没有任何需要在运行时解析的东西。
     compileOnly 'io.github.libxposed:api:102.0.0'
+
+    // P1-24：纯逻辑的单测（Addresses/Decision/Explains——三个零 Android 依赖的类）。
+    // 只进 test classpath，不进包。
+    testImplementation 'junit:junit:4.13.2'
 }
