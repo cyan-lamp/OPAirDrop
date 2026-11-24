@@ -69,9 +69,6 @@ jobs:
       - name: 载荷哈希校验
         run: ./tools/verify-payload.sh
 
-      - name: JVM unit tests (P1-24)
-        run: cd android && ./gradlew testDebugUnitTest
-
       - name: JVM 往返（394 条）
         run: bash crates/ffi/jvm/check.sh
 
@@ -82,3 +79,6 @@ jobs:
         run: |
           apk=$(find android/app/build/outputs/apk -name '*.apk' | head -1)
           unzip -l "$apk" | grep -E 'lib/.*/libopairdrop_ffi\.so'
+
+      - name: JVM unit tests (P1-24)
+        run: cd android && ./gradlew testDebugUnitTest
