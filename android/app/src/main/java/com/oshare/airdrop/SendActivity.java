@@ -238,7 +238,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
     /** 每台设备当前的进度 [0..1]。环只认它，所以重建之后环还在原处。 */
     private final Map<String, Float> progressOf = new LinkedHashMap<>();
     /** 当前这一份视图里的头像与状态字。重建时清空重填，进度更新按名字找。 */
-    private final Map<String, Nick> nicks = new LinkedHashMap<>();
+    private final Map<String, SendViews.Nick> nicks = new LinkedHashMap<>();
     private final Map<String, TextView> stateViews = new LinkedHashMap<>();
     /**
      * 设备格子的名字那一行，键是 mDNS 实例名（hash）。
@@ -1027,7 +1027,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * <p>留一个引用是为了「叫醒」这条唯一的路：{@link #layer} 停下它之后，能把帧循环挂回去的
      * 只有发起停下的那个人，而它手上只有这个字段。
      */
-    private Radar radarView;
+    private SendViews.Radar radarView;
 
     // ------------------------------------------------------------------ 顶部
 
@@ -1104,7 +1104,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             middle.setOrientation(LinearLayout.VERTICAL);
             middle.setGravity(Gravity.CENTER);
 
-            Radar radar = new Radar();
+            SendViews.Radar radar = new SendViews.Radar(this, S.accent, density, () -> dragging);
             radarView = radar;
             LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(dp(180), dp(180));
             size.gravity = Gravity.CENTER_HORIZONTAL;
@@ -1338,7 +1338,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         cell.setGravity(Gravity.CENTER_HORIZONTAL);
         cell.setPadding(dp(5), 0, dp(5), dp(14));
 
-        Nick nick = new Nick();
+        SendViews.Nick nick = new SendViews.Nick(this, S.light, density, S.accent);
         cell.addView(nick, new LinearLayout.LayoutParams(dp(NICK_DP), dp(NICK_DP)));
 
         TextView name = new TextView(this);
@@ -1959,7 +1959,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
 
     /** 按 {@link #progressOf} 重画某一台的环。视图可能不在（还没建或已重建）。 */
     private void redrawProgress(String name) {
-        Nick nick = nicks.get(name);
+        SendViews.Nick nick = nicks.get(name);
         if (nick == null) {
             return;
         }
@@ -2100,8 +2100,6 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     cancelSlide();
                     // 上一段滑出被这一下按停，closing 要放掉：见 onTouchEvent 里的同名分支。
                     closing = false;
-                    // 按下就建层：见 {@link #layer} 里「为什么在按下时就建」。
-                    layer(true);
                     // 停在哪就从哪接着拖：见 {@link #startTop}。
                     startTop = offset();
                     shown = startTop;
@@ -2151,7 +2149,6 @@ public final class SendActivity extends Activity implements Peers.Watcher {
                     // 这是只能靠真机发现的：`close()` 的 finish 挂在动画的 end action 上，
                     // 动画被取消，那个 end action 就永远不会跑。
                     closing = false;
-                    layer(true);
                     startTop = offset();
                     shown = startTop;
                     return true;
@@ -2352,153 +2349,6 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         }
     }
 
-    /** 圆头像：手机图形 + 一圈进度。 */
-    private final class Nick extends View {
-        private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint ink = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final RectF box = new RectF();
-        private float progress;
-
-        Nick() {
-            super(SendActivity.this);
-            fill.setColor(S.light ? Color.WHITE : 0xFF2A2D33);
-            ink.setColor(S.light ? Color.BLACK : Color.WHITE);
-            ink.setStyle(Paint.Style.STROKE);
-            ink.setStrokeWidth(dp(2.2f));
-            ink.setStrokeCap(Paint.Cap.ROUND);
-            ink.setStrokeJoin(Paint.Join.ROUND);
-            ring.setColor(S.accent);
-            ring.setStyle(Paint.Style.STROKE);
-            ring.setStrokeWidth(dp(3));
-            ring.setStrokeCap(Paint.Cap.ROUND);
-        }
-
-        void progress(float value) {
-            float next = Math.max(0f, Math.min(1f, value));
-            if (next == progress) {
-                return;
-            }
-            progress = next;
-            invalidate();
-        }
-
-        @Override
-        protected void onDraw(Canvas canvas) {
-            float w = getWidth();
-            float h = getHeight();
-            float radius = Math.min(w, h) / 2f - dp(4);
-            float cx = w / 2f;
-            float cy = h / 2f;
-
-            fill.setStyle(Paint.Style.FILL);
-            canvas.drawCircle(cx, cy, radius, fill);
-
-            // 手机图形：窄、高、圆角大，比例照参照图。
-            float phoneW = radius * 0.60f;
-            float phoneH = radius * 0.96f;
-            box.set(cx - phoneW / 2f, cy - phoneH / 2f, cx + phoneW / 2f, cy + phoneH / 2f);
-            float corner = phoneW * 0.28f;
-            canvas.drawRoundRect(box, corner, corner, ink);
-            canvas.drawLine(cx - phoneW * 0.16f, box.top + phoneH * 0.11f,
-                    cx + phoneW * 0.16f, box.top + phoneH * 0.11f, ink);
-
-            if (progress > 0f) {
-                box.set(cx - radius, cy - radius, cx + radius, cy + radius);
-                canvas.drawArc(box, -90f, 360f * progress, false, ring);
-            }
-        }
-    }
-
-    /** 搜索态的雷达：两圈很淡的呼吸环 + 一个蓝圆 + 手机图形。 */
-    private final class Radar extends View {
-        private final Paint halo = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint disc = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint glyph = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final RectF box = new RectF();
-        private float phase;
-        private boolean attached;
-
-        Radar() {
-            super(SendActivity.this);
-            halo.setColor(S.accent);
-            halo.setStyle(Paint.Style.STROKE);
-            halo.setStrokeWidth(dp(1));
-            disc.setColor(S.accent);
-            glyph.setColor(Color.WHITE);
-            glyph.setStyle(Paint.Style.STROKE);
-            glyph.setStrokeWidth(dp(2.4f));
-            glyph.setStrokeCap(Paint.Cap.ROUND);
-            glyph.setStrokeJoin(Paint.Join.ROUND);
-        }
-
-        @Override
-        protected void onAttachedToWindow() {
-            super.onAttachedToWindow();
-            attached = true;
-        }
-
-        @Override
-        protected void onDetachedFromWindow() {
-            // 关掉自己的帧循环。这个 View 在每次发现设备、每次换主题时都会被丢掉，留下一个
-            // 还在 postInvalidateDelayed 的孤儿，等于每次换主题都多一条永不停止的心跳。
-            attached = false;
-            super.onDetachedFromWindow();
-        }
-
-        /**
-         * 把帧循环重新挂上。
-         *
-         * <p>呼吸环是靠 {@link #onDraw} 末尾的那一次 {@code postInvalidateDelayed(32)} 自我
-         * 续命的——它没有独立的定时器，所以「暂停一次」就等于**把这条链剪断**，而不是踩一脚
-         * 刹车。剪断之后没有人会再叫它，于是手指一抬，环就停在上一次画到的那一圈不动了。
-         *
-         * <p>2026-11-18 的真机现场就是这样：点一下页面（甚至只是按在空白处再抬手），搜索动画
-         * 从此静止，直到下一次发现设备把整块中部重建。所以暂停的人必须负责叫醒，见
-         * {@link SendActivity#layer(boolean)}。
-         */
-        void wake() {
-            if (attached && !dragging) {
-                postInvalidateDelayed(32);
-            }
-        }
-
-        @Override
-        protected void onDraw(Canvas canvas) {
-            float w = getWidth();
-            float h = getHeight();
-            float cx = w / 2f;
-            float cy = h / 2f;
-            float core = Math.min(w, h) * 0.30f;
-            float far = Math.min(w, h) * 0.47f;
-
-            // 两圈呼吸环，相位差半圈：读起来像「它在找人」。
-            phase = (phase + 0.012f) % 1f;
-            for (int index = 0; index < 2; index++) {
-                float grown = (phase + index * 0.5f) % 1f;
-                halo.setAlpha((int) (70 * (1f - grown)));
-                canvas.drawCircle(cx, cy, core + (far - core) * grown, halo);
-            }
-
-            canvas.drawCircle(cx, cy, core, disc);
-            float phoneW = core * 0.52f;
-            float phoneH = core * 0.82f;
-            box.set(cx - phoneW / 2f, cy - phoneH / 2f, cx + phoneW / 2f, cy + phoneH / 2f);
-            float corner = phoneW * 0.3f;
-            canvas.drawRoundRect(box, corner, corner, glyph);
-            canvas.drawLine(cx - phoneW * 0.14f, box.top + phoneH * 0.1f,
-                    cx + phoneW * 0.14f, box.top + phoneH * 0.1f, glyph);
-
-            // 拖动期间不自转。
-            //
-            // 面板这时是一个硬件层，层里的任何一次 invalidate 都要把整块 1440×3168 的纹理
-            // 重画一遍——每 32ms 一次，一边还在跟手，就是一秒三十次全屏重绘。停掉它，拖动的
-            // 每一帧就只剩下「把已有纹理挪个位置」。呼吸环没人盯着看的那半秒里，静止它不亏。
-            if (attached && !dragging) {
-                postInvalidateDelayed(32);
-            }
-        }
-    }
 
     // ------------------------------------------------------------------ 小工具
 
