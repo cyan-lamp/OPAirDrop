@@ -106,4 +106,106 @@ final class SendPipeline {
             Log.i(TAG, "closing a connection that was already gone", alreadyGone);
         }
     }
+
+    /**
+     * 这一趟发送走到了哪儿。
+     *
+     * <p>只回答两个问题，而它们在失败时说的不是同一件事：{@link #moving}——对面点了接受没有；
+     * {@link #sentBytes()}——有多少字节真的写进了那几条 socket。传输线程里那几个进度回调填，
+     * 同一个线程的 catch 读，所以**单流时**不需要锁。
+     *
+     * <p># 多流之后为什么多了原子量
+     *
+     * <p>N 条流各在自己的线程上填同一块板子，「同一个线程」这条前提没有了；而下面那个
+     * {@code catch} 又只在其中一条线程上读它。所以逐条流的计数用 {@link AtomicLongArray}
+     * （一条流一个格子，谁也不写别人的），几条汇总量用原子布尔/原子整数。取读侧总和时
+     * 各格子各取一次加起来——中途可能读到半新半旧的一组和，而这是进度条，不是账本。
+     */
+    static final class Flight {
+        /** 有几条流在跑。{@link #sent} 就是按它开的。 */
+        final int lanes;
+
+        /** 每条流最近一次报的「已经写下多少」。各流各算自己的分母，所以不能合成一个数。 */
+        final java.util.concurrent.atomic.AtomicLongArray sent;
+
+        /** 进度相位进过 SENDING：对面已经在手机上点了接受。任意一条流进过就算。 */
+        final java.util.concurrent.atomic.AtomicBoolean moving = new java.util.concurrent.atomic.AtomicBoolean();
+
+        /**
+         * 一条流倒下之后置位：其余几条没有继续的意义。
+         *
+         * <p>与人按下的取消分开记，因为两件事在界面上的说法完全不同——取消是「已取消」，
+         * 而这里要如实说原因。{@code cancelling} 只由人点的那一下置位。
+         */
+        final java.util.concurrent.atomic.AtomicBoolean abort = new java.util.concurrent.atomic.AtomicBoolean();
+
+        /** 第一个倒下的原因。谁先到谁算，后面的不再覆盖。 */
+        final java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+
+        /** 已经跑完的流数：{@code DONE} 每条流各来一次，界面只该在最后一条上说一次。 */
+        final java.util.concurrent.atomic.AtomicInteger finished = new java.util.concurrent.atomic.AtomicInteger();
+
+        /** 日志去重：上一次记下来的整体十分位。整件事一条曲线，不是每条流一条。 */
+        final java.util.concurrent.atomic.AtomicInteger decile = new java.util.concurrent.atomic.AtomicInteger(-1);
+
+        Flight(int lanes) {
+            this.lanes = lanes;
+            this.sent = new java.util.concurrent.atomic.AtomicLongArray(lanes);
+        }
+
+        /** 几条流加起来写了多少字节。 */
+        long sentBytes() {
+            long total = 0;
+            for (int i = 0; i < lanes; i++) {
+                total += sent.get(i);
+            }
+            return total;
+        }
+    }
+
+    /** Rust 收尾时给的那张回执。目前只有一个字段有用：实际落地的字节数。 */
+    static final class Report {
+        long bytes;
+
+        static Report parse(String text) {
+            Report report = new Report();
+            for (String line : text.split("\n")) {
+                int tab = line.indexOf('\t');
+                if (tab > 0 && line.substring(0, tab).equals("bytes")) {
+                    try {
+                        report.bytes = Long.parseLong(line.substring(tab + 1).trim());
+                    } catch (NumberFormatException notANumber) {
+                        report.bytes = 0;
+                    }
+                }
+            }
+            return report;
+        }
+    }
+
+    /**
+     * 问一台设备「你叫什么」：一条连接、一次 /Discover，问完就关。
+     *
+     * <p>与真正发送用的是同一套连接与钉住（{@link #rawSocket}/{@link #connectTls}），但
+     * **绝不登记 live**——一次后台查询不能把正在传的那条连接顶掉。问完即关：对面不会弹窗。
+     *
+     * @return 对端报来的名字；空白行原样返回，由调用方决定要不要采纳。
+     */
+    static String discoverName(Peers.Peer peer, int connectMs, int readMs,
+                               String settings, String sender, String model, String id)
+            throws Exception {
+        Socket raw = null;
+        SSLSocket tls = null;
+        try {
+            raw = rawSocket(peer, connectMs, readMs);
+            tls = connectTls(peer, raw);
+            byte[] answer = Native.discoverName(
+                    peer.host.isEmpty() ? peer.address : peer.host,
+                    settings, sender, model, id,
+                    tls.getInputStream(), tls.getOutputStream());
+            return new String(answer, java.nio.charset.StandardCharsets.UTF_8);
+        } finally {
+            closeQuietly(tls != null ? tls : raw);
+        }
+    }
 }

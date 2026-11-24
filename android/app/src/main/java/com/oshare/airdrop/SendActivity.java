@@ -58,8 +58,6 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLongArray;
-import java.util.concurrent.atomic.AtomicReference;
 
 import javax.net.ssl.SSLSocket;
 
@@ -1575,7 +1573,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             // 写进了那几条 socket」，它决定中断那句该不该怪环境。前者推不出后者——刚进 SENDING
             // 相位时可能一个字节都还没写出去；后者也推不出前者，因为 setSoTimeout 那一下
             // 看的就是相位。
-            Flight flight = new Flight(lanes.size());
+            SendPipeline.Flight flight = new SendPipeline.Flight(lanes.size());
             try {
                 long moved = sendLanes(peer, lanes, flight, tuned);
                 runOnUiThread(() -> {
@@ -1689,7 +1687,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * @param flight 各条流共用的那块记账板；{@code lane} 是这一条在里面占的格子
      * @param lane 这是第几条流，用自己的格子，不碰别人的
      */
-    private byte[] transfer(Peers.Peer peer, List<String> paths, Flight flight, int lane,
+    private byte[] transfer(Peers.Peer peer, List<String> paths, SendPipeline.Flight flight, int lane,
                             SettingsScreen tuned) throws Exception {
         // 人可能在连上之前就把这一趟取消了（卡片上的【取消发送】从「准备中」就在）。这时
         // 还去建连接，是拿几秒钟的握手换一次立刻作废——对面手机上会白弹一次邀请。
@@ -1877,7 +1875,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * 不是一个完整的交付。所以第一条抛出异常时置 {@link Flight#abort} 并掐掉全部连接，
      * 由调用方那句 {@code catch} 统一说这一次的结论——而不是让 N 条流各说一遍。
      */
-    private long sendLanes(Peers.Peer peer, List<List<String>> lanes, Flight flight,
+    private long sendLanes(Peers.Peer peer, List<List<String>> lanes, SendPipeline.Flight flight,
                            SettingsScreen tuned) throws Exception {
         byte[][] frames = new byte[lanes.size()][];
         CountDownLatch finished = new CountDownLatch(lanes.size());
@@ -1911,7 +1909,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         long bytes = 0;
         for (byte[] frame : frames) {
             if (frame != null) {
-                bytes += Report.parse(new String(frame, java.nio.charset.StandardCharsets.UTF_8)).bytes;
+                bytes += SendPipeline.Report.parse(new String(frame, java.nio.charset.StandardCharsets.UTF_8)).bytes;
             }
         }
         return bytes;
@@ -1939,7 +1937,7 @@ public final class SendActivity extends Activity implements Peers.Watcher {
      * <p>连接本身在 {@link #connectTls}——预查询那条不碰 live 的连接也走它，证书钉住的逻辑
      * 因此只有一份。
      */
-    private SSLSocket open(Peers.Peer peer, int connectMs, int readMs, Flight flight)
+    private SSLSocket open(Peers.Peer peer, int connectMs, int readMs, SendPipeline.Flight flight)
             throws IOException {
         Socket raw = SendPipeline.rawSocket(peer, connectMs, readMs);
         // 裸 socket 先登记：握手要几百毫秒，人在那期间点取消，能关的只有这一条。
@@ -1982,16 +1980,9 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             SettingsScreen tuned = Tuning.read(this);
             int connectMs = (int) Tuning.ms(tuned, "client.connect_timeout_ms", CONNECT_TIMEOUT_MS);
             int readMs = (int) Tuning.ms(tuned, "client.read_timeout_ms", READ_TIMEOUT_MS);
-            Socket raw = null;
-            SSLSocket tls = null;
             try {
-                raw = SendPipeline.rawSocket(peer, connectMs, readMs);
-                tls = SendPipeline.connectTls(peer, raw);
-                byte[] answer = Native.discoverName(
-                        peer.host.isEmpty() ? peer.address : peer.host,
-                        settingsText(), senderName(), modelName(), senderId(),
-                        tls.getInputStream(), tls.getOutputStream());
-                String name = new String(answer, java.nio.charset.StandardCharsets.UTF_8);
+                String name = SendPipeline.discoverName(peer, connectMs, readMs,
+                        settingsText(), senderName(), modelName(), senderId());
                 if (!name.trim().isEmpty()) {
                     PeerNames.put(peer, name);
                     runOnUiThread(() -> showRealName(peer, name));
@@ -2000,8 +1991,6 @@ public final class SendActivity extends Activity implements Peers.Watcher {
             } catch (Exception failed) {
                 // 问不到很正常：对面锁屏、AirDrop 关了、或者还没答完。留着 hash，下一次
                 // 广播会再试。不记日志——每台设备每两秒一次，会把日志冲掉。
-            } finally {
-                SendPipeline.closeQuietly(tls != null ? tls : raw);
             }
         }, "opairdrop-name-" + peer.name).start();
     }
@@ -2679,81 +2668,6 @@ public final class SendActivity extends Activity implements Peers.Watcher {
         } catch (Exception unreadable) {
             // 读不出来就用默认：这一项不是必填，而挡住发送是比默认值更坏的答案。
             return null;
-        }
-    }
-
-    /**
-     * 这一趟发送走到了哪儿。
-     *
-     * <p>只回答两个问题，而它们在失败时说的不是同一件事：{@link #moving}——对面点了接受没有；
-     * {@link #sentBytes()}——有多少字节真的写进了那几条 socket。传输线程里那几个进度回调填，
-     * 同一个线程的 catch 读，所以**单流时**不需要锁。
-     *
-     * <p># 多流之后为什么多了原子量
-     *
-     * <p>N 条流各在自己的线程上填同一块板子，「同一个线程」这条前提没有了；而下面那个
-     * {@code catch} 又只在其中一条线程上读它。所以逐条流的计数用 {@link AtomicLongArray}
-     * （一条流一个格子，谁也不写别人的），几条汇总量用原子布尔/原子整数。取读侧总和时
-     * 各格子各取一次加起来——中途可能读到半新半旧的一组和，而这是进度条，不是账本。
-     */
-    private static final class Flight {
-        /** 有几条流在跑。{@link #sent} 就是按它开的。 */
-        final int lanes;
-
-        /** 每条流最近一次报的「已经写下多少」。各流各算自己的分母，所以不能合成一个数。 */
-        final AtomicLongArray sent;
-
-        /** 进度相位进过 SENDING：对面已经在手机上点了接受。任意一条流进过就算。 */
-        final AtomicBoolean moving = new AtomicBoolean();
-
-        /**
-         * 一条流倒下之后置位：其余几条没有继续的意义。
-         *
-         * <p>与人按下的取消分开记，因为两件事在界面上的说法完全不同——取消是「已取消」，
-         * 而这里要如实说原因。{@code cancelling} 只由人点的那一下置位。
-         */
-        final AtomicBoolean abort = new AtomicBoolean();
-
-        /** 第一个倒下的原因。谁先到谁算，后面的不再覆盖。 */
-        final AtomicReference<Throwable> failure = new AtomicReference<>();
-
-        /** 已经跑完的流数：{@code DONE} 每条流各来一次，界面只该在最后一条上说一次。 */
-        final AtomicInteger finished = new AtomicInteger();
-
-        /** 日志去重：上一次记下来的整体十分位。整件事一条曲线，不是每条流一条。 */
-        final AtomicInteger decile = new AtomicInteger(-1);
-
-        Flight(int lanes) {
-            this.lanes = lanes;
-            this.sent = new AtomicLongArray(lanes);
-        }
-
-        /** 几条流加起来写了多少字节。 */
-        long sentBytes() {
-            long total = 0;
-            for (int i = 0; i < lanes; i++) {
-                total += sent.get(i);
-            }
-            return total;
-        }
-    }
-
-    private static final class Report {
-        long bytes;
-
-        static Report parse(String text) {
-            Report report = new Report();
-            for (String line : text.split("\n")) {
-                int tab = line.indexOf('\t');
-                if (tab > 0 && line.substring(0, tab).equals("bytes")) {
-                    try {
-                        report.bytes = Long.parseLong(line.substring(tab + 1).trim());
-                    } catch (NumberFormatException notANumber) {
-                        report.bytes = 0;
-                    }
-                }
-            }
-            return report;
         }
     }
 
