@@ -559,53 +559,6 @@ final class Peers {
      */
     private static final int RHYTHM_SAMPLES = 10;
 
-    /**
-     * 诊断态：先不删任何对端，每 {@link #DIAG_EVERY_MS} 打一行问答节奏。
-     *
-     * <p>**临时开关，调好阈值就关掉。** 开着是因为阈值必须用真机上的分布来定，而一删就换一个
-     * 新 {@code Peer}、统计归零——被闪烁打断的样本永远攒不够十次，看到的全是半截数据。
-     */
-    private static final boolean DIAG = false;
-
-    /**
-     * 每 {@link #PULSE_MS} 打一行「还看得见谁、它安静了多久」。
-     *
-     * <p>和为 {@link #DIAG} 分开，因为目的相反：{@code DIAG} 要求「不许删」（否则攒不够样本），
-     * 而这里要看的恰恰是**删掉之前和之后**各是什么样，所以行为一点都不能改。
-     *
-     * <p>**临时开关，量完分布就关。** 10 秒一行，开着的时候日志里每 10 秒多一行。
-     *
-     * <p>2026-11-19 17:30 关掉：`CONNECTABLE_MS` 定到 20 秒之后的最后一轮（round15，3 分 20 秒）
-     * 里它显示 `1 peer(s), foreign 135→207, quiet 2–1195 ms`，一次删除都没有，要看的分布已经
-     * 拿到了。留着只会每 10 秒多一行，把真出事时的上下文挤走。
-     */
-    private static final boolean PULSE = false;
-
-    /** {@link #PULSE} 的节奏。10 秒：一屏能放下三五分钟的历史，又不至于把别的行挤走。 */
-    private static final long PULSE_MS = 10_000;
-
-    /** 诊断态下的「永不删」，只为把分布采样完整。 */
-    private static final long DIAG_HOLD_MS = 30_000;
-
-    /** 诊断态下多久打一行。5 秒 = 一屏日志里能看出节奏，又不至于淹掉别的行。 */
-    private static final long DIAG_EVERY_MS = 5_000;
-
-    /**
-     * 把 5353 上收到的每一包**原样**打进日志：源地址、长度、解析行，外加整包的十六进制。
-     *
-     * <p>为什么不复用 {@link #DIAG}：那个开关会把 {@link #expire} 改成「永不删」，而这一轮要
-     * 量的正是「多久删」——两个目的在同一次运行里互斥。
-     *
-     * <p>为什么要有十六进制：{@link Native#mdnsRecords} 只交出它认得的那几种记录（srv / addr /
-     * txt / gone），而「iPhone 关掉 AirDrop 时到底发了什么」这个问题的答案很可能落在它**不认**
-     * 的东西上——收起一个服务的 goodbye 是 TTL=0，可 TTL 从来不在这几行里；一条只带 flags 的
-     * 空应答、一次 probe、一次冲突改名的 announce，解析行里全都看不见。抓包工具没有（这台机器
-     * 上没有 tcpdump，也没有 root 之外的注入手段），那就让唯一握着 socket 的人把字节抄下来。
-     *
-     * <p>**临时开关，取完证就关。** 每包一行十六进制，开着的时候日志是不好看的。
-     */
-    private static final boolean WIRE = false;
-
     /** 一台对端。字段可变，因为它是被几条记录先后填满的。 */
     static final class Peer {
         /**
@@ -924,8 +877,6 @@ final class Peers {
     private boolean dirty;
     /** 上一次记日志时那一串「谁在、在哪」。 */
     private volatile String lastSeen;
-    /** 上一次打诊断行是什么时候，只给 {@link #DIAG} 用。 */
-    private long lastDigest;
     /** 这一次浏览是什么时候开始的，用来量「对端多久出现在列表里」。 */
     private long startedAt;
     private Thread thread;
@@ -1004,9 +955,6 @@ final class Peers {
 
     /** 下一次「哑了」检查允许重开 socket 的时刻。 */
     private long nextDeaf;
-
-    /** 下一次打 {@link #PULSE} 那一行的时刻。 */
-    private long nextPulse;
 
     /** 下次重开要等多久。见 {@link #DEAF_RETRY_MS}。 */
     private long deafWait = DEAF_RETRY_MS;
@@ -1293,14 +1241,6 @@ final class Peers {
                             + (empty ? "; the list is empty, so this is the slow probe" : ""));
                     sendFails = 0;
                     reopen();
-                }
-                if (DIAG && now - lastDigest >= DIAG_EVERY_MS) {
-                    lastDigest = now;
-                    digest();
-                }
-                if (PULSE && now >= nextPulse) {
-                    nextPulse = now + PULSE_MS;
-                    pulse();
                 }
                 if (dirty) {
                     publish(null);
@@ -1611,27 +1551,8 @@ final class Peers {
             question = true;
             lines = "";
         }
-        if (WIRE) {
-            wire(packet.getAddress(), data, question, lines);
-        }
         heard(packet.getAddress(), question);
         return true;
-    }
-
-    /** 十六进制表。手工查表只因为 `String.format("%02x")` 在热路径上要造 1500 个字符串。 */
-    private static final char[] HEX = "0123456789abcdef".toCharArray();
-
-    /** {@link #WIRE} 的那一行：谁、多大、是问是答、解析出来的行、整包字节。 */
-    private static void wire(InetAddress from, byte[] data, boolean question, String lines) {
-        StringBuilder hex = new StringBuilder(data.length * 2);
-        for (byte b : data) {
-            hex.append(HEX[(b >> 4) & 0x0f]).append(HEX[b & 0x0f]);
-        }
-        String rows = lines.trim().replace('\n', '|');
-        trace("rx " + data.length + "B " + (question ? "Q" : "A") + " from "
-                + (from == null ? "?" : Addresses.bare(from.getHostAddress()))
-                + (rows.isEmpty() ? "" : " :: " + rows)
-                + " :: " + hex);
     }
 
     /**
@@ -2679,63 +2600,6 @@ final class Peers {
     }
 
     /**
-     * 诊断：把这台的问答节奏原样打出来。
-     *
-     * <p>要回答的是三个数：它多久说一次话（gaps 的平均/最小/最大）、那些话里几包是问、几包
-     * 是答、现在安静了多久。阈值只能从这三样推出来——「沉默多久算它走了」的正确答案是「比它
-     * 活着时的最长沉默再宽一点」，不是任何一个人能凭直觉拍出来的常数。真机上量到的第一个样本
-     * 就已经推翻了原先的 2.5 秒：一台活着的 iPhone 合法地安静过 2.6 秒。
-     */
-    private void digest() {
-        long now = System.currentTimeMillis();
-        for (Peer peer : snapshot()) {
-            if (peer.questions + peer.replies == 0) {
-                continue;
-            }
-            trace("probe: " + peer.name + "@" + peer.address
-                    + " q=" + peer.questions + " a=" + peer.replies
-                    + " gaps=" + peer.gaps + " avg=" + peer.period
-                    + " min=" + peer.gapMin + " max=" + peer.gapMax
-                    + " quiet=" + (now - lastHeard(peer)) + " ms");
-        }
-    }
-
-    /**
-     * 打一行「现在看得见什么」。
-     *
-     * <p>要回答的是「设备自己消失」这个问题里从没被问清的那一半：到底是**它不说话了**，还是
-     * **我们听不见了**。一行里三个数就能分开：
-     * <ul>
-     *   <li>{@code quiet=} 表里那台安静了多久——它在说、还是已经很久没吭声；</li>
-     *   <li>{@code foreign last … ms ago} 最近一次听见别人的地址记录是什么时候——几百毫秒说明
-     *       这条 socket 好好的，几十秒说明我们聋了，而这两种情况要做的事完全不同；</li>
-     *   <li>{@code q=}/{@code a=} 它是在答还是在自己问。</li>
-     * </ul>
-     *
-     * <p>**必须每 {@link #PULSE_MS} 无条件打，不能只打变化。** {@code announce} 只在列表变了
-     * 时写，于是「一切正常」在日志里和「什么都没在发生」长得一模一样——前面几轮正是被这一点
-     * 引向「抓 150 秒一个字都没有 = 没在跑」的错误结论。
-     */
-    private void pulse() {
-        long now = System.currentTimeMillis();
-        List<Peer> all = snapshot();
-        StringBuilder line = new StringBuilder();
-        for (Peer peer : all) {
-            if (line.length() > 0) {
-                line.append(", ");
-            }
-            line.append(peer.name)
-                    .append(peer.connectable() ? "" : "(partial)")
-                    .append(" q=").append(peer.questions)
-                    .append(" a=").append(peer.replies)
-                    .append(" quiet=").append(now - lastHeard(peer));
-        }
-        trace("pulse: " + all.size() + " peer(s), foreign " + foreign
-                + (lastForeign == 0 ? " (never)" : " (last " + (now - lastForeign) + " ms ago)")
-                + (line.length() == 0 ? "" : " — " + line));
-    }
-
-    /**
      * 这台设备沉默多久算走了。
      *
      * <p>两档，分界线是「能连」：能连的那一档知道我们正以 1 秒一次的节奏问它（见
@@ -2757,9 +2621,6 @@ final class Peers {
      * 真机证明 iPhone 关 AirDrop 时并不发那个告别，所以这一档不能只当兜底。
      */
     private long timeout(Peer peer) {
-        if (DIAG) {
-            return DIAG_HOLD_MS;
-        }
         if (!peer.connectable()) {
             return EXPIRE_MS;
         }
