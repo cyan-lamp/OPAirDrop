@@ -8,3 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+# 评审 P1-23：解析器吃不可信字节，属性测试（往返恒等 + 任意字节不 panic）
+# 是 fuzz 的稳定工具链替身——stable 就能跑，直接进 cargo test / CI。
+proptest = "~1.5"
