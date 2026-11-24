@@ -80,14 +80,6 @@ final class Peers {
     private static final long ASK_EAGER_MS = 300;
 
     /**
-     * 一次敲门等多久。
-     *
-     * <p>同一条链路上 {@code ping6} 实测 RTT min 9.6 / avg 213.9 / max 302.1 ms，900 是最大值的
-     * 三倍，够容一次重传。再长就只是让「走了」这件事晚一点被发现。
-     */
-    private static final int KNOCK_TIMEOUT_MS = 2_500;
-
-    /**
      * 连着几次敲不通才认它走了。
      *
      * <p>「敲不通」在这条链路上不是一种解释，是好几种：AirDrop 关了、设备走了、SYN 被 AWDL 的
@@ -130,19 +122,6 @@ final class Peers {
      * 一截就藏在这里。
      */
     private static final long WATCH_EVERY_MS = 1_000;
-
-    /**
-     * 守望探测一次允许多久，和 {@link #KNOCK_TIMEOUT_MS} 分开。
-     *
-     * <p>守望问的是「**现在**通不通」，敲门问的是「它到底在不在」，两件事对时间的要求相反：
-     * 前者一晚一拍就晚一次显示，后者要顶得住 AWDL 时隙调度吃掉一个 SYN。实测这一侧的端口
-     * 应答只要 9–13 毫秒（{@code ECONNREFUSED} 也是 9 毫秒就回来），400 毫秒是三十倍余量。
-     *
-     * <p>把失败当失败仍然安全：守望**从不记账**。它探测失败只是转给 {@link #knockNow}，由
-     * {@link #knock} 用满 {@link #KNOCK_TIMEOUT_MS} 再量一次——所以短超时换来的误判，代价
-     * 只是一次多余的敲门，不会是误删。
-     */
-    private static final int WATCH_TIMEOUT_MS = 400;
 
     /**
      * 一台被敲门证死之后，这个地址的那个「死」字保留多久。
@@ -1705,7 +1684,7 @@ private Thread thread;
      */
     private void knock(Peer peer) {
         long before = System.currentTimeMillis();
-        String why = reachable(peer);
+        String why = PortProbe.probe(peer);
         long took = System.currentTimeMillis() - before;
         synchronized (peers) {
             peer.knocking = false;
@@ -1735,7 +1714,7 @@ private Thread thread;
             // **我们这侧**没有把包送出去的路（曾经实测过 awdltun0 上一条 IPv6 路由都没有，
             // 于是 `ip -6 route get` 把 fe80:: 送到 rmnet_data3 去了）。拿这种失败去删设备，
             // 就是把自己的路由故障记在对面头上。这类一律不投票，退回到 20 秒的天花板。
-            if (ourFault(why)) {
+            if (PortProbe.ourFault(why)) {
                 // 可疑对端遇到这种失败就放行：我们连包都发不出去，等于没有证据。宁可暂时多显示
                 // 一台已经走了的设备，也不能因为自家路由问题把一台在旁边的手机藏起来。
                 boolean doubt = peer.unproven;
@@ -1836,7 +1815,7 @@ private Thread thread;
             // 不用碰（它只在浏览线程里读写）；冷启动最多六个旧对端，十八个包，不需要限流。
             sendWarm(probe);
             long before = System.currentTimeMillis();
-            String why = reachable(probe);
+            String why = PortProbe.probe(probe);
             long took = System.currentTimeMillis() - before;
             synchronized (peers) {
                 if (why != null) {
@@ -1956,7 +1935,7 @@ private Thread thread;
                 if (channel.nicIndex() != 0) {
                     grave.peer.scope = channel.nicIndex();
                 }
-                if (reachable(grave.peer, WATCH_TIMEOUT_MS) != null) {
+                if (PortProbe.probe(grave.peer, PortProbe.WATCH_TIMEOUT_MS) != null) {
                     continue;
                 }
                 // 通着。只贴便条，不动表——理由在 {@link #Grave#answered}。
@@ -1981,7 +1960,7 @@ private Thread thread;
                 // 守望用短超时（{@link #WATCH_TIMEOUT_MS}）：它只负责「该问了」，量得准不准由
                 // {@link #knock} 用满 {@link #KNOCK_TIMEOUT_MS} 再说。这里超时会转成一次敲门，
                 // 所以短超时的代价只是多问一次，不会是误删。
-                String why = reachable(peer, WATCH_TIMEOUT_MS);
+                String why = PortProbe.probe(peer, PortProbe.WATCH_TIMEOUT_MS);
                 if (why == null) {
                     // 通着。它说没说话是 mDNS 的账，这里一个字都不改——但敲门的账要清，见 alive。
                     if (peer.knocks > 0) {
@@ -1989,7 +1968,7 @@ private Thread thread;
                     }
                     continue;
                 }
-                if (ourFault(why)) {
+                if (PortProbe.ourFault(why)) {
                     // 我们没把包送出去。这种失败不能记在它头上，见 {@link #knock}。
                     continue;
                 }
@@ -2124,50 +2103,6 @@ private Thread thread;
             open.send(new DatagramPacket(query, query.length, address(peer), PORT));
         } catch (Exception lost) {
             // 地址暂时不可用，或者 socket 刚被关掉。下一拍再来，这里不是判断的地方。
-        }
-    }
-
-    /**
-     * 这次失败说的是「我们发不出去」，还是「它不接」。
-     *
-     * <p>{@code Network is unreachable} / {@code No route to host} 属于前者：曾经实测过
-     * {@code awdltun0} 上一条 IPv6 路由都没有，于是 {@code ip -6 route get} 把 {@code fe80::}
-     * 送到 {@code rmnet_data3} 去了。拿这种失败去删设备，就是把自己家的路由故障记在对面头上。
-     */
-    private static boolean ourFault(String why) {
-        return why.contains("unreachable") || why.contains("No route");
-    }
-
-    /**
-     * TCP 连一次它的服务端口。
-     *
-     * @return 连上了返回 {@code null}；否则返回「为什么没连上」，原样带异常名和消息——
-     *         调用方要靠它把「它不接」和「我们发不出去」分开。
-     */
-    private static String reachable(Peer peer) {
-        return reachable(peer, KNOCK_TIMEOUT_MS);
-    }
-
-    /**
-     * 同上，但自己定探测允许多久。
-     *
-     * <p>两个超时的分工见 {@link #WATCH_TIMEOUT_MS}：守望要快（它一晚一拍就晚一次显示），
-     * 敲门要准（它要顶得住 AWDL 时隙调度吃掉一个 SYN）。
-     */
-    private static String reachable(Peer peer, int timeout) {
-        Socket probe = new Socket();
-        try {
-            probe.connect(new InetSocketAddress(address(peer), peer.port), timeout);
-            return null;
-        } catch (Exception failure) {
-            String message = failure.getMessage();
-            return failure.getClass().getSimpleName() + (message == null ? "" : ": " + message);
-        } finally {
-            try {
-                probe.close();
-            } catch (Exception ignored) {
-                // 已经废了。
-            }
         }
     }
 
