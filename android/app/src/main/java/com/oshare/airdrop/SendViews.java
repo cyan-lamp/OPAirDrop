@@ -93,11 +93,21 @@ final class SendViews {
         private final BooleanSupplier draggingSource;
         private float phase;
         private boolean attached;
+        /** 只保留一条心跳。多条并行就是「点一下之后越转越快」。 */
+        private boolean scheduled;
+        private final Runnable tick;
 
         Radar(Context host, int accent, float density, BooleanSupplier draggingSource) {
             super(host);
             this.density = density;
             this.draggingSource = draggingSource;
+            // 必须在 draggingSource 赋值之后建：字段初始化器里前向引用实例字段编译不过。
+            this.tick = () -> {
+                scheduled = false;
+                if (attached && !draggingSource.getAsBoolean()) {
+                    invalidate();
+                }
+            };
             halo.setColor(accent);
             halo.setStyle(Paint.Style.STROKE);
             halo.setStrokeWidth(Ui.dp(density, 1));
@@ -113,31 +123,46 @@ final class SendViews {
         protected void onAttachedToWindow() {
             super.onAttachedToWindow();
             attached = true;
+            // 雷达一挂上窗口就自己起第一帧：呼吸环靠 onDraw 末尾自我续命，谁要是把那一次
+            // invalidate 吞了（层切换、布局重排），从这一帧就能重新接上，不必等外部 wake。
+            wake();
         }
 
         @Override
         protected void onDetachedFromWindow() {
             // 关掉自己的帧循环。这个 View 在每次发现设备、每次换主题时都会被丢掉，留下一个
-            // 还在 postInvalidateDelayed 的孤儿，等于每次换主题都多一条永不停止的心跳。
+            // 还在排队的 tick，等于每次换主题都多一条永不停止的心跳。
             attached = false;
+            scheduled = false;
+            removeCallbacks(tick);
             super.onDetachedFromWindow();
         }
 
         /**
-         * 把帧循环重新挂上。
+         * 把心跳重新挂上，且**保证全机只有一条**。
          *
-         * <p>呼吸环是靠 {@link #onDraw} 末尾的那一次 {@code postInvalidateDelayed(32)} 自我
-         * 续命的——它没有独立的定时器，所以「暂停一次」就等于**把这条链剪断**，而不是踩一脚
-         * 刹车。剪断之后没有人会再叫它，于是手指一抬，环就停在上一次画到的那一圈不动了。
+         * <p>呼吸环靠 {@link #onDraw} 末尾排下一帧自我续命。原来那里和这里都用
+         * {@code postInvalidateDelayed(32)}：那是个每次调用都排一条独立 Runnable 的方法，
+         * 谁都可以再排一条而彼此不知情。于是一次点击走 layer(false) 叫两遍、attach 再叫一遍，
+         * 就有三条心跳同时跑，onDraw 各自续命——用户看到的就是「点过之后越转越快」。
+         * 2026-11-25 改成统一走 {@link #schedule()}：一个 {@link #scheduled} 标志去重，
+         * 谁叫都只在没有心跳时才排。
          *
-         * <p>2026-11-18 的真机现场就是这样：点一下页面（甚至只是按在空白处再抬手），搜索动画
-         * 从此静止，直到下一次发现设备把整块中部重建。所以暂停的人必须负责叫醒，见
-         * {@code SendActivity.layer(boolean)}。
+         * <p>没有独立定时器，所以「暂停一次」就是把这条链剪断，而不是踩一脚刹车。剪断之后
+         * 没有人再排，手指一抬环就停在那一圈——所以暂停的人必须负责叫醒，见
+         * {@code SendPanel.layer(boolean)}。
          */
         void wake() {
-            if (attached && !draggingSource.getAsBoolean()) {
-                postInvalidateDelayed(32);
+            schedule();
+        }
+
+        /** 排下一帧；已有心跳、未 attach、正在拖动时都不排。 */
+        private void schedule() {
+            if (scheduled || !attached || draggingSource.getAsBoolean()) {
+                return;
             }
+            scheduled = true;
+            postDelayed(tick, 32);
         }
 
         @Override
@@ -166,10 +191,9 @@ final class SendViews {
             canvas.drawLine(cx - phoneW * 0.14f, box.top + phoneH * 0.1f,
                     cx + phoneW * 0.14f, box.top + phoneH * 0.1f, glyph);
 
-            // 拖动期间不自转（理由见类注释）。
-            if (attached && !draggingSource.getAsBoolean()) {
-                postInvalidateDelayed(32);
-            }
+            // 拖动期间不自转（理由见类注释）。统一走 schedule() 去重，绝不能在这里
+            // 直接 postInvalidateDelayed——那会让每一次 wake 都多长出一条心跳。
+            schedule();
         }
     }
 }
