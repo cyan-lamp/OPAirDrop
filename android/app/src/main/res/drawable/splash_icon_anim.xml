@@ -1,45 +1,186 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 冷启动的启动图标：中心点淡入，内环、外环各自从底缘向上揭示（左右两半同时生长），
-     最后停在静态图标那一帧上。
-
-     2026-11-25 改版：三样从一开始就站在最终位置上（缩放动画撤掉），动画改由揭示窗
-     驱动——objectAnimator 直接内联在 target 里。内联是刻意的：独立 animator 文件里
-     的 pathData 字符串值 AAPT 不做 path 类型推断（还拒绝显式 valueType="pathData"），
-     动画会静默不跑（2026-11-25 深夜的「开屏不动」就是这个）；AVD 内联的字符串以
-     "M" 开头时 AAPT 自动按 pathData morph 处理。
-
-     顺序靠各自的 startOffset。时序压到 440ms：ColorOS 在首帧就绪后约 450ms 就撤
-     splash（2026-11-25 录屏实测，theme 声明的 1000ms 只是上限、不是保证），原来的
-     250/500 起拍让外环整个没机会播。dot 0-150 / 内环 100-320 / 外环 250-430。
-     没有环绕、没有循环：动画的最后一帧（揭示窗全开）必须与静态启动图标一模一样，
-     否则系统撤掉 splash 的那一刻会看到图形跳一下。 -->
+<!-- 冷启动动画（2026-11-26 第二版）：全部用 alpha 逐段点亮（这台机器上唯一可靠
+     的 target 属性）。时序（实测 ColorOS 首帧后 ~450ms 撤 splash）：点 0-150；
+     内环 8 段自 100ms 起每段错 55ms、各亮 60ms；内耳 280-400；外环 8 段自 250ms
+     起每段错 45ms、各亮 50ms；外耳 360-440。左右两侧同步点亮 = 左右对称由下往上。 -->
 <animated-vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:drawable="@drawable/splash_icon">
-    <target
-        android:name="outerClip">
-        <objectAnimator
-            android:propertyName="pathData"
-            android:duration="180"
-            android:startOffset="250"
-            android:interpolator="@android:interpolator/decelerate_cubic"
-            android:valueFrom="M -20,78 L 128,78 L 128,128 L -20,128 Z"
-            android:valueTo="M -20,-20 L 128,-20 L 128,128 L -20,128 Z" />
-    </target>
-    <target
-        android:name="innerClip">
-        <objectAnimator
-            android:propertyName="pathData"
-            android:duration="220"
-            android:startOffset="100"
-            android:interpolator="@android:interpolator/decelerate_cubic"
-            android:valueFrom="M -20,70 L 128,70 L 128,128 L -20,128 Z"
-            android:valueTo="M -20,-20 L 128,-20 L 128,128 L -20,128 Z" />
-    </target>
-    <target
-        android:name="dot">
+    <target android:name="innerL0">
         <objectAnimator
             android:propertyName="alpha"
-            android:duration="150"
+            android:duration="60"
+            android:startOffset="100"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="innerL1">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="60"
+            android:startOffset="155"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="innerL2">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="60"
+            android:startOffset="210"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="innerL3">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="60"
+            android:startOffset="265"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="innerR0">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="60"
+            android:startOffset="100"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="innerR1">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="60"
+            android:startOffset="155"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="innerR2">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="60"
+            android:startOffset="210"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="innerR3">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="60"
+            android:startOffset="265"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="outerL0">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="50"
+            android:startOffset="250"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="outerL1">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="50"
+            android:startOffset="295"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="outerL2">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="50"
+            android:startOffset="340"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="outerL3">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="50"
+            android:startOffset="385"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="outerR0">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="50"
+            android:startOffset="250"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="outerR1">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="50"
+            android:startOffset="295"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="outerR2">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="50"
+            android:startOffset="340"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="outerR3">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="50"
+            android:startOffset="385"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="innerEarL">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="60"
+            android:startOffset="280"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="innerEarR">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="60"
+            android:startOffset="280"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="outerEarL">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="60"
+            android:startOffset="390"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
+    <target android:name="outerEarR">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="60"
+            android:startOffset="390"
             android:interpolator="@android:interpolator/decelerate_cubic"
             android:valueFrom="0"
             android:valueTo="1" />
