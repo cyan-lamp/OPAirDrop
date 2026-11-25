@@ -3,21 +3,45 @@
      最后停在静态图标那一帧上。
 
      2026-11-25 改版：三样从一开始就站在最终位置上（缩放动画撤掉），动画改由揭示窗
-     驱动——target 的 name 从环组改成了各自的 clip-path（innerClip / outerClip），
-     见 splash_icon.xml 里的改版注释与 animator 文件。
+     驱动——objectAnimator 直接内联在 target 里。内联是刻意的：独立 animator 文件里
+     的 pathData 字符串值 AAPT 不做 path 类型推断（还拒绝显式 valueType="pathData"），
+     动画会静默不跑（2026-11-25 深夜的「开屏不动」就是这个）；AVD 内联的字符串以
+     "M" 开头时 AAPT 自动按 pathData morph 处理。
 
-     顺序不靠 target 的书写次序，靠各自 animator 里的 startOffset（dot 0 / 内环 250 /
-     外环 500 ms）。没有环绕、没有循环：动画的最后一帧（揭示窗全开）必须与静态启动
-     图标一模一样，否则系统撤掉 splash 的那一刻会看到图形跳一下。 -->
+     顺序靠各自的 startOffset。时序压到 440ms：ColorOS 在首帧就绪后约 450ms 就撤
+     splash（2026-11-25 录屏实测，theme 声明的 1000ms 只是上限、不是保证），原来的
+     250/500 起拍让外环整个没机会播。dot 0-150 / 内环 100-320 / 外环 250-430。
+     没有环绕、没有循环：动画的最后一帧（揭示窗全开）必须与静态启动图标一模一样，
+     否则系统撤掉 splash 的那一刻会看到图形跳一下。 -->
 <animated-vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:drawable="@drawable/splash_icon">
     <target
-        android:name="outerClip"
-        android:animation="@animator/splash_ring_outer" />
+        android:name="outerClip">
+        <objectAnimator
+            android:propertyName="pathData"
+            android:duration="180"
+            android:startOffset="250"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="M -20,78 L 128,78 L 128,128 L -20,128 Z"
+            android:valueTo="M -20,-20 L 128,-20 L 128,128 L -20,128 Z" />
+    </target>
     <target
-        android:name="innerClip"
-        android:animation="@animator/splash_ring_inner" />
+        android:name="innerClip">
+        <objectAnimator
+            android:propertyName="pathData"
+            android:duration="220"
+            android:startOffset="100"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="M -20,70 L 128,70 L 128,128 L -20,128 Z"
+            android:valueTo="M -20,-20 L 128,-20 L 128,128 L -20,128 Z" />
+    </target>
     <target
-        android:name="dot"
-        android:animation="@animator/splash_dot" />
+        android:name="dot">
+        <objectAnimator
+            android:propertyName="alpha"
+            android:duration="150"
+            android:interpolator="@android:interpolator/decelerate_cubic"
+            android:valueFrom="0"
+            android:valueTo="1" />
+    </target>
 </animated-vector>

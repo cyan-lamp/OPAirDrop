@@ -13,18 +13,20 @@ import java.io.File;
  *
  * <p># 会话是什么
  *
- * <p>会话 = 发送页开着 <b>或</b> 接收监听开着。射频策略只在这段期间生效：
+ * <p>会话 = 发送页开着 <b>或</b> 接收监听开着。会话中按开关控制 AP：
  *
  * <ul>
- *   <li>开关开（{@link RadioShare.Want#SHARE}）：请求共享。回执确认后看 STA 落在哪——
+ *   <li>开关开（{@link RadioShare.Want#SHARE}）：请求共享，回执确认后看 STA 落点——
  *       AP 恰好在 149（5745 MHz）就是同信道共存，一个字节都不动；AP 不在 149 就断开
  *       AP（Wi-Fi 保持开启），跨信道的 45% 损耗不值得付。</li>
- *   <li>开关关（{@link RadioShare.Want#EXCLUSIVE}）：请求独占，并断开 AP。Wi-Fi 一样
- *       保持开启（守护与脚本在 2026-11-25 会话制改造后都不再关 Wi-Fi），断开的只是
- *       关联。</li>
+ *   <li>开关关（{@link RadioShare.Want#EXCLUSIVE}）：请求独占并断开 AP，Wi-Fi 一样
+ *       保持开启（守护与脚本在 2026-11-25 会话制改造后都不再关 Wi-Fi）。</li>
  * </ul>
  *
- * <p>会话外（两个因子都不在）：恢复——AP 重新关联，请求文件写成 {@code share}。
+ * <p># 会话外的规则（用户的规则表，2026-11-25 定稿）
+ *
+ * <p>开关开：恢复 AP 关联。开关关：什么都不做——断开的状态保持下去，既不恢复也
+ * 不再断开；用户手动连上的就让它连着。会话外两种状态都永不主动断开。
  *
  * <p># AP 怎么断、怎么恢复
  *
@@ -86,20 +88,28 @@ public final class RadioSession {
 
         try {
             if (!session) {
-                // 会话外：恢复 AP 关联，射频请求停在 share（Wi-Fi 开 + STA 关联）。
-                restoreAp(app);
-                RadioShare.ask(dir, RadioShare.Want.SHARE);
+                // 会话外的规则（2026-11-25 按用户的规则表定稿）：
+                //  - 共享（开关开）：恢复 AP 关联——第 9/10 条「会话结束恢复热点」。
+                //  - 独占（开关关）：什么都不做——第 7/8 条「无需恢复热点」，
+                //    断开的状态保持到下一次会话（或用户手动连）。
+                //  两种情况下都不主动断开（第 2/4 条：会话外连着就连着）。
+                if (want == RadioShare.Want.SHARE) {
+                    restoreAp(app);
+                    RadioShare.ask(dir, RadioShare.Want.SHARE);
+                }
                 return;
             }
 
             RadioShare.ask(dir, want);
             if (want == RadioShare.Want.EXCLUSIVE) {
-                // 独占：先断 AP，再等守护把 Wi-Fi 打开（如果它还关着）。顺序无妨，
+                // 独占：断开 AP，再等守护把 Wi-Fi 打开（如果它还关着）。顺序无妨，
                 // 两件事互不依赖。
                 dropAp(app);
                 return;
             }
-            // 共享：等确认，再看 STA 落点决定要不要断 AP（跨信道才断）。
+            // 共享：先恢复关联（独占期间可能断着），等确认后再看 STA 落点——
+            // AP 恰好在 149 就共存，落在别的信道再断开（第 3 条的例外）。
+            restoreAp(app);
             pollShareSettled(app, 0);
         } catch (java.io.IOException failed) {
             // 请求写不进去（磁盘/目录）：射频保持原状，下次会话事件会再试。
