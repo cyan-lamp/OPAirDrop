@@ -49,21 +49,11 @@ final class FeaturePage {
     private static final String RUNNING_LINE = "正在换驱动并建链，大约半分钟，Wi-Fi 会断。";
 
     /**
-     * 等回执时多久看一眼那两个文件。
-     *
-     * <p>250ms 是守护进程自己的轮询节奏（{@code awdld} 每 250ms 读一次请求文件）。比它更密只是
-     * 白读同一份盘面，比它更疏则回执已经写完、页面还空着，看起来像没反应。
+     * 副标题与回执的常驻轮询节拍（2026-11-26 取代原来的 250ms 拨开关专轮询）：一秒一次，
+     * 盘面与 RadioSession 的动作落进来最迟一秒可见。比一秒更密只是白读，更疏则人拨了
+     * 开关要盯着旧话等太久。
      */
-    private static final int ANSWER_TICK_MS = 250;
-
-    /**
-     * 最多看多少眼，八十眼即二十秒。
-     *
-     * <p>二十秒是守护进程开 Wi-Fi 的上限（{@code ON_LIMIT_US}）：它自己都等不到的事，这一页
-     * 没有理由等更久。到了这里不停在「失败」上——停在哪句话由
-     * {@link RadioShare.State#subtitle()} 说，这里只是不再看了。
-     */
-    private static final int ANSWER_TICKS = 80;
+    private static final int RADIO_POLL_MS = 1000;
 
     /**
      * 输入浮窗那张卡的圆角，单位 dp。
@@ -601,45 +591,48 @@ final class FeaturePage {
                 return;
             }
             // 会话制：偏好变了就按当前会话状态立即重放（发送页/监听哪个开着，断 AP 或
-            // 恢复都立刻兑现，而不是等下一次页面进出）。
+            // 恢复都立刻兑现，而不是等下一次页面进出）。副标题与回执由常驻轮询刷新
+            // （pollRadio），拨开关之后的第一拍由 say() 先给个即时反馈。
             RadioSession.onWantChanged(host);
-            followAnswer(sub[0], record, 0);
         });
+        // 副标题与回执常驻轮询（2026-11-26 用户要求实时及时更新）：这一页活着就每秒
+        // 重读一次状态与回执——RadioSession 断开/恢复热点、守护写回执、会话进出的
+        // 任何变化，最迟一秒落到这两行上。页面切走时旧视图 detach，轮询自停。
+        pollRadio(sub[0], record, 0);
         return card;
     }
 
     /**
-     * 等守护进程回话：每 250ms 读一次那两个文件，直到回执对盘上这一次请求说出结论。
+     * 副标题与回执的常驻轮询：这一页活着就每秒把两行重写到最新。
      *
-     * <p>「说出结论」是 {@link RadioShare.State#settled()}，不是 {@code answered()}。
-     * {@code share pending} 也是一个答案——它是守护进程说「我还在弄」，页面该原样印出来——但
-     * 把它当成谈话结束就再也不看了。设备上真发生过：拨回共享，守护进程一个轮询之内就写了
-     * {@code share pending}，这一页信了、停了，四十秒后还停在「正在开 Wi-Fi」，而盘上是
-     * {@code share confirmed sta=5745}、Wi-Fi 也早就开了。
+     * <p>取代原来的 {@code followAnswer}（拨开关后专跑 20 轮就停）——那个模型在会话制
+     * 下不够了：RadioSession 断开/恢复热点、看门狗按下又断、守护写回执，这些事发生在
+     * 拨开关之后很久，副标题和回执必须一直追着盘面跑（2026-11-26 用户要求实时及时更新）。
      *
-     * <p>没有超时就报错这一说——超时之后停在哪个状态，由 {@link RadioShare.State#subtitle()}
-     * 说出来（「已请求共享，还没有回执——守护进程可能没在运行」），而不是这里再编一句。二十秒
-     * 是守护进程自己的上限（{@code ON_LIMIT_US}），再宽一点只是给它收尾的余地。
-     *
-     * <p>先问 {@code isAttachedToWindow}：这一页切走会整页重画，那时这个循环还挂在旧视图上，
+     * <p>两行的分工不变：副标题说状态的人话（RadioSession 最近一次动作优先——它比回执
+     * 更贴近用户的操作；没有动作时才念回执的语义），回执行是守护的原始记录。先问
+     * {@code isAttachedToWindow}：这一页切走会整页重画，那时这个循环还挂在旧视图上，
      * 继续拨下去只是在给一堆没人看的 TextView 赋值。
      */
-    private void followAnswer(TextView sub, TextView record, int tick) {
+    private void pollRadio(TextView sub, TextView record, int tick) {
         if (!sub.isAttachedToWindow()) {
             return;
         }
         RadioShare.State state = RadioShare.read(filesDir());
-        sub.setText(state.subtitle());
-        sub.setTextColor(state.failed() ? S.red : S.textDim);
+        String action = RadioSession.lastAction();
+        if (action != null && !action.isEmpty()) {
+            sub.setText(action);
+            sub.setTextColor(S.textDim);
+        } else {
+            sub.setText(state.subtitle());
+            sub.setTextColor(state.failed() ? S.red : S.textDim);
+        }
         // 每次都照盘面重写这一行，包括「没有回执」那种情况。写成「有就改、没有就不动」会让
         // 上一轮回执留在屏幕上，而上面那句已经改成「还没有回执」——两句里有一句是假的。
         record.setText(state.receipt().present() ? state.receipt().line() : "");
         record.setTextColor(state.failed() ? S.red : S.textDim);
         record.setVisibility(state.receipt().present() ? View.VISIBLE : View.GONE);
-        if (state.settled() || tick >= ANSWER_TICKS) {
-            return;
-        }
-        sub.postDelayed(() -> followAnswer(sub, record, tick + 1), ANSWER_TICK_MS);
+        sub.postDelayed(() -> pollRadio(sub, record, tick + 1), RADIO_POLL_MS);
     }
 
     /**

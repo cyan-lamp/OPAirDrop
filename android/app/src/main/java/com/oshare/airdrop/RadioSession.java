@@ -57,6 +57,24 @@ public final class RadioSession {
     /** 看门狗的自续体：同一实例才能被 removeCallbacks 精确摘掉。 */
     private static Runnable watchdogTick;
 
+    /**
+     * 最近一次射频动作的人话（「热点已断开…」/「已恢复热点…」/裁决句），给首页
+     * 之外的射频行实时显示——回执（radio-state）只说守护的事，断开/恢复热点是
+     * 应用自己干的，那句话只有这里有。null = 还没有动作。
+     */
+    private static volatile String lastAction;
+
+    /** 最近一次射频动作的人话；还没有动作时返回空串。 */
+    public static String lastAction() {
+        String line = lastAction;
+        return line == null ? "" : line;
+    }
+
+    private static void action(String line) {
+        lastAction = line;
+        Log.i("OPAirDrop", "STA 共存：" + line);
+    }
+
     private static final Handler HANDLER = new Handler(Looper.getMainLooper());
     /** share 确认后的跨信道检查：250ms 一次，最多 40 次（10 秒）。 */
     private static final long POLL = 250;
@@ -108,9 +126,12 @@ public final class RadioSession {
                 //    断开的状态保持到下一次会话（或用户手动连）。
                 //  两种情况下都不主动断开（第 2/4 条：会话外连着就连着）。
                 if (want == RadioShare.Want.SHARE) {
+                    action("会话外·共享：恢复热点连接");
                     stopWatchdog();
                     bringUp(app);
                     RadioShare.ask(dir, RadioShare.Want.SHARE);
+                } else {
+                    action("会话外·独占：热点保持断开，不做动作");
                 }
                 return;
             }
@@ -118,11 +139,13 @@ public final class RadioSession {
             RadioShare.ask(dir, want);
             if (want == RadioShare.Want.EXCLUSIVE) {
                 // 独占：断开热点并挂看门狗（周期确认 down，见类注释）。
+                action("会话中·独占：断开热点");
                 startWatchdog(app);
                 return;
             }
             // 共享：先恢复关联（独占期间可能断着），等确认后再看 STA 落点——
             // AP 恰好在 149 就共存，落在别的信道再断开（第 3 条的例外）。
+            action("会话中·共享：恢复热点，等信道判定");
             stopWatchdog();
             bringUp(app);
             pollShareSettled(app, 0);
@@ -145,8 +168,10 @@ public final class RadioSession {
             }
             int mhz = state.staMhz();
             if (mhz > 0 && mhz != 5745) {
-                Log.i("OPAirDrop", "STA 共存：AP 在 " + mhz + " MHz，跨信道，断开热点");
+                action("会话中·共享：AP 在 " + mhz + " MHz，跨信道，断开热点");
                 bringDown(app);
+            } else if (mhz == 5745) {
+                action("会话中·共享：AP 在 149 信道，同信道共存，热点保持");
             }
         }, POLL);
     }
@@ -178,7 +203,7 @@ public final class RadioSession {
         if (isDown()) {
             return;
         }
-        Log.i("OPAirDrop", "STA 共存：看门狗发现热点已连上，重新断开");
+        action("看门狗：热点被系统拉回，重新断开");
         bringDown(app);
     }
 
@@ -207,7 +232,7 @@ public final class RadioSession {
                     "ip link set " + STA_IF + " down").start();
             process.waitFor(3000, java.util.concurrent.TimeUnit.MILLISECONDS);
             process.destroy();
-            Log.i("OPAirDrop", "STA 共存：已断开热点（" + STA_IF + " down），Wi-Fi 保持开启");
+            action("热点已断开（Wi-Fi 保持开启）");
         } catch (Throwable failed) {
             Log.w("OPAirDrop", "断开热点失败：" + failed);
         }
@@ -220,7 +245,7 @@ public final class RadioSession {
                     "ip link set " + STA_IF + " up").start();
             process.waitFor(3000, java.util.concurrent.TimeUnit.MILLISECONDS);
             process.destroy();
-            Log.i("OPAirDrop", "STA 共存：已恢复热点（" + STA_IF + " up）");
+            action("热点已恢复连接");
         } catch (Throwable failed) {
             Log.w("OPAirDrop", "恢复热点失败：" + failed);
         }
