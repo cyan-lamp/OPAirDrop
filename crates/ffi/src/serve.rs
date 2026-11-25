@@ -300,6 +300,12 @@ impl Store {
     pub(crate) fn landed(&self) -> &Report {
         &self.landed
     }
+
+    /// 一次投送成功落地后，上一份 `/Ask` 诊断就没有保留了：留着只会让收件箱里
+    /// 多一份对端文件名，而它本就只在「解析失败、无从解释」时才有用（P1-10）。
+    fn clear_ask_diag(&self) {
+        let _ = std::fs::remove_file(self.directory.join(".diag/.ask-last.bin"));
+    }
 }
 
 impl Receiver for Store {
@@ -342,15 +348,17 @@ impl Receiver for Store {
     /// grows is a disk-full bug waiting for a busy day.
     fn saw_ask_body(&mut self, body: &[u8]) {
         const KEEP: usize = 64 * 1024;
-        const NAME: &str = ".ask-last.bin";
         if body.is_empty() {
             return;
         }
-        if let Err(error) = std::fs::write(self.directory.join(NAME), &body[..body.len().min(KEEP)])
-        {
-            // A diagnostic that cannot be written is not a reason to fail a transfer.
-            let _ = error;
+        // 评审 P1-10：诊断字节不落在收件箱根上（那是给人看文件的地方），也不在
+        // accept 之前假设目录已存在。独立子目录 + create_dir_all，写不了也照样收——
+        // 诊断失败不是拒收的理由。成功落盘后由 upload() 删除（见下）。
+        let diag = self.directory.join(".diag");
+        if std::fs::create_dir_all(&diag).is_err() {
+            return;
         }
+        let _ = std::fs::write(diag.join(".ask-last.bin"), &body[..body.len().min(KEEP)]);
     }
 
     fn upload(&mut self, body: &mut dyn std::io::Read, upload: &Upload<'_>) -> io::Result<()> {
@@ -375,6 +383,7 @@ impl Receiver for Store {
         .map_err(io::Error::other)?;
         self.landed.bytes += received.bytes;
         self.landed.names.extend(received.names);
+        self.clear_ask_diag();
         Ok(())
     }
 }

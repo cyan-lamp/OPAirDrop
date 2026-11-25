@@ -381,10 +381,13 @@ impl Request {
         push(&mut out, &self.version);
         out.extend_from_slice(b"\r\n");
         for (name, value) in self.headers.entries() {
-            debug_assert!(
-                is_safe_header_text(name) && is_safe_header_text(value),
-                "header {name:?}: {value:?} would split the request"
-            );
+            // 评审 P1-7：这条检查原来是 debug_assert!，release 下整个被剥掉——
+            // Host 头来自 mDNS SRV target（对端可控），CRLF 会原样写进请求，
+            // 变成请求走私。现在任何构建下都跳过不安全的头。调用方要塞什么由它自己
+            // 负责，这里保证的是「出手的字节里不会有第二行请求头」。
+            if !is_safe_header_text(name) || !is_safe_header_text(value) {
+                continue;
+            }
             push(&mut out, name);
             out.extend_from_slice(b": ");
             push(&mut out, value);
@@ -623,22 +626,29 @@ pub(crate) fn trim_ascii(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
-/// Whether a comma-separated header value contains `token`, case-insensitively.
+/// Whether a comma-separated header value has `token` as one of its tokens,
+/// case-insensitively.
 ///
-/// Allocates nothing: lowercasing the value to search it would be one allocation per
-/// header per request on the hot path of every upload.
+/// 评审 P1-8：原来是 `windows()` 子串匹配，`Transfer-Encoding: chunkedNOT` 会被
+/// 当成 chunked，一个 by-design 的合法值被误读成另一种分帧。现在按逗号切段、每段
+/// 取 `;` 之前的部分（参数不属于 token 本身）、trim 后整段比较：
+/// `application/x-cpio; charset=utf-8` 仍然匹配，`chunkedNOT` 不再匹配。
+///
+/// Allocates nothing: splitting with `str::split` and comparing byte slices does not
+/// lowercase the whole value, which would be one allocation per header per request on
+/// the hot path of every upload.
 ///
 /// Public because the endpoint layer decides `406` the same way — a `Content-Type`
-/// that "contains `application/x-cpio`" is an archive — and two implementations of
+/// that names `application/x-cpio` is an archive — and two implementations of
 /// "contains, ignoring case" is how one of them ends up case-sensitive.
 pub fn contains_token(value: &str, token: &str) -> bool {
-    let value = value.as_bytes();
-    let token = token.as_bytes();
-    !token.is_empty()
-        && value.len() >= token.len()
-        && value
-            .windows(token.len())
-            .any(|window| window.eq_ignore_ascii_case(token))
+    if token.is_empty() {
+        return false;
+    }
+    value.split(',').any(|part| {
+        let part = part.split(';').next().unwrap_or(part).trim();
+        part.eq_ignore_ascii_case(token)
+    })
 }
 
 #[cfg(test)]
@@ -1001,12 +1011,40 @@ mod tests {
     }
 
     #[test]
+    fn an_unsafe_header_never_reaches_the_wire() {
+        // P1-7：Host 来自 mDNS SRV target，对端可控。CRLF 必须在写字节时被挡掉，
+        // 而不是靠 release 下不存在的 debug_assert。
+        let head = Request::new("GET", "/")
+            .with_header("Host", "phone.local\r\nX-Evil: yes")
+            .with_header("X-Good", "kept")
+            .head_bytes(0);
+        let text = String::from_utf8(head).unwrap();
+        assert!(!text.contains("X-Evil"), "{text}");
+        assert!(text.contains("X-Good: kept"), "{text}");
+        assert_eq!(
+            text.matches("\r\n").count(),
+            4,
+            "request line + X-Good + Content-Length + final blank: {text}"
+        );
+    }
+
+    #[test]
     fn contains_token_matches_whole_runs_not_just_prefixes() {
         assert!(contains_token("br, gzip, chunked", "chunked"));
         assert!(contains_token("CHUNKED", "chunked"));
         assert!(!contains_token("chunkedx", "chunkedx-more"), "longer token");
         assert!(!contains_token("", "chunked"));
         assert!(!contains_token("chunked", ""), "empty token never matches");
+        // P1-8：子串误判会让 chunkedNOT 被当成 chunked 分帧。
+        assert!(!contains_token("chunkedNOT", "chunked"));
+        assert!(!contains_token("x-chunked", "chunked"));
+        assert!(!contains_token("notchunked", "chunked"));
+        // 参数不属于 token：`; charset=` 不能让一个合法的 Content-Type 漏掉。
+        assert!(contains_token(
+            "application/x-cpio; charset=utf-8",
+            "application/x-cpio"
+        ));
+        assert!(contains_token("gzip;q=1, chunked", "chunked"));
     }
 
     /// The head a sender puts in front of an `/Upload`, in the order `HttpCall` wrote it:

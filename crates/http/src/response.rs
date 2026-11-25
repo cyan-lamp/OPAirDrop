@@ -98,10 +98,12 @@ impl Response {
     /// accessor cannot be confused at a call site — this type is written by the server
     /// and read by the client, so both directions are in use.
     pub fn with_header(mut self, name: &str, value: &str) -> Self {
-        debug_assert!(
-            is_safe_header_text(name) && is_safe_header_text(value),
-            "header {name:?}: {value:?} would split the response"
-        );
+        // 和 Request::head_bytes 对称（评审 P1-7）：这里的 debug_assert 在 release
+        // 下会被剥掉，而响应文案里可能带着对端给的文件名。不放行不安全的头，
+        // 免得一个 CRLF 在响应里写出第二组头。
+        if !is_safe_header_text(name) || !is_safe_header_text(value) {
+            return self;
+        }
         self.headers.insert(name.to_string(), value.to_string());
         self
     }
