@@ -5,6 +5,9 @@ import android.view.View;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import com.oshare.airdrop.oshare.Engine;
+import com.oshare.airdrop.oshare.OshareBridge;
+
 /**
  * 首页：一眼看完「这台设备现在是什么状况」。
  *
@@ -87,6 +90,11 @@ final class HomePage {
                 chrome.text("›", 20, true, S.textDim));
         chrome.addRow(card, row, chrome.rowHeight());
         chrome.setRowAction(row, true, Scheme.CORNERS_TOP, () -> {
+            // 「OPPO互传」体系：选文件与发送都在一加互传里（它的磁贴也在控制中心），
+            // 自研面板不出现。打不开互传才回落自研页，人总有地方按。
+            if (Engine.isOshare(host) && OshareBridge.openApp(host)) {
+                return;
+            }
             android.content.Intent send = new android.content.Intent(host, SendActivity.class);
             try {
                 host.startActivity(send);
@@ -105,6 +113,16 @@ final class HomePage {
         receiveSub = receiveSubOut[0];
         chrome.addRow(card, receiveRow, chrome.rowHeight());
         chrome.setRowAction(receiveRow, true, Scheme.CORNERS_BOTTOM, () -> {
+            // 「OPPO互传」体系：接收由一加互传负责——去它的应用里开接收开关（开 10 分钟，
+            // 与自研「手动开监听」是同一形态）。自研的凭据体系不动，免得两套开关各说各话。
+            if (Engine.isOshare(host)) {
+                if (OshareBridge.openApp(host)) {
+                    chrome.say("接收在一加互传里开启");
+                } else {
+                    chrome.say("打不开一加互传");
+                }
+                return;
+            }
             // 和控制中心那块【AirDrop】磁贴走同一条路：都读写 ReceiveService 的 manual 凭据。
             // 之前这里直接 listener.start/stop，只动了底层监听、没写凭据，结果磁贴那边（或下次
             // follow 对齐）一看凭据没变就把接收端改回去——两个开关各说各话。现在拨这一行，就是
@@ -149,6 +167,11 @@ final class HomePage {
 
     /** 接收文件那行的状态胶囊，每次画卡现取——状态在运行中会变。 */
     private TextView buildListenPill() {
+        // 「OPPO互传」体系：接收归一加互传，自研监听既不该在跑、胶囊也不该报它的状态。
+        if (Engine.isOshare(host)) {
+            listenPill = chrome.statusPill("互传负责", S.accent);
+            return listenPill;
+        }
         boolean running = ReceiveService.listening(host);
         boolean failed = listener.problem();
         // 在跑、却缺一条权限：这是唯一一个「看起来一切正常、实际全聋」的状态。胶囊这时
@@ -257,6 +280,10 @@ final class HomePage {
 
     /** 接收端那句话；库没加载时把原因顶上来，比「未开始」有用得多。 */
     private String listenState() {
+        // 「OPPO互传」体系：接收的状态在一加互传那边，这一行只指路。
+        if (Engine.isOshare(host)) {
+            return "由一加互传负责：在它的应用/磁贴里开接收";
+        }
         int abi;
         try {
             abi = Native.abiVersion();

@@ -16,6 +16,8 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import com.oshare.airdrop.oshare.Engine;
+
 import java.io.File;
 import java.io.IOException;
 import java.util.List;
@@ -174,6 +176,10 @@ final class FeaturePage {
         // 第二行改机型，已撤——理由见 deviceCard()。
         body.addView(chrome.sectionTitle("设备显示"), chrome.margins(6, 0));
         body.addView(deviceCard(), chrome.margins(0, 8));
+
+        // 收发体系：收发动作走哪一套（一加互传 / 自研）。切换的启停语义见 engineCard()。
+        body.addView(chrome.sectionTitle("收发体系"), chrome.margins(6, 0));
+        body.addView(engineCard(), chrome.margins(0, 8));
 
         return chrome.scroller(body);
     }
@@ -706,6 +712,64 @@ final class FeaturePage {
     }
 
     private TextView directoryValue;
+
+    /**
+     * 收发体系一张卡，两行单选：一加互传（默认）/ 自研。
+     *
+     * <p>切的是「收发动作由谁完成」，**不是**底层链路：自研栈与 hans 守护跟模式无关、
+     * 始终在跑——一加互传的收发跑在我们建的 AWDL 链路上（社区已有「自研栈 + 一加互传
+     * 收发」的成例）。两行右边分别是当前选中态的对钩和未选中的「›」。
+     *
+     * <p>切到一加互传时自研接收监听必须先停：Listener 的 mDNS 与一加互传的接收体系
+     * 会对同一条链路各自起一套监听，叠在一起谁都是半个聋子。反过来切回自研时不用做
+     * 什么——自研接收的开关本来就在首页「接收文件」那行，人开的是哪个体系，就去哪
+     * 开接收。
+     */
+    private View engineCard() {
+        boolean oshare = Engine.isOshare(host);
+        LinearLayout card = chrome.rowCard();
+
+        LinearLayout oshareRow = chrome.featureRow(
+                IconView.NO_ICON, "OPPO互传",
+                "分享转给一加互传的界面发送；接收在它的磁贴/应用里开",
+                chrome.text(oshare ? "✓" : "›", 18, true, oshare ? S.accent : S.textDim));
+        chrome.addRow(card, oshareRow, chrome.rowHeight());
+        chrome.setRowAction(oshareRow, true, Scheme.CORNERS_TOP, () -> {
+            if (Engine.isOshare(host)) {
+                return;
+            }
+            stopCustomReceive(host);
+            Engine.set(host, Engine.OSHARE);
+            chrome.say("收发已交给一加互传");
+            onChanged.run();
+        });
+
+        card.addView(chrome.divider(), chrome.insetDivider());
+
+        LinearLayout customRow = chrome.featureRow(
+                IconView.NO_ICON, "定制体系",
+                "自研发送面板与自研接收监听（首页那行开接收）",
+                chrome.text(oshare ? "›" : "✓", 18, true, oshare ? S.textDim : S.accent));
+        chrome.addRow(card, customRow, chrome.rowHeight());
+        chrome.setRowAction(customRow, true, Scheme.CORNERS_BOTTOM, () -> {
+            if (!Engine.isOshare(host)) {
+                return;
+            }
+            Engine.set(host, Engine.CUSTOM);
+            chrome.say("收发已切回定制体系");
+            onChanged.run();
+        });
+
+        return card;
+    }
+
+    /** 自研接收还在监听就停掉：体系切走时，旧监听不能留着占同一条链路。 */
+    private static void stopCustomReceive(Activity host) {
+        if (ReceiveService.listening(host)) {
+            ReceiveService.setManual(host, false);
+            ReceiveService.apply(host);
+        }
+    }
 
     private View directoryCard() {
         LinearLayout card = chrome.rowCard();

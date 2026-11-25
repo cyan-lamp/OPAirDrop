@@ -12,6 +12,8 @@ import android.content.ServiceConnection;
 import android.os.Binder;
 import android.os.IBinder;
 
+import com.oshare.airdrop.oshare.Engine;
+
 /**
  * 接收端的前台身份：让「这十分钟里可以被找到」是一句能兑现的话。
  *
@@ -169,6 +171,12 @@ public final class ReceiveService extends Service {
      * 写。开关开着就收，关掉就停，没有第三种状态。
      */
     static boolean listening(Context context) {
+        // 「OPPO互传」体系下自研监听永远算“关”：磁贴/开机对齐看到 false 就不会把监听
+        // 拉起来，人也不会在一个显示“已停止”的开关旁边看到后台真的在听。凭据本身保留——
+        // 切回定制体系时它还在，人不用重开。
+        if (Engine.isOshare(context)) {
+            return false;
+        }
         if (!manual(context)) {
             return false;
         }
