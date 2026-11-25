@@ -330,6 +330,24 @@ mod tests {
     }
 
     #[test]
+    fn giving_up_clears_starting_so_it_cannot_get_stuck() {
+        let _turn = in_turn();
+        stopped();
+        assert_eq!(starting(), "starting");
+        assert!(current().is_awake());
+        // 评审 P1-20：new_bytes 抛异常 / BleRadio.start 抛异常时，stack 永远不会回
+        // verdict。如果这条路径不回滚，is_awake() 对 Starting 为真，状态就永久
+        // 停在「叫醒中」，之后再点接收也不会重发广播。
+        let line = given_up("BleRadio.start threw before the stack answered");
+        assert!(line.starts_with("failed: "), "{line}");
+        assert!(!current().is_awake());
+        assert_eq!(
+            current(),
+            State::Failed("BleRadio.start threw before the stack answered".into())
+        );
+    }
+
+    #[test]
     fn a_handed_over_advertisement_is_only_advertising_once_the_stack_says_so() {
         let _turn = in_turn();
         stopped();

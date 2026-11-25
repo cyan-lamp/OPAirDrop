@@ -1270,7 +1270,10 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_bleAdvertise(
     let data = unsafe { new_bytes(env, &payload) };
     if data.is_null() {
         // `new_bytes` has already thrown, and an array that could not be made is not the
-        // radio's failure to report.
+        // radio's failure to report. 但 starting() 已经把状态推到了 Starting：没人会来
+        // 给这次没发生的投递送 verdict，状态会永久卡在 Starting（评审 P1-20）。
+        // 这里只回滚 Rust 侧状态，不碰 JVM——异常仍归调用方。
+        let _ = ble::given_up("the advertisement data could not be copied to Java");
         // SAFETY: `radio.class` is a local reference this frame owns.
         unsafe { delete_local(env, radio.class) };
         return ptr::null_mut();
@@ -1301,8 +1304,10 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_bleAdvertise(
     };
 
     // A pending exception is the honest report and belongs to the caller: copying the state
-    // out would answer with null and leave the exception unexplained.
+    // out would answer with null and leave the exception unexplained. 同样要回滚 Starting——
+    // 投出去的调用抛了，stack 不会回 verdict，状态不回滚就永久停在 Starting（P1-20）。
     if unsafe { pending(env) } {
+        let _ = ble::given_up("BleRadio.start threw before the stack answered");
         return ptr::null_mut();
     }
     let line = ble::line();

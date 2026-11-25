@@ -253,13 +253,19 @@ final class Listener {
     private Thread worker;
     /** Volatile because the loop reads it outside the lock, in the finally that tidies up. */
     private volatile boolean stopping;
-
     /**
-     * 评审 P1-12 的启停竞态收口：{@code loop} 收尾时只清「自己」——{@code worker} 与
-     * 当前线程一致才置空。否则快速「关→开」时，旧线程的 finally 会在新线程建好之后
-     * 把它清掉：{@code running()} 说在收、端口却已经没人听。（用代际计数也对，但
-     * 「线程自证」少一个要同步的字段。）
+     * 每一轮 start 的代际。stop 会立刻放掉 worker 槽位，让紧接着的 start 不被挡；
+     * 但旧线程的 bind/finally 可能还没跑完，靠这个代际让它认出自己已经过期，不再
+     * 碰新代的 server 与状态行（评审 P1-12）。
      */
+    private long generation;
+
+    /** 当前线程这一代还有效吗——锁内读，避免和 start/stop 的改交错。 */
+    private boolean current(long gen) {
+        synchronized (lock) {
+            return gen == generation;
+        }
+    }
 
     /**
      * 此刻正在被接待的连接数：握着 socket、握着线程的那些。
@@ -463,9 +469,12 @@ final class Listener {
             if (worker != null) {
                 return;
             }
+            // 新线程要带着自己的代际进 loop：旧线程哪怕还没退出，它的收尾也不会
+            // 把这一代的状态改掉（见 end()/loop finally 里的 gen 比对）。
+            long gen = ++generation;
             stopping = false;
             state = new Line("正在绑定 " + PORT + "…", false);
-            worker = new Thread(this::loop, "opairdrop-listener");
+            worker = new Thread(() -> loop(gen), "opairdrop-listener");
             worker.setDaemon(true);
             worker.start();
         }
@@ -491,6 +500,11 @@ final class Listener {
             open = server;
             server = null;
             shown = worker != null;
+            // 评审 P1-12：立刻放掉 worker 槽位。原来留到旧线程 finally 才清，于是
+            // 「关→开」紧接着来时，start() 看见 worker != null 直接返回——没人再启动，
+            // 旧线程随后退出，端口就一直空着。旧线程的收尾靠 end() 的线程自证和下面
+            // loop 的代际比对，不会误伤这一代的新 worker。
+            worker = null;
             if (shown) {
                 state = new Line("正在停止…", false);
             }
@@ -502,7 +516,7 @@ final class Listener {
     }
 
     /** The loop: load the certificate, bind, accept, serve, until told to stop or the socket breaks. */
-    private void loop() {
+    private void loop(long gen) {
         Identity identity;
         try {
             // Once per start, and before the bind, because the same object has to do both
@@ -517,6 +531,9 @@ final class Listener {
             // knows the address; a receiver with no certificate cannot complete a single
             // handshake, and the failure would appear on the sender's screen where there is
             // nothing to read. This is the only place a person can be told.
+            if (!current(gen)) {
+                return; // 已被 stop+restart 取代：这一代的失败与新页面无关。
+            }
             end();
             setState("无法建立本机证书：" + Explains.describe(failed), true);
             return;
@@ -551,17 +568,24 @@ final class Listener {
             bound.setNeedClientAuth(false);
         } catch (IOException | GeneralSecurityException refused) {
             closeQuietly(bound);
+            if (!current(gen)) {
+                return;
+            }
             end();
             setState("无法监听 " + PORT + "：" + Explains.describe(refused), true);
             return;
         }
 
         synchronized (lock) {
-            if (stopping) {
-                // Stopped while binding: do not go on to accept on a socket nobody wants.
+            // 代际也放进同一把锁里判：old 线程不能在已经 stop+restart 之后把它的
+            // socket 装进新代的 server 槽（那会让 running() 对不上真正的端口）。
+            if (gen != generation || stopping) {
+                // Stopped while binding（或已被下一代取代）：不在没人要的 socket 上接听。
                 closeQuietly(bound);
-                end();
-                setState("已停止", false);
+                if (gen == generation) {
+                    end();
+                    setState("已停止", false);
+                }
                 return;
             }
             server = bound;
@@ -605,11 +629,16 @@ final class Listener {
                 handOver((SSLSocket) peer);
             }
         } finally {
+            closeQuietly(bound);
+            if (!current(gen)) {
+                // 这一代已被 stop+restart 取代：连 announcer 的退出广播也不能发——
+                // 那会让刚起来的新一代从对端名单里消失。socket 已关，仅此而已。
+                return;
+            }
             // First, so the last thing peers hear from this device is that it is gone. The
             // withdrawal travels through the announcer's own socket and has to leave before
             // anything about this start is torn down.
             announcer.end();
-            closeQuietly(bound);
             end();
             if (stopping) {
                 setState("已停止", false);
