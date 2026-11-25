@@ -1,15 +1,15 @@
 package com.oshare.airdrop;
 
 import android.content.Context;
-import android.net.wifi.WifiInfo;
-import android.net.wifi.WifiManager;
 import android.os.Handler;
 import android.os.Looper;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.InputStreamReader;
 
 /**
- * 「STA 共存」的会话控制器：什么时候该对射频提出什么请求。
+ * 「STA 共存」的会话控制器：什么时候该对 AP 连接做什么。
  *
  * <p># 会话是什么
  *
@@ -18,8 +18,8 @@ import java.io.File;
  * <ul>
  *   <li>开关开（{@link RadioShare.Want#SHARE}）：请求共享，回执确认后看 STA 落点——
  *       AP 恰好在 149（5745 MHz）就是同信道共存，一个字节都不动；AP 不在 149 就断开
- *       AP（Wi-Fi 保持开启），跨信道的 45% 损耗不值得付。</li>
- *   <li>开关关（{@link RadioShare.Want#EXCLUSIVE}）：请求独占并断开 AP，Wi-Fi 一样
+ *       热点（Wi-Fi 保持开启），跨信道的 45% 损耗不值得付。</li>
+ *   <li>开关关（{@link RadioShare.Want#EXCLUSIVE}）：请求独占并断开热点，Wi-Fi 一样
  *       保持开启（守护与脚本在 2026-11-25 会话制改造后都不再关 Wi-Fi）。</li>
  * </ul>
  *
@@ -28,18 +28,23 @@ import java.io.File;
  * <p>开关开：恢复 AP 关联。开关关：什么都不做——断开的状态保持下去，既不恢复也
  * 不再断开；用户手动连上的就让它连着。会话外两种状态都永不主动断开。
  *
- * <p># AP 怎么断、怎么恢复
+ * <p># 热点怎么断、怎么恢复
  *
- * <p>用 {@link WifiManager#disableNetwork}/{@link WifiManager#enableNetwork}：前者把
- * 当前网络标记为不自动加入并断开关联（Wi-Fi 总开关不动），后者恢复自动加入并立即
- * 重连。netId 在断开前从 {@link WifiInfo#getNetworkId} 记下来。这需要
- * {@code CHANGE_WIFI_STATE} 权限（manifest 里已声明）。
+ * <p>用 root 的链路层原语 {@code ip link set wlan0 down/up}（2026-11-26 实测定稿）：
+ * down 后 supplicant 立刻 DISCONNECTED（热点断了，Wi-Fi 总开关仍是开启状态），
+ * up 后 autojoin 自动把关联接回 COMPLETED——恢复动作连 netId 都不需要。wonder0
+ * 在同一芯片的另一个接口上，down 不影响 AWDL 链路。
  *
- * <p># 为什么轮询回执
+ * <p>为什么不用 WifiManager.disableNetwork：Android 12 起对非系统应用收口——
+ * {@code getConnectionInfo} 的 networkId 恒为 -1（「cleared for non-owner」，
+ * 2026-11-26 实测轮询 20 次全是 -1），{@code disableNetwork} 对用户的网络被
+ * 系统静默忽略。这两条 API 在这台机器上都是摆设。
  *
- * <p>share 的确认是守护进程写的，断 AP 要等它确认之后（否则抢占时机对不上）：确认行
- * 出现时读 {@code sta=}——149 放行，其他信道断开。轮询复用 {@link #POLL}，上限
- * {@link #POLLS}，超了就放弃（Wi-Fi 还开着，损失只是没断干净）。
+ * <p># 看门狗
+ *
+ * <p>独占会话期间每 5 秒确认一次 wlan0 是 down 的：框架的故障恢复（ClientModeManager
+ * 检测到接口异常会重建 STA）可能把接口拉起来，看门狗把它按回去。会话结束或切到
+ * 共享时看门狗停——exclusive 的会话外保持 down（第 7/8 条不恢复），但不再强按。
  */
 public final class RadioSession {
 
@@ -47,13 +52,20 @@ public final class RadioSession {
     private static volatile boolean sendActive;
     private static volatile boolean listening;
 
-    /** 断开前记下的网络，恢复时用它重连。 */
-    private static volatile int savedNetId = -1;
+    /** 看门狗开关与句柄（exclusive 会话中周期性确保 down）。 */
+    private static volatile boolean watchdogOn;
+    /** 看门狗的自续体：同一实例才能被 removeCallbacks 精确摘掉。 */
+    private static Runnable watchdogTick;
 
     private static final Handler HANDLER = new Handler(Looper.getMainLooper());
     /** share 确认后的跨信道检查：250ms 一次，最多 40 次（10 秒）。 */
     private static final long POLL = 250;
     private static final int POLLS = 40;
+    /** 独占看门狗的节拍。 */
+    private static final long WATCHDOG_TICK = 5000;
+
+    /** wlan0 的名字。ColorOS 的 STA 接口固定是它（共享模式也在这上面关联）。 */
+    private static final String STA_IF = "wlan0";
 
     private RadioSession() {}
 
@@ -85,6 +97,8 @@ public final class RadioSession {
         boolean session = sendActive || listening;
         File dir = app.getFilesDir();
         RadioShare.Want want = RadioShare.read(dir).want();
+        Log.i("OPAirDrop", "射频裁决：session=" + session + " send=" + sendActive
+                + " listen=" + listening + " want=" + want.word());
 
         try {
             if (!session) {
@@ -94,7 +108,8 @@ public final class RadioSession {
                 //    断开的状态保持到下一次会话（或用户手动连）。
                 //  两种情况下都不主动断开（第 2/4 条：会话外连着就连着）。
                 if (want == RadioShare.Want.SHARE) {
-                    restoreAp(app);
+                    stopWatchdog();
+                    bringUp(app);
                     RadioShare.ask(dir, RadioShare.Want.SHARE);
                 }
                 return;
@@ -102,14 +117,14 @@ public final class RadioSession {
 
             RadioShare.ask(dir, want);
             if (want == RadioShare.Want.EXCLUSIVE) {
-                // 独占：断开 AP，再等守护把 Wi-Fi 打开（如果它还关着）。顺序无妨，
-                // 两件事互不依赖。
-                dropAp(app);
+                // 独占：断开热点并挂看门狗（周期确认 down，见类注释）。
+                startWatchdog(app);
                 return;
             }
             // 共享：先恢复关联（独占期间可能断着），等确认后再看 STA 落点——
             // AP 恰好在 149 就共存，落在别的信道再断开（第 3 条的例外）。
-            restoreAp(app);
+            stopWatchdog();
+            bringUp(app);
             pollShareSettled(app, 0);
         } catch (java.io.IOException failed) {
             // 请求写不进去（磁盘/目录）：射频保持原状，下次会话事件会再试。
@@ -117,7 +132,7 @@ public final class RadioSession {
         }
     }
 
-    /** share 确认后：STA 在 149 放行；在其他信道断 AP（Wi-Fi 保持开启）。 */
+    /** share 确认后：STA 在 149 放行；在其他信道断开热点（Wi-Fi 保持开启）。 */
     private static void pollShareSettled(Context app, int round) {
         HANDLER.postDelayed(() -> {
             RadioShare.State state = RadioShare.read(app.getFilesDir());
@@ -130,46 +145,84 @@ public final class RadioSession {
             }
             int mhz = state.staMhz();
             if (mhz > 0 && mhz != 5745) {
-                dropAp(app);
+                Log.i("OPAirDrop", "STA 共存：AP 在 " + mhz + " MHz，跨信道，断开热点");
+                bringDown(app);
             }
         }, POLL);
     }
 
-    /** 断开当前 AP：记下 netId，禁用该网络（Wi-Fi 总开关不动）。 */
-    private static void dropAp(Context app) {
-        WifiManager wifi = app.getSystemService(WifiManager.class);
-        if (wifi == null) {
-            return;
-        }
-        WifiInfo info = wifi.getConnectionInfo();
-        if (info == null || info.getNetworkId() < 0) {
-            return;
-        }
-        savedNetId = info.getNetworkId();
-        try {
-            wifi.disableNetwork(savedNetId);
-            Log.i("OPAirDrop", "STA 共存：已断开 AP（netId=" + savedNetId + "），Wi-Fi 保持开启");
-        } catch (Throwable failed) {
-            Log.w("OPAirDrop", "断开 AP 失败：" + failed);
+    private static void startWatchdog(Context app) {
+        watchdogOn = true;
+        bringDown(app);
+        if (watchdogTick == null) {
+            watchdogTick = () -> {
+                if (!watchdogOn) {
+                    return;
+                }
+                ensureDown(app);
+                HANDLER.postDelayed(watchdogTick, WATCHDOG_TICK);
+            };
+            HANDLER.postDelayed(watchdogTick, WATCHDOG_TICK);
         }
     }
 
-    /** 恢复 AP：把断开前那个网络重新启用，自动加入会把关联接回来。 */
-    private static void restoreAp(Context app) {
-        int netId = savedNetId;
-        savedNetId = -1;
-        if (netId < 0) {
+    private static void stopWatchdog() {
+        watchdogOn = false;
+        if (watchdogTick != null) {
+            HANDLER.removeCallbacks(watchdogTick);
+        }
+    }
+
+    /** 看门狗的一拍：独占会话期间确保热点是断开的。 */
+    private static void ensureDown(Context app) {
+        if (isDown()) {
             return;
         }
-        WifiManager wifi = app.getSystemService(WifiManager.class);
-        if (wifi == null) {
-            return;
-        }
+        Log.i("OPAirDrop", "STA 共存：看门狗发现热点已连上，重新断开");
+        bringDown(app);
+    }
+
+    private static boolean isDown() {
+        // 接口 down 时 operstate 是 DOWN/NO-CARRIER；连着时是 UP。用 ip link 读。
         try {
-            wifi.enableNetwork(netId, true);
-            Log.i("OPAirDrop", "STA 共存：已恢复 AP（netId=" + netId + "）");
+            Process process = new ProcessBuilder("su", "-c",
+                    "ip link show " + STA_IF + " | grep -oE 'state [A-Z]+'")
+                    .start();
+            BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(process.getInputStream()));
+            String line = reader.readLine();
+            process.waitFor(3000, java.util.concurrent.TimeUnit.MILLISECONDS);
+            process.destroy();
+            return line != null && !line.contains("UP");
         } catch (Throwable failed) {
-            Log.w("OPAirDrop", "恢复 AP 失败：" + failed);
+            Log.w("OPAirDrop", "读 wlan0 状态失败：" + failed);
+            return false;
+        }
+    }
+
+    /** 断开热点：链路层 down（Wi-Fi 总开关不动，supplicant 立刻 DISCONNECTED）。 */
+    private static void bringDown(Context app) {
+        try {
+            Process process = new ProcessBuilder("su", "-c",
+                    "ip link set " + STA_IF + " down").start();
+            process.waitFor(3000, java.util.concurrent.TimeUnit.MILLISECONDS);
+            process.destroy();
+            Log.i("OPAirDrop", "STA 共存：已断开热点（" + STA_IF + " down），Wi-Fi 保持开启");
+        } catch (Throwable failed) {
+            Log.w("OPAirDrop", "断开热点失败：" + failed);
+        }
+    }
+
+    /** 恢复热点：链路层 up（autojoin 自动把关联接回来）。 */
+    private static void bringUp(Context app) {
+        try {
+            Process process = new ProcessBuilder("su", "-c",
+                    "ip link set " + STA_IF + " up").start();
+            process.waitFor(3000, java.util.concurrent.TimeUnit.MILLISECONDS);
+            process.destroy();
+            Log.i("OPAirDrop", "STA 共存：已恢复热点（" + STA_IF + " up）");
+        } catch (Throwable failed) {
+            Log.w("OPAirDrop", "恢复热点失败：" + failed);
         }
     }
 }
