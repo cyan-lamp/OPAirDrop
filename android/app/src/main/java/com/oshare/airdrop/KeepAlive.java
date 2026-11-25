@@ -217,6 +217,68 @@ final class KeepAlive {
             }
         }
         info("划掉不再强停：钩住 " + hooked + " 个 forceStop*");
+
+        // 第三刀：拦通知清理（2026-11-25）。第一刀拦住杀进程之后，划卡的发起者
+        // （OplusAthenaAmManager）自己还会发一轮 forceStop 通知清理广播，NMS 照单全收——
+        // 实测划卡后 pid 不变、ReceiveService 前台记录还在，常驻通知却没了。钩 NMS 里
+        // 名字以 cancelAll 开头的方法：参数里认出我们的包就跳过这次清理。应用自己很少
+        // cancelAll（单条用 notify/cancel），跳过的代价只是「通知没清掉」，方向安全。
+        hookNotificationSweeper(module, loader);
+    }
+
+    /**
+     * 钩 NMS 的 cancelAll*。找不到类/方法只记账——ColorOS 改了包结构的话这一刀就空过，
+     * 兜底还有 ReceiveService.onTaskRemoved 的延迟重挂。
+     */
+    private static void hookNotificationSweeper(XposedModule module, ClassLoader loader) {
+        final String NMS = "com.android.server.notification.NotificationManagerService";
+        Class<?> nms;
+        try {
+            nms = Class.forName(NMS, false, loader);
+        } catch (Throwable t) {
+            info("找不到 " + NMS + "，通知清理这一刀不装（兜底靠 onTaskRemoved 重挂）");
+            return;
+        }
+        int hooked = 0;
+        int index = 0;
+        for (Method method : nms.getDeclaredMethods()) {
+            if (!method.getName().startsWith("cancelAll")) {
+                continue;
+            }
+            try {
+                module.hook(method)
+                        .setPriority(XposedInterface.PRIORITY_DEFAULT)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PASSTHROUGH)
+                        .setId("opairdrop-keepalive-noti-" + (index++))
+                        .intercept(chain -> onNotificationSweep(chain, method));
+                hooked++;
+            } catch (Throwable t) {
+                warn("钩不上 NMS." + method.getName() + "，这一支照常清理", t);
+            }
+        }
+        info("划掉不清通知：钩住 " + hooked + " 个 cancelAll*");
+    }
+
+    /** 参数里认出我们的包名（String 或 String[]）就跳过这次全量清理；无关的照旧放行。 */
+    private static Object onNotificationSweep(XposedInterface.Chain chain, Method method)
+            throws Throwable {
+        Class<?>[] params = method.getParameterTypes();
+        for (int i = 0; i < params.length; i++) {
+            Object value = chain.getArg(i);
+            if (value instanceof String && PKG.equals(value)) {
+                info("划掉不清通知：跳过 " + method.getName() + " 的本轮清理");
+                return null;
+            }
+            if (value instanceof String[] packages) {
+                for (String pkg : (String[]) value) {
+                    if (PKG.equals(pkg)) {
+                        info("划掉不清通知：跳过 " + method.getName() + " 的本轮清理");
+                        return null;
+                    }
+                }
+            }
+        }
+        return chain.proceed();
     }
 
     /**

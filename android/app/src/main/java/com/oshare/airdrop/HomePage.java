@@ -192,9 +192,10 @@ final class HomePage {
         } else if (root.granted) {
             pill = "已获取";
             pillColor = S.green;
+            // 「 · 」和「LSPosed 框架」那一行的版本号同一格式。
             subtitle = root.manager.isEmpty()
                     ? "已获得 root 授权"
-                    : root.manager + (root.version.isEmpty() ? "" : " " + root.version);
+                    : root.manager + (root.version.isEmpty() ? "" : " · " + root.version);
         } else {
             pill = "未获取";
             pillColor = S.red;

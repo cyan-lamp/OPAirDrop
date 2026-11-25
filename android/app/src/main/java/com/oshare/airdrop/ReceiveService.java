@@ -463,6 +463,29 @@ public final class ReceiveService extends Service {
     }
 
     /**
+     * 划掉最近任务时系统会先知会一下还在跑的服务（{@code onTaskRemoved}）。
+     *
+     * <p>2026-11-25 实测：KeepAlive 的钩子拦住了 AMS 杀进程（划卡后 pid 不变），但划卡的
+     * 发起者（OplusAthenaAmManager）自己还会发一轮 forceStop 通知清理广播，NotificationManagerService
+     * 照单全收——进程活着，常驻通知却被摘走了。这里加一手兜底：延迟两秒把通知重新提交
+     * （服务此刻仍是前台，重新 {@code startForeground} 合法且幂等）。延迟是给系统的清理
+     * 留时间——立刻重挂会被随后落下的那轮取消再摘一次。
+     */
+    @Override
+    public void onTaskRemoved(android.content.Intent rootIntent) {
+        super.onTaskRemoved(rootIntent);
+        if (!shown) {
+            return;
+        }
+        CLOSER.postDelayed(() -> {
+            if (shown && running()) {
+                startForeground(NOTIFICATION, notification(this));
+                Log.i(TAG, "划掉任务后重新挂上常驻通知");
+            }
+        }, 2000);
+    }
+
+    /**
      * 造这条通知。
      *
      * <p>静态的，因为它有第二个调用方 {@link #refresh}——那一位手里只有一个 {@code Context}，
