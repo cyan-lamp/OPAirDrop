@@ -24,6 +24,12 @@
 -keep class com.oshare.airdrop.Decision { *; }
 -keep class com.oshare.airdrop.DecisionReceiver { *; }
 
+# LSPosed 从 META-INF/xposed/java_init.list 按字符串加载 FluidModule：
+# APK 内没有任何代码引用它，R8 判成未使用整个裁掉（usage.txt 里那行就是证据），
+# 结果模块 class not found、流体云卡不再自动展开。外部按名字加载的类必须 keep。
+# 2026-11-25：release 开混淆后 hook 失效，真因就是这个。
+-keep class com.oshare.airdrop.FluidModule { *; }
+
 # 栈还原要用的类型信息；行号会被 R8 重写，不强制保留。
 -keepattributes Signature, InnerClasses, EnclosingMethod
 -keepattributes *Annotation*
