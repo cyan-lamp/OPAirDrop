@@ -69,6 +69,11 @@ public final class Lsp {
         return service != null;
     }
 
+    /** 重读一次作用域（行点击时刷新缓存，不触发事件）。 */
+    public static void refresh() {
+        refreshScope();
+    }
+
     /** 作用域是否齐全：systemui 与 system 两条都在。未连接时 false。 */
     public static boolean scoped() {
         List<String> current = scope;

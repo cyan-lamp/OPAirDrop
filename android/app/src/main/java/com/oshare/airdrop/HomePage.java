@@ -254,9 +254,24 @@ final class HomePage {
         TextView lspPill = chrome.statusPill(pill, pillColor);
         LinearLayout row = chrome.featureRow(
                 IconView.CARD, "LSPosed 框架", subtitle, lspPill);
-        if (Lsp.framework() && !Lsp.scoped()) {
-            chrome.setRowAction(row, true, null, Lsp::requestScope);
-        }
+        // 三态都可点（2026-11-25 用户要求：已生效也要有涟漪）——未齐走申请，已生效重读
+        // 一次作用域并确认，未连接只是说一声。没有点击动作的行挂着涟漪才会让人误会，
+        // 反过来，有意义的行就该有反馈。
+        chrome.setRowAction(row, true, Scheme.CORNERS_TOP, () -> {
+            if (Lsp.framework()) {
+                if (Lsp.scoped()) {
+                    Lsp.refresh();
+                    chrome.say(Lsp.scoped()
+                            ? "LSPosed 作用域齐全：" + Lsp.versionLine()
+                            : "作用域有变化，点这行重新申请");
+                } else {
+                    Lsp.requestScope();
+                    chrome.say("已向 LSPosed 申请作用域，请在弹窗里确认");
+                }
+            } else {
+                chrome.say("未检测到 LSPosed 框架");
+            }
+        });
         return row;
     }
 

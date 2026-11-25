@@ -409,9 +409,12 @@ public final class ReceiveService extends Service {
         }
         // 不再叫互传的门：流体云是我们自己发的一条实时通知（LiveCard），系统负责画它，
         // 谁的进程在不在都与它无关。
-        // 不 sticky：进程被杀之后由 App/面板重新对齐，而不是让系统在一个没人知道的时刻
-        // 把它拉起来——那种重启没有窗口、没有理由，只有一条通知。
-        return START_NOT_STICKY;
+        // sticky（2026-11-25 改）：接收开着的进程被系统杀掉（比如 ColorOS 从最近任务清理）
+        // 之后，系统自动把它拉起来——监听恢复、常驻通知回来。原来 NOT_STICKY 的理由是
+        // 「重启没有窗口、没有理由」，但那说的是任意进程死亡；凭据（receive.manual）就
+        // 是理由：开着接收被杀，就该在原地站起来。forceStop 场景由 KeepAlive 的
+        // system_server 钩子拦，两道防线各管各的。
+        return START_STICKY;
     }
 
     @Override

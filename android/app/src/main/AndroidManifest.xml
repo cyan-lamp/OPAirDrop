@@ -76,7 +76,8 @@
 
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTask">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -213,4 +214,16 @@
             android:exported="false" />
 
     </application>
+
+    <!-- Android 11+ 包可见性过滤：不加这段，getPackageInfo 对下面这些包一律
+         NameNotFoundException——首页 root 那行的管理器名字与版本就是这么变空的
+         （设备上装着 APatch，副标题却显示「已获得 root 授权」）。
+         只声明用到的包，不申请 QUERY_ALL_PACKAGES。 -->
+    <queries>
+        <package android:name="me.weishu.kernelsu" />
+        <package android:name="com.rifsxd.ksunext" />
+        <package android:name="me.bmax.apatch" />
+        <package android:name="com.topjohnwu.magisk" />
+        <package android:name="io.github.huskydg.magisk" />
+    </queries>
 </manifest>

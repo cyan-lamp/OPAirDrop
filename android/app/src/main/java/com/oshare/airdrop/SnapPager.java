@@ -175,12 +175,10 @@ final class SnapPager extends HorizontalScrollView {
                 downY = event.getY();
                 startScroll = getScrollX();
                 obtainTracker(event);
-                if (settle != null) {
-                    settle.cancel();
-                }
-                if (bounce != null) {
-                    bounce.cancel();
-                }
+                // 吸附动画不在这里取消（2026-11-25 修「切页偶发停在两页之间」）：切页动画
+                // 进行中的任何触摸都会先送来 DOWN，原来在这一下就把动画掐掉，之后判成
+                // 纵轴（人只是想滚动内容）就再也没有吸附兜底——停在两页之间。取消推迟到
+                // 横轴判定成立的那一刻。
                 return false;
             case MotionEvent.ACTION_MOVE: {
                 if (axis == AXIS_VERTICAL) {
@@ -198,6 +196,16 @@ final class SnapPager extends HorizontalScrollView {
                     downX = event.getX();
                     downY = event.getY();
                     startScroll = getScrollX();
+                    // 正在跑的吸附动画在这里才取消（2026-11-25 修「切页偶发停在两页之间」）：
+                    // 原来在 ACTION_DOWN 就取消，切页动画进行中手指一按（哪怕只是想纵向滚动
+                    // 内容）动画就没了，随后判成纵轴的话谁也不会再吸附——页面停在两页之间。
+                    // 横轴成立说明新手势真的要接管翻页，这时取消才安全。
+                    if (settle != null) {
+                        settle.cancel();
+                    }
+                    if (bounce != null) {
+                        bounce.cancel();
+                    }
                     if (tracker != null) {
                         tracker.addMovement(event);
                     }
@@ -385,6 +393,7 @@ final class SnapPager extends HorizontalScrollView {
                 // 走到这里说明按下时没有子视图要吃它（页面里没有可滚的东西），整条手势都
                 // 归翻页器。若那张滚动表吃掉了按下，这里根本不会被叫到，方向由
                 // onInterceptTouchEvent 判。
+                // 吸附动画不在这里取消（同 onInterceptTouchEvent）：等横轴成立再接管。
                 axis = AXIS_HORIZONTAL;
                 downX = event.getX();
                 downY = event.getY();
@@ -392,21 +401,22 @@ final class SnapPager extends HorizontalScrollView {
                 if (tracker == null) {
                     obtainTracker(event);
                 }
-                if (settle != null) {
-                    settle.cancel();
-                }
-                if (bounce != null) {
-                    bounce.cancel();
-                }
                 return true;
             case MotionEvent.ACTION_MOVE: {
                 if (axis != AXIS_HORIZONTAL) {
                     return false;
                 }
                 if (tracker == null) {
-                    tracker = VelocityTracker.obtain();
+                    obtainTracker(event);
                 }
                 tracker.addMovement(event);
+                // 横轴成立（第一个够远的 MOVE）：这时才取消吸附动画，理由见 onInterceptTouchEvent。
+                if (settle != null) {
+                    settle.cancel();
+                }
+                if (bounce != null) {
+                    bounce.cancel();
+                }
                 float desired = startScroll + (downX - event.getX());
                 ViewGroup content = (ViewGroup) getChildAt(0);
                 int stripMax = content == null
