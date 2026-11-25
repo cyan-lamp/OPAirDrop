@@ -61,8 +61,8 @@ public final class RadioCheck {
         check("no request file is not the same as an answered request", !state.asked(),
                 "asked=" + state.asked());
         check("no receipt is not an answer", !state.answered(), "answered");
-        check("the default state says the phone has no Wi-Fi",
-                state.subtitle().contains("独占") && state.subtitle().contains("Wi-Fi"),
+        check("the default state says the AP stays connected without a session",
+                state.subtitle().contains("AP 保持连接") && state.subtitle().contains("会话未开始"),
                 state.subtitle());
         check("the default state is not drawn as a failure", !state.failed(), "failed");
         check("the default state names no channel", state.staMhz() == 0, "" + state.staMhz());
@@ -118,10 +118,12 @@ public final class RadioCheck {
                 "not settled");
         check("the channel is lifted out of the receipt", shared.staMhz() == 5745,
                 "" + shared.staMhz());
-        check("the channel reaches the sentence", shared.subtitle().contains("5745"),
+        check("the channel reaches the sentence", shared.subtitle().contains("149"),
                 shared.subtitle());
-        check("the sentence claims sharing and not a guarantee",
-                shared.subtitle().contains("共享")
+        // 2026-11-25 会话制：同信道（5745）的新措辞是「共存中」——同一射频、互不打断，
+        // 不再承诺损耗数字（那数字只在跨信道时存在，而跨信道时应用会断开 AP）。
+        check("the sentence claims coexistence and not a guarantee",
+                shared.subtitle().contains("共存")
                         && !shared.subtitle().contains("%")
                         && !shared.subtitle().contains("丢包率"),
                 shared.subtitle());
@@ -157,8 +159,10 @@ public final class RadioCheck {
         receipt(dir, "exclusive confirmed");
         RadioShare.State done = RadioShare.read(dir);
         check("the new receipt answers it", done.answered(), "not answered");
-        check("exclusive says the phone has no Wi-Fi",
-                done.subtitle().contains("没有 Wi-Fi"), done.subtitle());
+        // 2026-11-25 会话制：独占不再关 Wi-Fi——确认的是「AP 已断开、Wi-Fi 保持开启」。
+        check("exclusive says the AP is gone while Wi-Fi stays on",
+                done.subtitle().contains("AP 已断开") && done.subtitle().contains("Wi-Fi 保持开启"),
+                done.subtitle());
         check("exclusive names no channel", done.staMhz() == 0, "" + done.staMhz());
     }
 
@@ -185,9 +189,9 @@ public final class RadioCheck {
                 RadioShare.read(dir).subtitle().contains("没有打开"),
                 RadioShare.read(dir).subtitle());
 
-        receipt(dir, "exclusive failed wi-fi still on");
+        receipt(dir, "exclusive failed wi-fi still off");
         RadioShare.ask(dir, RadioShare.Want.EXCLUSIVE);
-        check("a failure to turn it off is worded as exclusive",
+        check("a failure to turn Wi-Fi on is worded as exclusive",
                 RadioShare.read(dir).subtitle().startsWith("独占失败"),
                 RadioShare.read(dir).subtitle());
 

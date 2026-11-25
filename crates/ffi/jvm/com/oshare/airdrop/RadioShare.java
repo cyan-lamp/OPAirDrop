@@ -245,9 +245,9 @@ public final class RadioShare {
         public String subtitle() {
             if (!receipt.present()) {
                 if (!asked) {
-                    // The default. Said out loud because it is the state this app starts in,
-                    // and because "no Wi-Fi" is the cost of it, not a detail.
-                    return "默认独占：AWDL 独占射频，手机没有 Wi-Fi 网络";
+                    // The default. Said out loud because it is the state this app starts in:
+                    // no session is running, so the AP stays connected either way.
+                    return "默认：会话未开始，AP 保持连接（Wi-Fi 开启）";
                 }
                 return "已请求" + chinese(want) + "，还没有回执——守护进程可能没在运行";
             }
@@ -257,16 +257,20 @@ public final class RadioShare {
             switch (receipt.standing()) {
                 case CONFIRMED:
                     if (want == Want.EXCLUSIVE) {
-                        return "独占中：Wi-Fi 已关闭，手机没有 Wi-Fi 网络";
+                        // 2026-11-25 会话制：独占不再关 Wi-Fi——AP 的断开由应用侧的
+                        // WifiManager 负责，守护只确认 Wi-Fi 开着（STA 接口可用）。
+                        return "独占中：AP 已断开，Wi-Fi 保持开启";
                     }
                     int mhz = staMhz();
-                    return mhz > 0
-                            ? "共享中：Wi-Fi 在 " + mhz + " MHz，与 AWDL 共用射频"
-                            : "共享中：Wi-Fi 开着，与 AWDL 共用射频";
+                    return mhz == 5745
+                            ? "共存中：AP 在 149 信道，与 AWDL 同信道，互不打断"
+                            : mhz > 0
+                                    ? "共享中：AP 在 " + mhz + " MHz（跨信道，会话将断开它）"
+                                    : "共享中：Wi-Fi 开着，与 AWDL 共用射频";
                 case PENDING:
                     return want == Want.SHARE
                             ? "正在开 Wi-Fi，等 STA 拿到信道"
-                            : "正在关 Wi-Fi";
+                            : "正在确认 Wi-Fi 开启";
                 case FAILED:
                     return (want == Want.SHARE ? "共享失败：" : "独占失败：") + reason(receipt.detail());
                 default:
@@ -342,9 +346,10 @@ public final class RadioShare {
             default:
                 break;
         }
-        // "wi-fi still on" / "wi-fi still off" / "wi-fi still unknown"
+        // "wi-fi still on" / "wi-fi still off" / "wi-fi still unknown"——2026-11-25 会话制
+        // 之后两种状态都在等 Wi-Fi 开启，失败原因就是它没开成。
         if (why.startsWith("wi-fi still")) {
-            return "Wi-Fi 没有按请求关掉";
+            return "Wi-Fi 没有按请求开启";
         }
         if (why.startsWith("unknown request")) {
             return "守护进程看不懂这个请求（新旧版本不一致）";

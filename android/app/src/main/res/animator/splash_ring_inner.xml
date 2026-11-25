@@ -1,23 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 第二拍：内圈。中心点长完之后 110 ms 起，比点慢一点（620 ms 对 420 ms），
-     于是点已经站住了，圈还在往外推。
+<!-- 第二拍：内环的揭示。点淡入之后跟上，揭示窗（innerClip）的上沿从环的底缘（y=70）
+     收到 -20——露出的部分从底弧开始，左右两半同时向上生长，直到整个环站出来。
 
-     0.55 的起始缩放是原版的数：外圈、内圈、点各自由一个小一号的自己长到最终尺寸，
-     三者的「小一号」程度一致，才不会显得某一圈是突然插进来的。方向改了，这个一致性留着。 -->
+     pathData 的 morph 是「矩形到矩形」：两串命令同构（M L L L Z），只是上沿的 y 不同，
+     这正是 vector morph 的要求。2026-11-25 改版：缩放撤掉（三样从一开始就站在最终
+     位置上），「出现」全部交给这个揭示窗。
+
+     时长 350 + 起拍 250 = 750 之内结束，外环（500 起、400 长）在其后半程跟上，
+     三个值仍落在 theme 的 1000 ms 窗口内。曲线 decelerate_cubic：越接近全露越缓，
+     和「向上生长」的直觉一致。 -->
 <objectAnimator xmlns:android="http://schemas.android.com/apk/res/android"
-    android:duration="620"
-    android:startOffset="110"
+    android:duration="350"
+    android:startOffset="250"
     android:interpolator="@android:interpolator/decelerate_cubic">
     <propertyValuesHolder
-        android:propertyName="alpha"
-        android:valueFrom="0"
-        android:valueTo="1" />
-    <propertyValuesHolder
-        android:propertyName="scaleX"
-        android:valueFrom="0.55"
-        android:valueTo="1" />
-    <propertyValuesHolder
-        android:propertyName="scaleY"
-        android:valueFrom="0.55"
-        android:valueTo="1" />
+        android:propertyName="pathData"
+        android:valueFrom="M -20,70 L 128,70 L 128,128 L -20,128 Z"
+        android:valueTo="M -20,-20 L 128,-20 L 128,128 L -20,128 Z" />
 </objectAnimator>

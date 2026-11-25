@@ -397,6 +397,8 @@ public final class ReceiveService extends Service {
             return START_NOT_STICKY;
         }
         up();
+        // STA 共存的会话因子：监听开。射频策略由 RadioSession 按开关与会话状态统一裁决。
+        RadioSession.setListening(this, true);
         // 限时开着的，到点自己收摊：那个期限是我们自己的承诺，不该等某个观察者来兑现。
         long left = remaining(this);
         if (left != 0) {
@@ -422,6 +424,8 @@ public final class ReceiveService extends Service {
         // 第一句就落回去：从这一刻起 8770 正在关，磁贴不该再亮。下面两步都是「还能收到」的
         // 最后一段，而人看见的是磁贴那一格。
         running = false;
+        // STA 共存的会话因子：监听关。若发送页也不在，RadioSession 会恢复 AP 关联。
+        RadioSession.setListening(this, false);
         // 顺序是有讲究的：先叫看护者停手，再关广播，最后把这个进程的前台身份收掉。
         //
         // unwatch 只置一个标志（理由见 StackKeeper#unwatch）：它那条线程除了枚举网卡什么都不做，

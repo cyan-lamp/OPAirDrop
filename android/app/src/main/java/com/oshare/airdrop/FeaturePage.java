@@ -157,11 +157,9 @@ final class FeaturePage {
         // 接收板块已撤：接收开关在首页「接收文件」那一行，设备名在设置页，这里不再重复。
         // 开关板块也撤了：同名文件固定加编号、跟随一加互传随脱离互传一起去掉，没有可拨的开关；
         // 射频这一项是唯一仍要拨的，留在这一页。传输状态也不需要了。
-        body.addView(chrome.sectionTitle("射频"), chrome.margins(6, 0));
-        TextView radioNote = chrome.caption(
-                "共用一根天线：共用时会丢一部分包，丢多少取决于 Wi-Fi 落在哪个信道，回执里的 MHz 就是落点。");
-        radioNote.setPadding(chrome.dp(6), 0, chrome.dp(6), chrome.dp(8));
-        body.addView(radioNote);
+        // STA 共存：这一板块只回答一个问题——会话期间（发送页开着或监听开着）AP 连不连。
+        // Wi-Fi 总开关两种状态都保持开启（2026-11-25 会话制改造后，脚本与守护都不再关它）。
+        body.addView(chrome.sectionTitle("STA 共存"), chrome.margins(6, 0));
         body.addView(radioCard(), chrome.margins(0, 8));
 
         // 接收文件保存位置原先在设置页的「接收」里。那一块撤了，但这一项是唯一还在用的接收设置，
@@ -570,7 +568,7 @@ final class FeaturePage {
         Toggle toggle = toggle(state.want() == RadioShare.Want.SHARE);
         TextView[] sub = new TextView[1];
         LinearLayout row = chrome.featureRow(
-                IconView.NO_ICON, "WiFi 共享射频", state.subtitle(), toggle, sub);
+                IconView.NO_ICON, "保持 WiFi 开启", state.subtitle(), toggle, sub);
         // 说明是一句完整的话，两行放不下：定高会把它裁在卡片下沿上。
         chrome.addWrappingRow(card, row);
         // 这里不挂 pressableRow。理由和「有开关的行不按」是同一条：这一行没有点击动作，唯一
@@ -602,6 +600,9 @@ final class FeaturePage {
                 sub[0].setTextColor(S.red);
                 return;
             }
+            // 会话制：偏好变了就按当前会话状态立即重放（发送页/监听哪个开着，断 AP 或
+            // 恢复都立刻兑现，而不是等下一次页面进出）。
+            RadioSession.onWantChanged(host);
             followAnswer(sub[0], record, 0);
         });
         return card;

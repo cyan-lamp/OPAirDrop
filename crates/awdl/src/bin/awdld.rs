@@ -862,9 +862,13 @@ mod device {
             }
 
             fn svc_arg(self) -> &'static str {
+                // 2026-11-25 会话制改造：「保持 WiFi 开启」——两种状态都不再关 Wi-Fi。
+                // Exclusive 的「断开 AP」由应用侧执行（WifiManager.disableNetwork，
+                // 恢复走 enableNetwork），守护只保证 Wi-Fi 总开关是开的：STA 接口存在，
+                // 应用才有东西可断。
                 match self {
                     Want::Share => "enable",
-                    Want::Exclusive => "disable",
+                    Want::Exclusive => "enable",
                 }
             }
         }
@@ -1096,8 +1100,12 @@ mod device {
             fn probe(&mut self, now: u64, since: u64) {
                 let enabled = wifi_enabled();
                 match self.want {
+                    // 2026-11-25 会话制：独占不再关 Wi-Fi（见 svc_arg），确认条件从
+                    // 「Wi-Fi 已禁用」改成「Wi-Fi 已开启」。AP 的断开/恢复由应用侧的
+                    // WifiManager 负责，守护只保证 STA 接口存在——应用断开 AP 之后
+                    // wlan0 停在 DORMANT（无关联），这属于独占的正常终态。
                     Want::Exclusive => {
-                        if enabled == Some(false) {
+                        if enabled == Some(true) {
                             self.phase = Phase::Settled;
                             self.sta_mhz = None;
                             self.publish();

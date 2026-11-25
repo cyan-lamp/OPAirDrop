@@ -1257,7 +1257,12 @@ choose_radio() {
         case "$wifi_before" in 1) svc wifi enable ;; esac
         wifi_wait "$wifi_before" || say 'Wi-Fi did not come back to the previous state'
     else
-        say 'RADIO_WANT=exclusive the radio stays exclusive; the phone is offline until share or stop'
+        # 2026-11-25 会话制：独占不再关 Wi-Fi（与 awdld 的 svc_arg 同步改）——两种状态
+        # 都保持 Wi-Fi 开启，AP 的断开/恢复由应用的 WifiManager 负责。这里把 Wi-Fi
+        # 打开，让守护与应用有 STA 接口可用；此前这一支什么都不做，Wi-Fi 停在关机前
+        # 的状态（多半是关）。
+        svc wifi enable
+        say 'RADIO_WANT=exclusive Wi-Fi stays ON; the app drops the AP for the session'
     fi
 }
 

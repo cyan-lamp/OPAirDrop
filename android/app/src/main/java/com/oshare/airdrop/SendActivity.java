@@ -362,6 +362,9 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
 
         // 这一页在人眼前的这段时间里，流体云该有（判据见 {@link SendSession}）。
         SendSession.opened();
+        // STA 共存的会话因子：发送页开了。射频策略（共享/独占/恢复）由 RadioSession
+        // 按开关与会话状态统一裁决，页面自己不碰射频。
+        RadioSession.setSendActive(this, true);
         // 告诉卡片由谁画：不 attach 的话 SendHost 没有 Context，begin/progress/finished 全都
         // 悄悄 return——卡片一帧都不会出现，而日志里什么都没有。页面活着它就活着。
         SendHost.attach(this);
@@ -522,6 +525,8 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
      */
     @Override
     protected void onDestroy() {
+        // STA 共存的会话因子：发送页关了。会话是否还剩监听一个因子，由控制器自己判断。
+        RadioSession.setSendActive(this, false);
         SendSession.closed();
         pageGone = true;
         if (phase == SendPhase.IDLE) {

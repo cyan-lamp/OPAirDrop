@@ -16,6 +16,12 @@
          once the screen dims, because the platform treats an app with no multicast lock as
          one that does not need the packets. It is normal-level and needs no prompt. -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- STA 共存的会话制：断开/恢复 AP 用 WifiManager.disableNetwork/enableNetwork，
+         这两个调用都要 CHANGE_WIFI_STATE；读当前关联（netId）需要 ACCESS_WIFI_STATE。
+         缺 ACCESS_WIFI_STATE 时 getConnectionInfo 抛 SecurityException——它跑在
+         RadioSession 的轮询回调里，会变成重启循环。 -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
 
     <!-- 叫醒 iPhone 用的那条 AirDrop 广播。发现**不是**从 mDNS 开始的：iPhone 要先在蓝牙
          上听到一条 AirDrop 广播，才会把 AWDL 上的 AirDrop 服务拉起来。少了这一层，空口上
