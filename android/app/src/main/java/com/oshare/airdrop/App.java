@@ -40,5 +40,8 @@ public final class App extends Application {
         Log.i(TAG, "background running: " + (Notices.awake(this) ? "allowed" : "restricted"));
         // 不传页面：这里没有页面，也不该碰任何一个页面正在用的观察者。
         ReceiveService.follow(this);
+        // 连 LSPosed 框架的服务（异步绑定）：首页环境板块的「LSPosed 框架」行读它的
+        // 版本与作用域。状态缓存在 Lsp 的静态字段里，绑定/掉线时各页自己决定重画。
+        Lsp.connect(this);
     }
 }

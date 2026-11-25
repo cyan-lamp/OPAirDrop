@@ -253,6 +253,10 @@ dependencies {
     // 只有这一条，而且不进包。剩下的都是「框架 Java + Rust 库」：没有 AndroidX、没有 Kotlin、
     // 没有任何需要在运行时解析的东西。
     compileOnly 'io.github.libxposed:api:102.0.0'
+    // LSPosed 的服务接口（首页环境板块读框架版本/查/申请作用域）。普通应用进程里用，
+    // 必须打进 APK——这与上面 compileOnly 的 api 不同：api 由框架在目标进程注入。
+    // service 的 classes.jar 不夹带 api 包的类，二者不会在 dex 里撞名。
+    implementation 'io.github.libxposed:service:102.0.0'
 
     // P1-24：纯逻辑的单测（Addresses/Decision/Explains——三个零 Android 依赖的类）。
     // 只进 test classpath，不进包。

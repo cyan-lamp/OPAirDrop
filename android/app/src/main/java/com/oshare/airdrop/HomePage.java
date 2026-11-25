@@ -176,6 +176,11 @@ final class HomePage {
     private View envCard() {
         LinearLayout card = chrome.rowCard();
 
+        // LSPosed 框架一行：流体云那一刀跑在 SystemUI 进程里，它的作用域勾没勾全直接
+        // 决定卡片听不听话——这是环境的一部分，和 root 排在一起。
+        chrome.addRow(card, lspRow(), chrome.rowHeight());
+        card.addView(chrome.divider(), chrome.insetDivider());
+
         RootInfo.Snapshot root = RootInfo.get();
         String pill;
         int pillColor;
@@ -200,7 +205,8 @@ final class HomePage {
                 IconView.TERMINAL, "root 权限", subtitle, rootPill);
         chrome.addRow(card, rootRow, chrome.rowHeight());
         // 可按压：点一下重新测一次授权（人刚在 KernelSU / Magisk 里点了授权，不必重启应用）。
-        chrome.setRowAction(rootRow, true, Scheme.CORNERS_ALL, () -> {
+        // root 行现在排在 LSPosed 之后，是这张卡的最后一行：按压高亮的圆角跟着换到下面两角。
+        chrome.setRowAction(rootRow, true, Scheme.CORNERS_BOTTOM, () -> {
             chrome.say("正在重新检测 root 权限");
             RootInfo.probe(host, onRootChecked);
         });
@@ -213,10 +219,52 @@ final class HomePage {
     }
 
     /**
+     * LSPosed 框架一行。三态，全部从 {@link Lsp} 的缓存现读：
+     *
+     * <ul>
+     *   <li>框架在且作用域齐全：绿胶囊「已生效」，副标题是框架版本和我们的 API 版本——
+     *       这两样回答「hook 环境是否就绪」，比一句「正常」有用。</li>
+     *   <li>框架在但作用域缺：橙胶囊「作用域未齐」，行可按——走 LSPosed 官方的
+     *       {@code requestScope}，框架自己弹确认框，批下来 scope 事件会重画这一行。</li>
+     *   <li>框架不在/未启用：灰胶囊「未连接」。LSPosed 的服务只对它认得的模块开放，
+     *       连不上就说明框架没装、模块没启用，或者框架还没下发凭据。</li>
+     *   </ul>
+     */
+    private View lspRow() {
+        boolean ready = Lsp.framework() && Lsp.scoped();
+        String pill;
+        int pillColor;
+        String subtitle;
+        if (Lsp.framework()) {
+            if (Lsp.scoped()) {
+                pill = "已生效";
+                pillColor = S.green;
+                subtitle = Lsp.versionLine();
+            } else {
+                pill = "作用域未齐";
+                pillColor = S.orange;
+                subtitle = "点这里向 LSPosed 申请作用域";
+            }
+        } else {
+            pill = "未连接";
+            pillColor = S.gray;
+            subtitle = "未检测到 LSPosed 框架，或模块尚未启用";
+        }
+
+        TextView lspPill = chrome.statusPill(pill, pillColor);
+        LinearLayout row = chrome.featureRow(
+                IconView.CARD, "LSPosed 框架", subtitle, lspPill);
+        if (Lsp.framework() && !Lsp.scoped()) {
+            chrome.setRowAction(row, true, null, Lsp::requestScope);
+        }
+        return row;
+    }
+
+    /**
      * 设备信息六行：型号、版本号、内核、ColorOS、Android、安全补丁。
      *
-     * <p>六行都不可点，但仍然挂着按压高亮（第一行圆上两角、最后一行圆下两角）：这张卡是整页
-     * 最像列表的一块，没有按下反馈的那一行会让人以为界面卡住了。
+     * <p>六行纯展示，不挂按压高亮（2026-11-25 按用户要求去掉）：它们没有点击动作，
+     * 按下去没反应的高亮反而让人以为界面出了错。
      */
     private View devCard() {
         LinearLayout card = chrome.rowCard();
@@ -243,8 +291,6 @@ final class HomePage {
             if (i < titles.length - 1) {
                 card.addView(chrome.divider(), chrome.insetDivider());
             }
-            chrome.pressableRow(row, i == 0 ? Scheme.CORNERS_TOP
-                    : i == titles.length - 1 ? Scheme.CORNERS_BOTTOM : null);
         }
         return card;
     }

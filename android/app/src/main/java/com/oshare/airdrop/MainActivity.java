@@ -180,6 +180,13 @@ public final class MainActivity extends Activity {
         // 评审 P1-16：listener 的状态变化只画在首页——回调走 refreshHome，不把设置页
         // 也重建一遍（那要在 UI 线程读一次盘）。一次接收状态变化的 5+ 次回调全都受益。
         listener = Listener.open(this, () -> runOnUiThread(this::refreshHome));
+        // LSPosed 框架的连接是进程级的（App.onCreate 注册），绑定/作用域变化到这里重画首页：
+        // 「LSPosed 框架」行的三态（已生效/作用域未齐/未连接）全部来自这组回调。
+        Lsp.addListener(() -> runOnUiThread(() -> {
+            if (currentTab == 0) {
+                refreshHome();
+            }
+        }));
         setContentView(buildUi());
         // 深色/浅色切换会让这个 Activity 整个重建（uiMode 不在 configChanges 里，也不该在：
         // 颜色、模糊配方、启动资源全都要跟着换）。不记住停在哪一页，人一换主题就被弹回首页。
