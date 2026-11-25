@@ -405,6 +405,7 @@ public final class FluidModule extends XposedModule {
 
     /** 跳过计数：日志只在第 1 次和此后每 25 次打一条，进度卡每秒刷新好几轮，别刷屏。 */
     private static int sSkipCount;
+    private static int sOtherCount;
 
     private Object skipShrinkTimer(XposedInterface.Chain chain) throws Throwable {
         Object key = chain.getArg(0);
@@ -415,6 +416,22 @@ public final class FluidModule extends XposedModule {
             }
             // 不调 proceed()：这个定时任务根本不排。
             return null;
+        }
+        // 诊断：2026-11-25 现场显示 key 从来判不上（提醒级别打了 30 次、这条一次没有），
+        // 卡 3 秒就缩回。key 只见 过 "capsuleToBubble" 这类动作名——那不是 per-card 的。
+        // 这里把 delay（arg1，「3 秒缩回」应为 3000）和调用栈一起打出来，定位真正的
+        // 排队调用方。栈是混淆后的名字，但调用链结构 + delay 足以对上号。
+        sOtherCount++;
+        if (sOtherCount <= 50) {
+            Object delay = chain.getArg(1);
+            StringBuilder frames = new StringBuilder();
+            StackTraceElement[] stack = new Throwable().getStackTrace();
+            for (int i = 1; i < Math.min(stack.length, 8); i++) {
+                frames.append(stack[i].getClassName()).append('.')
+                        .append(stack[i].getMethodName()).append(" <- ");
+            }
+            log(Log.INFO, TAG, "缩回定时器 #" + sOtherCount + " key=" + key
+                    + " delay=" + delay + " 栈: " + frames);
         }
         return chain.proceed();
     }
