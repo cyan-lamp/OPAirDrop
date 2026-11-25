@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 冷启动 splash 的静态图标（2026-11-26）：只有中心那一点。
+
+     绘制动画不再走系统 splash 的 AVD——这台 ColorOS 上 trim 与揭示的内联动画
+     都不生效（2026-11-25/26 两版实测），alpha 逐段点亮又没有绘制感。最终方案：
+     系统 splash 只显示中心点（这一帧与绘制动画的开场无缝衔接），真正的「两环
+     由下往上绘制」由 SplashOverlay 在主窗口里用 Canvas 自绘（drawArc 的 sweep
+     由 ValueAnimator 驱动，完全可控）。见 SplashOverlay 的类注释。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:pathData="M47.5,54 a6.5,6.5 0 1 0 13,0 a6.5,6.5 0 1 0 -13,0 Z">
+        <aapt:attr name="android:fillColor" xmlns:aapt="http://schemas.android.com/aapt">
+            <gradient
+                android:type="linear"
+                android:startX="30" android:startY="26"
+                android:endX="78" android:endY="82"
+                android:startColor="#FF47A3F8"
+                android:endColor="#FF1B5CF0" />
+        </aapt:attr>
+    </path>
+</vector>

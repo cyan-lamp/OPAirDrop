@@ -188,6 +188,12 @@ public final class MainActivity extends Activity {
             }
         }));
         setContentView(buildUi());
+        // 冷启动的绘制动画（两环由下往上）：只有真冷启动（无保存状态）才放——
+        // 热启动/旋转重建不重播。遮罩自绘自拆（见 SplashOverlay），系统 splash
+        // 只显示中心点，撤掉时遮罩已经接上，点从未消失。
+        if (state == null) {
+            SplashOverlay.attach(this);
+        }
         // 深色/浅色切换会让这个 Activity 整个重建（uiMode 不在 configChanges 里，也不该在：
         // 颜色、模糊配方、启动资源全都要跟着换）。不记住停在哪一页，人一换主题就被弹回首页。
         if (state != null) {

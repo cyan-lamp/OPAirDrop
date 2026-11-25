@@ -1,8 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 深色模式的启动背景：浅色的 #F6F7F9 在夜里刺眼，换成近黑的深蓝灰。
+     遮罩（SplashOverlay）与系统 splash 引用同一资源，两侧自动跟随。 -->
 <resources>
-    <!-- 深色下的图标底与启动底色，和页底同一个数（#1F1F1F）。
-
-         自适应图标和冷启动的 splash 读的是同一个颜色资源，所以这一行同时让两件事跟着深色
-         走：桌面上的图标从浅灰底变成深底，冷启动也不再是「黑屏之后打开一张白纸」。 -->
-    <color name="ic_launcher_background">#1F1F1F</color>
+    <color name="ic_launcher_background">#10151C</color>
 </resources>

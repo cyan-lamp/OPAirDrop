@@ -27,7 +27,7 @@
              a style is selected whole, never merged item by item, so a night style that only
              listed the differing lines would silently drop the rest. -->
         <item name="android:windowSplashScreenBackground">@color/ic_launcher_background</item>
-        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_icon_anim</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_icon_static</item>
         <item name="android:windowSplashScreenAnimationDuration">1000</item>
     </style>
 
