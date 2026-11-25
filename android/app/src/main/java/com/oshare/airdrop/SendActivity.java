@@ -18,9 +18,6 @@ import android.view.ViewGroup;
 import android.view.Window;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
-
-import com.oshare.airdrop.oshare.Engine;
-import com.oshare.airdrop.oshare.OshareBridge;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
@@ -354,17 +351,6 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
     protected void onCreate(Bundle state) {
         super.onCreate(state);
 
-        // 「OPPO互传」体系：分享一律转给一加互传的发送界面，本页面板不出现。
-        // 检测放在面板构建之前——转发成功就 finish，一个 view 都不建；失败（互传不在）
-        // 说明是 false，回落自研，什么都没丢。重试动作不在这条路上：那是自研卡片的产物，
-        // 「OPPO互传」体系下没有自研发送，自然也没有那张卡。
-        if (!ACTION_RETRY.equals(getIntent().getAction())
-                && Engine.isOshare(this)
-                && OshareBridge.forwardShare(this, getIntent())) {
-            finish();
-            return;
-        }
-
         S = schemeOf(getResources().getConfiguration());
         density = getResources().getDisplayMetrics().density;
         PeerNames.load(this);
@@ -417,12 +403,6 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
             if (!SendHost.retry()) {
                 requestFiles();
             }
-            return;
-        }
-        // 「OPPO互传」体系：页面活着时又来一条分享（singleTop 复用本实例），同样转给
-        // 一加互传并退出，别让上一次的面板替新分享接客。
-        if (Engine.isOshare(this) && OshareBridge.forwardShare(this, intent)) {
-            finish();
             return;
         }
         if (!shared(intent)) {
