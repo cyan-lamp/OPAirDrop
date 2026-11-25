@@ -113,7 +113,8 @@ impl Question {
     /// [`TYPE_ANY`] on either side matches everything, which is how an mDNS probe
     /// asks "does anyone own this name at all".
     pub fn matches(&self, other: &str, other_type: u16) -> bool {
-        if other_type != TYPE_ANY && self.record_type != TYPE_ANY && self.record_type != other_type {
+        if other_type != TYPE_ANY && self.record_type != TYPE_ANY && self.record_type != other_type
+        {
             return false;
         }
         same_name(&self.name, other)
@@ -184,7 +185,10 @@ impl<'a> Record<'a> {
         self.require_length(16)?;
         let mut groups = [0u16; 8];
         for (i, group) in groups.iter_mut().enumerate() {
-            *group = u16::from_be_bytes([self.data[self.offset + i * 2], self.data[self.offset + i * 2 + 1]]);
+            *group = u16::from_be_bytes([
+                self.data[self.offset + i * 2],
+                self.data[self.offset + i * 2 + 1],
+            ]);
         }
 
         let mut best_start = None;
@@ -440,7 +444,12 @@ impl Builder {
     }
 
     /// Appends a full SRV record's rdata: priority, weight, port, target.
-    pub fn srv_rdata(priority: u16, weight: u16, port: u16, target: &str) -> Result<Vec<u8>, Error> {
+    pub fn srv_rdata(
+        priority: u16,
+        weight: u16,
+        port: u16,
+        target: &str,
+    ) -> Result<Vec<u8>, Error> {
         let mut rdata = Vec::with_capacity(6 + target.len() + 2);
         rdata.extend_from_slice(&priority.to_be_bytes());
         rdata.extend_from_slice(&weight.to_be_bytes());
@@ -654,10 +663,9 @@ impl Txt {
         }
         match entry.find('=') {
             Some(0) | None => self.pairs.push((entry.into_owned(), String::new())),
-            Some(split) => self.pairs.push((
-                entry[..split].to_string(),
-                entry[split + 1..].to_string(),
-            )),
+            Some(split) => self
+                .pairs
+                .push((entry[..split].to_string(), entry[split + 1..].to_string())),
         }
     }
 
@@ -866,7 +874,10 @@ mod tests {
             ),
             ([0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2], "1::2"),
             // A single zero group is not worth the two bytes `::` costs.
-            ([0, 1, 0, 0, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7], "1:0:2:3:4:5:6:7"),
+            (
+                [0, 1, 0, 0, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7],
+                "1:0:2:3:4:5:6:7",
+            ),
         ];
         for (bytes, expected) in cases {
             assert_eq!(v6_of(&bytes), expected, "for {bytes:02x?}");

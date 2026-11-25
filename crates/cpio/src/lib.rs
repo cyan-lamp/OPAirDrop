@@ -119,10 +119,9 @@ impl fmt::Display for Error {
             Self::ImplausibleNameSize(n) => write!(f, "implausible cpio name size {n}"),
             Self::Truncated => write!(f, "truncated cpio header or name"),
             Self::LostFraming => write!(f, "lost cpio framing: no header within four bytes"),
-            Self::ShortMember { name, got, want } => write!(
-                f,
-                "member {name} ended {got} bytes into a declared {want}"
-            ),
+            Self::ShortMember { name, got, want } => {
+                write!(f, "member {name} ended {got} bytes into a declared {want}")
+            }
         }
     }
 }
@@ -558,13 +557,7 @@ impl<W: Write> Builder<W> {
         Ok(self.out)
     }
 
-    fn write_head(
-        &mut self,
-        name: &str,
-        mode: u32,
-        size: u64,
-        inode: u32,
-    ) -> Result<(), Error> {
+    fn write_head(&mut self, name: &str, mode: u32, size: u64, inode: u32) -> Result<(), Error> {
         let head = head_bytes(
             self.format,
             name,
@@ -607,14 +600,7 @@ pub fn to_vec(entries: &[Entry], format: Format) -> Result<Vec<u8>, Error> {
 /// in six in 1971 and octal sizes stopped fitting well before files did. Truncating
 /// rather than overflowing keeps a header well-formed when a value is out of range,
 /// which is what cpio itself does.
-fn head_bytes(
-    format: Format,
-    name: &str,
-    mode: u32,
-    size: u64,
-    inode: u32,
-    mtime: u64,
-) -> Vec<u8> {
+fn head_bytes(format: Format, name: &str, mode: u32, size: u64, inode: u32, mtime: u64) -> Vec<u8> {
     let name_size = name.len() as u64 + 1;
     let mut head = String::with_capacity(format.header_len());
     match format {
@@ -641,7 +627,11 @@ fn head_bytes(
             head.push_str(&oct_field(mode as u64, 6)); // mode
             head.push_str(&oct_field(0, 6)); // uid
             head.push_str(&oct_field(0, 6)); // gid
-            let nlink = if type_of(mode) == TYPE_DIRECTORY { 2 } else { 1 };
+            let nlink = if type_of(mode) == TYPE_DIRECTORY {
+                2
+            } else {
+                1
+            };
             head.push_str(&oct_field(nlink, 6));
             head.push_str(&oct_field(0, 6)); // rdev
             head.push_str(&oct_field(mtime, 11));
@@ -937,8 +927,7 @@ mod tests {
     #[test]
     fn gzip_wrapper_is_transparent() {
         let plain = to_vec(&sample(), Format::Odc).unwrap();
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&plain).unwrap();
         let gzipped = encoder.finish().unwrap();
         assert_eq!(&gzipped[..2], &[0x1f, 0x8b]);
@@ -1022,10 +1011,7 @@ mod tests {
 
     #[test]
     fn permission_bits_survive_the_round_trip() {
-        let entries = vec![
-            Entry::directory("dir"),
-            Entry::file("dir/f", b"1".to_vec()),
-        ];
+        let entries = vec![Entry::directory("dir"), Entry::file("dir/f", b"1".to_vec())];
         for format in [Format::Newc, Format::Odc] {
             let parsed = read(&to_vec(&entries, format).unwrap()).unwrap();
             assert_eq!(parsed[0].mode, MODE_DIRECTORY);
@@ -1076,7 +1062,11 @@ mod tests {
             "a regular file is 0100644 in octal, not 010644"
         );
         assert_eq!(field(&head, 36, 6), "000001", "nlink of a file");
-        assert_eq!(field(&head, 59, 6), "000014", "namesize of `./probe.txt` + NUL");
+        assert_eq!(
+            field(&head, 59, 6),
+            "000014",
+            "namesize of `./probe.txt` + NUL"
+        );
         assert_eq!(field(&head, 65, 11), "00000000002");
         assert_eq!(size, 2);
     }

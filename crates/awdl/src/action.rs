@@ -23,9 +23,7 @@
 //! not the 802.11 frame control: on the wire every one of these is the same action frame.
 
 use crate::mac::Mac;
-use crate::schedule::{
-    Schedule, AW_PERIOD_TU, PRESENCE_MODE, PSF_INTERVAL_TU, SLOTS, SLOT_TU,
-};
+use crate::schedule::{Schedule, AW_PERIOD_TU, PRESENCE_MODE, PSF_INTERVAL_TU, SLOTS, SLOT_TU};
 
 /// Vendor-specific category, the one Apple uses for AWDL.
 pub const CATEGORY_VENDOR: u8 = 0x7f;
@@ -226,10 +224,10 @@ fn sync_params(
         v.extend_from_slice(&0x1800u16.to_le_bytes()); // flags: reserved
         v.extend_from_slice(&u16::from(AW_PERIOD_TU).to_le_bytes()); // extended AW
         v.extend_from_slice(&u16::from(AW_PERIOD_TU).to_le_bytes()); // common AW
-        // What is left of the AW that `next_tu` lands in. A node announcing
-        // `next_tu = 43` has three AWs of the slot behind it and reports zero.
-        let elapsed = u16::from(AW_PERIOD_TU) * u16::from(PRESENCE_MODE)
-            - u16::from(next_tu.min(SLOT_TU));
+                                                                     // What is left of the AW that `next_tu` lands in. A node announcing
+                                                                     // `next_tu = 43` has three AWs of the slot behind it and reports zero.
+        let elapsed =
+            u16::from(AW_PERIOD_TU) * u16::from(PRESENCE_MODE) - u16::from(next_tu.min(SLOT_TU));
         let remaining = u16::from(AW_PERIOD_TU).saturating_sub(elapsed);
         v.extend_from_slice(&remaining.to_le_bytes());
         // Minimum extended, maximum extended, multicast, and AF: four AWs each.
@@ -528,7 +526,10 @@ pub fn clock_of(frame: &[u8]) -> Option<(u8, u16)> {
     if sync.body.len() < at + 2 {
         return None;
     }
-    Some((next_tu, u16::from_le_bytes([sync.body[at], sync.body[at + 1]])))
+    Some((
+        next_tu,
+        u16::from_le_bytes([sync.body[at], sync.body[at + 1]]),
+    ))
 }
 
 /// The sequence map a presence frame announces: which channel each of the sixteen slots
@@ -620,12 +621,8 @@ pub fn election_of(frame: &[u8]) -> Option<Election> {
         if v2.body.len() >= 24 {
             return Some(Election {
                 master: Mac::from_slice(&v2.body[..6])?,
-                height: u32::from_le_bytes([
-                    v2.body[16],
-                    v2.body[17],
-                    v2.body[18],
-                    v2.body[19],
-                ]) as u8,
+                height: u32::from_le_bytes([v2.body[16], v2.body[17], v2.body[18], v2.body[19]])
+                    as u8,
                 master_metric: u32::from_le_bytes([
                     v2.body[20],
                     v2.body[21],
@@ -643,12 +640,7 @@ pub fn election_of(frame: &[u8]) -> Option<Election> {
     Some(Election {
         master: Mac::from_slice(&v1.body[5..11])?,
         height: v1.body[3],
-        master_metric: u32::from_le_bytes([
-            v1.body[11],
-            v1.body[12],
-            v1.body[13],
-            v1.body[14],
-        ]),
+        master_metric: u32::from_le_bytes([v1.body[11], v1.body[12], v1.body[13], v1.body[14]]),
     })
 }
 
@@ -665,19 +657,21 @@ mod tests {
     }
 
     fn subframe<'a>(frame: &'a [u8], name: &str) -> Option<Tlv<'a>> {
-        tlvs(frame)?.into_iter().find(|t| t.kind == {
-            match name {
-                "sync" => TLV_SYNC_PARAMS,
-                "election1" => TLV_ELECTION_V1,
-                "election2" => TLV_ELECTION_V2,
-                "sequence" => TLV_CHANNEL_SEQUENCE,
-                "service" => TLV_SERVICE_PARAMS,
-                "ht" => TLV_HT_CAPABILITIES,
-                "vht" => TLV_VHT_CAPABILITIES,
-                "arpa" => TLV_ARPA,
-                "path" => TLV_DATA_PATH_STATE,
-                "version" => TLV_VERSION,
-                _ => unreachable!(),
+        tlvs(frame)?.into_iter().find(|t| {
+            t.kind == {
+                match name {
+                    "sync" => TLV_SYNC_PARAMS,
+                    "election1" => TLV_ELECTION_V1,
+                    "election2" => TLV_ELECTION_V2,
+                    "sequence" => TLV_CHANNEL_SEQUENCE,
+                    "service" => TLV_SERVICE_PARAMS,
+                    "ht" => TLV_HT_CAPABILITIES,
+                    "vht" => TLV_VHT_CAPABILITIES,
+                    "arpa" => TLV_ARPA,
+                    "path" => TLV_DATA_PATH_STATE,
+                    "version" => TLV_VERSION,
+                    _ => unreachable!(),
+                }
             }
         })
     }
@@ -687,7 +681,11 @@ mod tests {
         let s = Schedule::anchored(1_000_000, 149);
         let frame = presence(&node(), &s, 1_000_000, 5, false, 36);
         let o = 9;
-        assert_eq!(u16::from_le_bytes([frame[o], frame[o + 1]]), 0x00d0, "action");
+        assert_eq!(
+            u16::from_le_bytes([frame[o], frame[o + 1]]),
+            0x00d0,
+            "action"
+        );
         assert_eq!(&frame[o + 4..o + 10], Mac::BROADCAST.as_slice());
         assert_eq!(&frame[o + 10..o + 16], node().addr.as_slice());
         assert_eq!(&frame[o + 16..o + 22], Mac::AWDL_BSSID.as_slice());
@@ -793,7 +791,11 @@ mod tests {
         assert_eq!(&tlv.body[4..6], &[0xff, 0xff], "fill channel");
         for slot in 0..SLOTS {
             assert_eq!(tlv.body[6 + slot * 2], 149);
-            assert_eq!(tlv.body[7 + slot * 2], 0x80, "channel 149's operating class");
+            assert_eq!(
+                tlv.body[7 + slot * 2],
+                0x80,
+                "channel 149's operating class"
+            );
         }
     }
 
@@ -890,7 +892,10 @@ mod tests {
         let s = Schedule::anchored(0, 149);
         let frame = presence(&node(), &s, 0, 1, false, 36);
         let v1 = subframe(&frame, "election1").expect("v1");
-        assert_eq!(v1.body[3], 0, "height at offset 3, past the flags and the id");
+        assert_eq!(
+            v1.body[3], 0,
+            "height at offset 3, past the flags and the id"
+        );
         assert_eq!(&v1.body[5..11], node().addr.as_slice(), "master at 5");
         assert_eq!(
             u32::from_le_bytes([v1.body[11], v1.body[12], v1.body[13], v1.body[14]]),
@@ -927,7 +932,10 @@ mod tests {
         assert_eq!(me.master, root);
         assert_eq!(me.height, 1);
         assert_eq!(me.master_metric, 1280);
-        assert_eq!(me.master_channel, 149, "the radio does not move with the election");
+        assert_eq!(
+            me.master_channel, 149,
+            "the radio does not move with the election"
+        );
     }
 
     #[test]
@@ -955,7 +963,10 @@ mod tests {
             master_metric: INIT_METRIC,
             height: 0,
         };
-        assert!(me.outranks(&same_metric_shallower), "height 0 ties height 0");
+        assert!(
+            me.outranks(&same_metric_shallower),
+            "height 0 ties height 0"
+        );
 
         let same_metric_deeper = Election {
             master: me.addr,

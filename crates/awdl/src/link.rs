@@ -373,7 +373,6 @@ fn copies_for(packet_len: usize, burst: u8) -> u8 {
     }
 }
 
-
 /// A packet waiting for the slot phases that may carry it.
 struct Pending {
     /// The IPv6 packet, still unwrapped.
@@ -1007,8 +1006,11 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
 
         if let Some(theirs) = action::election_of(frame) {
             if !self.node.outranks(&theirs) {
-                self.node
-                    .follow(theirs.master, theirs.height.saturating_add(1), theirs.master_metric);
+                self.node.follow(
+                    theirs.master,
+                    theirs.height.saturating_add(1),
+                    theirs.master_metric,
+                );
             }
         }
 
@@ -1125,8 +1127,7 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
             self.last_presence_us = Some(now_us);
             // Half a slot past the boundary this PSF just named.
             let to_boundary = u64::from(SLOT_TU - self.schedule.next_slot_tu(now_us));
-            let scheduled =
-                now_us + to_boundary * TU_US + u64::from(SLOT_TU) * TU_US / 2;
+            let scheduled = now_us + to_boundary * TU_US + u64::from(SLOT_TU) * TU_US / 2;
             self.next_mif_us = Some(match pending_mif {
                 Some(due) if due < scheduled => due,
                 _ => scheduled,
@@ -1346,12 +1347,18 @@ mod tests {
         let in_the_gap = ANCHOR_US + 4 * SLOT_US + 30 * TU_US;
         assert!(!l.schedule().owns_now(in_the_gap));
         assert_eq!(l.flush(in_the_gap), 0);
-        assert!(l.radio.outbound.is_empty(), "nothing leaves into a vacant slot");
+        assert!(
+            l.radio.outbound.is_empty(),
+            "nothing leaves into a vacant slot"
+        );
         let wait = l.send_due_in(in_the_gap);
         // Across the gap to slot 8's boundary, plus the guard the frame has to keep from
         // it: three slots and a guard, not one boundary.
         assert_eq!(wait, SLOT_US - 30 * TU_US + 3 * SLOT_US + 3 * TU_US);
-        assert!(l.schedule().owns_now(in_the_gap + wait), "the wait ends in slot 8");
+        assert!(
+            l.schedule().owns_now(in_the_gap + wait),
+            "the wait ends in slot 8"
+        );
 
         // And a slot the peer is on this channel for takes the frame.
         let in_our_slot = ANCHOR_US + SLOT_US + 30 * TU_US;
@@ -1380,8 +1387,15 @@ mod tests {
         assert!(l.up(&mut buf, ANCHOR_US).expect("up"));
 
         let in_the_gap = ANCHOR_US + 5 * SLOT_US + 30 * TU_US;
-        assert!(!l.schedule().owns_now(in_the_gap), "slot 5 is the peer's channel 6");
-        assert_eq!(l.flush(in_the_gap), 0, "no payload heard yet, so the map rules");
+        assert!(
+            !l.schedule().owns_now(in_the_gap),
+            "slot 5 is the peer's channel 6"
+        );
+        assert_eq!(
+            l.flush(in_the_gap),
+            0,
+            "no payload heard yet, so the map rules"
+        );
         assert_eq!(l.stats.tx_live, 0);
         // And the loop would have slept until slot 9: four slots and a guard away.
         assert!(l.send_due_in(in_the_gap) > 3 * SLOT_US);
@@ -1393,7 +1407,10 @@ mod tests {
 
         let after = in_the_gap + 1_000 + TU_US;
         assert_eq!(l.flush(after), 1, "the ack goes out four slots early");
-        assert_eq!(l.stats.tx_live, 1, "and the counter says which gate opened it");
+        assert_eq!(
+            l.stats.tx_live, 1,
+            "and the counter says which gate opened it"
+        );
         // The wait is still charged from when the packet was queued, which here was four
         // slots before the evidence arrived — so it lands in the over-16-ms bucket even
         // though the frame left at the first instant the override allowed. That is the
@@ -1402,7 +1419,10 @@ mod tests {
         // of the sequence. `live` is what says the path was taken; `wait` is what says how
         // long the packet had already been sitting.
         assert_eq!(l.stats.tx_wait_n, 1);
-        assert_eq!(l.stats.tx_wait_buckets[6], 1, "queued long before the payload");
+        assert_eq!(
+            l.stats.tx_wait_buckets[6], 1,
+            "queued long before the payload"
+        );
         assert_eq!(l.stats.tx_wait_max_us, after - ANCHOR_US);
     }
 
@@ -1426,7 +1446,8 @@ mod tests {
 
         let heard_at = ANCHOR_US + 5 * SLOT_US + 30 * TU_US;
         let payload = ipv6_to(&node().addr.link_local(), 64);
-        l.radio.inbound
+        l.radio
+            .inbound
             .push(frame::data_frame(peer(), node().addr, 7, 7, &payload, 36));
         assert!(l.down(&mut buf, heard_at).expect("down"));
 
@@ -1464,14 +1485,9 @@ mod tests {
         // A channel-6 slot, so the peer's map says no — and payload arrives one TU in.
         let in_the_gap = ANCHOR_US + 5 * SLOT_US;
         let payload = ipv6_to(&node().addr.link_local(), 64);
-        l.radio.inbound.push(frame::data_frame(
-            peer(),
-            node().addr,
-            7,
-            7,
-            &payload,
-            36,
-        ));
+        l.radio
+            .inbound
+            .push(frame::data_frame(peer(), node().addr, 7, 7, &payload, 36));
         assert!(l.down(&mut buf, in_the_gap + 1_000).expect("down"));
 
         assert_eq!(
@@ -1501,14 +1517,22 @@ mod tests {
         l.radio.inbound.push(frame.clone());
         let mut buf = [0u8; 4096];
         let _ = l.down(&mut buf, ANCHOR_US + 30 * TU_US);
-        assert_eq!(l.schedule().peer_map(), None, "one frame is a reading, not a map");
+        assert_eq!(
+            l.schedule().peer_map(),
+            None,
+            "one frame is a reading, not a map"
+        );
         assert!(l.schedule().owns_now(ANCHOR_US + 4 * SLOT_US + 30 * TU_US));
 
         for step in 1..3u64 {
             l.radio.inbound.push(frame.clone());
             let _ = l.down(&mut buf, ANCHOR_US + step * 200_000 + 30 * TU_US);
         }
-        assert_eq!(l.schedule().peer_map(), Some(&map), "the peer's map, slot for slot");
+        assert_eq!(
+            l.schedule().peer_map(),
+            Some(&map),
+            "the peer's map, slot for slot"
+        );
         assert_eq!(l.stats.maps_adopted, 1);
         assert_eq!(
             l.schedule().slots(),
@@ -1556,7 +1580,10 @@ mod tests {
         let _ = l.down(&mut buf, ANCHOR_US);
         assert_eq!(l.phy_mhz(), Some(5745));
         assert_eq!(l.phy_channel(), Some(149));
-        assert!(!l.off_channel(), "5745 is channel 149, which is what we announce");
+        assert!(
+            !l.off_channel(),
+            "5745 is channel 149, which is what we announce"
+        );
 
         // The same node, a frame that arrived on 5220: the radio is on 44 and the
         // announcement is a fiction. This is the state the device was actually in for a
@@ -1574,7 +1601,11 @@ mod tests {
         echo.resize(64, 0);
         l.radio.inbound.push(echo);
         let _ = l.down(&mut buf, ANCHOR_US + 400_000);
-        assert_eq!(l.phy_channel(), Some(44), "unchanged by a header with no frequency");
+        assert_eq!(
+            l.phy_channel(),
+            Some(44),
+            "unchanged by a header with no frequency"
+        );
     }
 
     #[test]
@@ -1610,7 +1641,11 @@ mod tests {
 
         let sent = &l.radio.outbound[0];
         match frame::parse(sent) {
-            Some(Inbound::Ipv6 { src, dst, packet: got }) => {
+            Some(Inbound::Ipv6 {
+                src,
+                dst,
+                packet: got,
+            }) => {
                 assert_eq!(src, node().addr);
                 assert_eq!(dst, peer());
                 assert_eq!(got, &packet[..]);
@@ -1757,12 +1792,19 @@ mod tests {
         // queue was deep. On a transfer the queue is nothing but acknowledgements, and the
         // peer measures its round trip by when one comes back: forty-eight milliseconds of
         // that was `tx=23171p/76575f` in five seconds and `rx` that never passed 200 KB/s.
-        assert_eq!(l.flush(guard_edge_us()), 2, "both first copies, in one window");
+        assert_eq!(
+            l.flush(guard_edge_us()),
+            2,
+            "both first copies, in one window"
+        );
         assert_eq!(l.stats.tx_packets, 2);
 
         // And the two packets waiting on their second copies are still exactly one window
         // away, so nothing was sent early to get that second frame out.
-        assert_eq!(l.send_due_in(guard_edge_us() + 1000), u64::from(AW_PERIOD_TU) * TU_US - 1000);
+        assert_eq!(
+            l.send_due_in(guard_edge_us() + 1000),
+            u64::from(AW_PERIOD_TU) * TU_US - 1000
+        );
     }
 
     #[test]
@@ -1779,7 +1821,11 @@ mod tests {
         // been heard. Nothing is asked about the rest of the burst before the first one.
         let late = ANCHOR_US + 40 * TU_US;
         assert!(l.schedule().owns_now(late));
-        assert_eq!(l.flush(late), 1, "the first copy, without asking about the rest");
+        assert_eq!(
+            l.flush(late),
+            1,
+            "the first copy, without asking about the rest"
+        );
         assert_eq!(l.radio.outbound.len(), 1);
         assert_eq!(l.stats.tx_packets, 1);
 
@@ -1965,14 +2011,9 @@ mod tests {
     fn a_frame_from_the_peer_reaches_the_tunnel() {
         let mut l = link();
         let packet = ipv6_to(&node().addr.link_local(), 12);
-        l.radio.inbound.push(frame::data_frame(
-            peer(),
-            node().addr,
-            1,
-            1,
-            &packet,
-            36,
-        ));
+        l.radio
+            .inbound
+            .push(frame::data_frame(peer(), node().addr, 1, 1, &packet, 36));
         let mut buf = [0u8; 2048];
         assert!(l.down(&mut buf, 2_000_000).expect("down"));
         assert_eq!(l.tunnel.outbound[0], packet);
@@ -1988,7 +2029,8 @@ mod tests {
         group[1] = 0x02;
         group[15] = 0xfb;
         let packet = ipv6_to(&group, 20);
-        l.radio.inbound
+        l.radio
+            .inbound
             .push(frame::data_frame(peer(), Mac::MDNS_V6, 1, 1, &packet, 36));
         let mut buf = [0u8; 2048];
         assert!(l.down(&mut buf, 2_000_000).expect("down"));
@@ -1999,14 +2041,9 @@ mod tests {
     fn an_echo_of_our_own_frame_never_returns_to_the_kernel() {
         let mut l = link();
         let packet = ipv6_to(&peer().link_local(), 8);
-        l.radio.inbound.push(frame::data_frame(
-            node().addr,
-            peer(),
-            1,
-            1,
-            &packet,
-            36,
-        ));
+        l.radio
+            .inbound
+            .push(frame::data_frame(node().addr, peer(), 1, 1, &packet, 36));
         let mut buf = [0u8; 2048];
         assert!(!l.down(&mut buf, 2_000_000).expect("down"));
         assert!(l.tunnel.outbound.is_empty());
@@ -2018,7 +2055,8 @@ mod tests {
         let mut l = link();
         let other = Mac::parse("02:00:00:00:00:01").expect("valid");
         let packet = ipv6_to(&other.link_local(), 8);
-        l.radio.inbound
+        l.radio
+            .inbound
             .push(frame::data_frame(peer(), other, 1, 1, &packet, 36));
         let mut buf = [0u8; 2048];
         assert!(!l.down(&mut buf, 2_000_000).expect("down"));
@@ -2221,7 +2259,11 @@ mod tests {
             let expected = u64::from(i == ANCHOR_REJECT_LIMIT);
             assert_eq!(l.stats().anchored, expected, "after {} frames", i + 1);
         }
-        assert_eq!(l.schedule().next_slot_tu(at), last, "believed on the last one");
+        assert_eq!(
+            l.schedule().next_slot_tu(at),
+            last,
+            "believed on the last one"
+        );
     }
 
     #[test]
@@ -2232,7 +2274,10 @@ mod tests {
         assert!(!l.announce(t0 + 1000).expect("too soon"));
         let due = u64::from(PSF_INTERVAL_TU) * TU_US;
         assert!(l.announce(t0 + due).expect("due"));
-        assert_eq!(l.stats.mif, 1, "its mid-slot MIF had come due in the same call");
+        assert_eq!(
+            l.stats.mif, 1,
+            "its mid-slot MIF had come due in the same call"
+        );
         let psfs = l
             .radio
             .outbound
@@ -2281,7 +2326,11 @@ mod tests {
         assert_eq!(l.presence_due_in(t0), 0, "nothing sent yet");
         l.announce(t0).expect("first");
         let slot = u64::from(SLOT_TU) * TU_US;
-        assert_eq!(l.presence_due_in(t0), slot / 2, "the mid-slot MIF comes first");
+        assert_eq!(
+            l.presence_due_in(t0),
+            slot / 2,
+            "the mid-slot MIF comes first"
+        );
         assert_eq!(l.presence_due_in(t0 + 1000), slot / 2 - 1000);
         assert_eq!(l.presence_due_in(t0 + slot * 8), 0, "saturates");
     }

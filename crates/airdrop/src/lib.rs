@@ -179,9 +179,13 @@ pub const MEDIA_CAPABILITIES: &str = concat!(
 pub fn is_archive_type(content_type: &str) -> bool {
     // "contains" and not "equals": senders append parameters, and at least one has sent
     // a doubled type. Comparing the whole value would reject both.
-    ["application/x-dvzip", "application/x-cpio", "application/octet-stream"]
-        .iter()
-        .any(|declared| opairdrop_http::contains_token(content_type, declared))
+    [
+        "application/x-dvzip",
+        "application/x-cpio",
+        "application/octet-stream",
+    ]
+    .iter()
+    .any(|declared| opairdrop_http::contains_token(content_type, declared))
 }
 
 /// A transfer identifier.
@@ -380,7 +384,10 @@ mod tests {
                 (false, b']') => brackets -= 1,
                 _ => {}
             }
-            assert!(depth >= 0 && brackets >= 0, "a closing bracket arrives too early");
+            assert!(
+                depth >= 0 && brackets >= 0,
+                "a closing bracket arrives too early"
+            );
         }
         assert_eq!(depth, 0, "the object is not closed");
         assert_eq!(brackets, 0, "the array is not closed");

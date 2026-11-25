@@ -85,7 +85,12 @@ pub unsafe extern "C" fn opairdrop_mdns_query(report: *mut OpairdropBuffer) -> i
         }
         Err(error) => {
             // SAFETY: as above.
-            unsafe { fill(report, format!("the query could not be built: {error}").into_bytes()) };
+            unsafe {
+                fill(
+                    report,
+                    format!("the query could not be built: {error}").into_bytes(),
+                )
+            };
             status::TRANSPORT
         }
     }
@@ -148,7 +153,14 @@ pub unsafe extern "C" fn opairdrop_mdns_records(
                 };
                 push(
                     &mut lines,
-                    &["addr", &record.name, &format!("{}.{}.{}.{}", address[0], address[1], address[2], address[3])],
+                    &[
+                        "addr",
+                        &record.name,
+                        &format!(
+                            "{}.{}.{}.{}",
+                            address[0], address[1], address[2], address[3]
+                        ),
+                    ],
                 );
             }
             TYPE_AAAA => {
@@ -250,9 +262,18 @@ mod tests {
             .build();
 
         let text = records(&packet);
-        assert!(text.contains("srv\tAda._airdrop._tcp.local\tadas-iphone.local\t8770\n"), "{text}");
-        assert!(text.contains("addr\tadas-iphone.local\t192.168.1.5\n"), "{text}");
-        assert!(text.contains("txt\tAda._airdrop._tcp.local\tmodel\tiPhone14,3\n"), "{text}");
+        assert!(
+            text.contains("srv\tAda._airdrop._tcp.local\tadas-iphone.local\t8770\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("addr\tadas-iphone.local\t192.168.1.5\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("txt\tAda._airdrop._tcp.local\tmodel\tiPhone14,3\n"),
+            "{text}"
+        );
     }
 
     /// The fingerprint key is `h`, and that is the whole point of this test.
@@ -264,17 +285,19 @@ mod tests {
     /// error; it returns nothing, forever.
     #[test]
     fn the_fingerprint_is_reported_under_the_name_peers_actually_send() {
-        const HASH: &str =
-            "3F2A9C1D4B6E8F0A2C4E6F8A0B1D3F5A7C9E1B3D5F7A9C1E3B5D7F9A1C3E5B7D";
-        let txt = Builder::txt_rdata(&[("model", "iPhone14,3"), ("h", HASH), ("flags", "2")])
-            .unwrap();
+        const HASH: &str = "3F2A9C1D4B6E8F0A2C4E6F8A0B1D3F5A7C9E1B3D5F7A9C1E3B5D7F9A1C3E5B7D";
+        let txt =
+            Builder::txt_rdata(&[("model", "iPhone14,3"), ("h", HASH), ("flags", "2")]).unwrap();
         let packet = Builder::response()
             .answer("Ada._airdrop._tcp.local", TYPE_TXT, 120, &txt)
             .unwrap()
             .build();
 
         let text = records(&packet);
-        assert!(text.contains(&format!("txt\tAda._airdrop._tcp.local\th\t{HASH}\n")), "{text}");
+        assert!(
+            text.contains(&format!("txt\tAda._airdrop._tcp.local\th\t{HASH}\n")),
+            "{text}"
+        );
         // And the made-up name stays unreported: nothing should start reading it again.
         assert!(!text.contains("phash"), "{text}");
     }
@@ -283,8 +306,8 @@ mod tests {
     /// never has to decide what an unknown key means.
     #[test]
     fn a_txt_key_nobody_reads_is_not_reported() {
-        let txt = Builder::txt_rdata(&[("model", "iPhone14,3"), ("pk", "0123456789abcdef")])
-            .unwrap();
+        let txt =
+            Builder::txt_rdata(&[("model", "iPhone14,3"), ("pk", "0123456789abcdef")]).unwrap();
         let packet = Builder::response()
             .answer("Ada._airdrop._tcp.local", TYPE_TXT, 120, &txt)
             .unwrap()

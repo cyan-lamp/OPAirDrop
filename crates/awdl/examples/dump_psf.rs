@@ -37,6 +37,12 @@ fn main() {
 fn printable(bytes: &[u8]) -> String {
     bytes
         .iter()
-        .map(|&b| if (32..127).contains(&b) { b as char } else { '.' })
+        .map(|&b| {
+            if (32..127).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
         .collect()
 }

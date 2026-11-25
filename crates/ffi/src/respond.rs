@@ -370,7 +370,10 @@ pub unsafe extern "C" fn opairdrop_mdns_announce(
         (Ok(instance), Ok(host), Ok(txt), Ok(addresses)) => {
             (instance, host, txt_pairs(txt), addresses)
         }
-        (Err(message), ..) | (_, Err(message), ..) | (_, _, Err(message), _) | (_, _, _, Err(message)) => {
+        (Err(message), ..)
+        | (_, Err(message), ..)
+        | (_, _, Err(message), _)
+        | (_, _, _, Err(message)) => {
             // SAFETY: `report` is non-null and zeroed, per the contract.
             unsafe { fill(report, message.into_bytes()) };
             return status::TRANSPORT;
@@ -395,7 +398,12 @@ pub unsafe extern "C" fn opairdrop_mdns_announce(
         }
         Err(error) => {
             // SAFETY: as above.
-            unsafe { fill(report, format!("the announcement could not be built: {error}").into_bytes()) };
+            unsafe {
+                fill(
+                    report,
+                    format!("the announcement could not be built: {error}").into_bytes(),
+                )
+            };
             status::TRANSPORT
         }
     }
@@ -451,7 +459,10 @@ pub unsafe extern "C" fn opairdrop_mdns_reply(
         (Ok(instance), Ok(host), Ok(txt), Ok(addresses)) => {
             (instance, host, txt_pairs(txt), addresses)
         }
-        (Err(message), ..) | (_, Err(message), ..) | (_, _, Err(message), _) | (_, _, _, Err(message)) => {
+        (Err(message), ..)
+        | (_, Err(message), ..)
+        | (_, _, Err(message), _)
+        | (_, _, _, Err(message)) => {
             // SAFETY: `report` is non-null and zeroed, per the contract.
             unsafe { fill(report, message.into_bytes()) };
             return status::TRANSPORT;
@@ -554,7 +565,10 @@ mod tests {
         assert_eq!(records[1].priority().unwrap(), 0);
         assert_eq!(records[2].txt().unwrap().get("h"), "AB12");
         assert_eq!(records[2].txt().unwrap().get("flags"), "1078");
-        assert_eq!(records[3].address_v6().unwrap(), "fe80::6410:37ff:fe63:44fb");
+        assert_eq!(
+            records[3].address_v6().unwrap(),
+            "fe80::6410:37ff:fe63:44fb"
+        );
     }
 
     #[test]
@@ -607,7 +621,8 @@ mod tests {
 
     #[test]
     fn zero_ttl_is_the_withdrawal_and_reaches_the_wire_as_zero() {
-        let packet = announce(INSTANCE, HOST, PORT, &txt(), &addresses(), 0, RECORD_ALL, 0).unwrap();
+        let packet =
+            announce(INSTANCE, HOST, PORT, &txt(), &addresses(), 0, RECORD_ALL, 0).unwrap();
         let message = Message::parse(&packet).unwrap();
         for record in message.records() {
             assert_eq!(record.ttl, 0, "{} was not withdrawn", record.name);

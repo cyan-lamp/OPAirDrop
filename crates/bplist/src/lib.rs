@@ -139,9 +139,7 @@ impl Value {
     }
 
     pub fn get_array(&self, key: &str) -> &[Value] {
-        self.get(key)
-            .and_then(Value::as_array)
-            .unwrap_or(&[])
+        self.get(key).and_then(Value::as_array).unwrap_or(&[])
     }
 
     pub fn get_i64(&self, key: &str, fallback: i64) -> i64 {
@@ -275,12 +273,9 @@ impl<'a> Reader<'a> {
             }
         }
 
-        let count = read_unsigned(data, trailer + 8, 8)
-            .ok_or(Error::Truncated)?;
-        let top = read_unsigned(data, trailer + 16, 8)
-            .ok_or(Error::Truncated)?;
-        let table = read_unsigned(data, trailer + 24, 8)
-            .ok_or(Error::Truncated)? as usize;
+        let count = read_unsigned(data, trailer + 8, 8).ok_or(Error::Truncated)?;
+        let top = read_unsigned(data, trailer + 16, 8).ok_or(Error::Truncated)?;
+        let table = read_unsigned(data, trailer + 24, 8).ok_or(Error::Truncated)? as usize;
 
         if count == 0 || count > MAX_OBJECTS {
             return Err(Error::BadCount(count));
@@ -292,14 +287,19 @@ impl<'a> Reader<'a> {
         // 在 usize 上会回绕（评审 P0-2：`table = u64::MAX, count = 1, width = 8`
         // 时 release 下 `table + 8` 回绕成 7，旧检查放行，随后越界 panic）。
         let table_end = table
-            .checked_add((count as usize).checked_mul(offset_width).ok_or(Error::BadOffsetTable)?)
+            .checked_add(
+                (count as usize)
+                    .checked_mul(offset_width)
+                    .ok_or(Error::BadOffsetTable)?,
+            )
             .ok_or(Error::BadOffsetTable)?;
         if table < MAGIC.len() || table_end > trailer {
             return Err(Error::BadOffsetTable);
         }
 
         // 容量按表的真实跨度钳制，不按对端声称的 count 预分配。
-        let mut offsets = Vec::with_capacity(((trailer - table) / offset_width).min(count as usize));
+        let mut offsets =
+            Vec::with_capacity(((trailer - table) / offset_width).min(count as usize));
         for i in 0..count as usize {
             let offset = read_unsigned(data, table + i * offset_width, offset_width)
                 .ok_or(Error::BadObjectOffset(i as u32))? as usize;
@@ -368,14 +368,15 @@ impl<'a> Reader<'a> {
                 } else {
                     (offset + 1, width)
                 };
-                Value::Integer(read_unsigned(self.data, start, take)
-                    .ok_or(Error::Truncated)? as i64)
+                Value::Integer(
+                    read_unsigned(self.data, start, take).ok_or(Error::Truncated)? as i64,
+                )
             }
             0x2 => match info {
                 0x2 => {
                     self.need(offset + 1, 4)?;
-                    let bits = read_unsigned(self.data, offset + 1, 4)
-                        .ok_or(Error::Truncated)? as u32;
+                    let bits =
+                        read_unsigned(self.data, offset + 1, 4).ok_or(Error::Truncated)? as u32;
                     Value::Real(f32::from_bits(bits) as f64)
                 }
                 0x3 => {
@@ -405,7 +406,12 @@ impl<'a> Reader<'a> {
                 let (start, count) = self.length(offset, info)?;
                 self.need(start, count)?;
                 // ISO-8859-1 is byte-for-byte Latin-1, so each byte is a char.
-                Value::String(self.data[start..start + count].iter().map(|&b| b as char).collect())
+                Value::String(
+                    self.data[start..start + count]
+                        .iter()
+                        .map(|&b| b as char)
+                        .collect(),
+                )
             }
             0x6 => {
                 let (start, count) = self.length(offset, info)?;
@@ -418,13 +424,16 @@ impl<'a> Reader<'a> {
             0x7 => {
                 let (start, count) = self.length(offset, info)?;
                 self.need(start, count)?;
-                Value::String(String::from_utf8_lossy(&self.data[start..start + count]).into_owned())
+                Value::String(
+                    String::from_utf8_lossy(&self.data[start..start + count]).into_owned(),
+                )
             }
             0x8 => {
                 let width = info + 1;
                 self.need(offset + 1, width)?;
-                Value::Integer(read_unsigned(self.data, offset + 1, width)
-                    .ok_or(Error::Truncated)? as i64)
+                Value::Integer(
+                    read_unsigned(self.data, offset + 1, width).ok_or(Error::Truncated)? as i64,
+                )
             }
             0xa | 0xc => {
                 let (start, count) = self.length(offset, info)?;
@@ -434,8 +443,9 @@ impl<'a> Reader<'a> {
                 self.need(start, count * self.ref_size)?;
                 let mut items = Vec::with_capacity(count);
                 for i in 0..count {
-                    let reference = read_unsigned(self.data, start + i * self.ref_size, self.ref_size)
-                        .ok_or(Error::Truncated)? as u32;
+                    let reference =
+                        read_unsigned(self.data, start + i * self.ref_size, self.ref_size)
+                            .ok_or(Error::Truncated)? as u32;
                     items.push(self.object(reference, depth + 1)?);
                 }
                 Value::Array(items)
@@ -852,7 +862,10 @@ mod tests {
     fn parses_a_hand_built_empty_dictionary() {
         // The smallest legal payload: one 0xd0 object and a trailer that names
         // both widths as one byte.
-        assert_eq!(parse(&hand_built(&[&[0xd0]], 0)).unwrap(), Value::Dict(Vec::new()));
+        assert_eq!(
+            parse(&hand_built(&[&[0xd0]], 0)).unwrap(),
+            Value::Dict(Vec::new())
+        );
     }
 
     #[test]
@@ -988,7 +1001,7 @@ mod tests {
         let mut bytes = MAGIC.to_vec();
         bytes.extend_from_slice(&[0x6f, 0x13]); // extended-length marker, width 8
         bytes.extend_from_slice(&0x8000_0000_0000_0000u64.to_be_bytes()); // count = 2^63
-        // offset 表单独放（表里存的是"对象的偏移"，不是对象本身）：
+                                                                          // offset 表单独放（表里存的是"对象的偏移"，不是对象本身）：
         bytes.push(8); // 表只有一项，值 8 = 对象起点
         let table = bytes.len() as u64 - 1;
         // trailer: 6 个保留字节 + offset_width(1) + ref_width(1) + count(8) + top(8) + table(8)

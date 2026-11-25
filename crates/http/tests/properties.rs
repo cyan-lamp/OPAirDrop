@@ -6,12 +6,7 @@ use opairdrop_http::Request;
 use proptest::prelude::*;
 
 /// 生成一条合法请求头：方法/路径/版本/若干头。
-fn head(
-    method: &str,
-    path: &str,
-    headers: &[(String, String)],
-    body_len: usize,
-) -> String {
+fn head(method: &str, path: &str, headers: &[(String, String)], body_len: usize) -> String {
     let mut raw = format!("{method} {path} HTTP/1.1\r\n");
     for (name, value) in headers {
         raw.push_str(&format!("{name}: {value}\r\n"));

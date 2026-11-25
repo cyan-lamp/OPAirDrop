@@ -349,7 +349,11 @@ mod tests {
         assert_eq!(rt[0], 0, "version");
         assert_eq!(rt[1], 0, "pad");
         assert_eq!(u16::from_le_bytes([rt[2], rt[3]]), 9, "length");
-        assert_eq!(u32::from_le_bytes([rt[4], rt[5], rt[6], rt[7]]), 4, "rate present");
+        assert_eq!(
+            u32::from_le_bytes([rt[4], rt[5], rt[6], rt[7]]),
+            4,
+            "rate present"
+        );
         assert_eq!(rt[8], 72, "36 Mb/s in 500 kb/s units");
     }
 
@@ -361,7 +365,11 @@ mod tests {
         let frame = data_frame(src, dst, 7, 21, &packet, 36);
 
         assert_eq!(&frame[..9], &radiotap(36));
-        assert_eq!(u16::from_le_bytes([frame[9], frame[10]]), 0x0088, "QoS data");
+        assert_eq!(
+            u16::from_le_bytes([frame[9], frame[10]]),
+            0x0088,
+            "QoS data"
+        );
         assert_eq!(&frame[13..19], dst.as_slice(), "address 1 is the receiver");
         assert_eq!(&frame[19..25], src.as_slice(), "address 2 is us");
         assert_eq!(&frame[25..31], Mac::AWDL_BSSID.as_slice(), "address 3");
@@ -372,7 +380,11 @@ mod tests {
         );
         assert_eq!(&frame[33..35], &[0, 0], "QoS control");
         assert_eq!(&frame[35..43], &LLC_SNAP);
-        assert_eq!(u16::from_le_bytes([frame[43], frame[44]]), 0x0403, "data head");
+        assert_eq!(
+            u16::from_le_bytes([frame[43], frame[44]]),
+            0x0403,
+            "data head"
+        );
         assert_eq!(u16::from_le_bytes([frame[45], frame[46]]), 21, "awdl seq");
         assert_eq!(&frame[47..49], &[0, 0], "reserved");
         assert_eq!(&frame[49..51], &[0x86, 0xdd], "ethertype, big endian");
@@ -386,7 +398,11 @@ mod tests {
         let packet = ipv6_stub(96);
         let frame = data_frame(src, dst, 1, 2, &packet, 36);
         match parse(&frame) {
-            Some(Inbound::Ipv6 { src: got_src, dst: got_dst, packet: got }) => {
+            Some(Inbound::Ipv6 {
+                src: got_src,
+                dst: got_dst,
+                packet: got,
+            }) => {
                 assert_eq!(got_src, src);
                 assert_eq!(got_dst, dst);
                 assert_eq!(got, &packet[..]);
@@ -465,7 +481,14 @@ mod tests {
 
     #[test]
     fn rejects_a_frame_with_a_bad_radiotap_length() {
-        let mut frame = data_frame(mac("ee:aa:d3:d0:cb:f1"), Mac::BROADCAST, 1, 2, &ipv6_stub(48), 36);
+        let mut frame = data_frame(
+            mac("ee:aa:d3:d0:cb:f1"),
+            Mac::BROADCAST,
+            1,
+            2,
+            &ipv6_stub(48),
+            36,
+        );
         frame[2] = 0xff;
         frame[3] = 0xff;
         assert!(parse(&frame).is_none());

@@ -143,7 +143,12 @@ impl<S: Read + Write> Client<S> {
     pub fn discover(&mut self, sender: &Sender) -> Result<DiscoverAnswer, Error> {
         self.open(PATH_DISCOVER)?;
         let body = discover_request(sender);
-        let request = self.head(PATH_DISCOVER, OCTET_STREAM, &[], Framing::Length(body.len()));
+        let request = self.head(
+            PATH_DISCOVER,
+            OCTET_STREAM,
+            &[],
+            Framing::Length(body.len()),
+        );
         self.stream
             .write_all(&request.to_bytes(&body))
             .map_err(Error::Io)?;
@@ -649,7 +654,6 @@ mod tests {
         }
     }
 
-
     fn id() -> TransferId {
         TransferId::from_bytes16(&[0x37; 16])
     }
@@ -764,9 +768,7 @@ mod tests {
         let script = answer(200, AskAnswer::new("Air", "MacBook Pro").encode());
         let mut client = Client::new(Wire::answering(script), "air.local");
         let files = [Item::new("a.jpg")];
-        client
-            .ask(&sender(), &id(), &files, &[])
-            .expect("offers");
+        client.ask(&sender(), &id(), &files, &[]).expect("offers");
 
         let wire = client.into_inner();
         let lines = wire.head_lines();
@@ -786,12 +788,18 @@ mod tests {
         assert_eq!(lines.len(), 6, "no blank-line artefacts, no seventh header");
 
         let head = wire.head();
-        assert!(!head.contains("chunked"), "the offer is not chunked\n{head}");
+        assert!(
+            !head.contains("chunked"),
+            "the offer is not chunked\n{head}"
+        );
         assert!(
             !head.to_lowercase().contains("accept"),
             "HTTP-2: no `Accept*`\n{head}"
         );
-        assert!(!head.contains("Expect"), "HTTP-3: no `100-continue`\n{head}");
+        assert!(
+            !head.contains("Expect"),
+            "HTTP-3: no `100-continue`\n{head}"
+        );
     }
 
     #[test]
@@ -809,9 +817,7 @@ mod tests {
         client.renew().expect("a second connection");
 
         let files = [Item::new("a.jpg").with_size(10)];
-        let names = client
-            .ask(&sender(), &id(), &files, &[])
-            .expect("offers");
+        let names = client.ask(&sender(), &id(), &files, &[]).expect("offers");
         assert_eq!(names.model_name, "MacBook Pro");
 
         let reel = client.into_inner();
@@ -838,7 +844,8 @@ mod tests {
             answer(200, Vec::new()),
         ]
         .concat();
-        let reel = Reel::first(answer(200, DiscoverAnswer::new("Air").encode())).then(ask_then_upload);
+        let reel =
+            Reel::first(answer(200, DiscoverAnswer::new("Air").encode())).then(ask_then_upload);
         let mut client = Client::new(reel, "air.local");
 
         client.discover(&sender()).expect("answers");
@@ -937,10 +944,7 @@ mod tests {
         match &error {
             Error::Refused { status, head, .. } => {
                 assert_eq!(*status, 401);
-                assert!(
-                    head.to_lowercase().contains("connection: close"),
-                    "{head}"
-                );
+                assert!(head.to_lowercase().contains("connection: close"), "{head}");
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
@@ -1087,7 +1091,10 @@ mod tests {
         let mut script = Response::new(100).to_bytes();
         script.extend(answer(200, DiscoverAnswer::new("Air").encode()));
         let mut client = Client::new(Wire::answering(script), "air");
-        assert_eq!(client.discover(&sender()).expect("answers").computer_name, "Air");
+        assert_eq!(
+            client.discover(&sender()).expect("answers").computer_name,
+            "Air"
+        );
     }
 
     #[test]
@@ -1140,6 +1147,9 @@ mod tests {
         let mut client = Client::new(Wire::answering(script), "air").with_limit(4096);
         let found = client.discover(&sender()).expect("reads");
         assert_eq!(found.computer_name, "Air");
-        assert!(body.len() < 4096, "the fixture must not be the thing under test");
+        assert!(
+            body.len() < 4096,
+            "the fixture must not be the thing under test"
+        );
     }
 }

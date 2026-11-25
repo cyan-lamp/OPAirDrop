@@ -222,7 +222,11 @@ mod tests {
 
     #[test]
     fn link_local_round_trips_through_for_ipv6() {
-        for text in ["2a:d8:dc:5d:8c:5a", "ee:aa:d3:d0:cb:f1", "00:11:22:33:44:55"] {
+        for text in [
+            "2a:d8:dc:5d:8c:5a",
+            "ee:aa:d3:d0:cb:f1",
+            "00:11:22:33:44:55",
+        ] {
             let mac = Mac::parse(text).expect("valid");
             let back = Mac::for_ipv6(&mac.link_local()).expect("unicast maps back");
             assert_eq!(back, mac, "{text}");

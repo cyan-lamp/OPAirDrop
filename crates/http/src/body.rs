@@ -127,7 +127,9 @@ impl<'a, R: Read> Body<'a, R> {
                 let want = (*remaining).min(buf.len() as u64) as usize;
                 let read = read_some(input, &mut buf[..want])?;
                 if read == 0 {
-                    return Err(Error::TruncatedBody { missing: *remaining });
+                    return Err(Error::TruncatedBody {
+                        missing: *remaining,
+                    });
                 }
                 *remaining -= read as u64;
                 Ok(read)
@@ -172,7 +174,10 @@ fn next_chunk<R: Read>(input: &mut R, state: &mut ChunkState) -> Result<bool, Er
         // Chunk extensions (`5;foo=bar`) have never been used by anything, but a peer
         // is allowed to send them and reading one as part of the size would fail.
         let line = &state.line;
-        let end = line.iter().position(|&byte| byte == b';').unwrap_or(line.len());
+        let end = line
+            .iter()
+            .position(|&byte| byte == b';')
+            .unwrap_or(line.len());
         parse_hex(crate::trim_ascii(&line[..end]))?
     };
     if size == 0 {
@@ -226,7 +231,10 @@ fn parse_hex(bytes: &[u8]) -> Result<u64, Error> {
             Some(digit) => digit as u64,
             None => return Err(Error::BadChunkSize(crate::latin1(bytes))),
         };
-        value = match value.checked_mul(16).and_then(|value| value.checked_add(digit)) {
+        value = match value
+            .checked_mul(16)
+            .and_then(|value| value.checked_add(digit))
+        {
             Some(value) => value,
             // Java rejected every size above i64::MAX here; rejecting only what does
             // not fit in u64 keeps more legal framings and still refuses the attack.
@@ -413,7 +421,10 @@ mod tests {
         assert!(framed.starts_with(b"4000\r\n"));
         let mut rest = framed.as_slice();
         for expected in [16_384usize, 16_384, 7_232] {
-            let end = rest.iter().position(|&byte| byte == b'\r').expect("size line");
+            let end = rest
+                .iter()
+                .position(|&byte| byte == b'\r')
+                .expect("size line");
             let hex = std::str::from_utf8(&rest[..end]).unwrap();
             assert_eq!(usize::from_str_radix(hex, 16).unwrap(), expected);
             let after = end + 2 + expected;

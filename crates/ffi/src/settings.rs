@@ -377,9 +377,7 @@ mod tests {
         let path = path.to_str().expect("the fixture path is UTF-8");
 
         // SAFETY: the buffer is a live local and the path outlives the call.
-        let code = unsafe {
-            opairdrop_settings_load(path.as_ptr(), path.len(), &mut out)
-        };
+        let code = unsafe { opairdrop_settings_load(path.as_ptr(), path.len(), &mut out) };
 
         assert_eq!(code, status::OK);
         // SAFETY: the call that just returned filled the buffer.
@@ -403,7 +401,13 @@ mod tests {
         let mut out = OpairdropBuffer::EMPTY;
         // SAFETY: the buffer is a live local and both strings outlive the call.
         let code = unsafe {
-            opairdrop_settings_save(path.as_ptr(), path.len(), stored.as_ptr(), stored.len(), &mut out)
+            opairdrop_settings_save(
+                path.as_ptr(),
+                path.len(),
+                stored.as_ptr(),
+                stored.len(),
+                &mut out,
+            )
         };
         assert_eq!(code, status::OK);
         // SAFETY: the buffer came from the call above.
@@ -420,7 +424,9 @@ mod tests {
 
         assert_eq!(text, edited.to_text());
         assert_eq!(
-            fs::read_dir(&root).expect("the directory is readable").count(),
+            fs::read_dir(&root)
+                .expect("the directory is readable")
+                .count(),
             1,
             "the temporary was renamed, not left behind"
         );
@@ -439,13 +445,7 @@ mod tests {
         let mut out = OpairdropBuffer::EMPTY;
         // SAFETY: the buffer is a live local and both strings outlive the call.
         let code = unsafe {
-            opairdrop_settings_save(
-                path.as_ptr(),
-                path.len(),
-                bad.as_ptr(),
-                bad.len(),
-                &mut out,
-            )
+            opairdrop_settings_save(path.as_ptr(), path.len(), bad.as_ptr(), bad.len(), &mut out)
         };
 
         assert_eq!(code, status::SETTINGS);
@@ -500,7 +500,9 @@ mod tests {
 
         // The row's range ends at sixteen mebibytes and that is the largest answer this can
         // be asked to hold: nothing here inflates it.
-        values.set(RESPONSE_LIMIT, "16777216").expect("the top of the range");
+        values
+            .set(RESPONSE_LIMIT, "16777216")
+            .expect("the top of the range");
         assert_eq!(response_limit(&values), 16 * 1024 * 1024);
     }
 

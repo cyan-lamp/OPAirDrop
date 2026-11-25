@@ -137,7 +137,9 @@ impl fmt::Display for Error {
             }
             Error::TruncatedChunk => f.write_str("chunk data truncated"),
             Error::BadChunkSize(line) => write!(f, "bad chunk size '{line}'"),
-            Error::BadChunkFrame(line) => write!(f, "chunk not followed by a line ending: '{line}'"),
+            Error::BadChunkFrame(line) => {
+                write!(f, "chunk not followed by a line ending: '{line}'")
+            }
             Error::BodyTooLarge { limit } => write!(f, "body exceeds {limit} bytes"),
         }
     }
@@ -239,10 +241,11 @@ impl Headers {
     /// 按 RFC 9112 的列表语义逐项比较（评审 P1-8）：`chunkedNOT` 是一个不同的
     /// token，不是 chunked。
     pub(crate) fn is_chunked(&self) -> bool {
-        self.get("transfer-encoding")
-            .is_some_and(|value| {
-                value.split(',').any(|part| part.trim().eq_ignore_ascii_case("chunked"))
-            })
+        self.get("transfer-encoding").is_some_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+        })
     }
 
     /// Opens the body these headers describe.
@@ -322,7 +325,10 @@ impl Request {
                 latin1(&request_line[first_space + 1..index]),
                 latin1(trim_ascii(&request_line[index + 1..])),
             ),
-            None => (latin1(&request_line[first_space + 1..]), String::from("HTTP/1.1")),
+            None => (
+                latin1(&request_line[first_space + 1..]),
+                String::from("HTTP/1.1"),
+            ),
         };
 
         let headers = read_headers(input, &mut line)?;
@@ -586,7 +592,8 @@ pub(crate) fn read_some<R: Read>(input: &mut R, buf: &mut [u8]) -> Result<usize,
 /// than a runtime error path that could never be taken — but it exists, because a header
 /// built from a peer-supplied string would otherwise be a request-splitting hole.
 pub(crate) fn is_safe_header_text(text: &str) -> bool {
-    text.bytes().all(|byte| byte != b'\r' && byte != b'\n' && byte != 0)
+    text.bytes()
+        .all(|byte| byte != b'\r' && byte != b'\n' && byte != 0)
 }
 
 /// Appends ASCII text to a byte buffer.
@@ -605,8 +612,14 @@ fn latin1(bytes: &[u8]) -> String {
 
 pub(crate) fn trim_ascii(bytes: &[u8]) -> &[u8] {
     let is_space = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
-    let start = bytes.iter().position(|byte| !is_space(byte)).unwrap_or(bytes.len());
-    let end = bytes.iter().rposition(|byte| !is_space(byte)).map_or(start, |index| index + 1);
+    let start = bytes
+        .iter()
+        .position(|byte| !is_space(byte))
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !is_space(byte))
+        .map_or(start, |index| index + 1);
     &bytes[start..end]
 }
 
@@ -686,7 +699,10 @@ mod tests {
             .map(|(name, _)| name.as_str())
             .collect();
         assert_eq!(names, ["Zeta", "Alpha", "Mu"]);
-        assert_eq!(request.head_summary(TRACE_HEAD_CAP), "Zeta: 1; Alpha: 2; Mu: 3");
+        assert_eq!(
+            request.head_summary(TRACE_HEAD_CAP),
+            "Zeta: 1; Alpha: 2; Mu: 3"
+        );
     }
 
     #[test]
@@ -712,7 +728,8 @@ mod tests {
 
     #[test]
     fn content_length_body_is_exact() {
-        let mut input = "POST /Discover HTTP/1.1\r\nContent-Length: 4\r\n\r\nplstTRAILING".as_bytes();
+        let mut input =
+            "POST /Discover HTTP/1.1\r\nContent-Length: 4\r\n\r\nplstTRAILING".as_bytes();
         let request = Request::read(&mut input).unwrap().unwrap();
         assert_eq!(request.read_body(&mut input, 1024).unwrap(), b"plst");
         // The stream is positioned at the byte after the body, not past it.
@@ -780,8 +797,9 @@ mod tests {
 
     #[test]
     fn bad_chunk_size_is_rejected() {
-        let mut input = "POST /Upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n0\r\n\r\n"
-            .as_bytes();
+        let mut input =
+            "POST /Upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n0\r\n\r\n"
+                .as_bytes();
         let request = Request::read(&mut input).unwrap().unwrap();
         assert_eq!(
             request.read_body(&mut input, 64).unwrap_err(),
@@ -791,8 +809,9 @@ mod tests {
 
     #[test]
     fn a_chunk_not_followed_by_a_line_ending_is_rejected() {
-        let mut input = "POST /Upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXX\r\n0\r\n\r\n"
-            .as_bytes();
+        let mut input =
+            "POST /Upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXX\r\n0\r\n\r\n"
+                .as_bytes();
         let request = Request::read(&mut input).unwrap().unwrap();
         assert!(matches!(
             request.read_body(&mut input, 64).unwrap_err(),
@@ -829,7 +848,11 @@ mod tests {
 
     #[test]
     fn unusable_content_length_is_treated_as_absent() {
-        for raw in ["Content-Length: -5", "Content-Length: abc", "Content-Length: "] {
+        for raw in [
+            "Content-Length: -5",
+            "Content-Length: abc",
+            "Content-Length: ",
+        ] {
             let request = read_ok(&format!("POST /Ask HTTP/1.1\r\n{raw}\r\n\r\n"));
             assert_eq!(request.content_length(), None, "{raw}");
         }
@@ -847,7 +870,8 @@ mod tests {
 
     #[test]
     fn truncated_chunk_is_reported() {
-        let mut input = "POST /Upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nabc".as_bytes();
+        let mut input =
+            "POST /Upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nabc".as_bytes();
         let request = Request::read(&mut input).unwrap().unwrap();
         assert_eq!(
             request.read_body(&mut input, 64).unwrap_err(),
@@ -859,7 +883,10 @@ mod tests {
     /// gigabyte gets a gigabyte of reservation out of a 32-byte header.
     #[test]
     fn body_limit_is_refused_before_growing() {
-        let raw = format!("POST /Ask HTTP/1.1\r\nContent-Length: 100\r\n\r\n{}", "x".repeat(100));
+        let raw = format!(
+            "POST /Ask HTTP/1.1\r\nContent-Length: 100\r\n\r\n{}",
+            "x".repeat(100)
+        );
         let mut input = raw.as_bytes();
         let request = Request::read(&mut input).unwrap().unwrap();
         assert_eq!(
@@ -870,7 +897,10 @@ mod tests {
 
     #[test]
     fn a_body_of_exactly_the_limit_is_accepted() {
-        let raw = format!("POST /Ask HTTP/1.1\r\nContent-Length: 50\r\n\r\n{}", "x".repeat(50));
+        let raw = format!(
+            "POST /Ask HTTP/1.1\r\nContent-Length: 50\r\n\r\n{}",
+            "x".repeat(50)
+        );
         let mut input = raw.as_bytes();
         let request = Request::read(&mut input).unwrap().unwrap();
         assert_eq!(request.read_body(&mut input, 50).unwrap().len(), 50);
@@ -956,7 +986,10 @@ mod tests {
 
     #[test]
     fn head_summary_is_capped_and_never_empty() {
-        assert_eq!(read_ok("GET / HTTP/1.1\r\n\r\n").head_summary(TRACE_HEAD_CAP), "-");
+        assert_eq!(
+            read_ok("GET / HTTP/1.1\r\n\r\n").head_summary(TRACE_HEAD_CAP),
+            "-"
+        );
         let mut raw = String::from("GET / HTTP/1.1\r\n");
         for index in 0..8 {
             raw.push_str(&format!("X-Pad-{index}: {}\r\n", "y".repeat(60)));
@@ -1034,7 +1067,8 @@ mod tests {
 
     #[test]
     fn a_request_with_a_known_length_carries_no_chunk_framing() {
-        let request = Request::new("POST", "/Discover").with_header("Content-Type", "application/x-bplist");
+        let request =
+            Request::new("POST", "/Discover").with_header("Content-Type", "application/x-bplist");
         let bytes = request.to_bytes(b"abc");
         assert!(bytes.ends_with(b"\r\n\r\nabc"));
         let text = String::from_utf8_lossy(&bytes).into_owned();

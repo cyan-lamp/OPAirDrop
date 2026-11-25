@@ -324,7 +324,13 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_mdnsRecords(
     }
     if packet.is_null() {
         // SAFETY: `env` was checked non-null.
-        unsafe { throw(env, "java/lang/NullPointerException", "a packet is required") };
+        unsafe {
+            throw(
+                env,
+                "java/lang/NullPointerException",
+                "a packet is required",
+            )
+        };
         return ptr::null_mut();
     }
     // SAFETY: `packet` is a live array, per the JVM's call.
@@ -595,7 +601,12 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_send(
     if env.is_null() {
         return ptr::null_mut();
     }
-    if host.is_null() || transfer_id.is_null() || paths.is_null() || input.is_null() || output.is_null() {
+    if host.is_null()
+        || transfer_id.is_null()
+        || paths.is_null()
+        || input.is_null()
+        || output.is_null()
+    {
         // SAFETY: `env` was checked non-null.
         unsafe {
             throw(
@@ -686,8 +697,12 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_sendWithProgress(
     if env.is_null() {
         return ptr::null_mut();
     }
-    if host.is_null() || transfer_id.is_null() || paths.is_null() || input.is_null()
-        || output.is_null() || progress.is_null()
+    if host.is_null()
+        || transfer_id.is_null()
+        || paths.is_null()
+        || input.is_null()
+        || output.is_null()
+        || progress.is_null()
     {
         // SAFETY: `env` was checked non-null.
         unsafe {
@@ -788,8 +803,11 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_discoverName(
     }
     if host.is_null() || input.is_null() || output.is_null() {
         unsafe {
-            throw(env, "java/lang/NullPointerException",
-                "host and both streams are required");
+            throw(
+                env,
+                "java/lang/NullPointerException",
+                "host and both streams are required",
+            );
         }
         return ptr::null_mut();
     }
@@ -831,7 +849,11 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_discoverName(
         return ptr::null_mut();
     };
     // No Link: `/Discover` is one request on one connection.
-    let mut connection = Connection { reader, sink, link: None };
+    let mut connection = Connection {
+        reader,
+        sink,
+        link: None,
+    };
 
     let slice = |text: &Option<String>| match text {
         Some(value) => (value.as_ptr(), value.len()),
@@ -1067,9 +1089,9 @@ unsafe fn serve_for_java(
                 decide_java,
                 &mut decider as *mut Decider as *mut c_void,
             )),
-            landing
-                .as_mut()
-                .map(|landing| Watcher::new(report_landing, landing as *mut Landing as *mut c_void)),
+            landing.as_mut().map(|landing| {
+                Watcher::new(report_landing, landing as *mut Landing as *mut c_void)
+            }),
             &mut report,
         )
     };
@@ -1114,7 +1136,13 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_loadSettings(
     }
     if path.is_null() {
         // SAFETY: `env` was checked non-null.
-        unsafe { throw(env, "java/lang/NullPointerException", "a settings path is required") };
+        unsafe {
+            throw(
+                env,
+                "java/lang/NullPointerException",
+                "a settings path is required",
+            )
+        };
         return ptr::null_mut();
     }
     // SAFETY: `path` is a live `java.lang.String`, per the JVM's call.
@@ -1173,7 +1201,13 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_saveSettings(
     let mut out = OpairdropBuffer::EMPTY;
     // SAFETY: `out` is a zeroed buffer and both strings outlive the call.
     let outcome = unsafe {
-        settings::opairdrop_settings_save(path.as_ptr(), path.len(), text.as_ptr(), text.len(), &mut out)
+        settings::opairdrop_settings_save(
+            path.as_ptr(),
+            path.len(),
+            text.as_ptr(),
+            text.len(),
+            &mut out,
+        )
     };
     // SAFETY: as above, filled one way or the other.
     unsafe { finish(env, outcome, &mut out) }
@@ -1205,7 +1239,13 @@ pub unsafe extern "system" fn Java_com_oshare_airdrop_Native_bleAdvertise(
     }
     if context.is_null() {
         // SAFETY: `env` was checked non-null.
-        unsafe { throw(env, "java/lang/NullPointerException", "a Context is required") };
+        unsafe {
+            throw(
+                env,
+                "java/lang/NullPointerException",
+                "a Context is required",
+            )
+        };
         return ptr::null_mut();
     }
     if ble::current().is_awake() {
@@ -1381,7 +1421,12 @@ impl Radio {
         };
         // SAFETY: as above.
         let stop = unsafe {
-            (entry!(table, GetStaticMethodID))(env, class, stop_name.as_ptr(), stop_signature.as_ptr())
+            (entry!(table, GetStaticMethodID))(
+                env,
+                class,
+                stop_name.as_ptr(),
+                stop_signature.as_ptr(),
+            )
         };
         // SAFETY: `env` is valid.
         if start.is_null() || stop.is_null() || unsafe { pending(env) } {
@@ -1432,6 +1477,32 @@ unsafe fn finish(env: *mut JNIEnv, outcome: i32, report: &mut OpairdropBuffer) -
     // SAFETY: `env` is valid.
     unsafe { throw(env, class_for(outcome), &message) };
     ptr::null_mut()
+}
+
+/// 把 Rust 文本交给 JVM，走 UTF-16 而不是 modified UTF-8。
+///
+/// JNI 的 `NewStringUTF` 要的是 modified UTF-8：NUL 编成 `C0 80`，补充平面字符（emoji）
+/// 要编成一对 UTF-16 代理项各占三字节。喂它标准 UTF-8 时，一个 emoji 的四个字节会被
+/// 当成四个独立的 U+00xx，CheckJNI 下 ART 直接 abort，不是抛异常。设备名和对端摘要
+/// 都是对端可控的文本，所以这条路径是远程可达的。
+///
+/// `NewString` 收 `jchar*`（即 `u16*`），正好是 `str::encode_utf16()` 的产物：没有编码
+/// 转换，也没有 NUL 的坑（UTF-16 的 0 就是 0）。空串仍返回一个合法的 Java 空串。
+///
+/// # Safety
+///
+/// `env` 必须有效，且调用前没有 pending 异常。
+unsafe fn new_utf16_string(env: *mut JNIEnv, text: &str) -> jstring {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let table = unsafe { table(env) };
+    // SAFETY: `units` 在调用期间有效；长度是 UTF-16 码元数，不是字节数。
+    unsafe {
+        (entry!(table, NewString))(
+            env,
+            units.as_ptr(),
+            units.len().try_into().unwrap_or(jni_sys::jsize::MAX),
+        )
+    }
 }
 
 /// The Java exception that best describes a status.
@@ -1487,7 +1558,8 @@ impl Stream {
         let signature = c_str("([BII)I");
         // SAFETY: `class` is the live class object made above and both strings outlive the
         // call.
-        let read = unsafe { (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr()) };
+        let read =
+            unsafe { (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr()) };
         // SAFETY: `class` is the local reference made above.
         unsafe { (entry!(table, DeleteLocalRef))(env, class) };
         if read.is_null() || unsafe { pending(env) } {
@@ -1548,7 +1620,16 @@ unsafe extern "C" fn read_stream(context: *mut c_void, buf: *mut u8, len: usize)
     // SAFETY: `stream.read` is `InputStream.read([BII)I` on `stream.stream`, `buffer` is an
     // array this layer allocated for exactly that purpose, and the trailing numbers are the
     // `int offset, int length` the variadic call expects.
-    let got = unsafe { (entry!(table, CallIntMethod))(stream.env, stream.stream, stream.read, stream.buffer, 0, want) };
+    let got = unsafe {
+        (entry!(table, CallIntMethod))(
+            stream.env,
+            stream.stream,
+            stream.read,
+            stream.buffer,
+            0,
+            want,
+        )
+    };
 
     // SAFETY: `stream.env` is valid.
     if unsafe { pending(stream.env) } {
@@ -1570,7 +1651,9 @@ unsafe extern "C" fn read_stream(context: *mut c_void, buf: *mut u8, len: usize)
 
     // SAFETY: `got` bytes are present in `stream.buffer`, and `buf` has room for `len`,
     // which is at least `want`.
-    unsafe { (entry!(table, GetByteArrayRegion))(stream.env, stream.buffer, 0, got, buf as *mut jbyte) };
+    unsafe {
+        (entry!(table, GetByteArrayRegion))(stream.env, stream.buffer, 0, got, buf as *mut jbyte)
+    };
     if unsafe { pending(stream.env) } {
         stream.failed = true;
         return -1;
@@ -1613,7 +1696,8 @@ impl Sink {
         let signature = c_str("([BII)V");
         // SAFETY: `class` is the live class object made above and both strings outlive the
         // call.
-        let write = unsafe { (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr()) };
+        let write =
+            unsafe { (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr()) };
         // SAFETY: `class` is the local reference made above.
         unsafe { (entry!(table, DeleteLocalRef))(env, class) };
         if write.is_null() || unsafe { pending(env) } {
@@ -1743,7 +1827,8 @@ impl Gauge {
         let name = c_str("report");
         let signature = c_str("(IJJ)V");
         // SAFETY: `class` is the live class object made above, both strings outlive the call.
-        let report = unsafe { (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr()) };
+        let report =
+            unsafe { (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr()) };
 
         // `name(String)` is optional: a sink written before the peer-name callback existed
         // still works for byte counts. A missing method leaves NoSuchMethodError pending, so
@@ -1824,11 +1909,7 @@ unsafe extern "C" fn report_progress(context: *mut c_void, phase: i32, sent: u64
 /// # Safety
 ///
 /// `context` must point at a live [`Gauge`] and `name` must be readable for `name_len` bytes.
-unsafe extern "C" fn report_peer_name(
-    context: *mut c_void,
-    name: *const u8,
-    name_len: usize,
-) {
+unsafe extern "C" fn report_peer_name(context: *mut c_void, name: *const u8, name_len: usize) {
     if context.is_null() || name.is_null() {
         return;
     }
@@ -1840,22 +1921,18 @@ unsafe extern "C" fn report_peer_name(
         return;
     }
     let bytes = unsafe { std::slice::from_raw_parts(name, name_len) };
+    // UTF-16 crossing: emoji and embedded NUL both survive, unlike NewStringUTF, which
+    // ART's CheckJNI aborts on for non-BMP text from a peer-controlled name.
     let text = String::from_utf8_lossy(bytes);
-    // A name with an embedded NUL cannot cross through NewStringUTF. Skip it rather than
-    // truncate: a half name is worse than the mDNS hash the UI already has.
-    let Ok(c_text) = CString::new(text.as_bytes()) else {
-        return;
-    };
-    let table = unsafe { table(gauge.env) };
-    let argument = unsafe { (entry!(table, NewStringUTF))(gauge.env, c_text.as_ptr()) };
+    // SAFETY: `env` is valid and checked pending above.
+    let argument = unsafe { new_utf16_string(gauge.env, &text) };
     if argument.is_null() {
         gauge.failed = true;
         return;
     }
+    let table = unsafe { table(gauge.env) };
     // SAFETY: `method` is `Progress.name(String)V` on the object the caller handed over.
-    unsafe {
-        (entry!(table, CallVoidMethod))(gauge.env, gauge.object, method, argument)
-    };
+    unsafe { (entry!(table, CallVoidMethod))(gauge.env, gauge.object, method, argument) };
     // SAFETY: `argument` is a local reference made above.
     unsafe { (entry!(table, DeleteLocalRef))(gauge.env, argument) };
     if unsafe { pending(gauge.env) } {
@@ -1891,7 +1968,8 @@ impl Decider {
         let signature = c_str("(Ljava/lang/String;)Z");
         // SAFETY: `class` is the live class object made above and both strings outlive the
         // call.
-        let accept = unsafe { (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr()) };
+        let accept =
+            unsafe { (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr()) };
         // SAFETY: `class` is the local reference made above.
         unsafe { (entry!(table, DeleteLocalRef))(env, class) };
         if accept.is_null() || unsafe { pending(env) } {
@@ -1924,8 +2002,8 @@ unsafe extern "C" fn decide_java(context: *mut c_void, summary: *const u8, len: 
     // SAFETY: `decider.env` is valid.
     //
     // A prompt is a person's decision and must never be asked on behalf of an exception:
-    // the body before it may already have failed, and `NewStringUTF` below would abort the
-    // process rather than return a refusal.
+    // the body before it may already have failed, and building the string below would abort
+    // the process rather than return a refusal.
     if unsafe { pending(decider.env) } {
         return 0;
     }
@@ -1933,25 +2011,18 @@ unsafe extern "C" fn decide_java(context: *mut c_void, summary: *const u8, len: 
     // A sender name may be any text the other phone allows; invalid UTF-8 is replaced
     // rather than dropped, because a prompt with a mangled name still describes a transfer
     // and an empty one does not.
-    let text = String::from_utf8_lossy(bytes).into_owned();
-    let Ok(c_text) = CString::new(text) else {
-        return 0;
-    };
-    let table = unsafe { table(decider.env) };
-    // SAFETY: `c_text` is a NUL-terminated C string that outlives the call.
-    let argument = unsafe { (entry!(table, NewStringUTF))(decider.env, c_text.as_ptr()) };
+    let text = String::from_utf8_lossy(bytes);
+    // SAFETY: `env` is valid and checked pending above. UTF-16 crossing keeps a sender
+    // name with emoji intact; NewStringUTF would hand ART invalid modified UTF-8.
+    let argument = unsafe { new_utf16_string(decider.env, &text) };
     if argument.is_null() {
         return 0;
     }
+    let table = unsafe { table(decider.env) };
     // SAFETY: `argument` is the string just made, and `accept` is
     // `Decision.accept(String)Z` on the object the caller handed over.
     let answer = unsafe {
-        (entry!(table, CallBooleanMethod))(
-            decider.env,
-            decider.object,
-            decider.accept,
-            argument,
-        )
+        (entry!(table, CallBooleanMethod))(decider.env, decider.object, decider.accept, argument)
     };
     // SAFETY: `decider.env` is valid.
     if unsafe { pending(decider.env) } {
@@ -1997,9 +2068,8 @@ impl Landing {
         let name = c_str("landed");
         let signature = c_str("(JJ)V");
         // SAFETY: `class` is the live class object made above, both strings outlive the call.
-        let landed = unsafe {
-            (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr())
-        };
+        let landed =
+            unsafe { (entry!(table, GetMethodID))(env, class, name.as_ptr(), signature.as_ptr()) };
         // SAFETY: `class` is the local reference made above.
         unsafe { (entry!(table, DeleteLocalRef))(env, class) };
         if landed.is_null() || unsafe { pending(env) } {
@@ -2136,12 +2206,7 @@ impl Link {
         let input_signature = c_str("()Ljava/io/InputStream;");
         // SAFETY: `socket` is the live class object made above.
         let input = unsafe {
-            (entry!(table, GetMethodID))(
-                env,
-                socket,
-                get_input.as_ptr(),
-                input_signature.as_ptr(),
-            )
+            (entry!(table, GetMethodID))(env, socket, get_input.as_ptr(), input_signature.as_ptr())
         };
         let get_output = c_str("getOutputStream");
         let output_signature = c_str("()Ljava/io/OutputStream;");
@@ -2257,7 +2322,13 @@ unsafe extern "C" fn read_connection(context: *mut c_void, buf: *mut u8, len: us
     let connection = unsafe { &mut *(context as *mut Connection) };
     // SAFETY: `buf` and `len` come from the caller unchanged, and the field's address is
     // valid for the call.
-    unsafe { read_stream(&mut connection.reader as *mut Stream as *mut c_void, buf, len) }
+    unsafe {
+        read_stream(
+            &mut connection.reader as *mut Stream as *mut c_void,
+            buf,
+            len,
+        )
+    }
 }
 
 /// The C ABI's write callback, pointed at the connection's sink.
@@ -2441,7 +2512,13 @@ unsafe fn read_paths(env: *mut JNIEnv, array: jobjectArray) -> Option<String> {
     let length = unsafe { (entry!(table, GetArrayLength))(env, array) };
     if length <= 0 {
         // SAFETY: `env` is valid.
-        unsafe { throw(env, "java/lang/IllegalArgumentException", "at least one path is required") };
+        unsafe {
+            throw(
+                env,
+                "java/lang/IllegalArgumentException",
+                "at least one path is required",
+            )
+        };
         return None;
     }
 
@@ -2547,19 +2624,19 @@ unsafe fn read_bytes(env: *mut JNIEnv, array: jbyteArray) -> Option<Vec<u8>> {
         // An empty packet is not a packet; the parser would refuse it a frame later with a
         // message about a truncated header, which names the wrong thing.
         // SAFETY: `env` is valid.
-        unsafe { throw(env, "java/lang/IllegalArgumentException", "the packet is empty") };
+        unsafe {
+            throw(
+                env,
+                "java/lang/IllegalArgumentException",
+                "the packet is empty",
+            )
+        };
         return None;
     }
     let mut bytes = vec![0u8; length as usize];
     // SAFETY: `bytes` has room for `length` and `array` holds at least that many.
     unsafe {
-        (entry!(table, GetByteArrayRegion))(
-            env,
-            array,
-            0,
-            length,
-            bytes.as_mut_ptr() as *mut jbyte,
-        )
+        (entry!(table, GetByteArrayRegion))(env, array, 0, length, bytes.as_mut_ptr() as *mut jbyte)
     };
     // SAFETY: `env` is valid.
     if unsafe { pending(env) } {

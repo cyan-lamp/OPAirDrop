@@ -7,8 +7,7 @@ use proptest::prelude::*;
 
 /// DNS 名字：点分隔的 label，只含字母数字与连字符（真实 AirDrop 记录的字符类）。
 fn dns_name() -> impl Strategy<Value = String> {
-    prop::collection::vec("[a-zA-Z0-9][a-zA-Z0-9-]{0,15}", 1..6)
-        .prop_map(|labels| labels.join("."))
+    prop::collection::vec("[a-zA-Z0-9][a-zA-Z0-9-]{0,15}", 1..6).prop_map(|labels| labels.join("."))
 }
 
 /// SRV 的 rdata 常用构造：优先级、权重、端口、目标。

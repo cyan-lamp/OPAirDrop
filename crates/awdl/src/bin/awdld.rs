@@ -203,7 +203,9 @@ mod device {
         if uid != 0 {
             // The number is in the message because "must run as root" from a shell that
             // has just printed `uid=0` is a sentence with no next step in it.
-            eprintln!("awdld: must run as root (euid={uid}, AF_PACKET and TUN both need capabilities)");
+            eprintln!(
+                "awdld: must run as root (euid={uid}, AF_PACKET and TUN both need capabilities)"
+            );
             return Err(1);
         }
 
@@ -225,10 +227,7 @@ mod device {
         if let Err(err) = configure_tun(&args.tun, mac, args.uid) {
             // Not fatal: an interface that is up but unconfigured still carries frames,
             // and a caller may have set it up already.
-            eprintln!(
-                "awdld: warning: could not configure {}: {err}",
-                args.tun
-            );
+            eprintln!("awdld: warning: could not configure {}: {err}", args.tun);
         }
         let local = link_local(&args.tun).ok().flatten();
         println!(
@@ -343,7 +342,12 @@ mod device {
                         eprintln!("awdld: poll survived: {err}");
                         std::thread::sleep(std::time::Duration::from_millis(
                             if err.raw_os_error() == Some(libc::ENETDOWN)
-                                || err.raw_os_error() == Some(libc::ENODEV) { 2000 } else { 10 },
+                                || err.raw_os_error() == Some(libc::ENODEV)
+                            {
+                                2000
+                            } else {
+                                10
+                            },
                         ));
                         continue;
                     }
@@ -367,7 +371,12 @@ mod device {
                                 eprintln!("awdld: radio read survived: {err}");
                                 std::thread::sleep(std::time::Duration::from_millis(
                                     if err.raw_os_error() == Some(libc::ENETDOWN)
-                                        || err.raw_os_error() == Some(libc::ENODEV) { 2000 } else { 10 },
+                                        || err.raw_os_error() == Some(libc::ENODEV)
+                                    {
+                                        2000
+                                    } else {
+                                        10
+                                    },
                                 ));
                                 break;
                             }
@@ -391,7 +400,12 @@ mod device {
                                 eprintln!("awdld: tunnel read survived: {err}");
                                 std::thread::sleep(std::time::Duration::from_millis(
                                     if err.raw_os_error() == Some(libc::ENETDOWN)
-                                        || err.raw_os_error() == Some(libc::ENODEV) { 2000 } else { 10 },
+                                        || err.raw_os_error() == Some(libc::ENODEV)
+                                    {
+                                        2000
+                                    } else {
+                                        10
+                                    },
                                 ));
                                 break;
                             }
@@ -601,7 +615,16 @@ mod device {
 
         exec(
             "ip",
-            &["-6", "route", "replace", "fe80::/64", "dev", name, "table", "1087"],
+            &[
+                "-6",
+                "route",
+                "replace",
+                "fe80::/64",
+                "dev",
+                name,
+                "table",
+                "1087",
+            ],
         )?;
 
         if let Some(uid) = uid {
@@ -613,15 +636,33 @@ mod device {
             let _ = exec(
                 "ip",
                 &[
-                    "-6", "rule", "del", "to", "fe80::/64", "uidrange", &range, "lookup",
-                    "1087", "pref", "100",
+                    "-6",
+                    "rule",
+                    "del",
+                    "to",
+                    "fe80::/64",
+                    "uidrange",
+                    &range,
+                    "lookup",
+                    "1087",
+                    "pref",
+                    "100",
                 ],
             );
             exec(
                 "ip",
                 &[
-                    "-6", "rule", "add", "to", "fe80::/64", "uidrange", &range, "lookup",
-                    "1087", "pref", "100",
+                    "-6",
+                    "rule",
+                    "add",
+                    "to",
+                    "fe80::/64",
+                    "uidrange",
+                    &range,
+                    "lookup",
+                    "1087",
+                    "pref",
+                    "100",
                 ],
             )?;
         }
@@ -832,11 +873,15 @@ mod device {
         /// keep carrying frames while the framework thinks about it.
         enum Phase {
             Settled,
-            Pending { since: u64 },
+            Pending {
+                since: u64,
+            },
             /// The last attempt did not take effect, with the reason kept so the app can
             /// show it. A switch that stays where it was put while claiming success is
             /// the one failure this page must not have.
-            Failed { why: String },
+            Failed {
+                why: String,
+            },
         }
 
         pub struct Radio {
@@ -895,11 +940,7 @@ mod device {
                 };
                 // Stated once so an operator reading the log knows which mode the daemon
                 // believes it is in before the first frame, not after the first switch.
-                println!(
-                    "RADIO want={} ctl={}",
-                    want.word(),
-                    base.display()
-                );
+                println!("RADIO want={} ctl={}", want.word(), base.display());
                 radio.apply_initial(now);
                 Some(radio)
             }

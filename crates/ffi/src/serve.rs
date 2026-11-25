@@ -346,7 +346,8 @@ impl Receiver for Store {
         if body.is_empty() {
             return;
         }
-        if let Err(error) = std::fs::write(self.directory.join(NAME), &body[..body.len().min(KEEP)]) {
+        if let Err(error) = std::fs::write(self.directory.join(NAME), &body[..body.len().min(KEEP)])
+        {
             // A diagnostic that cannot be written is not a reason to fail a transfer.
             let _ = error;
         }
@@ -758,7 +759,12 @@ mod tests {
     }
 
     /// Drives one conversation and returns the status, the buffer's bytes, and the answers.
-    fn serve(directory: &str, settings: &str, model: &str, requests: Vec<u8>) -> (i32, Vec<u8>, Vec<u8>) {
+    fn serve(
+        directory: &str,
+        settings: &str,
+        model: &str,
+        requests: Vec<u8>,
+    ) -> (i32, Vec<u8>, Vec<u8>) {
         let mut wire = Wire::new(requests);
         let mut out = OpairdropBuffer::EMPTY;
         // SAFETY: the strings and the wire outlive the call, and `out` is a zeroed buffer
@@ -980,8 +986,7 @@ mod tests {
         );
 
         assert_eq!(
-            summary,
-            "链接探针\t0\t0\t2\t\thttps://example.com/a\u{1e}https://example.com/b",
+            summary, "链接探针\t0\t0\t2\t\thttps://example.com/a\u{1e}https://example.com/b",
             "the link count is the fourth field, and a links offer names no files — \
              but the sixth field is where the links themselves finally cross over, \
              because a link with no URL on this side is a card that cannot be opened"
@@ -1176,12 +1181,8 @@ mod tests {
 
         let mut requests = post("/Ask", "application/x-apple-binary-plist", &accepted_ask());
         requests.extend(post("/Upload", "application/x-cpio", &body));
-        let (code, report, answers) = serve(
-            root.to_str().expect("UTF-8"),
-            "",
-            "OPPO PJZ110",
-            requests,
-        );
+        let (code, report, answers) =
+            serve(root.to_str().expect("UTF-8"), "", "OPPO PJZ110", requests);
 
         assert_eq!(code, status::OK);
         assert!(String::from_utf8_lossy(&answers).starts_with("HTTP/1.1 200"));
@@ -1214,7 +1215,10 @@ mod tests {
         assert_eq!(code, status::OK);
         assert!(String::from_utf8_lossy(&answers).starts_with("HTTP/1.1 200"));
         let report = Report::decode(&report).expect("a frame came back");
-        assert!(!seen.is_empty(), "a watcher on a receive that landed bytes saw none");
+        assert!(
+            !seen.is_empty(),
+            "a watcher on a receive that landed bytes saw none"
+        );
         assert!(
             seen.windows(2).all(|pair| pair[0].0 <= pair[1].0),
             "a bar that goes backwards is worse than none: {seen:?}"
@@ -1230,7 +1234,10 @@ mod tests {
         // 轨道；线上字节数就是传输总量，误差由调用方 clamp）。每个回调的 total 都相同，
         // 且是这条请求声明过的数——不是编出来的。
         let total = seen[0].1;
-        assert!(total > 0, "the head promised a body, so the fallback total is its length");
+        assert!(
+            total > 0,
+            "the head promised a body, so the fallback total is its length"
+        );
         assert!(
             seen.iter().all(|&(_, t)| t == total),
             "the denominator must not drift mid-transfer: {seen:?}"
@@ -1277,8 +1284,16 @@ mod tests {
     fn an_upload_ends_the_connection_so_a_second_one_is_not_read() {
         let root = scratch("twice");
         let mut requests = post("/Ask", "application/x-apple-binary-plist", &accepted_ask());
-        requests.extend(post("/Upload", "application/x-cpio", &archive("a.txt", b"one")));
-        requests.extend(post("/Upload", "application/x-cpio", &archive("b.txt", b"two")));
+        requests.extend(post(
+            "/Upload",
+            "application/x-cpio",
+            &archive("a.txt", b"one"),
+        ));
+        requests.extend(post(
+            "/Upload",
+            "application/x-cpio",
+            &archive("b.txt", b"two"),
+        ));
 
         let (code, report, _) = serve(root.to_str().expect("UTF-8"), "", "", requests);
 
@@ -1301,15 +1316,19 @@ mod tests {
         // Not cpio, not gzip, not DVZip: the inbox refuses it, the endpoint answers `500`,
         // and the refusal has to survive being wrapped in an I/O error.
         let mut requests = post("/Ask", "application/x-apple-binary-plist", &accepted_ask());
-        requests.extend(post("/Upload", "application/x-cpio", b"this is not an archive"));
-        let (code, message, answers) = serve(
-            root.to_str().expect("UTF-8"),
-            "",
-            "",
-            requests,
-        );
+        requests.extend(post(
+            "/Upload",
+            "application/x-cpio",
+            b"this is not an archive",
+        ));
+        let (code, message, answers) = serve(root.to_str().expect("UTF-8"), "", "", requests);
 
-        assert_eq!(code, status::ARCHIVE, "{}", String::from_utf8_lossy(&message));
+        assert_eq!(
+            code,
+            status::ARCHIVE,
+            "{}",
+            String::from_utf8_lossy(&message)
+        );
         // 先是 /Ask 的 200（评审 P0-1 之后上传必须跟在接受后面），500 只属于 upload。
         let answers = String::from_utf8_lossy(&answers);
         assert!(answers.starts_with("HTTP/1.1 200"));

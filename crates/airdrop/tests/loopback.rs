@@ -303,7 +303,10 @@ fn the_three_endpoints_walk_over_one_connection() {
     assert_eq!(answer.airdropable, Some(true));
     assert_eq!(answer.computer_name, "Air");
 
-    let files = [Item::new("a.jpg").with_size(3_000_019), Item::new("empty.txt").with_size(0)];
+    let files = [
+        Item::new("a.jpg").with_size(3_000_019),
+        Item::new("empty.txt").with_size(0),
+    ];
     let ask = ask_request(&sender, &id(), &files, &[]);
     write!(
         stream,
@@ -354,7 +357,12 @@ fn three_megabytes_and_seventeen_bytes_arrive_whole() {
 
     // 评审 P0-1 之后 /Upload 必须先有 /Ask 的接受，这条连接才能送 archive。
     let sender = Sender::new("iPhone von Ada", "iPhone", "8A2B:1F:9C");
-    let ask = ask_request(&sender, &id(), &[Item::new("a.jpg").with_size(3_147_017)], &[]);
+    let ask = ask_request(
+        &sender,
+        &id(),
+        &[Item::new("a.jpg").with_size(3_147_017)],
+        &[],
+    );
     write!(
         stream,
         "POST /Ask HTTP/1.1\r\nHost: air\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
@@ -425,7 +433,12 @@ fn an_offer_whose_body_is_cut_off_ends_the_connection_quietly() {
     let (listener, handle) = listen();
     let mut stream = connect(&listener);
 
-    let ask = ask_request(&Sender::new("Mac", "MacBook", "id"), &id(), &[Item::new("a")], &[]);
+    let ask = ask_request(
+        &Sender::new("Mac", "MacBook", "id"),
+        &id(),
+        &[Item::new("a")],
+        &[],
+    );
     write!(
         stream,
         "POST /Ask HTTP/1.1\r\nHost: air\r\nContent-Length: {}\r\n\r\n",
@@ -600,7 +613,10 @@ fn the_offer_and_the_archive_arrive_on_a_connection_of_their_own() {
     // The first connection asked one question and was then spent.
     let first = &served[0].receiver().received;
     assert_eq!(first.senders, ["OPPO Find X"]);
-    assert!(first.offers.is_empty(), "the spent connection carried no offer");
+    assert!(
+        first.offers.is_empty(),
+        "the spent connection carried no offer"
+    );
     assert!(first.archives.is_empty(), "and no archive");
 
     // The second opened with the offer, because that is the first thing it was written.
@@ -610,8 +626,10 @@ fn the_offer_and_the_archive_arrive_on_a_connection_of_their_own() {
         "the second connection was never asked whether the peer accepts files"
     );
     assert_eq!(second.offers.len(), 1);
-    assert_eq!(second.offers[0].transfer_id.as_deref(), Some(transfer_id.as_str()));
+    assert_eq!(
+        second.offers[0].transfer_id.as_deref(),
+        Some(transfer_id.as_str())
+    );
     assert_eq!(second.archives.len(), 1);
     assert_eq!(second.archives[0], b"07070100000000TRAILER");
 }
-

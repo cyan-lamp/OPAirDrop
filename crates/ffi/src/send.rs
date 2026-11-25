@@ -369,7 +369,12 @@ unsafe fn drive(
     };
     let Some(id) = parse_transfer_id(transfer_text) else {
         // SAFETY: as above.
-        unsafe { fill(report, b"the transfer id is not 32 hexadecimal digits".to_vec()) };
+        unsafe {
+            fill(
+                report,
+                b"the transfer id is not 32 hexadecimal digits".to_vec(),
+            )
+        };
         return status::BAD_PATH;
     };
 
@@ -481,7 +486,9 @@ fn transfer(
     if let Some(gauge) = meter {
         gauge.say(phase::WAITING);
     }
-    let asked = client.ask(sender, id, &items, &[]).map_err(describe_error)?;
+    let asked = client
+        .ask(sender, id, &items, &[])
+        .map_err(describe_error)?;
 
     let peer = match peer_name {
         Some(name) => name,
@@ -496,7 +503,6 @@ fn transfer(
     if let Some(gauge) = meter {
         gauge.say(phase::SENDING);
     }
-
 
     client
         .upload(id, total, |out| archive(out, &files, meter))
@@ -568,8 +574,9 @@ fn archive(
         // turns every member into a file that arrives as nothing. `Item::bom_path` answers
         // with the same string the offer used, by construction.
         let member = item.bom_path();
-        let file = File::open(path)
-            .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
+        let file = File::open(path).map_err(|error| {
+            io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+        })?;
         match meter {
             Some(gauge) => {
                 let mut counted = Counted { file, meter: gauge };
@@ -748,7 +755,11 @@ pub unsafe extern "C" fn opairdrop_discover_name(
     // No `reopen`: `/Discover` is one request on one connection. A phone that answers it and
     // stops reading is exactly why the transfer path renews — but there is no follow-up here.
     let mut client = Client::new(
-        Wire { reader, writer, reopen: None },
+        Wire {
+            reader,
+            writer,
+            reopen: None,
+        },
         host,
     )
     .with_limit(limit);
@@ -901,7 +912,10 @@ mod tests {
     #[test]
     fn the_path_list_keeps_order_and_drops_empty_entries() {
         let paths = path_list("/a/one\0\0/b/two").unwrap();
-        assert_eq!(paths, vec![PathBuf::from("/a/one"), PathBuf::from("/b/two")]);
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/a/one"), PathBuf::from("/b/two")]
+        );
         assert!(path_list("").is_err());
     }
 
@@ -1023,8 +1037,9 @@ mod tests {
             };
             let name_size = usize::from_str_radix(&field(59, 6), 8).unwrap();
             let size = u64::from_str_radix(&field(65, 11), 8).unwrap();
-            let name = String::from_utf8(plain[head_at + 76..head_at + 76 + name_size - 1].to_vec())
-                .unwrap();
+            let name =
+                String::from_utf8(plain[head_at + 76..head_at + 76 + name_size - 1].to_vec())
+                    .unwrap();
             seen.push((
                 name.clone(),
                 u32::from_str_radix(&field(12, 6), 8).unwrap(),
@@ -1051,7 +1066,10 @@ mod tests {
         assert_eq!(inodes, vec![0, 1, 2, 3, 0]);
         // Modes: the directory, then three regular files, then the sentinel's zero.
         let modes: Vec<&str> = seen.iter().map(|(_, _, mode, _)| mode.as_str()).collect();
-        assert_eq!(modes, vec!["040755", "100644", "100644", "100644", "000000"]);
+        assert_eq!(
+            modes,
+            vec!["040755", "100644", "100644", "100644", "000000"]
+        );
         let sizes: Vec<u64> = seen.iter().map(|(_, _, _, size)| *size).collect();
         // `七个字` is nine bytes, not three: the header counts UTF-8 bytes.
         assert_eq!(sizes, vec![0, 5, 9, 70_000, 0]);

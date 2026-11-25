@@ -68,7 +68,10 @@ impl Sender {
 
     fn pairs(&self) -> Vec<(&'static str, Value)> {
         vec![
-            ("SenderComputerName", Value::String(self.computer_name.clone())),
+            (
+                "SenderComputerName",
+                Value::String(self.computer_name.clone()),
+            ),
             ("SenderModelName", Value::String(self.model_name.clone())),
             ("SenderID", Value::String(self.id.clone())),
         ]
@@ -186,7 +189,9 @@ impl DiscoverAnswer {
         let root = opairdrop_bplist::parse_dict(body)?;
         Ok(DiscoverAnswer {
             computer_name: field(&root, "ReceiverComputerName"),
-            media_capabilities: root.get_data("ReceiverMediaCapabilities").map(<[u8]>::to_vec),
+            media_capabilities: root
+                .get_data("ReceiverMediaCapabilities")
+                .map(<[u8]>::to_vec),
             airdropable: root.get("IsAirDropable").and_then(Value::as_bool),
         })
     }
@@ -557,7 +562,10 @@ mod tests {
     fn discover_request_has_exactly_the_three_captured_fields_in_order() {
         let body = discover_request(&sender());
         let root = decode(&body);
-        assert_eq!(keys(&root), ["SenderComputerName", "SenderModelName", "SenderID"]);
+        assert_eq!(
+            keys(&root),
+            ["SenderComputerName", "SenderModelName", "SenderID"]
+        );
         let parsed = Sender::parse(&body).unwrap();
         assert_eq!(parsed, sender());
     }
@@ -655,10 +663,18 @@ mod tests {
 
     #[test]
     fn ask_request_always_carries_both_files_and_items() {
-        let only_links = ask_request(&sender(), &transfer_id(), &[], &["https://example.com".into()]);
+        let only_links = ask_request(
+            &sender(),
+            &transfer_id(),
+            &[],
+            &["https://example.com".into()],
+        );
         let root = decode(&only_links);
         assert_eq!(root.get_array("Files").len(), 0);
-        assert!(root.get("Files").is_some(), "an empty Files key, not a missing one");
+        assert!(
+            root.get("Files").is_some(),
+            "an empty Files key, not a missing one"
+        );
         assert_eq!(root.get_array("Items").len(), 1);
 
         let only_files = ask_request(&sender(), &transfer_id(), &[Item::new("a.txt")], &[]);
@@ -669,11 +685,21 @@ mod tests {
 
     #[test]
     fn transfer_type_names_what_is_offered() {
-        let files = decode(&ask_request(&sender(), &transfer_id(), &[Item::new("a")], &[]));
+        let files = decode(&ask_request(
+            &sender(),
+            &transfer_id(),
+            &[Item::new("a")],
+            &[],
+        ));
         let transfer_type = files.get("TransferType").expect("TransferType");
         assert_eq!(keys(transfer_type), ["files"]);
 
-        let links = decode(&ask_request(&sender(), &transfer_id(), &[], &["https://x".into()]));
+        let links = decode(&ask_request(
+            &sender(),
+            &transfer_id(),
+            &[],
+            &["https://x".into()],
+        ));
         let transfer_type = links.get("TransferType").expect("TransferType");
         assert_eq!(keys(transfer_type), ["links"]);
     }
@@ -736,10 +762,17 @@ mod tests {
     #[test]
     fn ask_parses_what_a_sender_sends() {
         let files = [
-            Item::new("photo.heic").with_file_type("public.heic").with_size(1234),
+            Item::new("photo.heic")
+                .with_file_type("public.heic")
+                .with_size(1234),
             Item::new("folder").as_directory(),
         ];
-        let body = ask_request(&sender(), &transfer_id(), &files, &["https://example.com".into()]);
+        let body = ask_request(
+            &sender(),
+            &transfer_id(),
+            &files,
+            &["https://example.com".into()],
+        );
         let parsed = Ask::parse(&body).unwrap();
         assert_eq!(parsed.sender, sender());
         assert_eq!(parsed.bundle_id, "com.apple.finder");
@@ -807,10 +840,7 @@ mod tests {
     fn a_missing_file_type_falls_back_to_public_content() {
         let body = opairdrop_bplist::encode(&Value::dict([(
             "Files",
-            Value::Array(vec![Value::dict([(
-                "FileName",
-                Value::String("a".into()),
-            )])]),
+            Value::Array(vec![Value::dict([("FileName", Value::String("a".into()))])]),
         )]));
         let parsed = Ask::parse(&body).unwrap();
         assert_eq!(parsed.files[0].file_type, DEFAULT_FILE_TYPE);

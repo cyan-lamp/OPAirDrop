@@ -47,9 +47,7 @@ impl TunDevice {
                 Err(err) => last = Some(err),
             }
         }
-        Err(last.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no TUN device node")
-        }))
+        Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no TUN device node")))
     }
 
     fn open_at(path: &str, name: &str) -> io::Result<Self> {
@@ -72,7 +70,10 @@ impl TunDevice {
         if name.len() >= libc::IFNAMSIZ {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("interface name {name} is longer than {}", libc::IFNAMSIZ - 1),
+                format!(
+                    "interface name {name} is longer than {}",
+                    libc::IFNAMSIZ - 1
+                ),
             ));
         }
 

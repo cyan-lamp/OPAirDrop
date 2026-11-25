@@ -146,7 +146,14 @@ impl Response {
             push(&mut out, "\r\n");
         }
         push(&mut out, "Connection: ");
-        push(&mut out, if self.keep_alive { "keep-alive" } else { "close" });
+        push(
+            &mut out,
+            if self.keep_alive {
+                "keep-alive"
+            } else {
+                "close"
+            },
+        );
         push(&mut out, "\r\n\r\n");
         out.extend_from_slice(&self.body);
         out
@@ -282,7 +289,8 @@ impl From<Error> for Response {
 }
 
 fn is_safe_header_text(text: &str) -> bool {
-    text.bytes().all(|byte| byte != b'\r' && byte != b'\n' && byte != 0)
+    text.bytes()
+        .all(|byte| byte != b'\r' && byte != b'\n' && byte != 0)
 }
 
 fn push(out: &mut Vec<u8>, text: &str) {
@@ -296,7 +304,10 @@ mod tests {
     fn head(response: &Response) -> String {
         let bytes = response.to_bytes();
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        text.split_once("\r\n\r\n").expect("blank line").0.to_string()
+        text.split_once("\r\n\r\n")
+            .expect("blank line")
+            .0
+            .to_string()
     }
 
     /// Header lookup over the rendered head, so assertions read the bytes and not the
@@ -332,8 +343,14 @@ mod tests {
     #[test]
     fn an_empty_rejection_carries_a_zero_length_and_closes() {
         let response = Response::new(406).with_keep_alive(false);
-        assert_eq!(header_value(&response, "content-length").as_deref(), Some("0"));
-        assert_eq!(header_value(&response, "connection").as_deref(), Some("close"));
+        assert_eq!(
+            header_value(&response, "content-length").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            header_value(&response, "connection").as_deref(),
+            Some("close")
+        );
         assert!(response.to_bytes().ends_with(b"\r\n\r\n"));
     }
 
@@ -366,10 +383,7 @@ mod tests {
     fn framing_failures_map_to_the_status_the_peer_should_see() {
         assert_eq!(Response::from(Error::TruncatedHead).status, 400);
         assert_eq!(Response::from(Error::BadChunkSize("zz".into())).status, 400);
-        assert_eq!(
-            Response::from(Error::BodyTooLarge { limit: 1 }).status,
-            413
-        );
+        assert_eq!(Response::from(Error::BodyTooLarge { limit: 1 }).status, 413);
         // A stream that failed under us is not the peer's fault.
         let io = Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         assert_eq!(Response::from(io).status, 500);
@@ -389,7 +403,14 @@ mod tests {
             .collect();
         assert_eq!(
             order,
-            ["Server", "Content-Type", "X-One", "X-Two", "Content-Length", "Connection"]
+            [
+                "Server",
+                "Content-Type",
+                "X-One",
+                "X-Two",
+                "Content-Length",
+                "Connection"
+            ]
         );
     }
 
@@ -399,7 +420,10 @@ mod tests {
         let response = Response::new(200).with_body(payload.clone());
         let bytes = response.to_bytes();
         assert!(bytes.ends_with(&payload));
-        assert_eq!(header_value(&response, "content-length"), Some("256".into()));
+        assert_eq!(
+            header_value(&response, "content-length"),
+            Some("256".into())
+        );
     }
 
     /// One KiB is the limit every read test uses, so the number in a failure is the
@@ -427,12 +451,16 @@ mod tests {
 
     #[test]
     fn an_interim_answer_carries_no_body_and_leaves_the_next_one_in_the_stream() {
-        let mut stream: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut stream: &[u8] =
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
         let interim = Response::read(&mut stream, LIMIT).expect("reads the interim");
         assert_eq!(interim.status(), 100);
         assert!(interim.is_informational());
         assert!(!interim.ok());
-        assert!(interim.body().is_empty(), "100 has no body, not one until close");
+        assert!(
+            interim.body().is_empty(),
+            "100 has no body, not one until close"
+        );
 
         // The point of not consuming the body here: the real answer is still queued.
         let answer = Response::read(&mut stream, LIMIT).expect("reads the answer");
@@ -455,12 +483,16 @@ mod tests {
         let mut stream: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nunframed";
         let response = Response::read(&mut stream, LIMIT).expect("reads");
         assert_eq!(response.body(), b"unframed");
-        assert!(!response.keeps_alive(), "close is why reading to the end worked");
+        assert!(
+            !response.keeps_alive(),
+            "close is why reading to the end worked"
+        );
     }
 
     #[test]
     fn a_rejected_answer_is_read_as_a_status_and_nothing_else() {
-        let mut stream: &[u8] = b"HTTP/1.1 406 Not Acceptable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let mut stream: &[u8] =
+            b"HTTP/1.1 406 Not Acceptable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let response = Response::read(&mut stream, LIMIT).expect("reads");
         assert_eq!(response.status(), 406);
         assert!(!response.ok());

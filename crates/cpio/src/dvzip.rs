@@ -248,7 +248,10 @@ impl<R: Read> Decoder<R> {
             out.push_str(&format!(", {} empty block(s) skipped", self.empty));
         }
         out.push_str(&format!("; the body began 0x{}", hex_of(&self.head)));
-        out.push_str(&format!("; block one decoded to 0x{}", hex_of(&self.decoded)));
+        out.push_str(&format!(
+            "; block one decoded to 0x{}",
+            hex_of(&self.decoded)
+        ));
         out
     }
 
@@ -423,8 +426,10 @@ fn inflate(payload: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 fn deflate(block: &[u8]) -> io::Result<Vec<u8>> {
-    let mut encoder =
-        flate2::write::ZlibEncoder::new(Vec::with_capacity(block.len()), flate2::Compression::default());
+    let mut encoder = flate2::write::ZlibEncoder::new(
+        Vec::with_capacity(block.len()),
+        flate2::Compression::default(),
+    );
     encoder.write_all(block)?;
     encoder.finish()
 }
@@ -464,7 +469,11 @@ mod tests {
         encoder.write_all(&data).unwrap();
         encoder.finish().unwrap();
         let body = encoder.into_inner();
-        assert!(body.len() < data.len() / 10, "body was {} bytes", body.len());
+        assert!(
+            body.len() < data.len() / 10,
+            "body was {} bytes",
+            body.len()
+        );
         assert_eq!(round_trip(&data), data);
     }
 
@@ -539,7 +548,9 @@ mod tests {
     #[test]
     fn rejects_implausible_length() {
         let body = (MAX_BLOCK as u32 + 1).to_be_bytes();
-        let err = Decoder::new(&body[..]).read_to_end(&mut Vec::new()).unwrap_err();
+        let err = Decoder::new(&body[..])
+            .read_to_end(&mut Vec::new())
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("implausible"), "{err}");
     }
@@ -558,7 +569,9 @@ mod tests {
         body.extend_from_slice(b"abcd");
         body.extend_from_slice(&(MAX_BLOCK as u32 + 1).to_be_bytes());
 
-        let err = Decoder::new(&body[..]).read_to_end(&mut Vec::new()).unwrap_err();
+        let err = Decoder::new(&body[..])
+            .read_to_end(&mut Vec::new())
+            .unwrap_err();
         let text = err.to_string();
         assert!(text.contains("at offset 8"), "{text}");
         assert!(text.contains("1 block(s) were read first"), "{text}");
@@ -600,7 +613,9 @@ mod tests {
     #[test]
     fn a_body_of_zeros_does_not_hang() {
         let body = vec![0u8; 4 * (MAX_EMPTY_RUN as usize + 1)];
-        let err = Decoder::new(&body[..]).read_to_end(&mut Vec::new()).unwrap_err();
+        let err = Decoder::new(&body[..])
+            .read_to_end(&mut Vec::new())
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("has no end"), "{err}");
     }
@@ -620,14 +635,18 @@ mod tests {
     #[test]
     fn rejects_truncated_payload() {
         let body = [0u8, 0, 0, 10, 1, 2, 3];
-        let err = Decoder::new(&body[..]).read_to_end(&mut Vec::new()).unwrap_err();
+        let err = Decoder::new(&body[..])
+            .read_to_end(&mut Vec::new())
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
     fn rejects_truncated_header() {
         let body = [0u8, 0, 0];
-        let err = Decoder::new(&body[..]).read_to_end(&mut Vec::new()).unwrap_err();
+        let err = Decoder::new(&body[..])
+            .read_to_end(&mut Vec::new())
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 

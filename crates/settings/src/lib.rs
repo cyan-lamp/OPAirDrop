@@ -382,7 +382,11 @@ impl fmt::Display for Error {
                 key,
                 value,
                 options,
-            } => write!(out, "{key} is {value:?}, but must be one of {}", options.join(", ")),
+            } => write!(
+                out,
+                "{key} is {value:?}, but must be one of {}",
+                options.join(", ")
+            ),
             Error::NotASwitch { key, value } => {
                 write!(out, "{key} is {value:?}, but must be true or false")
             }
@@ -759,7 +763,10 @@ mod tests {
         let mut values = Values::new();
         for bad in ["a\tb", "a\nb", "a\rb"] {
             let error = values.set("receive.directory", bad).unwrap_err();
-            assert!(matches!(error, Error::Unstorable { .. }), "{bad:?} gave {error:?}");
+            assert!(
+                matches!(error, Error::Unstorable { .. }),
+                "{bad:?} gave {error:?}"
+            );
         }
         assert!(values.set("receive.directory", "Download/Air").is_ok());
     }

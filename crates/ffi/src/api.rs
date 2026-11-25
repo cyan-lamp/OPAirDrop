@@ -93,7 +93,8 @@ pub mod status {
 /// caller's own code, so a caller can say *why* it gave up. The callback must not write
 /// more than `len` bytes, and must not return a positive number without filling that
 /// many.
-pub type ReadCallback = unsafe extern "C" fn(context: *mut c_void, buf: *mut u8, len: usize) -> isize;
+pub type ReadCallback =
+    unsafe extern "C" fn(context: *mut c_void, buf: *mut u8, len: usize) -> isize;
 
 /// Consumes bytes the library produces, in order.
 ///

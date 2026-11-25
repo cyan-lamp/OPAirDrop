@@ -147,11 +147,7 @@ pub trait Receiver {
     /// archive gets a `500`, which is the honest verdict: we accepted the transfer and
     /// then failed to store it, and no status code can un-send the `200` the answer to
     /// `/Ask` already promised.
-    fn upload(
-        &mut self,
-        body: &mut dyn Read,
-        upload: &Upload<'_>,
-    ) -> io::Result<()>;
+    fn upload(&mut self, body: &mut dyn Read, upload: &Upload<'_>) -> io::Result<()>;
 }
 
 /// What the head of an `/Upload` says before its body is touched.
@@ -297,7 +293,9 @@ impl<R: Receiver> Server<R> {
                 match request.path() {
                     PATH_DISCOVER => self.discover(&request, input, output)?,
                     PATH_ASK => self.ask(&request, input, output, &mut offer, &mut accepted)?,
-                    PATH_UPLOAD => self.upload(&request, input, output, offer.as_ref(), accepted)?,
+                    PATH_UPLOAD => {
+                        self.upload(&request, input, output, offer.as_ref(), accepted)?
+                    }
                     _ => {
                         send(output, &Response::new(404).with_keep_alive(false))?;
                         false
@@ -507,7 +505,10 @@ impl<R: Receiver> Server<R> {
         }
 
         let transfer_id = request.header("transferid").filter(|id| !id.is_empty());
-        let matches_offer = match (offer.and_then(|ask| ask.transfer_id.as_deref()), transfer_id) {
+        let matches_offer = match (
+            offer.and_then(|ask| ask.transfer_id.as_deref()),
+            transfer_id,
+        ) {
             (Some(promised), Some(sent)) => Some(promised == sent),
             _ => None,
         };
@@ -710,7 +711,12 @@ mod tests {
     #[test]
     fn a_declined_offer_is_answered_401_close_and_never_answered_200() {
         let files = [Item::new("a.pdf").with_size(7)];
-        let body = crate::ask_request(&Sender::new("Mac", "MacBookPro18,3", "id"), &id(), &files, &[]);
+        let body = crate::ask_request(
+            &Sender::new("Mac", "MacBookPro18,3", "id"),
+            &id(),
+            &files,
+            &[],
+        );
         let (receiver, output) = run(
             Recorder {
                 late_answer: true,
@@ -734,13 +740,21 @@ mod tests {
         // receiver that refuses without looking cannot say what it refused.
         assert_eq!(receiver.offers.len(), 1);
         // And the prompt was never raised: `ask` is what a receiver uses to ask a person.
-        assert_eq!(receiver.asks, 0, "a declined offer must not raise the prompt");
+        assert_eq!(
+            receiver.asks, 0,
+            "a declined offer must not raise the prompt"
+        );
     }
 
     #[test]
     fn an_accepted_offer_is_answered_200_and_the_prompt_runs_once() {
         let files = [Item::new("a.pdf").with_size(7)];
-        let body = crate::ask_request(&Sender::new("Mac", "MacBookPro18,3", "id"), &id(), &files, &[]);
+        let body = crate::ask_request(
+            &Sender::new("Mac", "MacBookPro18,3", "id"),
+            &id(),
+            &files,
+            &[],
+        );
         let (receiver, output) = run(
             Recorder {
                 late_answer: true,
@@ -816,7 +830,10 @@ mod tests {
     #[test]
     fn a_discover_body_that_is_not_a_plist_costs_nothing() {
         // The answer is already on the wire, so the only casualty is the name.
-        let (receiver, output) = run(Recorder::default(), &post(PATH_DISCOVER, "", b"not a plist"));
+        let (receiver, output) = run(
+            Recorder::default(),
+            &post(PATH_DISCOVER, "", b"not a plist"),
+        );
         assert_eq!(statuses(&output), [200]);
         assert!(receiver.senders.is_empty());
     }
@@ -824,12 +841,20 @@ mod tests {
     #[test]
     fn ask_is_answered_early_and_the_offer_is_still_collected() {
         let files = [Item::new("a.pdf").with_size(7), Item::new("b.pdf")];
-        let body = crate::ask_request(&Sender::new("Mac", "MacBookPro18,3", "id"), &id(), &files, &[]);
+        let body = crate::ask_request(
+            &Sender::new("Mac", "MacBookPro18,3", "id"),
+            &id(),
+            &files,
+            &[],
+        );
         let (receiver, output) = run(Recorder::default(), &post(PATH_ASK, "", &body));
 
         assert_eq!(statuses(&output), [200]);
         let answer = AskAnswer::parse(body_of(&output)).expect("a plist answer");
-        assert_eq!(answer.model_name, "early", "answered before the offer was read");
+        assert_eq!(
+            answer.model_name, "early",
+            "answered before the offer was read"
+        );
         assert_eq!(receiver.offers.len(), 1);
         assert_eq!(receiver.offers[0].files.len(), 2);
         assert_eq!(receiver.offers[0].display_name(), "Mac");
@@ -841,7 +866,12 @@ mod tests {
             late_answer: true,
             ..Recorder::default()
         };
-        let body = crate::ask_request(&Sender::new("Mac", "MacBookPro18,3", "id"), &id(), &[Item::new("a")], &[]);
+        let body = crate::ask_request(
+            &Sender::new("Mac", "MacBookPro18,3", "id"),
+            &id(),
+            &[Item::new("a")],
+            &[],
+        );
         let (receiver, output) = run(recorder, &post(PATH_ASK, "", &body));
 
         assert_eq!(statuses(&output), [200]);
@@ -857,8 +887,12 @@ mod tests {
         // difference — a loop that went back for one more request would read it, and this
         // receiver would end up holding an upload it should never have been offered.
         let links = ["https://example.com/a".to_string()];
-        let body =
-            crate::ask_request(&Sender::new("iPhone", "iPhone15,2", "id"), &id(), &[], &links);
+        let body = crate::ask_request(
+            &Sender::new("iPhone", "iPhone15,2", "id"),
+            &id(),
+            &[],
+            &links,
+        );
         let mut raw = post(PATH_ASK, "", &body);
         raw.extend_from_slice(&post(
             PATH_UPLOAD,
@@ -873,7 +907,10 @@ mod tests {
         assert_eq!(statuses(&output), [200]);
         assert_eq!(receiver.offers.len(), 1);
         assert_eq!(receiver.offers[0].links, ["https://example.com/a"]);
-        assert!(receiver.uploads.is_empty(), "nothing was read after the offer");
+        assert!(
+            receiver.uploads.is_empty(),
+            "nothing was read after the offer"
+        );
     }
 
     #[test]
@@ -881,7 +918,12 @@ mod tests {
         // The other half of the rule above, and the reason it is `files.is_empty()` rather
         // than "a links share": a normal offer must still be served to its archive.
         let files = [Item::new("a.pdf").with_size(7)];
-        let body = crate::ask_request(&Sender::new("Mac", "MacBookPro18,3", "id"), &id(), &files, &[]);
+        let body = crate::ask_request(
+            &Sender::new("Mac", "MacBookPro18,3", "id"),
+            &id(),
+            &files,
+            &[],
+        );
         let mut raw = post(PATH_ASK, "", &body);
         raw.extend_from_slice(&post(
             PATH_UPLOAD,
@@ -915,7 +957,12 @@ mod tests {
     #[test]
     fn two_requests_share_one_connection() {
         let discover = discover_request(&Sender::new("Mac", "MacBookPro18,3", "id"));
-        let ask = crate::ask_request(&Sender::new("Mac", "MacBookPro18,3", "id"), &id(), &[Item::new("a")], &[]);
+        let ask = crate::ask_request(
+            &Sender::new("Mac", "MacBookPro18,3", "id"),
+            &id(),
+            &[Item::new("a")],
+            &[],
+        );
         let mut raw = post(PATH_DISCOVER, "Connection: keep-alive\r\n", &discover);
         raw.extend_from_slice(&post(PATH_ASK, "", &ask));
 
@@ -928,7 +975,10 @@ mod tests {
     #[test]
     fn a_connection_close_request_ends_the_conversation() {
         let body = discover_request(&Sender::new("Mac", "MacBook", "id"));
-        let (_, output) = run(Recorder::default(), &post(PATH_DISCOVER, "Connection: close\r\n", &body));
+        let (_, output) = run(
+            Recorder::default(),
+            &post(PATH_DISCOVER, "Connection: close\r\n", &body),
+        );
         assert_eq!(statuses(&output), [200]);
         assert!(
             String::from_utf8_lossy(&output).contains("Connection: close"),
@@ -951,7 +1001,12 @@ mod tests {
 
     #[test]
     fn upload_without_an_archive_type_is_refused_before_a_byte_is_read() {
-        let ask = crate::ask_request(&Sender::new("Mac", "Mac", "id"), &id(), &[Item::new("a")], &[]);
+        let ask = crate::ask_request(
+            &Sender::new("Mac", "Mac", "id"),
+            &id(),
+            &[Item::new("a")],
+            &[],
+        );
         let mut raw = post(PATH_ASK, "", &ask);
         raw.extend_from_slice(&post(
             PATH_UPLOAD,
@@ -959,14 +1014,23 @@ mod tests {
             b"not an archive",
         ));
         let (receiver, output) = run(Recorder::default(), &raw);
-        assert_eq!(statuses(&output), [200, 406], "no 100-continue before a refusal");
+        assert_eq!(
+            statuses(&output),
+            [200, 406],
+            "no 100-continue before a refusal"
+        );
         assert!(receiver.uploads.is_empty());
     }
 
     #[test]
     fn continue_precedes_the_upload_answer_and_the_bytes_reach_the_receiver() {
         let archive = b"070701 trailer";
-        let ask = crate::ask_request(&Sender::new("Mac", "Mac", "id"), &id(), &[Item::new("a")], &[]);
+        let ask = crate::ask_request(
+            &Sender::new("Mac", "Mac", "id"),
+            &id(),
+            &[Item::new("a")],
+            &[],
+        );
         let mut raw = post(PATH_ASK, "", &ask);
         raw.extend_from_slice(&post(
             PATH_UPLOAD,
@@ -976,9 +1040,12 @@ mod tests {
         let (receiver, output) = run(Recorder::default(), &raw);
 
         assert_eq!(statuses(&output), [200, 100, 200]);
-        let continue_at = output.windows(CONTINUE.len()).position(|w| w == CONTINUE)
+        let continue_at = output
+            .windows(CONTINUE.len())
+            .position(|w| w == CONTINUE)
             .expect("the continue has to be there");
-        let upload_answer_at = output.windows(b"HTTP/1.1 200".len())
+        let upload_answer_at = output
+            .windows(b"HTTP/1.1 200".len())
             .rposition(|w| w == b"HTTP/1.1 200")
             .expect("the upload answer has to be there");
         assert!(
@@ -992,17 +1059,28 @@ mod tests {
 
     #[test]
     fn an_upload_repeats_the_transfer_id_the_offer_promised() {
-        let ask = crate::ask_request(&Sender::new("Mac", "Mac", "id"), &id(), &[Item::new("a")], &[]);
+        let ask = crate::ask_request(
+            &Sender::new("Mac", "Mac", "id"),
+            &id(),
+            &[Item::new("a")],
+            &[],
+        );
         let mut raw = post(PATH_ASK, "", &ask);
         raw.extend_from_slice(&post(
             PATH_UPLOAD,
-            &format!("Content-Type: application/x-dvzip\r\nTransferID: {}\r\n", id()),
+            &format!(
+                "Content-Type: application/x-dvzip\r\nTransferID: {}\r\n",
+                id()
+            ),
             b"archive",
         ));
 
         let (receiver, output) = run(Recorder::default(), &raw);
         assert_eq!(statuses(&output), [200, 200]);
-        assert_eq!(receiver.uploads[0].transfer_id.as_deref(), Some(id().as_str()));
+        assert_eq!(
+            receiver.uploads[0].transfer_id.as_deref(),
+            Some(id().as_str())
+        );
         assert_eq!(
             receiver.uploads[0].matches_offer,
             Some(true),
@@ -1013,7 +1091,12 @@ mod tests {
     #[test]
     fn an_upload_that_breaks_the_promise_is_refused() {
         // 评审 P0-1：TransferID 对不上 offer 的点名，这笔 /Upload 不是被统计、是被拒。
-        let ask = crate::ask_request(&Sender::new("Mac", "Mac", "id"), &id(), &[Item::new("a")], &[]);
+        let ask = crate::ask_request(
+            &Sender::new("Mac", "Mac", "id"),
+            &id(),
+            &[Item::new("a")],
+            &[],
+        );
         let mut raw = post(PATH_ASK, "", &ask);
         raw.extend_from_slice(&post(
             PATH_UPLOAD,
@@ -1038,7 +1121,10 @@ mod tests {
         );
         let (receiver, output) = run(Recorder::default(), &raw);
         assert_eq!(statuses(&output), [401]);
-        assert!(receiver.uploads.is_empty(), "nothing is stored without asking");
+        assert!(
+            receiver.uploads.is_empty(),
+            "nothing is stored without asking"
+        );
     }
 
     #[test]
@@ -1049,7 +1135,12 @@ mod tests {
         };
         // 先 /Ask 拿到人的接受（评审 P0-1 之后裸 /Upload 会被 401 拒掉），
         // 再送一个读不出来的 archive，看 500 的诚实判决。
-        let ask = crate::ask_request(&Sender::new("Mac", "Mac", "id"), &id(), &[Item::new("a")], &[]);
+        let ask = crate::ask_request(
+            &Sender::new("Mac", "Mac", "id"),
+            &id(),
+            &[Item::new("a")],
+            &[],
+        );
         let mut raw = post(PATH_ASK, "", &ask);
         raw.extend_from_slice(&post(
             PATH_UPLOAD,
@@ -1088,7 +1179,11 @@ mod tests {
             ..Recorder::default()
         };
         let mut server = Server::new(recorder);
-        let raw = post(PATH_ASK, "", &opairdrop_bplist::encode(&Value::String("nope".into())));
+        let raw = post(
+            PATH_ASK,
+            "",
+            &opairdrop_bplist::encode(&Value::String("nope".into())),
+        );
         let mut input: &[u8] = &raw;
         let mut output = Vec::new();
         let error = server.serve(&mut input, &mut output).unwrap_err();

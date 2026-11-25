@@ -270,11 +270,7 @@ impl Schedule {
     /// The believed peer map in the comma form a status line uses, or `none`.
     pub fn describe_peer(&self) -> String {
         match self.peer.believed {
-            Some(map) => map
-                .iter()
-                .map(u8::to_string)
-                .collect::<Vec<_>>()
-                .join(","),
+            Some(map) => map.iter().map(u8::to_string).collect::<Vec<_>>().join(","),
             None => "none".to_string(),
         }
     }
@@ -313,9 +309,7 @@ impl Schedule {
         let tu = self.since_us(now_us) / TU_US;
         let within = (tu % u64::from(SLOT_TU)) / u64::from(AW_PERIOD_TU);
         let slots = tu / u64::from(SLOT_TU);
-        let aw = u64::from(self.base_aw)
-            + within
-            + u64::from(PRESENCE_MODE) * slots;
+        let aw = u64::from(self.base_aw) + within + u64::from(PRESENCE_MODE) * slots;
         (aw & 0xffff) as u16
     }
 
@@ -397,8 +391,7 @@ impl Schedule {
         let theirs = i32::from(aw_counter) / i32::from(PRESENCE_MODE);
         let ours = i32::from(self.aw_counter(now_us)) / i32::from(PRESENCE_MODE);
         let slots = (theirs - ours + WRAP / 2).rem_euclid(WRAP) - WRAP / 2;
-        slots * i32::from(SLOT_TU)
-            - (i32::from(next_tu) - i32::from(self.next_slot_tu(now_us)))
+        slots * i32::from(SLOT_TU) - (i32::from(next_tu) - i32::from(self.next_slot_tu(now_us)))
     }
 
     /// The sequence map in the comma form a status line and a peer's frame both use.
@@ -513,8 +506,16 @@ mod tests {
         s.follow(now, 32, 8);
         let next_tu = s.next_slot_tu(now);
         assert_eq!(s.error_tu(now, next_tu, 8), 0, "same counter, aligned");
-        assert_eq!(s.error_tu(now, next_tu, 12), SLOT_TU as i32, "one slot ahead");
-        assert_eq!(s.error_tu(now, next_tu, 4), -(SLOT_TU as i32), "one slot behind");
+        assert_eq!(
+            s.error_tu(now, next_tu, 12),
+            SLOT_TU as i32,
+            "one slot ahead"
+        );
+        assert_eq!(
+            s.error_tu(now, next_tu, 4),
+            -(SLOT_TU as i32),
+            "one slot behind"
+        );
     }
 
     #[test]
@@ -523,7 +524,10 @@ mod tests {
         for slot in 0..SLOTS as u64 * 2 {
             assert!(s.owns_now(slot * SLOT_US + 1000));
         }
-        assert_eq!(s.describe(), "149,149,149,149,149,149,149,149,149,149,149,149,149,149,149,149");
+        assert_eq!(
+            s.describe(),
+            "149,149,149,149,149,149,149,149,149,149,149,149,149,149,149,149"
+        );
     }
 
     #[test]
@@ -533,7 +537,10 @@ mod tests {
         map[3] = 6;
         assert_eq!(believe(&mut s, map), MapVerdict::Adopted);
         assert!(s.owns_now(0));
-        assert!(!s.owns_now(3 * SLOT_US), "slot 3 belongs to the other channel");
+        assert!(
+            !s.owns_now(3 * SLOT_US),
+            "slot 3 belongs to the other channel"
+        );
         assert!(s.owns_now(4 * SLOT_US));
     }
 
@@ -548,7 +555,10 @@ mod tests {
         let mut map = [149u8; SLOTS];
         map[3] = 6;
         assert_eq!(believe(&mut s, map), MapVerdict::Adopted);
-        assert!(!s.owns_now(3 * SLOT_US), "slot 3 is the departed peer's channel");
+        assert!(
+            !s.owns_now(3 * SLOT_US),
+            "slot 3 is the departed peer's channel"
+        );
 
         s.forget_peer();
 
@@ -585,7 +595,11 @@ mod tests {
         assert_eq!(s.offer_map(map, 65_536), MapVerdict::Learning(2));
         assert_eq!(s.peer_map(), None, "two frames is not a map");
         assert_eq!(s.offer_map(map, 131_072), MapVerdict::Adopted);
-        assert_eq!(s.offer_map(map, 196_608), MapVerdict::Believed, "already obeyed");
+        assert_eq!(
+            s.offer_map(map, 196_608),
+            MapVerdict::Believed,
+            "already obeyed"
+        );
     }
 
     #[test]
@@ -619,7 +633,11 @@ mod tests {
         b[1] = 149;
         s.offer_map(a, 0);
         s.offer_map(a, 65_536);
-        assert_eq!(s.offer_map(b, 131_072), MapVerdict::Learning(1), "different shape");
+        assert_eq!(
+            s.offer_map(b, 131_072),
+            MapVerdict::Learning(1),
+            "different shape"
+        );
         assert_eq!(s.peer_map(), None);
     }
 

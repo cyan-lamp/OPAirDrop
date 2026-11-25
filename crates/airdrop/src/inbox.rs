@@ -116,13 +116,18 @@ impl fmt::Display for Error {
             Error::Archive(error) => write!(out, "the archive could not be read: {error}"),
             Error::Io(error) => write!(out, "the inbox could not be written: {error}"),
             Error::OverBudget { limit } => {
-                write!(out, "the transfer exceeds the inbox budget of {limit} bytes")
+                write!(
+                    out,
+                    "the transfer exceeds the inbox budget of {limit} bytes"
+                )
             }
             Error::TooManyMembers(n) => {
                 write!(out, "more than {n} members in one transfer")
             }
             Error::NoFreeName { name } => write!(out, "no free name for {name}"),
-            Error::Outside { name } => write!(out, "refusing {name}: it resolves outside the inbox"),
+            Error::Outside { name } => {
+                write!(out, "refusing {name}: it resolves outside the inbox")
+            }
         }
     }
 }
@@ -472,7 +477,8 @@ impl Sink for Inbox {
         // 成员数单独设闸，目录与文件一视同仁；超限按预算超限同一语义处理
         // （记一次失败、后面成员不再落盘，archive 照旧排干）。
         if self.members >= self.member_limit {
-            self.failure.get_or_insert(Error::TooManyMembers(self.member_limit));
+            self.failure
+                .get_or_insert(Error::TooManyMembers(self.member_limit));
             return None;
         }
         self.members += 1;
@@ -732,7 +738,8 @@ mod tests {
             Entry::file("kept.txt", b"yes".to_vec()),
         ]);
 
-        let received = receive(&root, bytes.as_slice()).expect("the rest of the archive still lands");
+        let received =
+            receive(&root, bytes.as_slice()).expect("the rest of the archive still lands");
 
         assert_eq!(received.names, ["kept.txt"]);
         assert!(!root.join("..").join("escaped.txt").exists());
@@ -756,8 +763,8 @@ mod tests {
         let mut link = Entry::file("passwd", b"/etc/passwd".to_vec());
         link.mode = MODE_SYMLINK;
 
-        let received = receive(&root, archive(&[link]).as_slice())
-            .expect("dropping a link is not an error");
+        let received =
+            receive(&root, archive(&[link]).as_slice()).expect("dropping a link is not an error");
 
         assert!(received.names.is_empty());
         assert!(
@@ -806,7 +813,11 @@ mod tests {
 
         let received = receive_with(
             &root,
-            Limits { byte_limit: DEFAULT_BYTE_LIMIT, member_limit: DEFAULT_MEMBER_LIMIT, overwrite: true, },
+            Limits {
+                byte_limit: DEFAULT_BYTE_LIMIT,
+                member_limit: DEFAULT_MEMBER_LIMIT,
+                overwrite: true,
+            },
             archive(&[Entry::file("note.txt", b"newer".to_vec())]).as_slice(),
         )
         .expect("the archive is accepted");
@@ -826,7 +837,11 @@ mod tests {
 
         let received = receive_with(
             &root,
-            Limits { byte_limit: DEFAULT_BYTE_LIMIT, member_limit: DEFAULT_MEMBER_LIMIT, overwrite: true, },
+            Limits {
+                byte_limit: DEFAULT_BYTE_LIMIT,
+                member_limit: DEFAULT_MEMBER_LIMIT,
+                overwrite: true,
+            },
             bytes.as_slice(),
         )
         .expect("both members are stored");
@@ -841,7 +856,11 @@ mod tests {
         let root = scratch("overwrite-budget");
         let mut inbox = Inbox::with_limits(
             &root,
-            Limits { byte_limit: 10, member_limit: DEFAULT_MEMBER_LIMIT, overwrite: true, },
+            Limits {
+                byte_limit: 10,
+                member_limit: DEFAULT_MEMBER_LIMIT,
+                overwrite: true,
+            },
         )
         .expect("the inbox opens");
 
@@ -849,7 +868,10 @@ mod tests {
             .receive(archive(&[Entry::file("big.bin", vec![7u8; 64])]).as_slice())
             .expect_err("64 bytes do not fit in a 10 byte budget");
 
-        assert!(matches!(failure, Error::OverBudget { limit: 10 }), "{failure:?}");
+        assert!(
+            matches!(failure, Error::OverBudget { limit: 10 }),
+            "{failure:?}"
+        );
         assert_eq!(listing(&root), Vec::<String>::new(), "nothing is published");
     }
 
@@ -871,28 +893,53 @@ mod tests {
     #[test]
     fn a_transfer_that_outgrows_the_budget_leaves_no_partial_file() {
         let root = scratch("budget");
-        let mut inbox = Inbox::with_limits(&root, Limits { byte_limit: 10, member_limit: DEFAULT_MEMBER_LIMIT, overwrite: false }).expect("the inbox opens");
+        let mut inbox = Inbox::with_limits(
+            &root,
+            Limits {
+                byte_limit: 10,
+                member_limit: DEFAULT_MEMBER_LIMIT,
+                overwrite: false,
+            },
+        )
+        .expect("the inbox opens");
         let bytes = archive(&[Entry::file("big.bin", vec![7u8; 64])]);
 
         let failure = inbox
             .receive(bytes.as_slice())
             .expect_err("64 bytes do not fit in a 10 byte budget");
 
-        assert!(matches!(failure, Error::OverBudget { limit: 10 }), "{failure:?}");
+        assert!(
+            matches!(failure, Error::OverBudget { limit: 10 }),
+            "{failure:?}"
+        );
         assert!(inbox.names().is_empty());
-        assert_eq!(listing(&root), Vec::<String>::new(), "no truncated file, no temporary");
+        assert_eq!(
+            listing(&root),
+            Vec::<String>::new(),
+            "no truncated file, no temporary"
+        );
     }
 
     #[test]
     fn the_budget_is_spent_across_members_not_per_member() {
         let root = scratch("budget-across");
-        let mut inbox = Inbox::with_limits(&root, Limits { byte_limit: 10, member_limit: DEFAULT_MEMBER_LIMIT, overwrite: false }).expect("the inbox opens");
+        let mut inbox = Inbox::with_limits(
+            &root,
+            Limits {
+                byte_limit: 10,
+                member_limit: DEFAULT_MEMBER_LIMIT,
+                overwrite: false,
+            },
+        )
+        .expect("the inbox opens");
         let bytes = archive(&[
             Entry::file("first.bin", vec![1u8; 8]),
             Entry::file("second.bin", vec![2u8; 8]),
         ]);
 
-        let failure = inbox.receive(bytes.as_slice()).expect_err("16 bytes exceed a 10 byte budget");
+        let failure = inbox
+            .receive(bytes.as_slice())
+            .expect_err("16 bytes exceed a 10 byte budget");
 
         assert!(matches!(failure, Error::OverBudget { .. }), "{failure:?}");
         assert_eq!(inbox.names(), ["first.bin"], "the member that fit is kept");
@@ -931,8 +978,8 @@ mod tests {
         }
         assert!(opairdrop_cpio::dvzip::looks_like_block(&wrapped[..4]));
 
-        let received = receive(&root, wrapped.as_slice())
-            .expect("the wrapper is unwrapped on the way in");
+        let received =
+            receive(&root, wrapped.as_slice()).expect("the wrapper is unwrapped on the way in");
 
         assert_eq!(received.names, ["video.mov"]);
         assert_eq!(read(&root.join("video.mov")), payload);
@@ -947,11 +994,14 @@ mod tests {
         // leaves 32 of the 256 bytes the header promised.
         bytes.truncate(150);
 
-        let failure = receive(&root, bytes.as_slice())
-            .expect_err("a cut-short member is not accepted");
+        let failure =
+            receive(&root, bytes.as_slice()).expect_err("a cut-short member is not accepted");
 
         assert!(matches!(failure, Error::Archive(_)), "{failure:?}");
-        assert!(root.join("a.txt").symlink_metadata().is_err(), "half a member is not published");
+        assert!(
+            root.join("a.txt").symlink_metadata().is_err(),
+            "half a member is not published"
+        );
     }
 
     #[test]

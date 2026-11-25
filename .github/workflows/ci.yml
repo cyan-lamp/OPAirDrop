@@ -57,6 +57,11 @@ jobs:
           "$SDKMANAGER" --install "build-tools;37.0.0" "ndk;27.3.13750724" > /dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.3.13750724" >> "$GITHUB_ENV"
 
+      - name: fmt（格式门禁，P1-23）
+        # rust-toolchain@stable 默认带 rustfmt；全仓已 cargo fmt 过一次，
+        # 这条门禁保证之后新增的代码不会再把格式漂移攒回去。
+        run: cargo fmt --all -- --check
+
       - name: clippy（0 警告门禁）
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -69,7 +74,7 @@ jobs:
       - name: 载荷哈希校验
         run: ./tools/verify-payload.sh
 
-      - name: JVM 往返（394 条）
+      - name: JVM 往返（395 条）
         run: bash crates/ffi/jvm/check.sh
 
       - name: 组装 APK（android/build.sh：cargo + gradlew 一条龙）

@@ -344,7 +344,10 @@ mod tests {
         stopped();
         starting();
         let line = verdict(refusal::NO_PERMISSION);
-        assert!(line.starts_with("failed: BLUETOOTH_ADVERTISE not granted"), "{line}");
+        assert!(
+            line.starts_with("failed: BLUETOOTH_ADVERTISE not granted"),
+            "{line}"
+        );
         assert!(!current().is_awake());
     }
 
