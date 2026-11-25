@@ -106,16 +106,23 @@ android {
                 storePassword signingProperties['storePassword']
                 keyAlias signingProperties['keyAlias']
                 keyPassword signingProperties['keyPassword']
+                // 三套签名全开：v1 给老安装器/第三方工具验签，v2/v3 给现代 Android
+                // 做整包与轮换校验。AGP 8.9 的 DSL 是 enableVnSigning（不是
+                // vNSigningEnabled——后者在 v3 上不存在，会报 "Could not find method"）。
+                enableV1Signing true
+                enableV2Signing true
+                enableV3Signing true
             }
         }
     }
 
     buildTypes {
         release {
-            // minify stays off: there is no reflection here that would need keeping, but
-            // R8 also rewrites the stack traces in a crash report, and the value of this
-            // build is that it behaves exactly like the debug one minus the probe.
-            minifyEnabled false
+            // 交付版开 R8 混淆与裁剪。JNI 入口靠 @Keep 保住（Native/Rust 名字是
+            // 跨语言契约），其余类可自由改名。
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'),
+                    'proguard-rules.pro'
             if (signingPropertiesFile.isFile()) {
                 signingConfig signingConfigs.release
             }
