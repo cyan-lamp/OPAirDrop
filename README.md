@@ -141,7 +141,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-JDK、SDK 与 Gradle 放在 `tools/` 下，脚本按名字取而不查 `PATH`，可用 `JAVA_HOME`、`GRADLE_BIN`、`CARGO_BIN` 覆盖。真机脚本在 `tools/`：`awdl-stack.sh` 拉起链路，`capture.sh` 抓隧道上的包，`tap.sh` 在 802.11 侧再抓一份（两者一比才知道是「对端没发」还是「我们收丢了」），`awdld-probe.sh` 看守护进程状态，`hans_guard.sh` 是设备侧断网守护。
+JDK、SDK 与 Gradle 放在 `tools/` 下，脚本按名字取而不查 `PATH`，可用 `JAVA_HOME`、`GRADLE_BIN`、`CARGO_BIN` 覆盖。真机脚本在 `tools/`：`awdl-stack.sh` 拉起链路，`capture.sh` 抓隧道上的包，`tap.sh` 在 802.11 侧再抓一份（两者一比才分得清「对端没发」与「本端收丢」），`awdld-probe.sh` 看守护进程状态，`hans_guard.sh` 是设备侧断网守护。
 
 日志默认按 `debug` 记（`log.level`），一天一个文件写在 `Documents/AirDrop/airdrop-YYYY-MM-DD.log`；嫌吵可在设置页调回 `info`。
 
