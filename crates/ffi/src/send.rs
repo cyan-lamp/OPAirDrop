@@ -382,7 +382,6 @@ unsafe fn drive(
 
     // 分母不在这里定：源文件大小不是要发出去的字节数（实况要拆成图片 + 视频，源文件里
     // 那张 GainMap 不发）。真正的分母在 `transfer` 里由 `Plan::payload` 给出，见那里。
-    let mut meter = meter;
 
     // SAFETY: the caller guarantees the callbacks and their context for the duration.
     let reader = CallbackReader::new(read, context);
@@ -1299,6 +1298,37 @@ mod live_bundle_tests {
         out.extend_from_slice(&[0u8; 16]);
         out.extend_from_slice(&movie);
         out
+    }
+
+    /// 归档时真正读过的字节数必须等于分母——否则条到不了 100%，而少掉的那段
+    /// 在接收端就是被截断的成员（视频少一截 = 实况能显示、一播放就黑屏）。
+    #[test]
+    fn archiving_reads_exactly_what_the_denominator_says() {
+        unsafe extern "C" fn ignore(_c: *mut c_void, _p: i32, _s: u64, _t: u64) {}
+        let dir = std::env::temp_dir().join("opairdrop-live-meter");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        let photo = dir.join("IMG_0003.JPG");
+        fs::write(&photo, camera_photo()).expect("fixture");
+
+        let plan = describe(std::slice::from_ref(&photo)).expect("describes");
+        let meter = Meter {
+            callback: ignore,
+            context: std::ptr::null_mut(),
+            name_callback: None,
+            sent: std::cell::Cell::new(0),
+            total: std::cell::Cell::new(plan.payload()),
+            last: std::cell::Cell::new(0),
+        };
+        let mut sink = Vec::new();
+        archive(&mut sink, &plan.members, Some(&meter)).expect("archives");
+        assert_eq!(
+            meter.sent.get(),
+            plan.payload(),
+            "读过 {} 字节，分母说 {}",
+            meter.sent.get(),
+            plan.payload()
+        );
     }
 
     /// 进度分母必须是**发出去的字节**，不是源文件大小。相机实况的源文件里含一整张
