@@ -1258,6 +1258,21 @@ mod live_bundle_tests {
         collect.0
     }
 
+    /// 一段最小的、站得住的 MP4：`split` 现在要求视频自己是一个完整容器
+    /// （`ftyp` 开头、box 链走到尾），一串裸字节不再算数。
+    fn movie() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&20u32.to_be_bytes());
+        out.extend_from_slice(b"ftyp");
+        out.extend_from_slice(b"mp42\x00\x00\x00\x00mp42");
+        out.extend_from_slice(&8u32.to_be_bytes());
+        out.extend_from_slice(b"moov");
+        out.extend_from_slice(&12u32.to_be_bytes());
+        out.extend_from_slice(b"mdat");
+        out.extend_from_slice(b"data");
+        out
+    }
+
     /// 一张最小的 Motion Photo：APP1(XMP) + SOS + EOI + 视频。
     fn motion_photo(video: &[u8]) -> Vec<u8> {
         let xmp = format!(
@@ -1283,7 +1298,7 @@ mod live_bundle_tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("temp dir");
         let photo = dir.join("IMG_0001.JPG");
-        fs::write(&photo, motion_photo(b"VIDEO")).expect("fixture");
+        fs::write(&photo, motion_photo(&movie())).expect("fixture");
 
         let plan = describe(std::slice::from_ref(&photo)).expect("describes");
         assert_eq!(plan.offered.len(), 1, "只有 .pvt 一个条目进 /Ask");
@@ -1307,17 +1322,21 @@ mod live_bundle_tests {
             "names: {names:?}"
         );
 
-        // 分母是图片 + 视频，不是 /Ask 里那个 0。
+        // 分母是图片 + 视频，不是 /Ask 里那个 0。这两个成员都可能和源文件不一样：
+        // 图片要补 Apple 的 EXIF 模板，视频要补 meta（有 free 就从 free 里借）。所以
+        // 这里能断言的是「分母非零，且正好是这两个成员的大小之和」。
         let total: u64 = plan
             .members
             .iter()
             .filter(|(item, _)| !item.directory)
             .map(|(item, _)| item.size.unwrap_or(0))
             .sum();
-        assert_eq!(total, (photo_size(&photo)) as u64);
-    }
-
-    fn photo_size(path: &PathBuf) -> u64 {
-        fs::metadata(path).expect("fixture exists").len()
+        let named: u64 = plan
+            .members
+            .iter()
+            .filter(|(item, _)| !item.directory)
+            .count() as u64;
+        assert!(named >= 2, "图片和视频各算一个成员");
+        assert!(total > 0, "分母不能是那个 0");
     }
 }

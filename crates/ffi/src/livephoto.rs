@@ -43,9 +43,23 @@ pub struct LivePhoto {
 
 /// 一个文件是不是 Motion Photo；是就拆成两半。
 ///
-/// 判据全部来自文件本身，不信扩展名：SOI 开头、XMP 里声明了 Motion Photo、声明的长度
-/// 把文件恰好切在一个 EOI 上。三条都满足才拆——任何一条不满足，原文件照常作为一个成员
-/// 发出去，宁可少配一次对，也不能把一个好文件切坏。
+/// # 判据
+///
+/// 全部来自文件本身，不信扩展名：SOI 开头、XMP 里声明了 Motion Photo、声明的视频长度
+/// 切出来的那一段**自己站得住**（`ftyp` 开头、box 链正好走到文件尾）、主图的 EOI 在它
+/// 之前。三条都满足才拆——任何一条不满足，原文件照常作为一个成员发出去，宁可少配一次
+/// 对，也不能把一个好文件切坏。
+///
+/// # 为什么不能要求「视频紧贴 EOI」
+///
+/// 上一版就是这么判的，2026-11-26 21:16 那张实况直接被打回普通照片。相机把 Motion Photo
+/// 存成 `[主图][GainMap（另一张 JPEG）][填零][MP4]`：主图与视频之间还垫着几百 KB 的
+/// HDR 增益图，有的机型甚至垫着一段**GainMap 视频**。紧贴判据在真机上一次都没成立过，
+/// 于是所有相机实况都配不成对（iPhone 只显示一张普通照片）。
+///
+/// 现在图片按主图自己的 EOI 切：GainMap 是**另一张** JPEG，跟着发过去只会让 `.pvt` 变成
+/// 一个套着两张图的怪文件。视频还是按 XMP 声明的长度从尾巴上量——六个真机样本上
+/// `len - MotionPhoto 项长度` 全部精确落在 `ftyp` 上。
 pub fn split(bytes: &[u8]) -> Option<LivePhoto> {
     if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
         return None;
@@ -59,9 +73,15 @@ pub fn split(bytes: &[u8]) -> Option<LivePhoto> {
         return None;
     }
     let cut = bytes.len() - length;
-    // 视频必须紧贴在 EOI 之后。差一个字节就说明声明的长度不是这个意思（GainMap、
-    // 水印段、或者别的尾部数据），这时候拆开只会把图片切坏。
-    if cut < 2 || bytes[cut - 2] != 0xFF || bytes[cut - 1] != 0xD9 {
+    // 视频那一半必须是一段站得住的 MP4。这一条同时挡掉了「声明的长度不是这个意思」
+    // 的旧情况：真机上它落在 `00 00 00 18 ftyp` 上，box 链一直走到文件尾。
+    if !looks_like_movie(&bytes[cut..]) {
+        return None;
+    }
+    // 图片只到主图的 EOI。主图之后的东西（GainMap、填零）两边都不要：它们既不属于
+    // 图片，也不属于视频。
+    let image_end = picture_end(bytes)?;
+    if image_end > cut {
         return None;
     }
     let mut video = bytes[cut..].to_vec();
@@ -79,7 +99,7 @@ pub fn split(bytes: &[u8]) -> Option<LivePhoto> {
             identifier = Some(fresh);
         }
     }
-    let mut image = bytes[..cut].to_vec();
+    let mut image = bytes[..image_end].to_vec();
     // 图片那一半：相机实况的 EXIF 里没有 Apple 的 MakerNote（0x0011 就是配对 UUID），
     // 而 iPhone 看的是**两边都有且相同**。视频补了、图片没补，照样配不成对——用户实测
     // 的表现是「iPhone 显示一张打不开的图片」。
@@ -374,37 +394,167 @@ fn fresh_uuid() -> String {
     )
 }
 
-/// 给视频的 `moov` 末尾加一个只在声明配对标识的 `meta` box。
+/// 给视频的 `moov` 写进配对标识（`meta` box），并把因此挪动的采样偏移补回来。
 ///
 /// <p>结构照抄真机（`IMG_7603.MOV` 的 moov/meta：hdlr + keys + ilst，keys 的命名空间是
 /// `mdta`，ilst 里每项是一个 `data` box）。只写 `content.identifier` 这一条：make /
 /// model / software 说的是拍摄设备，我们不是那台设备，写进去就是假话。
 ///
-/// <p>能这么做的前提是这条视频的 `mdat` 在 `moov` **前面**（iPhone 与 OPPO 的实况都是）。
-/// 那样往 moov 末尾追加不会移动任何采样数据，`stco` 里的偏移一个都不用改。反过来的布局
-/// 直接放弃改写，返回 `None`——宁可不配对，也不能写出一条播不了的视频。
+/// <p># 相机的 moov 在 mdat 前面
+///
+/// <p>上一版只认「mdat 在 moov 前面」，可 OPPO 相机的六个真机样本清一色是
+/// `ftyp, moov, free, mdat`——于是相机实况**一次都没写成过标识**（2026-11-26 21:16 那张
+/// 就这么被打回普通照片）。现在 moov 变长以后分两条路：
+///
+/// <ul>
+///   <li>紧跟 moov 的是一个 `free`：从它身上借走同样多的字节。mdat 一个字节都不挪，
+///       `stco`/`co64` 里的绝对偏移原样有效。六张样本都有 964–2259 字节的 free，而 meta
+///       只要 172。</li>
+///   <li>没有可借的 free：后面的字节整体后移，把 `stco`/`co64` 的每个偏移加上差值。这条
+///       路只在能看懂的 moov 上走——见到 `mvex`（分片 MP4，偏移在 moof 里）、`saio`、
+///       `iloc`（另一套绝对偏移）就放弃。宁可不配对，也不能写出一条播不了的视频。</li>
+/// </ul>
 fn with_identifier(video: &[u8], uuid: &str) -> Option<Vec<u8>> {
-    let (at, size) = top_box(video, b"moov")?;
-    // mdat 必须在 moov 之前：之后的话，加长 moov 会把 mdat 往后推，而 stco 里记的是
-    // 绝对偏移，那些数字就成了错的。
+    let (moov_at, moov_size) = top_box(video, b"moov")?;
+    // mdat 在 moov 前面时，往后追加不会移动任何采样数据，偏移一个都不用改。
     let (mdat_at, _) = top_box(video, b"mdat")?;
-    if mdat_at > at {
-        return None;
+    let moves = mdat_at > moov_at;
+    let moov = &video[moov_at..moov_at + moov_size];
+    // 相机自己写的 meta（里面只有 `com.android.version`）整段换掉：合并 keys 表要重排
+    // 两张表，收益只是省 172 字节，而那条版本号对 iPhone 没有意义。
+    let mut children = Vec::with_capacity(moov_size);
+    let mut at = 8;
+    while at + 8 <= moov.len() {
+        let size = read_u32(moov, at) as usize;
+        if size < 8 || at + size > moov.len() {
+            return None;
+        }
+        if &moov[at + 4..at + 8] != b"meta" {
+            children.extend_from_slice(&moov[at..at + size]);
+        }
+        at += size;
     }
-    // 已经有 meta 就不碰：那说明这条视频本来就带着自己的元数据，改它需要合并 keys，
-    // 而合并的收益只是省下 172 字节。
-    if child_box(&video[at..at + size], b"meta").is_some() {
+    if at != moov.len() {
         return None;
     }
     let meta = meta_box(uuid);
-    let grown = size + meta.len();
-    let mut out = Vec::with_capacity(video.len() + meta.len());
-    out.extend_from_slice(&video[..at]);
-    out.extend_from_slice(&(grown as u32).to_be_bytes());
-    out.extend_from_slice(&video[at + 4..at + size]);
-    out.extend_from_slice(&meta);
-    out.extend_from_slice(&video[at + size..]);
+    children.extend_from_slice(&meta);
+    let grown = 8 + children.len();
+    let delta = grown as i64 - moov_size as i64;
+    let mut fresh = Vec::with_capacity(grown);
+    fresh.extend_from_slice(&(grown as u32).to_be_bytes());
+    fresh.extend_from_slice(b"moov");
+    fresh.extend_from_slice(&children);
+
+    let tail_at = moov_at + moov_size;
+    // 第一条路：从紧跟其后的 free 里借。
+    if moves {
+        if let Some(free_size) = box_at(video, tail_at) {
+            if &video[tail_at + 4..tail_at + 8] == b"free" {
+                let borrowed = free_size as i64 - delta;
+                if (8..=u32::MAX as i64).contains(&borrowed) {
+                    let mut out = Vec::with_capacity(video.len());
+                    out.extend_from_slice(&video[..moov_at]);
+                    out.extend_from_slice(&fresh);
+                    out.extend_from_slice(&(borrowed as u32).to_be_bytes());
+                    out.extend_from_slice(b"free");
+                    out.resize(out.len() + borrowed as usize - 8, 0);
+                    out.extend_from_slice(&video[tail_at + free_size..]);
+                    return Some(out);
+                }
+            }
+        }
+    }
+    // 第二条路：后移 + 补偏移。mdat 在前面时不用补。
+    if moves && delta != 0 {
+        shift_chunk_offsets(&mut fresh, delta)?;
+    }
+    let mut out = Vec::with_capacity((video.len() as i64 + if moves { delta } else { 0 }) as usize);
+    out.extend_from_slice(&video[..moov_at]);
+    out.extend_from_slice(&fresh);
+    out.extend_from_slice(&video[tail_at..]);
     Some(out)
+}
+
+/// `at` 处那个 box 的总长度（含头）。不搜索、不跳步：不在 `at` 就不是 box。
+fn box_at(bytes: &[u8], at: usize) -> Option<usize> {
+    if at + 8 > bytes.len() {
+        return None;
+    }
+    let mut size = read_u32(bytes, at) as usize;
+    if size == 1 {
+        if at + 16 > bytes.len() {
+            return None;
+        }
+        size = ((read_u32(bytes, at + 8) as usize) << 32) | read_u32(bytes, at + 12) as usize;
+    } else if size == 0 {
+        size = bytes.len() - at;
+    }
+    (size >= 8 && at + size <= bytes.len()).then_some(size)
+}
+
+/// 把 `moov` 里每一条采样偏移都加上 `delta`。
+///
+/// <p>`mdat` 后移多少，`stco`/`co64` 里的绝对偏移就得加多少。这是唯一一处「改容器就必须
+/// 跟着改数字」的地方，所以只在认得出整棵 moov 时做：遇到 `mvex`（分片 MP4 的偏移在
+/// `moof`/`trun` 里）、`saio`、`iloc`（辅助数据与元数据各自的绝对偏移）一律放弃。
+fn shift_chunk_offsets(moov: &mut [u8], delta: i64) -> Option<()> {
+    fn walk(bytes: &mut [u8], start: usize, end: usize, delta: i64) -> Option<()> {
+        let mut at = start;
+        while at + 8 <= end {
+            let size = read_u32(bytes, at) as usize;
+            if size < 8 || at + size > end {
+                return None;
+            }
+            let kind = [bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]];
+            match &kind {
+                b"stco" => shift_table(bytes, at, size, delta, 4)?,
+                b"co64" => shift_table(bytes, at, size, delta, 8)?,
+                b"mvex" | b"saio" | b"iloc" => return None,
+                // 我们自己写的那一份 meta，里面没有偏移。
+                b"meta" => {}
+                b"trak" | b"mdia" | b"minf" | b"stbl" | b"edts" | b"dinf" => {
+                    walk(bytes, at + 8, at + size, delta)?;
+                }
+                _ => {}
+            }
+            at += size;
+        }
+        (at == end).then_some(())
+    }
+
+    fn shift_table(bytes: &mut [u8], at: usize, size: usize, delta: i64, width: usize) -> Option<()> {
+        if at + 16 > bytes.len() {
+            return None;
+        }
+        let count = read_u32(bytes, at + 12) as usize;
+        // 长度和条数对不上就说明这根本不是一张偏移表。
+        if 16 + count * width != size {
+            return None;
+        }
+        for index in 0..count {
+            let cell = at + 16 + index * width;
+            if width == 4 {
+                let value = read_u32(bytes, cell) as i64 + delta;
+                if !(0..=u32::MAX as i64).contains(&value) {
+                    return None;
+                }
+                bytes[cell..cell + 4].copy_from_slice(&(value as u32).to_be_bytes());
+            } else {
+                let value = (((read_u32(bytes, cell) as u64) << 32)
+                    | read_u32(bytes, cell + 4) as u64) as i64
+                    + delta;
+                if value < 0 {
+                    return None;
+                }
+                bytes[cell..cell + 4].copy_from_slice(&((value as u64 >> 32) as u32).to_be_bytes());
+                bytes[cell + 4..cell + 8].copy_from_slice(&(value as u64 as u32).to_be_bytes());
+            }
+        }
+        Some(())
+    }
+
+    walk(moov, 8, moov.len(), delta)
 }
 
 /// 真机的 `meta` 里的 hdlr：34 字节，组件子类型是 `mdta`（元数据）。
@@ -453,31 +603,14 @@ fn meta_box(uuid: &str) -> Vec<u8> {
 }
 
 /// 顶层 box 的位置与大小。
+///
+/// <p>长度一律走 [`box_at`]：相机视频的 `mdat` 用的是 64 位长度（`size=1` 再跟一个
+/// `largesize`），按 32 位读会得到 1，然后被判成「坏的 box」——上一版就是这么在真机上
+/// 一直找不到 mdat 的。
 fn top_box(bytes: &[u8], kind: &[u8]) -> Option<(usize, usize)> {
     let mut at = 0;
     while at + 8 <= bytes.len() {
-        let size = u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
-            as usize;
-        if size < 8 || at + size > bytes.len() {
-            return None;
-        }
-        if &bytes[at + 4..at + 8] == kind {
-            return Some((at, size));
-        }
-        at += size;
-    }
-    None
-}
-
-/// 某一个 box 的直接子 box。
-fn child_box(bytes: &[u8], kind: &[u8]) -> Option<(usize, usize)> {
-    let mut at = 8;
-    while at + 8 <= bytes.len() {
-        let size = u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
-            as usize;
-        if size < 8 || at + size > bytes.len() {
-            return None;
-        }
+        let size = box_at(bytes, at)?;
         if &bytes[at + 4..at + 8] == kind {
             return Some((at, size));
         }
@@ -573,6 +706,81 @@ fn timing(video: &[u8]) -> (u32, u64) {
 
 fn read_u32(bytes: &[u8], at: usize) -> u32 {
     u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+/// 主图到哪里结束：走完段链找到真正的 SOS，再找它之后的第一个 `FF D9`。
+///
+/// <p>不能直接 `find(0xFFD9)`：EXIF 里内嵌的缩略图也是一张完整 JPEG，开头几 KB 就能撞上
+/// 好几个 EOI（真机样本前 100 KB 里有三个）。也不能用「第一个 SOS」——APP1 段里的缩略图
+/// 自己也有 SOS。只有按 marker+长度 跳过所有段之后遇到的那个 SOS，才是主图的。
+///
+/// <p>渐进式 JPEG 会有多段扫描，但每段的熵编码数据里 `FF` 后面只能跟 `00`（字节填充）或
+/// 重启标记，`FF D9` 不会出现在中间。
+fn picture_end(jpeg: &[u8]) -> Option<usize> {
+    let mut at = 2;
+    while at + 4 <= jpeg.len() {
+        if jpeg[at] != 0xFF {
+            return None;
+        }
+        let marker = jpeg[at + 1];
+        if marker == 0xD9 {
+            return None;
+        }
+        if marker == 0xDA {
+            let end = find(&jpeg[at..], &[0xFF, 0xD9])? + at + 2;
+            return (end <= jpeg.len()).then_some(end);
+        }
+        // 无长度的独立标记（TEM / RSTn），段链里不该出现；真出现就跳两字节。
+        if marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            at += 2;
+            continue;
+        }
+        let length = ((jpeg[at + 2] as usize) << 8) | jpeg[at + 3] as usize;
+        if length < 2 || at + 2 + length > jpeg.len() {
+            return None;
+        }
+        at += 2 + length;
+    }
+    None
+}
+
+/// 这一段字节是不是一段完整的 MP4：`ftyp` 开头，顶层 box 一个接一个正好走到末尾。
+///
+/// <p>真机的相机视频尾巴上还挂着一个私有 box（`comm`，几百 KB 的 OPPO 元数据），它的
+/// 类型名不是标准 box，但长度是自洽的——所以判据只能是「链走完」，不能是「只认识标准
+/// 类型」。
+fn looks_like_movie(bytes: &[u8]) -> bool {
+    if bytes.len() < 24 || &bytes[4..8] != b"ftyp" {
+        return false;
+    }
+    let mut at = 0;
+    let mut moov = false;
+    let mut mdat = false;
+    while at + 8 <= bytes.len() {
+        let mut size = read_u32(bytes, at) as usize;
+        let kind = &bytes[at + 4..at + 8];
+        let mut header = 8;
+        if size == 1 {
+            // 64 位长度：真机样本的 mdat 全是这种。
+            if at + 16 > bytes.len() {
+                return false;
+            }
+            size = ((read_u32(bytes, at + 8) as usize) << 32) | read_u32(bytes, at + 12) as usize;
+            header = 16;
+        } else if size == 0 {
+            size = bytes.len() - at;
+        }
+        if size < header || at + size > bytes.len() {
+            return false;
+        }
+        if kind == b"moov" {
+            moov = true;
+        } else if kind == b"mdat" {
+            mdat = true;
+        }
+        at += size;
+    }
+    at == bytes.len() && moov && mdat
 }
 
 /// XMP 包本身（`http://ns.adobe.com/xap/1.0/\0` 之后到段尾）。
@@ -714,26 +922,117 @@ mod tests {
         out
     }
 
-    const XMP: &str = "GCamera:MotionPhoto=\"1\" <Container:Item Item:Mime=\"video/mp4\" \
-                       Item:Semantic=\"MotionPhoto\" Item:Length=\"5\"/>";
+    fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// 相机形状的视频：`ftyp, moov(trak/stbl/co64), [free], mdat`，mdat 用 64 位长度。
+    /// `free_size` 为 0 时不放 free；`with_meta` 时 moov 里先有一份相机自己的 meta。
+    fn camera_movie(free_size: usize, with_meta: bool) -> Vec<u8> {
+        let mut co64 = vec![0u8; 4];
+        co64.extend_from_slice(&1u32.to_be_bytes());
+        co64.extend_from_slice(&4096u64.to_be_bytes());
+        let stbl = boxed(b"stbl", &boxed(b"co64", &co64));
+        let minf = boxed(b"minf", &stbl);
+        let mdia = boxed(b"mdia", &minf);
+        let mut moov = boxed(b"trak", &mdia);
+        if with_meta {
+            moov.extend_from_slice(&meta_box("11111111-2222-4333-8444-555555555555"));
+        }
+        let mut out = boxed(b"ftyp", b"mp42\x00\x00\x00\x00mp42");
+        out.extend_from_slice(&boxed(b"moov", &moov));
+        if free_size > 0 {
+            out.extend_from_slice(&boxed(b"free", &vec![0u8; free_size - 8]));
+        }
+        let payload = b"sample-bytes";
+        out.extend_from_slice(&1u32.to_be_bytes());
+        out.extend_from_slice(b"mdat");
+        out.extend_from_slice(&((16 + payload.len()) as u64).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// 视频里所有 `co64` 的偏移值（按出现顺序）。
+    fn chunk_offsets(video: &[u8]) -> Vec<u64> {
+        let at = find(video, b"co64").expect("样本里有一张 co64") + 8;
+        let count = read_u32(video, at) as usize;
+        (0..count)
+            .map(|index| {
+                let cell = at + 4 + index * 8;
+                ((read_u32(video, cell) as u64) << 32) | read_u32(video, cell + 4) as u64
+            })
+            .collect()
+    }
+
+    fn xmp_for(video: &[u8]) -> String {
+        format!(
+            "GCamera:MotionPhoto=\"1\" <Container:Item Item:Mime=\"video/mp4\" \
+             Item:Semantic=\"MotionPhoto\" Item:Length=\"{}\"/>",
+            video.len()
+        )
+    }
 
     #[test]
     fn splits_a_motion_photo_at_its_eoi() {
-        let file = motion_photo(XMP, b"VIDEO");
+        let video = camera_movie(0, false);
+        let file = motion_photo(&xmp_for(&video), &video);
         let live = split(&file).expect("this is a motion photo");
         assert_eq!(live.image.last(), Some(&0xD9));
-        assert_eq!(live.video, b"VIDEO");
+        assert_eq!(&live.video[4..8], b"ftyp");
+        assert_eq!(live.video.len(), video.len() + 172, "补了一份 meta");
+        assert_eq!(
+            content_identifier(&live.video).as_deref(),
+            live.identifier.as_deref(),
+            "写进去的标识要能读回来"
+        );
     }
 
     /// Primary 项的 `Item:Length="0"` 排在前面；拿它就会切出 0 字节的视频。
     #[test]
     fn takes_the_motion_photo_item_not_the_primary_one() {
-        let xmp = "GCamera:MotionPhoto=\"1\" \
-                   <Container:Item Item:Mime=\"image/jpeg\" Item:Semantic=\"Primary\" \
-                   Item:Length=\"0\"/><Container:Item Item:Mime=\"video/mp4\" \
-                   Item:Semantic=\"MotionPhoto\" Item:Length=\"5\"/>";
-        let file = motion_photo(xmp, b"VIDEO");
-        assert_eq!(split(&file).expect("still a motion photo").video, b"VIDEO");
+        let video = camera_movie(0, false);
+        let xmp = format!(
+            "GCamera:MotionPhoto=\"1\" \
+             <Container:Item Item:Mime=\"image/jpeg\" Item:Semantic=\"Primary\" \
+             Item:Length=\"0\"/><Container:Item Item:Mime=\"video/mp4\" \
+             Item:Semantic=\"MotionPhoto\" Item:Length=\"{}\"/>",
+            video.len()
+        );
+        let file = motion_photo(&xmp, &video);
+        assert_eq!(split(&file).expect("still a motion photo").video.len(), video.len() + 172);
+    }
+
+    /// 相机实况：主图之后垫着一张 GainMap（另一张 JPEG）和一段填零，视频还在更后面。
+    /// 图片只能切到主图自己的 EOI——把 GainMap 一起塞进 `.pvt`，那是**另一张**图。
+    #[test]
+    fn cuts_the_picture_at_its_eoi_even_with_a_gain_map_in_between() {
+        let video = camera_movie(1004, false);
+        let mut file = {
+            let mut jpeg = vec![0xFF, 0xD8];
+            let body = format!("http://ns.adobe.com/xap/1.0/\x00{}", xmp_for(&video));
+            jpeg.extend_from_slice(&[0xFF, 0xE1]);
+            jpeg.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
+            jpeg.extend_from_slice(body.as_bytes());
+            jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x01, 0x02, 0x03, 0xFF, 0xD9]);
+            jpeg
+        };
+        let mut gain = vec![0xFF, 0xD8, 0xFF, 0xE2];
+        gain.extend_from_slice(&((b"GAINMAP".len() + 2) as u16).to_be_bytes());
+        gain.extend_from_slice(b"GAINMAP");
+        gain.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x09, 0xFF, 0xD9]);
+        file.extend_from_slice(&gain);
+        file.extend_from_slice(&[0u8; 16]);
+        file.extend_from_slice(&video);
+
+        let live = split(&file).expect("相机实况要能拆");
+        assert_eq!(live.image.last(), Some(&0xD9));
+        assert!(find(&live.image, b"GAINMAP").is_none(), "GainMap 不属于这张图");
+        assert_eq!(&live.video[4..8], b"ftyp", "视频从 ftyp 开始，不带前面的填零");
+        assert!(live.identifier.is_some(), "相机实况要造一个配对标识");
     }
 
     #[test]
@@ -742,13 +1041,13 @@ mod tests {
         assert!(split(&file).is_none());
     }
 
-    /// 声明的长度没有落在 EOI 上：不是这个意思，不能拆。
+    /// 声明的长度没落在一段站得住的视频上：不是这个意思，不能拆。
     #[test]
-    fn refuses_when_the_declared_length_misses_the_eoi() {
-        let file = motion_photo(XMP, b"VIDEO");
-        let mut wrong = file.clone();
-        // 把 EOI 前插一个字节，声明长度就对不上了。
-        wrong.insert(wrong.len() - 5, 0x00);
+    fn refuses_when_the_declared_length_misses_the_video() {
+        let video = camera_movie(0, false);
+        let mut wrong = motion_photo(&xmp_for(&video), &video);
+        // 尾巴上多了一个字节：声明的长度从末尾往前量，就量到了 `ftyp` 里面。
+        wrong.push(0x00);
         assert!(split(&wrong).is_none());
     }
 
@@ -787,20 +1086,78 @@ mod tests {
         );
     }
 
-    /// mdat 在 moov 后面的布局不能改：加长 moov 会把 mdat 推开，stco 里的偏移就全错了。
+    /// 相机视频的真实布局：`ftyp, moov(带它自己的 meta), free, mdat`。标识要写进去，而且
+    /// **mdat 一个字节都不能挪**——从紧跟的 `free` 里借同样的长度，`co64` 的偏移原样有效。
     #[test]
-    fn refuses_when_mdat_follows_moov() {
+    fn borrows_from_the_free_box_so_mdat_never_moves() {
+        let uuid = "58485A87-1AEA-41A5-B94D-630384319DA5";
+        let video = camera_movie(1004, true);
+        let mdat_before = top_box(&video, b"mdat").expect("样本有 mdat").0;
+        let offsets = chunk_offsets(&video);
+
+        let out = with_identifier(&video, uuid).expect("相机视频要能写进标识");
+        assert_eq!(out.len(), video.len(), "借 free 的，文件长度不该变");
+        assert_eq!(content_identifier(&out).as_deref(), Some(uuid));
+        assert_eq!(
+            out.windows(4).filter(|window| *window == b"meta").count(),
+            1,
+            "相机那份 meta 要整段换掉，不许留两份"
+        );
+        assert!(
+            find(&out, b"11111111-2222-4333-8444-555555555555").is_none(),
+            "模板里那条旧 UUID 不能留着"
+        );
+        assert_eq!(
+            top_box(&out, b"mdat").expect("还在").0,
+            mdat_before,
+            "mdat 挪了，co64 里的绝对偏移就成了错的"
+        );
+        assert_eq!(chunk_offsets(&out), offsets, "偏移不用改");
+    }
+
+    /// 没有 free 可借：后面的字节整体后移，`co64` 的每个偏移都要补上差值。
+    #[test]
+    fn shifts_the_chunk_offsets_when_there_is_no_free_to_borrow() {
+        let uuid = "58485A87-1AEA-41A5-B94D-630384319DA5";
+        let video = camera_movie(0, false);
+        let mdat_before = top_box(&video, b"mdat").expect("样本有 mdat").0;
+        let offsets = chunk_offsets(&video);
+
+        let out = with_identifier(&video, uuid).expect("没有 free 也要写成");
+        let mdat_after = top_box(&out, b"mdat").expect("还在").0;
+        assert_eq!(mdat_after - mdat_before, 172, "moov 长的正好是一份 meta");
+        assert_eq!(out.len(), video.len() + 172);
+        assert_eq!(
+            chunk_offsets(&out),
+            offsets.iter().map(|value| value + 172).collect::<Vec<_>>()
+        );
+    }
+
+    /// 分片 MP4 的偏移在 `moof`/`trun` 里，改 moov 的时候补不回来——宁可放弃。
+    #[test]
+    fn refuses_a_fragmented_movie() {
+        let mut moov = boxed(b"mvex", &[]);
+        moov.extend_from_slice(&boxed(b"mfra", &[]));
+        let mut video = boxed(b"ftyp", b"mp42\x00\x00\x00\x00mp42");
+        video.extend_from_slice(&boxed(b"moov", &moov));
+        video.extend_from_slice(&boxed(b"mdat", b"data"));
+        assert!(with_identifier(&video, "58485A87-1AEA-41A5-B94D-630384319DA5").is_none());
+    }
+
+    /// mdat 在 moov 前面时不用补偏移：往后追加不移动任何采样数据。
+    #[test]
+    fn appends_without_touching_offsets_when_mdat_comes_first() {
         let mut video = Vec::new();
         video.extend_from_slice(&16u32.to_be_bytes());
         video.extend_from_slice(b"ftyp");
         video.extend_from_slice(b"qt  ");
         video.extend_from_slice(&0u32.to_be_bytes());
-        video.extend_from_slice(&8u32.to_be_bytes());
-        video.extend_from_slice(b"moov");
         video.extend_from_slice(&12u32.to_be_bytes());
         video.extend_from_slice(b"mdat");
         video.extend_from_slice(b"data");
-        assert!(with_identifier(&video, "58485A87-1AEA-41A5-B94D-630384319DA5").is_none());
+        video.extend_from_slice(&8u32.to_be_bytes());
+        video.extend_from_slice(b"moov");
+        assert!(with_identifier(&video, "58485A87-1AEA-41A5-B94D-630384319DA5").is_some());
     }
 
     /// 相机拍的图没有 MakerNote：补一份，而且里面的 UUID 必须是本次配对的那一个。
@@ -875,6 +1232,7 @@ mod tests {
         jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x01, 0xFF, 0xD9]);
         jpeg
     }
+
 
     #[test]
     fn no_identifier_is_not_an_error() {
