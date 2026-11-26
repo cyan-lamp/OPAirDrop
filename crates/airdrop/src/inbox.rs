@@ -698,18 +698,34 @@ mod tests {
         ]);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = Arc::clone(&seen);
+        let members = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let counted = Arc::clone(&members);
 
         let received = receive_watched(
             &root,
             Limits::default(),
             bytes.as_slice(),
-            Arc::new(move |done| {
-                log.lock().expect("the log is not poisoned").push(done);
+            Arc::new(move |done, top| {
+                let mut recorded = log.lock().expect("the log is not poisoned");
+                recorded.push(done);
+                counted
+                    .lock()
+                    .expect("the log is not poisoned")
+                    .push(top);
             }),
         )
         .expect("the archive is accepted");
 
         let reported = seen.lock().expect("the log is not poisoned").clone();
+        // 卡片同时显示「已收 N/M 份」：件数只数顶层成员，与 `/Ask` 的分母同一个单位。
+        // 这份归档没有显式的目录成员，`photos/one.jpg` 是嵌套路径，所以顶层只有 `note.txt`
+        // 一件；字节进度那几次报告带的是 0（约定为「没有成员事件」），非零值只有成员收尾。
+        let tops = members.lock().expect("the log is not poisoned").clone();
+        assert_eq!(
+            tops.iter().copied().filter(|count| *count > 0).collect::<Vec<_>>(),
+            [1, 1],
+            "each member's completion reports the top-level count so far: {tops:?}"
+        );
         assert!(
             reported.windows(2).all(|pair| pair[0] <= pair[1]),
             "a bar that goes backwards is worse than none: {reported:?}"

@@ -483,8 +483,16 @@ final class ReceiveHost {
             if (!announced || settled) {
                 return;
             }
-            membersDone = doneMembers;
-            membersTotal = totalMembers;
+            // native 侧的约定是「成员数为 0 表示自上次报告以来没有成员完成」，不是「已收
+            // 0 份」（见 `crates/airdrop/src/inbox.rs` 的 `Progress`）。每写一块都会来一次
+            // 带 0 的调用，照抄就会让「已收 N/M 份」那半句在传输过程中反复消失又出现，
+            // 看上去像进度在倒退。
+            if (doneMembers > 0) {
+                membersDone = doneMembers;
+            }
+            if (totalMembers > 0) {
+                membersTotal = totalMembers;
+            }
             // 只有「每一份都声明了大小」时 total 才是可信的分母；实况/混合场景下它只是
             // 部分值，用它算百分比会画出「100% 还在传」的假进度。不可信时 percent 留 -1，
             // 卡片只报「已收 X」。

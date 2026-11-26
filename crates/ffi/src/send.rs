@@ -667,14 +667,6 @@ fn is_image(name: &str) -> bool {
     )
 }
 
-/// 同一个 stem 的兄弟文件名：`IMG_0202.JPG` → `IMG_0202.MOV`。
-fn sibling(name: &str, extension: &str) -> String {
-    match name.rsplit_once('.') {
-        Some((stem, _)) => format!("{stem}.{extension}"),
-        None => format!("{name}.{extension}"),
-    }
-}
-
 /// The archive the upload carries: cpio per member, DVZip per block.
 ///
 /// Three parts, in the order the reference sender writes them: the `.` directory member
