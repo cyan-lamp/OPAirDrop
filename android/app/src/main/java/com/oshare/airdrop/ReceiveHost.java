@@ -3,6 +3,9 @@ package com.oshare.airdrop;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
 
 import java.net.Socket;
 import java.util.ArrayList;
@@ -466,6 +469,12 @@ final class ReceiveHost {
         private int membersDone;
         private int membersTotal;
 
+        /** 卡片最快多久换一次（与发送侧同一个理由：别让通知拖慢传输线程）。 */
+        private static final long CARD_EVERY_MS = 400;
+
+        private final Handler main = new Handler(Looper.getMainLooper());
+        private long lastCardAt;
+
         void progress(long done, long total) {
             progress(done, total, membersDone, membersTotal);
         }
@@ -489,8 +498,23 @@ final class ReceiveHost {
                 //
                 // 进度卡上带【取消接收】：点了「接收」之后，人在系统这一侧唯一的出口就是它。
                 // 不发这一颗，一张传到 30% 的卡上就一个按钮也没有——人只能等，或者去杀进程。
-                LiveCard.updateWithCancel(context, "正在接收", line(done, total), percent,
-                        cancelAction());
+                // 投卡是 Binder 到 system_server，再让 SystemUI 重建流体云卡片（本机还挂着
+                // LSPosed 那个「每个 notify 都把卡展开一次」的钩子）。这件事**不能**在接收
+                // 线程上做：一条通知慢 100ms，接收线程就少读 100ms；几秒下来 TCP 窗口填满，
+                // 对端重传几次就把连接 abort 掉——2026-11-27 00:16 那次 58 MB 在 76% 断掉
+                // （Software caused connection abort）就是这个形状。
+                //
+                // 所以：按 400ms 节拍、扔回主线程投；接收线程只管读字节。
+                long now = SystemClock.uptimeMillis();
+                if (percent >= 0 && percent < 100 && now - lastCardAt < CARD_EVERY_MS) {
+                    return;
+                }
+                lastCardAt = now;
+                String text = line(done, total);
+                int shown = percent;
+                PendingIntent cancel = cancelAction();
+                main.post(() -> LiveCard.updateWithCancel(context, "正在接收", text, shown,
+                        cancel));
             }
         }
 
