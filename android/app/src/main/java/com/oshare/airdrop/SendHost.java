@@ -35,10 +35,10 @@ final class SendHost {
     static final int SUCCESS = 1006;
 
     /** 成功卡之前留给进度条的时间，见 {@link #finished}：最后一跳很小时用这个。 */
-    private static final long SETTLE_HOLD_MS = 500;
+    private static final long SETTLE_HOLD_MS = 700;
 
     /** 最后一跳跨满 100 个百分点时给多久。 */
-    private static final long MAX_SETTLE_HOLD_MS = 1600;
+    private static final long MAX_SETTLE_HOLD_MS = 1500;
     static final int REFUSED = 1008;
     static final int CANCELLED = 1009;
     static final int TIMEOUT = 1010;
@@ -96,9 +96,11 @@ final class SendHost {
      * 起跳，越落越远。2026-11-26 23:42 用户实测「传到 2/3 就发送完了，完成后很快加速滑到
      * 100%」——数字一直是对的（日志里已经报到 100%），落后的是那条被反复重启的动画。
      *
-     * <p>450ms：一次动画（两三百毫秒）能走完；小文件也能拿到两三帧，最后一跳不会太大。
+     * <p>1200ms：系统那条动画比想象的黏——每 450ms 投一次时它仍然追不上，传输结束才
+     * 滑到底（2026-11-27 00:02 用户实测「还是不行」）。间隔必须大于动画时长，这个数值是
+     * 按「动画最长一秒多」定的。
      */
-    private static final long CARD_EVERY_MS = 450;
+    private static final long CARD_EVERY_MS = 1200;
 
     /** 上一次把进度投到卡上的时刻（{@link SystemClock#uptimeMillis}）。 */
     private static long lastCardAt;
