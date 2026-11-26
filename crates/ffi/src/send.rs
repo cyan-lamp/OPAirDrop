@@ -93,8 +93,9 @@ struct Meter {
     name_callback: Option<NameCallback>,
     /// Bytes taken off disk so far.
     sent: std::cell::Cell<u64>,
-    /// Bytes the person chose, from the file sizes.
-    total: u64,
+    /// 归档里真正要写出去的字节数（`Plan::payload`）。**不是**源文件大小：实况发出去的
+    /// 是拆好的图片 + 视频，比源文件少一整张 GainMap。
+    total: std::cell::Cell<u64>,
     /// What `sent` was when it last reported.
     last: std::cell::Cell<u64>,
 }
@@ -103,7 +104,7 @@ impl Meter {
     fn advance(&self, bytes: u64) {
         let sent = self.sent.get() + bytes;
         self.sent.set(sent);
-        if sent.saturating_sub(self.last.get()) >= REPORT_EVERY || sent >= self.total {
+        if sent.saturating_sub(self.last.get()) >= REPORT_EVERY || sent >= self.total.get() {
             self.last.set(sent);
             self.say(phase::SENDING);
         }
@@ -113,7 +114,7 @@ impl Meter {
     fn say(&self, phase: i32) {
         // SAFETY: the caller of `opairdrop_send_with_progress` promised the callback and its
         // context for the duration of the call.
-        unsafe { (self.callback)(self.context, phase, self.sent.get(), self.total) };
+        unsafe { (self.callback)(self.context, phase, self.sent.get(), self.total.get()) };
     }
 
     /// Announces the peer's name. Called once, right after `/Discover` answers.
@@ -274,7 +275,7 @@ pub unsafe extern "C" fn opairdrop_send_with_progress(
         context: progress_context,
         name_callback: peer_name,
         sent: std::cell::Cell::new(0),
-        total: 0,
+        total: std::cell::Cell::new(0),
         last: std::cell::Cell::new(0),
     };
     // SAFETY: as above, plus the callback pair the caller promises.
@@ -379,16 +380,9 @@ unsafe fn drive(
         return status::BAD_PATH;
     };
 
-    // The total is known before anything is read: it is what `/Ask` offers, and a ring needs
-    // its denominator before the first report.
+    // 分母不在这里定：源文件大小不是要发出去的字节数（实况要拆成图片 + 视频，源文件里
+    // 那张 GainMap 不发）。真正的分母在 `transfer` 里由 `Plan::payload` 给出，见那里。
     let mut meter = meter;
-    if let Some(gauge) = &mut meter {
-        gauge.total = paths
-            .iter()
-            .filter_map(|path| fs::metadata(path).ok())
-            .map(|metadata| metadata.len())
-            .sum();
-    }
 
     // SAFETY: the caller guarantees the callbacks and their context for the duration.
     let reader = CallbackReader::new(read, context);
@@ -456,12 +450,11 @@ fn transfer(
     // 分母是**归档里真正要发的字节**，不是 `/Ask` 里那些 size 之和：实况列的是一个
     // `FileSize: 0` 的目录，按它算分母的话发送进度永远是 0/0（2026-11-26 用户实测
     // 「发送进度不对」正是这一条）。
-    let total: u64 = plan
-        .members
-        .iter()
-        .filter(|(item, _)| !item.directory)
-        .map(|(item, _)| item.size.unwrap_or(0))
-        .sum();
+    let total = plan.payload();
+    // 分母跟着真正要发的字节走，第一条进度之前就定下来。
+    if let Some(gauge) = meter {
+        gauge.total.set(total);
+    }
 
     // `/Discover` first, for the name and for what the peer says it can take. Fatal only if
     // it fails outright: a `200` whose boolean says no is not a failure, and `/Ask` below is
@@ -555,6 +548,21 @@ struct Plan {
     offered: Vec<Item>,
     /// 进归档的成员（含目录本身）。
     members: Vec<(Item, Source)>,
+}
+
+impl Plan {
+    /// 归档里**真正要写出去**的字节数：目录成员不算。
+    ///
+    /// 这是发送进度的分母。用源文件大小当分母是个坑：实况发出去的是拆好的图片 + 视频，
+    /// 比源文件少一整张 GainMap（真机样本里 0.2–3.7 MB），进度条就永远差最后那一截
+    /// （2026-11-26 22:04 用户实测：停在 91%，还有停在 1/2、1/3 的）。
+    fn payload(&self) -> u64 {
+        self.members
+            .iter()
+            .filter(|(item, _)| !item.directory)
+            .map(|(item, _)| item.size.unwrap_or(0))
+            .sum()
+    }
 }
 
 fn describe(paths: &[PathBuf]) -> Result<Plan, Failure> {
@@ -1271,6 +1279,47 @@ mod live_bundle_tests {
         out.extend_from_slice(b"mdat");
         out.extend_from_slice(b"data");
         out
+    }
+
+    /// 相机实况的真形状：`[主图][GainMap][填零][MP4]`。
+    fn camera_photo() -> Vec<u8> {
+        let movie = movie();
+        let xmp = format!(
+            "http://ns.adobe.com/xap/1.0/\x00GCamera:MotionPhoto=\"1\" \
+             <Container:Item Item:Mime=\"video/mp4\" Item:Semantic=\"MotionPhoto\" \
+             Item:Length=\"{}\"/>",
+            movie.len()
+        );
+        let mut out = vec![0xFF, 0xD8];
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&((xmp.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(xmp.as_bytes());
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x01, 0xFF, 0xD9]);
+        out.extend_from_slice(&[0xAAu8; 32 * 1024]);
+        out.extend_from_slice(&[0u8; 16]);
+        out.extend_from_slice(&movie);
+        out
+    }
+
+    /// 进度分母必须是**发出去的字节**，不是源文件大小。相机实况的源文件里含一整张
+    /// GainMap（真机 0.2–3.7 MB）而我们不发送——拿源文件当分母，进度条永远差最后一截
+    /// （2026-11-26 22:04 用户实测：停在 91%，还有停在 1/2、1/3 的）。
+    #[test]
+    fn the_denominator_is_what_we_send_not_the_file_size() {
+        let dir = std::env::temp_dir().join("opairdrop-live-payload");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        let photo = dir.join("IMG_0002.JPG");
+        fs::write(&photo, camera_photo()).expect("fixture");
+
+        let plan = describe(std::slice::from_ref(&photo)).expect("describes");
+        let payload = plan.payload();
+        let size = fs::metadata(&photo).expect("fixture").len();
+        assert!(payload > 0, "分母不能是 0");
+        assert!(
+            payload < size,
+            "分母 {payload} 必须小于源文件 {size}：GainMap 不发"
+        );
     }
 
     /// 一张最小的 Motion Photo：APP1(XMP) + SOS + EOI + 视频。
