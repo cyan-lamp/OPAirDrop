@@ -1,52 +1,31 @@
+# 构建产物
 target/
 android/.gradle/
 android/build/
 android/app/build/
-.tmp/
-*.log
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
+fuzz/coverage
 
-# Working notes for a session: screenshots, `uiautomator dump` output, one-off probes.
-# Kept on disk because they answer "what did the screen actually look like", which is
-# the one question a log cannot. Never worth a commit.
-.workbuddy/
-
-# Plan.md 进仓库（2026-11-24 用户拍板）：它不只是工程日志，还是唯一能把
-# 「为什么是这个设计、哪些结论被实测证伪过」讲清楚的文档，丢了不可再生。
-
-# Release signing. The key already lives outside the tree; this keeps its password
-# and any stray keystore that gets dropped in here from reaching the archive, where
-# the only fix is rotating the key for every clone.
+# 本机配置：SDK 位置与签名口令，每台机器自己写，不进仓库
+android/local.properties
 android/keystore.properties
 *.jks
 *.keystore
 
-# Packet captures: every question they can answer has already been turned into a
-# number in the notes, and the count keeps growing as new questions show up. The
-# scripts that read them are worth a commit (they are the argument); the bytes
-# underneath are not - GitHub refuses a single file over 100 MB anyway. Kept on
-# disk (now under .workbuddy/tmp), readable by the committed scripts, never in
-# the tree.
-*.pcap
-
-# Python leaves these behind the first time anyone runs a probe.
+# 临时文件、日志与 Python 缓存
+.tmp/
+*.log
 __pycache__/
 *.pyc
 
-# Module payload backups: every `*.ko.gz` is a gzip of a whole driver build (the
-# big ones ~5 MB, the small ones tens of KB), and each experiment that swapped one
-# left a copy behind (`.bak`, `.prev`, `.selfbuild-backup`, `.eac-keep`, ...).
-# What matters for reproducing a number is *which* fingerprint ran, and that is
-# recorded as text in `kernel/README.md` and in Plan.md - the bytes themselves
-# answer nothing the sha256 does not. The payloads that ship (assets/kernel in the
-# APK, registered in kernel/PAYLOAD.sha256) are the un-suffixed `*.ko.gz`, which
-# stay tracked.
+# 抓包：能回答的问题都已折算成文档里的数字，读包的脚本留在 tools/ 里
+*.pcap
+
+# 模块载荷的实验副本：跑过哪一份由 sha256 与 kernel/README.md 记录，
+# 随包发布的 *.ko.gz 不带后缀，照常入库
 kernel/*.ko.gz.*
 
-# 本机的 SDK 位置（P1-21）：每台机器自己写，不进仓库。构建从 ANDROID_HOME 派生。
-android/local.properties
-
-# fuzz 的运行期产物：corpus 会越长越大，artifacts 是崩溃输入（发现即修，不留库）。
-fuzz/corpus
-fuzz/artifacts
-fuzz/coverage
-fuzz/target
+# Plan.md 是开发机上的任务书，随工作进度持续改写，不入库、不推送。
+Plan.md

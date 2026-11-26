@@ -1,21 +1,16 @@
-# The kernel tree is compiled by Kbuild and applied by patch(1); neither
-# tolerates CRLF. A Makefile with CRLF fails on the first variable assignment,
-# and a patch with CRLF is rejected as corrupt. Store these bytes verbatim,
-# whatever core.autocrlf says.
+# 行尾统一：文本一律以 LF 存、以 LF 取出，不看 core.autocrlf。
+# 目的是让 Windows 侧与 Linux 侧（CI、内核构建）看到同一份字节：
+# shell 脚本带 CRLF 到设备上会直接无法执行，内核 Makefile 带 CRLF 在第一个变量赋值就失败。
+* text=auto eol=lf
+
+# 例外一：Windows 批处理必须是 CRLF。
+*.bat text eol=crlf
+
+# 例外二：内核源码树由 Kbuild 编译、由 patch(1) 应用，两者都不容忍行尾转换。
+# 这些字节原样存放，补丁的上下文行才对得上。
 kernel/source/** -text
 
-# Shell scripts are pushed to the device and run there, where a trailing CR
-# becomes part of the command name. Keep them LF everywhere.
-*.sh text eol=lf
-
-# 随包载荷与音频是二进制，行尾转换会把字节改掉。
+# 例外三：随包载荷、音频与图形是二进制，任何行尾转换都会改字节，哈希随之失配。
 *.ko.gz binary
 *.wav binary
-# Python 脚本在 CI 与本机之间来回，统一 LF。
-*.py text eol=lf
-
-# 随包载荷与音频是二进制：CRLF 转换会改变字节，载荷哈希就全错了（P1-22 的门禁）。
-*.ko.gz binary
-*.wav binary
-*.py text eol=lf
 *.png binary
