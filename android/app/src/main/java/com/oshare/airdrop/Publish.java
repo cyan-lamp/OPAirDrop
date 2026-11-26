@@ -221,6 +221,16 @@ final class Publish {
                         }
                     }
                     if (videoName != null) {
+                        // Oplus 扫描器的硬条件：EXIF 的 UserComment 必须 oplus_ 开头
+                        // （checkOplusTag，反编译 ModernMediaScanner 确认）。原来这里换的是
+                        // 一整段 OPPO EXIF 模板；现在保留原图的 EXIF（它带着 Apple 的
+                        // MakerNote 与 Live Photo 的 ContentIdentifier，见 MotionPhoto.make），
+                        // 所以只改这一个字段。必须在 make() 之前：saveAttributes 重写文件会
+                        // 截掉 EOI 之后的东西，而 make() 正是要在那里嵌视频。
+                        android.media.ExifInterface exif =
+                                new android.media.ExifInterface(source.getPath());
+                        exif.setAttribute("UserComment", "oplus_" + source.getName());
+                        exif.saveAttributes();
                         MotionPhoto.Motion motion = MotionPhoto.make(
                                 readAll(source), readAll(new File(staged, videoName)));
                         java.nio.file.Files.write(source.toPath(), motion.data);

@@ -46,6 +46,7 @@ pub mod ble;
 pub mod browse;
 pub mod buffer;
 pub mod jni;
+pub mod livephoto;
 pub mod respond;
 pub mod send;
 pub mod serve;

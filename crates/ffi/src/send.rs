@@ -35,6 +35,7 @@
 //! encoder rather than the transfer, and would jump. The meter sits on the file reader, where
 //! the number means "this much of what the person chose has been taken".
 
+use crate::livephoto;
 use std::ffi::c_void;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -126,12 +127,12 @@ impl Meter {
 }
 
 /// A file read through a [`Meter`].
-struct Counted<'a> {
-    file: File,
+struct Counted<'a, R> {
+    file: R,
     meter: &'a Meter,
 }
 
-impl Read for Counted<'_> {
+impl<R: Read> Read for Counted<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let got = self.file.read(buffer)?;
         self.meter.advance(got as u64);
@@ -451,9 +452,16 @@ fn transfer(
     paths: &[PathBuf],
     meter: Option<&Meter>,
 ) -> Result<Sent, Failure> {
-    let files = describe(paths)?;
-    let items: Vec<Item> = files.iter().map(|(item, _)| item.clone()).collect();
-    let total = opairdrop_airdrop::offered_bytes(&items);
+    let plan = describe(paths)?;
+    // 分母是**归档里真正要发的字节**，不是 `/Ask` 里那些 size 之和：实况列的是一个
+    // `FileSize: 0` 的目录，按它算分母的话发送进度永远是 0/0（2026-11-26 用户实测
+    // 「发送进度不对」正是这一条）。
+    let total: u64 = plan
+        .members
+        .iter()
+        .filter(|(item, _)| !item.directory)
+        .map(|(item, _)| item.size.unwrap_or(0))
+        .sum();
 
     // `/Discover` first, for the name and for what the peer says it can take. Fatal only if
     // it fails outright: a `200` whose boolean says no is not a failure, and `/Ask` below is
@@ -487,7 +495,7 @@ fn transfer(
         gauge.say(phase::WAITING);
     }
     let asked = client
-        .ask(sender, id, &items, &[])
+        .ask(sender, id, &plan.offered, &[])
         .map_err(describe_error)?;
 
     let peer = match peer_name {
@@ -505,7 +513,7 @@ fn transfer(
     }
 
     client
-        .upload(id, total, |out| archive(out, &files, meter))
+        .upload(id, total, |out| archive(out, &plan.members, meter))
         .map_err(describe_error)?;
 
     if let Some(gauge) = meter {
@@ -518,8 +526,42 @@ fn transfer(
 }
 
 /// One file as `/Ask` describes it, paired with where its bytes are.
-fn describe(paths: &[PathBuf]) -> Result<Vec<(Item, PathBuf)>, Failure> {
-    let mut files = Vec::with_capacity(paths.len());
+/// 一个成员从哪儿来：磁盘上的文件，或者刚从实况里拆出来的两段内存。
+///
+/// 拆出来的视频不必落盘：`archive()` 本来就是流式写归档的，把来源从「路径」放宽成
+/// 「路径或字节」就能直接送进去，省掉一次临时文件和它的清理。
+enum Source {
+    File(PathBuf),
+    Bytes(Vec<u8>),
+}
+
+/// 会尝试按实况拆开的文件上限。
+///
+/// 实况的图片一般十几兆；再大的「JPEG」多半是误判或者别的东西，不值得为了试一次把
+/// 它整个读进内存——发送本来是按块流的，这里读全文是唯一的例外，所以要有上限。
+const SPLIT_LIMIT: u64 = 256 << 20;
+
+/// Apple 给实况目录包的 UTI。iPhone 的 `/Ask` 就用它标 `IMG_0001.pvt`。
+const LIVE_PHOTO_BUNDLE: &str = "com.apple.private.live-photo-bundle";
+
+/// 一次发送的两张清单：`/Ask` 里列出的条目，与归档里真正写的成员。
+///
+/// 分开是因为**实况**：iPhone 的 `/Ask` 对一个 `.pvt` 只列**一个**条目（目录、
+/// `FileIsDirectory: true`、`FileSize: 0`），而归档里是「目录成员 + 它下面的图片和
+/// 视频」。用一张清单兼任两件事只有两种结果：要么 `/Ask` 多列两个并不存在的顶层文件
+/// （对方会去找它们），要么归档少写两个成员（对方拿到一个空目录）。
+struct Plan {
+    /// 进 `/Ask` 的 `Files`。
+    offered: Vec<Item>,
+    /// 进归档的成员（含目录本身）。
+    members: Vec<(Item, Source)>,
+}
+
+fn describe(paths: &[PathBuf]) -> Result<Plan, Failure> {
+    let mut plan = Plan {
+        offered: Vec::with_capacity(paths.len()),
+        members: Vec::with_capacity(paths.len()),
+    };
     for path in paths {
         let name = path
             .file_name()
@@ -539,12 +581,91 @@ fn describe(paths: &[PathBuf]) -> Result<Vec<(Item, PathBuf)>, Failure> {
                 format!("{} is not a regular file", path.display()),
             ));
         }
+        // 实况：一张 Motion Photo 对 iPhone 是**两个文件**（图片 + 同名 MOV，靠同一
+        // 个 ContentIdentifier 配对）。原样发过去它只是一张普通照片——视频就在文件里，
+        // 但收的人不会去找。所以拆成两个成员，各自带自己的名字和大小。
+        if is_image(&name) && metadata.len() <= SPLIT_LIMIT {
+            if let Ok(bytes) = fs::read(path) {
+                if let Some(live) = livephoto::split(&bytes) {
+                    // iPhone 之间的实况是一个**目录包**：`IMG_0001.pvt/` 里放图片与
+                    // 视频，`/Ask` 只列那个目录、类型是 `com.apple.private.live-photo-
+                    // bundle`。平级两个文件发过去时，收的那一端会老老实实落成两条独立
+                    // 条目——配对标识都在，但没人去配（2026-11-26 实测）。
+                    let stem = name
+                        .rsplit_once('.')
+                        .map(|(stem, _)| stem)
+                        .unwrap_or(&name)
+                        .to_string();
+                    let folder = format!("{stem}.pvt");
+                    let image = format!("{folder}/{stem}.JPG");
+                    let video = format!("{folder}/{stem}.MOV");
+                    plan.offered.push(
+                        Item::new(folder.clone())
+                            .with_size(0)
+                            .as_directory()
+                            .with_file_type(LIVE_PHOTO_BUNDLE),
+                    );
+                    plan.members.push((
+                        Item::new(folder)
+                            .with_size(0)
+                            .as_directory()
+                            .with_file_type(LIVE_PHOTO_BUNDLE),
+                        Source::Bytes(Vec::new()),
+                    ));
+                    // plist 要在两段字节被移走之前算（它借用 `live` 的 UUID 与 timing）。
+                    let plist = live.plist();
+                    plan.members.push((
+                        Item::new(image)
+                            .with_size(live.image.len() as u64)
+                            .with_file_type("public.jpeg"),
+                        Source::Bytes(live.image),
+                    ));
+                    plan.members.push((
+                        Item::new(video)
+                            .with_size(live.video.len() as u64)
+                            .with_file_type("com.apple.quicktime-movie"),
+                        Source::Bytes(live.video),
+                    ));
+                    // 包里的第三样东西。真机样本（IMG_7603.pvt/metadata.plist）三个键：
+                    // 配对 UUID、一段 timing、版本 1。缺了它，收到的一端把 .pvt 当成装着
+                    // 两个文件的普通目录——图能看、视频能放，但不是实况。
+                    if let Some(plist) = plist {
+                        plan.members.push((
+                            Item::new(format!("{stem}.pvt/metadata.plist"))
+                                .with_size(plist.len() as u64)
+                                .with_file_type("com.apple.property-list"),
+                            Source::Bytes(plist.into_bytes()),
+                        ));
+                    }
+                    continue;
+                }
+            }
+        }
         let item = Item::new(name.clone())
             .with_size(metadata.len())
             .with_file_type(file_type(&name));
-        files.push((item, path.clone()));
+        plan.offered.push(item.clone());
+        plan.members.push((item, Source::File(path.clone())));
     }
-    Ok(files)
+    Ok(plan)
+}
+
+/// 值得试一次「这是不是实况」的名字。只看扩展名：真正的判据在文件内容里。
+fn is_image(name: &str) -> bool {
+    matches!(
+        name.rsplit_once('.')
+            .map(|(_, extension)| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("jpg") | Some("jpeg")
+    )
+}
+
+/// 同一个 stem 的兄弟文件名：`IMG_0202.JPG` → `IMG_0202.MOV`。
+fn sibling(name: &str, extension: &str) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, _)) => format!("{stem}.{extension}"),
+        None => format!("{name}.{extension}"),
+    }
 }
 
 /// The archive the upload carries: cpio per member, DVZip per block.
@@ -556,7 +677,7 @@ fn describe(paths: &[PathBuf]) -> Result<Vec<(Item, PathBuf)>, Failure> {
 /// it.
 fn archive(
     out: &mut dyn Write,
-    files: &[(Item, PathBuf)],
+    files: &[(Item, Source)],
     meter: Option<&Meter>,
 ) -> io::Result<()> {
     // Odc is what the protocol's upload section asks a sender to produce.
@@ -566,29 +687,58 @@ fn archive(
     builder
         .add(".", MODE_DIRECTORY, &[])
         .map_err(io::Error::other)?;
-    for (item, path) in files {
-        let size = item.size.unwrap_or(0);
+    for (item, source) in files {
         // The member name is the offer's own `FileBomPath`, `./` and all. UP-7 lets a
         // receiver drop a member it was never offered, and "offered" means the string that
         // went out in `/Ask` — so normalising the path here, which reads like tidying,
         // turns every member into a file that arrives as nothing. `Item::bom_path` answers
         // with the same string the offer used, by construction.
         let member = item.bom_path();
-        let file = File::open(path).map_err(|error| {
-            io::Error::new(error.kind(), format!("{}: {error}", path.display()))
-        })?;
-        match meter {
-            Some(gauge) => {
-                let mut counted = Counted { file, meter: gauge };
-                builder
-                    .add_reader(&member, MODE_REGULAR, size, &mut counted)
-                    .map_err(io::Error::other)?;
+        if item.directory {
+            builder
+                .add(&member, MODE_DIRECTORY, &[])
+                .map_err(io::Error::other)?;
+            continue;
+        }
+        let size = item.size.unwrap_or(0);
+        match source {
+            Source::File(path) => {
+                let file = File::open(path).map_err(|error| {
+                    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+                })?;
+                match meter {
+                    Some(gauge) => {
+                        let mut counted = Counted { file, meter: gauge };
+                        builder
+                            .add_reader(&member, MODE_REGULAR, size, &mut counted)
+                            .map_err(io::Error::other)?;
+                    }
+                    None => {
+                        let mut plain = file;
+                        builder
+                            .add_reader(&member, MODE_REGULAR, size, &mut plain)
+                            .map_err(io::Error::other)?;
+                    }
+                }
             }
-            None => {
-                let mut plain = file;
-                builder
-                    .add_reader(&member, MODE_REGULAR, size, &mut plain)
-                    .map_err(io::Error::other)?;
+            Source::Bytes(bytes) => {
+                let mut slice = bytes.as_slice();
+                match meter {
+                    Some(gauge) => {
+                        let mut counted = Counted {
+                            file: &mut slice,
+                            meter: gauge,
+                        };
+                        builder
+                            .add_reader(&member, MODE_REGULAR, size, &mut counted)
+                            .map_err(io::Error::other)?;
+                    }
+                    None => {
+                        builder
+                            .add_reader(&member, MODE_REGULAR, size, &mut slice)
+                            .map_err(io::Error::other)?;
+                    }
+                }
             }
         }
     }
@@ -931,7 +1081,8 @@ mod tests {
         // Larger than one DVZip block, so the archive crosses a block boundary.
         std::fs::write(&photo, vec![7u8; 200_000]).unwrap();
 
-        let files = describe(&[note.clone(), photo.clone()]).unwrap();
+        let plan = describe(&[note.clone(), photo.clone()]).unwrap();
+        let files = &plan.members;
         assert_eq!(files[0].0.name, "note.txt");
         assert_eq!(files[0].0.file_type, "public.plain-text");
         // The offer announces `./note.txt` and the archive carries `./note.txt`: not the
@@ -943,7 +1094,7 @@ mod tests {
         assert_eq!(files[1].0.size, Some(200_000));
 
         let mut body = Vec::new();
-        archive(&mut body, &files, None).unwrap();
+        archive(&mut body, files, None).unwrap();
 
         let mut plain = Vec::new();
         dvzip::Decoder::new(&body[..])
@@ -1009,9 +1160,10 @@ mod tests {
         // Two blocks' worth, so the archive crosses a boundary in the middle of a member.
         std::fs::write(&third, vec![9u8; 70_000]).unwrap();
 
-        let files = describe(&[first.clone(), second.clone(), third.clone()]).unwrap();
+        let plan = describe(&[first.clone(), second.clone(), third.clone()]).unwrap();
+        let files = &plan.members;
         let mut body = Vec::new();
-        archive(&mut body, &files, None).unwrap();
+        archive(&mut body, files, None).unwrap();
 
         // Every block header has to add up to the body exactly: a frame that overruns is
         // a receiver waiting for bytes that never come.
@@ -1084,5 +1236,88 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         assert!(describe(std::slice::from_ref(&root)).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod live_bundle_tests {
+    use super::*;
+
+    /// 把归档解开，列出成员名（含目录）。
+    fn members(archive: &[u8]) -> Vec<String> {
+        struct Collect(Vec<String>);
+        impl opairdrop_cpio::Sink for Collect {
+            fn open(&mut self, name: &str, _size: u64, _mode: u32) -> Option<&mut dyn Write> {
+                self.0.push(name.to_string());
+                None
+            }
+            fn close(&mut self) {}
+        }
+        let mut collect = Collect(Vec::new());
+        opairdrop_cpio::extract(archive, &mut collect).expect("the archive we wrote must parse");
+        collect.0
+    }
+
+    /// 一张最小的 Motion Photo：APP1(XMP) + SOS + EOI + 视频。
+    fn motion_photo(video: &[u8]) -> Vec<u8> {
+        let xmp = format!(
+            "http://ns.adobe.com/xap/1.0/\x00GCamera:MotionPhoto=\"1\" \
+             <Container:Item Item:Mime=\"video/mp4\" Item:Semantic=\"MotionPhoto\" \
+             Item:Length=\"{}\"/>",
+            video.len()
+        );
+        let mut out = vec![0xFF, 0xD8];
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&((xmp.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(xmp.as_bytes());
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x01, 0xFF, 0xD9]);
+        out.extend_from_slice(video);
+        out
+    }
+
+    /// 实况发出去必须是一个 `.pvt` 包：`/Ask` 只列那个目录，归档里是目录 + 它的两个
+    /// 子成员。这是 iPhone 自己的形状（2026-11-26 从接收侧取证）。
+    #[test]
+    fn a_live_photo_becomes_one_bundle() {
+        let dir = std::env::temp_dir().join("opairdrop-live-bundle");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        let photo = dir.join("IMG_0001.JPG");
+        fs::write(&photo, motion_photo(b"VIDEO")).expect("fixture");
+
+        let plan = describe(std::slice::from_ref(&photo)).expect("describes");
+        assert_eq!(plan.offered.len(), 1, "只有 .pvt 一个条目进 /Ask");
+        assert_eq!(plan.offered[0].name, "IMG_0001.pvt");
+        assert!(plan.offered[0].directory);
+        assert_eq!(
+            plan.offered[0].file_type,
+            "com.apple.private.live-photo-bundle"
+        );
+
+        let mut body = Vec::new();
+        archive(&mut body, &plan.members, None).expect("archives");
+        let names = members(&body);
+        assert!(names.contains(&"IMG_0001.pvt".to_string()), "names: {names:?}");
+        assert!(
+            names.contains(&"IMG_0001.pvt/IMG_0001.JPG".to_string()),
+            "names: {names:?}"
+        );
+        assert!(
+            names.contains(&"IMG_0001.pvt/IMG_0001.MOV".to_string()),
+            "names: {names:?}"
+        );
+
+        // 分母是图片 + 视频，不是 /Ask 里那个 0。
+        let total: u64 = plan
+            .members
+            .iter()
+            .filter(|(item, _)| !item.directory)
+            .map(|(item, _)| item.size.unwrap_or(0))
+            .sum();
+        assert_eq!(total, (photo_size(&photo)) as u64);
+    }
+
+    fn photo_size(path: &PathBuf) -> u64 {
+        fs::metadata(path).expect("fixture exists").len()
     }
 }

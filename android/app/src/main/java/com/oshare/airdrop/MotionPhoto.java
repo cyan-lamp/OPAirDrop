@@ -125,69 +125,7 @@ public final class MotionPhoto {
             throw new IOException("不是完整 JPEG（结尾不是 EOI）");
         }
 
-        // 原图的宽/高/方向（EXIF 0x0100/0x0101/0x0112）——写进 OPPO 实况 EXIF。
-        int width = 0;
-        int height = 0;
-        int orientation = 1;
-        try {
-            android.media.ExifInterface exif = new android.media.ExifInterface(
-                    new java.io.ByteArrayInputStream(jpeg));
-            String w = exif.getAttribute(android.media.ExifInterface.TAG_IMAGE_WIDTH);
-            String h = exif.getAttribute(android.media.ExifInterface.TAG_IMAGE_LENGTH);
-            String o = exif.getAttribute(android.media.ExifInterface.TAG_ORIENTATION);
-            if (w != null) {
-                width = Integer.parseInt(w.trim());
-            }
-            if (h != null) {
-                height = Integer.parseInt(h.trim());
-            }
-            if (o != null) {
-                orientation = Integer.parseInt(o.trim());
-            }
-        } catch (Throwable ignored) {
-        }
-        if (width <= 0 || height <= 0) {
-            width = 4032;
-            height = 3024;
-        }
-        if (orientation <= 0) {
-            orientation = 1;
-        }
-
-        byte[] exifTpl = hex(OPPO_EXIF_HEX);
-        exifTpl[28] = (byte) (width >> 24);
-        exifTpl[29] = (byte) (width >> 16);
-        exifTpl[30] = (byte) (width >> 8);
-        exifTpl[31] = (byte) width;
-        exifTpl[40] = (byte) (height >> 24);
-        exifTpl[41] = (byte) (height >> 16);
-        exifTpl[42] = (byte) (height >> 8);
-        exifTpl[43] = (byte) height;
-        exifTpl[64] = (byte) (orientation >> 8);
-        exifTpl[65] = (byte) orientation;
-
-        // 跳过原 JPG 的前两个 APP1（EXIF、XMP），保留其余段（ICC/DQT/SOF/DHT/SOS…）。
-        java.io.ByteArrayOutputStream rest = new java.io.ByteArrayOutputStream();
-        int pos = 2;
-        int skipped = 0;
-        while (pos + 4 <= jpeg.length) {
-            if ((jpeg[pos] & 0xFF) != 0xFF) {
-                break;
-            }
-            int marker = jpeg[pos + 1] & 0xFF;
-            if (marker == 0xD9 || marker == 0xDA) {
-                rest.write(jpeg, pos, jpeg.length - pos);
-                break;
-            }
-            int length = ((jpeg[pos + 2] & 0xFF) << 8) | (jpeg[pos + 3] & 0xFF);
-            if (skipped < 2 && marker == 0xE1) {
-                skipped++;
-            } else {
-                rest.write(jpeg, pos, 2 + length);
-            }
-            pos += 2 + length;
-        }
-
+        // XMP：OPPO 模板（照抄 motion-live-photo 的 "oppo full-support"，四家实测通）。
         String len = String.valueOf(video.length);
         byte[] xmp = OPPO_XMP.replace("{LEN}", len).getBytes(StandardCharsets.UTF_8);
         byte[] xmpSeg = new byte[2 + 2 + 29 + xmp.length];
@@ -199,18 +137,111 @@ public final class MotionPhoto {
         System.arraycopy(XAP_URI.getBytes(StandardCharsets.US_ASCII), 0, xmpSeg, 4, 29);
         System.arraycopy(xmp, 0, xmpSeg, 4 + 29, xmp.length);
 
+        // EXIF：**保留原图那一份**，不再换成固定模板（2026-11-26 实验 E1 定论）。
+        //
+        // 原来这里用 OPPO 的 116 字节模板整段替换，理由是"相机样本就是那样"。但那个模板
+        // 只有一个 UserComment，**没有 Apple 的 MakerNote**——而 MakerNote 里装着 Live
+        // Photo 的 ContentIdentifier（EXIF tag 0x0011，与 MOV 的
+        // com.apple.quicktime.content.identifier 同为那个 UUID）。把它换掉，等于把配对
+        // 标识的图片那一半删了：本地相册照样认（它只读 XMP 与 UserComment 前缀），但把这张
+        // 图发回 iPhone 就配不成对——视频还在文件里，iPhone 却不会去找。
+        //
+        // 保留原 EXIF 同样满足 ColorOS 的硬条件：扫描器要的是「UserComment 以 oplus_ 开头」
+        // （checkOplusTag），而这一条由发布流程在合成前用 ExifInterface 写入，不需要整段
+        // 换模板。E1 实测（原 EXIF + OPPO XMP + 原 MOV）在相册、微信、抖音、小红书全部
+        // 正常显示并播放。
+        java.io.ByteArrayOutputStream rest = new java.io.ByteArrayOutputStream();
+        boolean hasExif = false;
+        for (int at = 2; at + 4 <= jpeg.length; ) {
+            if ((jpeg[at] & 0xFF) != 0xFF) {
+                break;
+            }
+            int marker = jpeg[at + 1] & 0xFF;
+            if (marker == 0xD9 || marker == 0xDA) {
+                break;
+            }
+            int length = ((jpeg[at + 2] & 0xFF) << 8) | (jpeg[at + 3] & 0xFF);
+            if (length < 2) {
+                break;
+            }
+            if (marker == 0xE1 && isExif(jpeg, at, length)) {
+                hasExif = true;
+                break;
+            }
+            at += 2 + length;
+        }
+
+        int pos = 2;
+        boolean exifKept = false;
+        boolean xmpWritten = false;
+        if (!hasExif) {
+            // 没有 EXIF 的图（不是 iPhone 来的）没有 MakerNote 可保，XMP 放最前面即可。
+            rest.write(xmpSeg, 0, xmpSeg.length);
+            xmpWritten = true;
+        }
+        while (pos + 4 <= jpeg.length) {
+            if ((jpeg[pos] & 0xFF) != 0xFF) {
+                break;
+            }
+            int marker = jpeg[pos + 1] & 0xFF;
+            if (marker == 0xD9 || marker == 0xDA) {
+                rest.write(jpeg, pos, jpeg.length - pos);
+                break;
+            }
+            int length = ((jpeg[pos + 2] & 0xFF) << 8) | (jpeg[pos + 3] & 0xFF);
+            if (length < 2) {
+                break;
+            }
+            if (marker == 0xE1 && isExif(jpeg, pos, length) && !exifKept) {
+                // 原 EXIF 原样留下，OPPO 的 XMP 紧随其后（标准顺序：EXIF 在前、XMP 在后）。
+                rest.write(jpeg, pos, 2 + length);
+                rest.write(xmpSeg, 0, xmpSeg.length);
+                exifKept = true;
+                xmpWritten = true;
+            } else if (marker == 0xE1 && isXmp(jpeg, pos, length)) {
+                // 原 XMP 丢掉：它声明的是"这段视频有多长"，而长度由我们重新算过。
+            } else {
+                rest.write(jpeg, pos, 2 + length);
+            }
+            pos += 2 + length;
+        }
+        if (!xmpWritten) {
+            // 段链没走通（截断的图）：退回把 XMP 写在最前面，至少不丢它。
+            rest.write(xmpSeg, 0, xmpSeg.length);
+        }
+
         ByteArrayOutputStream out = new ByteArrayOutputStream(
                 jpeg.length + video.length + 256);
         out.write(0xFF);
         out.write(0xD8);
-        out.write(exifTpl);
-        out.write(xmpSeg);
         rest.writeTo(out);
         out.write(video);
 
         long[] info = new long[3];
         walkMoov(video, 0, video.length, info);
         return new Motion(out.toByteArray(), (int) info[0], (int) info[1], (int) info[2]);
+    }
+
+    /** 这个 APP1 段是不是 EXIF（"Exif\0\0" 开头）。 */
+    private static boolean isExif(byte[] jpeg, int at, int length) {
+        return length >= 8 && at + 10 <= jpeg.length
+                && jpeg[at + 4] == 'E' && jpeg[at + 5] == 'x' && jpeg[at + 6] == 'i'
+                && jpeg[at + 7] == 'f' && jpeg[at + 8] == 0 && jpeg[at + 9] == 0;
+    }
+
+    /** 这个 APP1 段是不是 XMP（XAP 命名空间串开头）。 */
+    private static boolean isXmp(byte[] jpeg, int at, int length) {
+        int need = 2 + XAP_URI.length();
+        if (length < need || at + 2 + need > jpeg.length) {
+            return false;
+        }
+        byte[] uri = XAP_URI.getBytes(StandardCharsets.US_ASCII);
+        for (int i = 0; i < uri.length; i++) {
+            if (jpeg[at + 4 + i] != uri[i]) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static byte[] hex(String value) {

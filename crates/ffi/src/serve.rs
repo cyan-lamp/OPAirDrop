@@ -995,7 +995,13 @@ mod tests {
     }
 
     /// What the test's own progress callback was told: `(done, total)` per call, in order.
-    unsafe extern "C" fn record_progress(context: *mut c_void, done: u64, total: u64) {
+    unsafe extern "C" fn record_progress(
+        context: *mut c_void,
+        done: u64,
+        total: u64,
+        _members: u32,
+        _member_total: u32,
+    ) {
         // SAFETY: every test passes the `Vec` it created as the context.
         let seen = unsafe { &mut *(context as *mut Vec<(u64, u64)>) };
         seen.push((done, total));
@@ -1422,6 +1428,8 @@ mod tests {
             decide: None,
             watcher: None,
             declared: 0,
+            members_total: 0,
+            fully_sized: false,
         };
 
         // Asked with nobody to ask: every transfer is taken, and the sizes are read on the
