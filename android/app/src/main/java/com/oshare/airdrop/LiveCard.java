@@ -139,6 +139,14 @@ final class LiveCard {
     /** 正在播的那个播放器。留着它是为了下一条来时能把上一声掐掉，别两路声音叠着响。 */
     private static MediaPlayer sChimePlayer;
 
+    /** 响铃线程：单线程、守护，见 {@link #chime}。 */
+    private static final java.util.concurrent.ExecutorService CHIME =
+            java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
+                Thread thread = new Thread(task, "opairdrop-chime");
+                thread.setDaemon(true);
+                return thread;
+            });
+
     /*
      * 曾经在这里的三个探针开关已经删掉了：priorityProbe（PRIORITY_HIGH）、
      * categoryProbe（CATEGORY_CALL）、loudChannelProbe（换一条会响的渠道）。
@@ -729,7 +737,21 @@ final class LiveCard {
      * <p>另外静音模式（{@code RINGER_MODE_SILENT}）连振动也不给：那是用户把手按住不放的表达。
      * 振动模式（{@code RINGER_MODE_VIBRATE}）则只振不响，正是它字面的意思。
      */
+    /**
+     * 响一声（拿应用上下文排到响铃线程上）。
+     *
+     * <p>调用它的地方是接/发线程：{@link #postInvite} 在 serving 线程上投邀请卡，紧接着就叫
+     * 这里。而这一声要过 4 次 binder（通知开关、渠道、勿扰、音频模式）再同步 {@code prepare()}
+     * 一次音频解码器——这些都不该压在正在读字节的线程上，一条通知/音频慢 100ms，接收线程就
+     * 少读 100ms（2026-11-27 那条断流的形状，见 Plan.md §6.9）。所以只把活排上去，立刻返回。
+     */
     private static void chime(Context context) {
+        Context app = context.getApplicationContext();
+        CHIME.execute(() -> chimeNow(app));
+    }
+
+    /** 响铃只在 {@link #CHIME} 这一条线程上做：{@code sLastChime} 与播放器的读写因此不需要锁。 */
+    private static void chimeNow(Context context) {
         try {
             // 同一件事可能会被投两次（比如探针先 cancel 再延迟 700ms 重发、或者上层重试）。
             // 一秒半之内只认第一次：这段时间里的第二次投递说的还是同一句话。

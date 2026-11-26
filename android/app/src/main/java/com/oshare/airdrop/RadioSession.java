@@ -7,6 +7,10 @@ import android.os.Looper;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.InputStreamReader;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 「STA 共存」的会话控制器：什么时候该对 AP 连接做什么。
@@ -40,11 +44,20 @@ import java.io.InputStreamReader;
  * 2026-11-26 实测轮询 20 次全是 -1），{@code disableNetwork} 对用户的网络被
  * 系统静默忽略。这两条 API 在这台机器上都是摆设。
  *
- * <p># 看门狗
+ * <p># 三条线程纪律（2026-11-27 定，见 Plan.md §6.10-4 / §6.10-7）
  *
- * <p>独占会话期间每 5 秒确认一次 wlan0 是 down 的：框架的故障恢复（ClientModeManager
- * 检测到接口异常会重建 STA）可能把接口拉起来，看门狗把它按回去。会话结束或切到
- * 共享时看门狗停——exclusive 的会话外保持 down（第 7/8 条不恢复），但不再强按。
+ * <ol>
+ *   <li><b>本类所有 {@code su} 只跑在 {@code opairdrop-radio} 这一条线程上。</b>每条 su 都要
+ *       {@code waitFor(3000)}，以前整条链跑在主线程上：最长 3 秒阻塞所有 {@code main.post}，
+ *       期间界面刷新、对端快照、射频副标题一起卡住。</li>
+ *   <li><b>裁决带代次。</b>以前 {@code reapply} 用 {@code removeCallbacksAndMessages(null)}
+ *       清空主线程队列，顺带把已经排着的跨信道轮询和看门狗一起取消——「看门狗时灵时不灵」
+ *       就是这么来的。现在只比代次：旧代次的轮询链自己退出，新代次重新开始。</li>
+ *   <li><b>说的话要么是量到的，要么带时刻。</b>「热点已断开」这句以前在 {@code su} 返回之后
+ *       就写，不管 wlan0 到底是什么状态；现在下发之后回读 {@code ip link}，写的是读回来的
+ *       结论，失败时如实写「未生效」。这句话还有有效期（{@link #ACTION_HOLD_MS}），过期后
+ *       副标题自动回落到磁盘回执 {@code radio-state}，不再停在最后一次动作上。</li>
+ * </ol>
  */
 public final class RadioSession {
 
@@ -52,30 +65,53 @@ public final class RadioSession {
     private static volatile boolean sendActive;
     private static volatile boolean listening;
 
-    /** 看门狗开关与句柄（exclusive 会话中周期性确保 down）。 */
+    /** 看门狗开关与排程标志（exclusive 会话中周期性确保 down）。 */
     private static volatile boolean watchdogOn;
-    /** 看门狗的自续体：同一实例才能被 removeCallbacks 精确摘掉。 */
-    private static Runnable watchdogTick;
+    private static volatile boolean watchdogScheduled;
 
     /**
-     * 最近一次射频动作的人话（「热点已断开…」/「已恢复热点…」/裁决句），给首页
-     * 之外的射频行实时显示——回执（radio-state）只说守护的事，断开/恢复热点是
-     * 应用自己干的，那句话只有这里有。null = 还没有动作。
+     * 最近一次射频动作的人话，以及写下它的时刻。
+     *
+     * <p>回执（`radio-state`）只说守护的事，断开/恢复热点是应用自己干的，那句话只有这里有。
+     * 但它是一个**动作**，不是**状态**：会话里做过一次动作之后状态可能又变了（系统把 wlan0
+     * 拉回来、用户手动连上），所以它带有效期，过期就闭嘴，让磁盘回执说话。
      */
     private static volatile String lastAction;
+    private static volatile long lastActionAt;
 
-    /** 最近一次射频动作的人话；还没有动作时返回空串。 */
+    /** 动作那句话的有效期：4 秒足够人看见一次反馈，又短到不会盖住随后变化的真实状态。 */
+    private static final long ACTION_HOLD_MS = 4_000;
+
+    /** 最近一次射频动作的人话；还没有动作、或动作已经过期时返回空串。 */
     public static String lastAction() {
         String line = lastAction;
-        return line == null ? "" : line;
+        if (line == null || System.currentTimeMillis() - lastActionAt > ACTION_HOLD_MS) {
+            return "";
+        }
+        return line;
     }
 
     private static void action(String line) {
         lastAction = line;
+        lastActionAt = System.currentTimeMillis();
         Log.i("OPAirDrop", "STA 共存：" + line);
     }
 
     private static final Handler HANDLER = new Handler(Looper.getMainLooper());
+
+    /** 所有 su / ip link 只在这条线程上跑（纪律 1）。 */
+    private static final ExecutorService RADIO = Executors.newSingleThreadExecutor(task -> {
+        Thread thread = new Thread(task, "opairdrop-radio");
+        thread.setDaemon(true);
+        return thread;
+    });
+
+    /** 裁决代次：每来一次 {@link #reapply} 加一，旧代次的轮询与旧排队的 apply 自己退出（纪律 2）。 */
+    private static final AtomicInteger GENERATION = new AtomicInteger();
+
+    /** 最近一次进入本类的 Context，供后台线程与看门狗使用。 */
+    private static volatile Context appContext;
+
     /** share 确认后的跨信道检查：250ms 一次，最多 40 次（10 秒）。 */
     private static final long POLL = 250;
     private static final int POLLS = 40;
@@ -104,11 +140,31 @@ public final class RadioSession {
         reapply(context);
     }
 
-    /** 按当前状态重放一遍射频请求。幂等：随便调。 */
+    /**
+     * 按当前状态重放一遍射频请求。幂等，可以在任何线程调。
+     *
+     * <p>不清理主线程队列：清一次就把别人的排程（跨信道轮询、看门狗）一起删了。新代次
+     * 一旦开始，旧代次的轮询链在下一拍自己看到代次变了就退出。
+     */
     public static void reapply(Context context) {
         Context app = context.getApplicationContext();
-        HANDLER.removeCallbacksAndMessages(null);
-        HANDLER.post(() -> apply(app));
+        appContext = app;
+        int mine = GENERATION.incrementAndGet();
+        submit(() -> {
+            if (mine != GENERATION.get()) {
+                return;
+            }
+            apply(app);
+        });
+    }
+
+    /** 排到射频线程上。已在射频线程时直接跑，避免自己排到自己后面去。 */
+    private static void submit(Runnable task) {
+        if (Thread.currentThread().getName().equals("opairdrop-radio")) {
+            task.run();
+            return;
+        }
+        RADIO.execute(task);
     }
 
     private static void apply(Context app) {
@@ -128,7 +184,7 @@ public final class RadioSession {
                 if (want == RadioShare.Want.SHARE) {
                     action("会话外·共享：恢复热点连接");
                     stopWatchdog();
-                    bringUp(app);
+                    bringUp();
                     RadioShare.ask(dir, RadioShare.Want.SHARE);
                 } else {
                     action("会话外·独占：热点保持断开，不做动作");
@@ -140,15 +196,15 @@ public final class RadioSession {
             if (want == RadioShare.Want.EXCLUSIVE) {
                 // 独占：断开热点并挂看门狗（周期确认 down，见类注释）。
                 action("会话中·独占：断开热点");
-                startWatchdog(app);
+                startWatchdog();
                 return;
             }
             // 共享：先恢复关联（独占期间可能断着），等确认后再看 STA 落点——
             // AP 恰好在 149 就共存，落在别的信道再断开（第 3 条的例外）。
             action("会话中·共享：恢复热点，等信道判定");
             stopWatchdog();
-            bringUp(app);
-            pollShareSettled(app, 0);
+            bringUp();
+            pollShareSettled(0, GENERATION.get());
         } catch (java.io.IOException failed) {
             // 请求写不进去（磁盘/目录）：射频保持原状，下次会话事件会再试。
             Log.w("OPAirDrop", "射频请求写不进去：" + failed);
@@ -156,67 +212,102 @@ public final class RadioSession {
     }
 
     /** share 确认后：STA 在 149 放行；在其他信道断开热点（Wi-Fi 保持开启）。 */
-    private static void pollShareSettled(Context app, int round) {
+    private static void pollShareSettled(int round, int mine) {
         HANDLER.postDelayed(() -> {
+            if (mine != GENERATION.get()) {
+                return;
+            }
+            Context app = appContext;
+            if (app == null) {
+                return;
+            }
             RadioShare.State state = RadioShare.read(app.getFilesDir());
             if (!state.answered()
                     || state.receipt().standing() != RadioShare.Standing.CONFIRMED) {
                 if (round < POLLS && (sendActive || listening)) {
-                    pollShareSettled(app, round + 1);
+                    pollShareSettled(round + 1, mine);
                 }
                 return;
             }
             int mhz = state.staMhz();
             if (mhz > 0 && mhz != 5745) {
-                action("会话中·共享：AP 在 " + mhz + " MHz，跨信道，断开热点");
-                bringDown(app);
+                submit(() -> {
+                    action("会话中·共享：AP 在 " + mhz + " MHz，跨信道，断开热点");
+                    bringDown();
+                });
             } else if (mhz == 5745) {
                 action("会话中·共享：AP 在 149 信道，同信道共存，热点保持");
             }
         }, POLL);
     }
 
-    private static void startWatchdog(Context app) {
-        watchdogOn = true;
-        bringDown(app);
-        if (watchdogTick == null) {
-            watchdogTick = () -> {
-                if (!watchdogOn) {
-                    return;
-                }
-                ensureDown(app);
-                HANDLER.postDelayed(watchdogTick, WATCHDOG_TICK);
-            };
-            HANDLER.postDelayed(watchdogTick, WATCHDOG_TICK);
+    /** 看门狗的一拍：先把排程标志清掉，再确认一次 down，最后重新排。 */
+    private static final Runnable WATCHDOG_ROUND = () -> {
+        watchdogScheduled = false;
+        if (!watchdogOn) {
+            return;
         }
+        submit(() -> {
+            if (!watchdogOn) {
+                return;
+            }
+            ensureDown();
+            scheduleWatchdog();
+        });
+    };
+
+    private static void scheduleWatchdog() {
+        if (watchdogScheduled || !watchdogOn) {
+            return;
+        }
+        watchdogScheduled = true;
+        HANDLER.postDelayed(WATCHDOG_ROUND, WATCHDOG_TICK);
+    }
+
+    private static void startWatchdog() {
+        watchdogOn = true;
+        bringDown();
+        scheduleWatchdog();
     }
 
     private static void stopWatchdog() {
         watchdogOn = false;
-        if (watchdogTick != null) {
-            HANDLER.removeCallbacks(watchdogTick);
-        }
+        watchdogScheduled = false;
+        HANDLER.removeCallbacks(WATCHDOG_ROUND);
     }
 
     /** 看门狗的一拍：独占会话期间确保热点是断开的。 */
-    private static void ensureDown(Context app) {
+    private static void ensureDown() {
         if (isDown()) {
             return;
         }
         action("看门狗：热点被系统拉回，重新断开");
-        bringDown(app);
+        bringDown();
+    }
+
+    /** 下发一条 ip link 并回读，返回「量到的状态是否就是想要的那个」（纪律 3）。 */
+    private static boolean setLink(boolean up) {
+        try {
+            Process process = new ProcessBuilder("su", "-c",
+                    "ip link set " + STA_IF + (up ? " up" : " down")).start();
+            process.waitFor(3000, TimeUnit.MILLISECONDS);
+            process.destroy();
+        } catch (Throwable failed) {
+            Log.w("OPAirDrop", (up ? "恢复" : "断开") + "热点失败：" + failed);
+            return false;
+        }
+        return up != isDown();
     }
 
     private static boolean isDown() {
         // 接口 down 时 operstate 是 DOWN/NO-CARRIER；连着时是 UP。用 ip link 读。
         try {
             Process process = new ProcessBuilder("su", "-c",
-                    "ip link show " + STA_IF + " | grep -oE 'state [A-Z]+'")
-                    .start();
+                    "ip link show " + STA_IF + " | grep -oE 'state [A-Z]+'").start();
             BufferedReader reader = new BufferedReader(
                     new InputStreamReader(process.getInputStream()));
             String line = reader.readLine();
-            process.waitFor(3000, java.util.concurrent.TimeUnit.MILLISECONDS);
+            process.waitFor(3000, TimeUnit.MILLISECONDS);
             process.destroy();
             return line != null && !line.contains("UP");
         } catch (Throwable failed) {
@@ -225,29 +316,26 @@ public final class RadioSession {
         }
     }
 
-    /** 断开热点：链路层 down（Wi-Fi 总开关不动，supplicant 立刻 DISCONNECTED）。 */
-    private static void bringDown(Context app) {
-        try {
-            Process process = new ProcessBuilder("su", "-c",
-                    "ip link set " + STA_IF + " down").start();
-            process.waitFor(3000, java.util.concurrent.TimeUnit.MILLISECONDS);
-            process.destroy();
-            action("热点已断开（Wi-Fi 保持开启）");
-        } catch (Throwable failed) {
-            Log.w("OPAirDrop", "断开热点失败：" + failed);
+    /**
+     * 断开热点：链路层 down（Wi-Fi 总开关不动，supplicant 立刻 DISCONNECTED）。
+     *
+     * <p>回执写的是**读回来的**状态：{@code su} 退出 0 只说明命令被接受，不说明接口真的
+     * down 了（系统侧可能立刻把它拉回来）。
+     */
+    private static void bringDown() {
+        if (setLink(false)) {
+            action("热点已断开（Wi-Fi 保持开启，wlan0 DOWN）");
+        } else {
+            action("断开热点未生效（wlan0 仍 UP）");
         }
     }
 
-    /** 恢复热点：链路层 up（autojoin 自动把关联接回来）。 */
-    private static void bringUp(Context app) {
-        try {
-            Process process = new ProcessBuilder("su", "-c",
-                    "ip link set " + STA_IF + " up").start();
-            process.waitFor(3000, java.util.concurrent.TimeUnit.MILLISECONDS);
-            process.destroy();
-            action("热点已恢复连接");
-        } catch (Throwable failed) {
-            Log.w("OPAirDrop", "恢复热点失败：" + failed);
+    /** 恢复热点：链路层 up（autojoin 自动把关联接回来），同样回读后再说话。 */
+    private static void bringUp() {
+        if (setLink(true)) {
+            action("热点已恢复（wlan0 UP）");
+        } else {
+            action("恢复热点未生效（wlan0 仍 DOWN）");
         }
     }
 }

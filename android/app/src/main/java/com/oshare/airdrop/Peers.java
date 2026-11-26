@@ -418,6 +418,17 @@ final class Peers {
             }
             return "附近设备";
         }
+
+        /**
+         * 有没有「它是什么」这一栏：TXT 里的 {@link #model} 到了。
+         *
+         * <p>空串表示还没收到，或者对端根本没发——这两种在这一侧分不开。没有型号的设备
+         * 只能靠 {@link #kind()} 的兜底文案上屏，而那句话不是设备名，是这一侧的自白；
+         * 界面于是宁愿等一次 {@code /Discover} 把真名问回来（见 {@code SendActivity.settle}）。
+         */
+        boolean identified() {
+            return this.model != null && !this.model.trim().isEmpty();
+        }
     }
 
     /** 有变化时回调。{@code problem} 非空表示这一轮出过事，列表可能因此是空的。 */
@@ -735,14 +746,53 @@ private Thread thread;
      */
     List<Peer> snapshot() {
         synchronized (peers) {
-            List<Peer> visible = new ArrayList<>(peers.size());
-            for (Peer peer : peers.values()) {
-                if (!peer.unproven) {
-                    visible.add(peer);
-                }
-            }
-            return visible;
+            return dedupe(peers.values());
         }
+    }
+
+    /**
+     * 按身份键收一遍，只留「听得更新」的那条。
+     *
+     * <p>一台设备在表里可能同时有两条记录：表的键是 mDNS 实例名，而 iPhone 的实例名每分钟
+     * 换一次（Apple 的隐私设计），换个名就是新记录；冷启动时 {@link #recall} 还会按磁盘里的
+     * **上一次**的名字再造一条。界面按地址缓存真名（{@link PeerNames}），于是两条记录画出来
+     * 是同一个名字、占两格，下一拍再被 {@link #expire} 的 retired 收掉——这就是「先两格、
+     * 随即变回一格」。这里只治「看见两格」：表、判定、墓碑一概不动（根因是键选错，换键要
+     * 对齐落盘格式，见 Plan.md §6.10-1）。
+     *
+     * <p>抽成静态方法是为了能在桌面 JVM 上直接测（{@code LivenessFloorTest}）。
+     */
+    static List<Peer> dedupe(java.util.Collection<Peer> all) {
+        Map<String, Peer> byIdentity = new LinkedHashMap<>(all.size());
+        for (Peer peer : all) {
+            if (peer.unproven) {
+                continue;
+            }
+            String key = identity(peer);
+            Peer kept = byIdentity.get(key);
+            // 同一个身份留「听得更新」的那条：换名之后，新记录才是对端此刻在用的实例，
+            // 旧记录的名字已经过期。相等时保留先入表的那条，列表顺序因此稳定。
+            if (kept == null || LivenessState.lastHeard(peer) > LivenessState.lastHeard(kept)) {
+                byIdentity.put(key, peer);
+            }
+        }
+        return new ArrayList<>(byIdentity.values());
+    }
+
+    /**
+     * 同一台设备的身份键：地址优先，其次主机名，最后才是实例名。
+     *
+     * <p>和 {@link PeerNames#key} 用的是同一条规则（按地址去掉 scope、小写），两处必须是
+     * 同一个答案——名字按哪个键缓存，去重就该按哪个键。
+     */
+    private static String identity(Peer peer) {
+        if (!peer.address.isEmpty()) {
+            return "a:" + Addresses.bare(peer.address);
+        }
+        if (!peer.host.isEmpty()) {
+            return "h:" + peer.host.toLowerCase(java.util.Locale.ROOT);
+        }
+        return "n:" + peer.name;
     }
 
     /**
@@ -1560,12 +1610,15 @@ private Thread thread;
                         if (!peer.address.isEmpty()) {
                             buried.put(Addresses.bare(peer.address), new Grave(peer, now));
                         }
-                        // 措辞改了：这条路也要安静满 QUIET_BEFORE_GONE_MS 才删，所以它不是
-                        // 「不靠沉默、只看端口」，而是两件事同时成立——端口回绝，沉默又过了地板。
-                        // 和按沉默删的区别，只在于这里的阈值是常数，不按节奏放大。
+                        // 措辞改了：这条路也要安静满地板才删，所以它不是「不靠沉默、只看端口」，
+                        // 而是两件事同时成立——端口回绝，沉默又过了地板。地板按实测节奏放大
+                        // （见 `LivenessState.goneFloor`），不再是一个常数：iPhone 的应答器
+                        // 会成段休眠 6–8 秒，常数地板会把只是睡着的设备删掉。
+                        long floor = LivenessState.goneFloor(peer);
                         trace("dropped " + peer.name + "@" + peer.address + " after " + peer.knocks
                                 + " unanswered knocks at port " + peer.port + ", once its silence passed "
-                                + LivenessState.QUIET_BEFORE_GONE_MS + " ms (" + silence
+                                + floor + " ms (" + silence
+                                + " ms, rhythm " + peer.period + " ms, max " + peer.gapMax
                                 + " ms) — the port said no and the quiet outlasted the floor");
                         return true;
                     case DROP_SILENT:
@@ -1759,7 +1812,6 @@ private Thread thread;
      * 每 300–1000 毫秒要发一次查询，被它卡住就把「等 mDNS」这件事本身也拖慢了。
      */
     private void recall() {
-        boolean found = false;
         for (String[] field : PeerMemory.load(context)) {
             String name = field[0];
             String address = field[1];
@@ -1810,13 +1862,14 @@ private Thread thread;
                 peer.readyAt = now;
                 peer.seenAt = now;
                 peer.heardFrom = now;
-                found = true;
                 trace("recall: " + name + "@" + address + ":" + port + " answered in " + took
                         + " ms — showing it after " + (now - startedAt)
                         + " ms of browsing, before mDNS says anything");
             }
-        }
-        if (found) {
+            // 每探通一台就投一次快照。原来等全部探完才 publish：六台旧对端时，第一台要等到
+            // 最后一台探完才上屏（每台最长 2.5 秒，最坏约 15 秒）——那是「打开面板半天不出
+            // 设备」里最长的一段（Plan.md §6.10-4）。探不通的那几台在锁内 continue 掉了，
+            // 不会走到这里。
             feed.publish(snapshot(), null);
         }
     }

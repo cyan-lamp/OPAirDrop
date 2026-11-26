@@ -366,6 +366,21 @@ final class LivenessState {
     }
 
     /**
+     * `gone`（端口回绝）之后还要安静多久才删。
+     *
+     * <p>常数 {@link #QUIET_BEFORE_GONE_MS} 是「端口刚回绝、它多半真走了」的默认值。但它不够
+     * 宽：iPhone 的应答器会成段休眠 6–8 秒，也会出现「在宣告、端口暂时不接」的状态（19:50
+     * 的现场，见 {@link #CONNECTABLE_MS} 上方与 203 行那一段实测），常数地板会把一台只是睡着
+     * 的设备删进墓里。所以地板跟着实测节奏走：`2 × gapMax + 800`，样本不够时退回常数。
+     *
+     * <p>这不是「把阈值调大」：真离场仍由 {@link #timeout} 的 20 秒兜底，地板只补上
+     * 「端口说了不接、但我们还没听够它的节奏」这一种情况。
+     */
+    static long goneFloor(Peers.Peer peer) {
+        return Math.max(QUIET_BEFORE_GONE_MS, lost(peer) + CONNECTABLE_SLACK_MS);
+    }
+
+    /**
      * 这台对端这一拍的判定。
      *
      * <p>顺序有讲究：{@code gone}（端口说它不接）最先——它比沉默硬；可疑对端其次——
@@ -377,7 +392,7 @@ final class LivenessState {
             // 端口说过「不接」了，但它还在这儿说话——那它没走，只是这一刻发不出去。
             // gone 留着不清：端口那笔账是真的，只是还没到能删的时候。它一旦开口，
             // watch 那侧会把它翻回来。
-            return silence < QUIET_BEFORE_GONE_MS ? Step.KEEP : Step.DROP_GONE;
+            return silence < goneFloor(peer) ? Step.KEEP : Step.DROP_GONE;
         }
         if (peer.unproven) {
             return Step.KNOCK_NOW;

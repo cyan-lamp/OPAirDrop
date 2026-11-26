@@ -937,8 +937,18 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
             if (!peer.connectable()) {
                 continue;
             }
-            if (known(peer) == null && now - peer.readyAt < NAME_HOLD_MS) {
-                continue;
+            if (known(peer) == null) {
+                // 没有真名时只有一个占位可以上屏：TXT 里的型号（「iPhone」说得对，换名时
+                // 宽度也不会翻倍）。连型号都没有的是 {@link Peers#recall} 从磁盘造的那条——
+                // 它没有 TXT，能上屏的名字只剩 {@code kind()} 的兜底文案「附近设备」。那不是
+                // 设备名，是这一侧的自白；用户 2026-11-27 明确要求「只允许真实设备显示」。
+                // 宁可等 {@link #probeName} 把真名问回来（通常不到一秒），也不画一个假格子。
+                if (!peer.identified()) {
+                    continue;
+                }
+                if (now - peer.readyAt < NAME_HOLD_MS) {
+                    continue;
+                }
             }
             usable.add(peer);
         }
