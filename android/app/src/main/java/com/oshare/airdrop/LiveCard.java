@@ -550,9 +550,19 @@ final class LiveCard {
         }
         channel(manager);
 
+        // 完成卡把「跟着进度上色」关掉：整条轨道一律按已完成的样式画。
+        //
+        // 这张卡是**先撤再投**的新通知（按钮行从【取消发送】换成【完成】），系统把它当成
+        // 一条全新通知，轨道会从零开始做入场动画——人看到的就是「明明写着发送完成，条还
+        // 停在半路」，而且每次停的位置都不一样（2026-11-26 22:16 用户实测：任何文件都
+        // 这样）。关掉 styledByProgress 之后轨道不再区分已完成/未完成，一投出来就是满的。
+        //
+        // 失败卡不能这么干：那会把「没发完」画成「发完了」。所以判据是**终态且 100%**，
+        // 不是「终态」。
+        boolean complete = terminal && percent >= 100;
         Notification.ProgressStyle style = new Notification.ProgressStyle()
                 // 形状跟着进度走：不设这个，系统画的是一段静态装饰而不是一条在走的轨道。
-                .setStyledByProgress(true)
+                .setStyledByProgress(!complete)
                 .setProgressIndeterminate(percent < 0);
         if (percent >= 0) {
             style.setProgress(Math.min(100, percent));

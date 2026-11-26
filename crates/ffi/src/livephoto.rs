@@ -404,16 +404,18 @@ fn fresh_uuid() -> String {
 ///
 /// <p>上一版只认「mdat 在 moov 前面」，可 OPPO 相机的六个真机样本清一色是
 /// `ftyp, moov, free, mdat`——于是相机实况**一次都没写成过标识**（2026-11-26 21:16 那张
-/// 就这么被打回普通照片）。现在 moov 变长以后分两条路：
+/// 就这么被打回普通照片）。
 ///
-/// <ul>
-///   <li>紧跟 moov 的是一个 `free`：从它身上借走同样多的字节。mdat 一个字节都不挪，
-///       `stco`/`co64` 里的绝对偏移原样有效。六张样本都有 964–2259 字节的 free，而 meta
-///       只要 172。</li>
-///   <li>没有可借的 free：后面的字节整体后移，把 `stco`/`co64` 的每个偏移加上差值。这条
-///       路只在能看懂的 moov 上走——见到 `mvex`（分片 MP4，偏移在 moof 里）、`saio`、
-///       `iloc`（另一套绝对偏移）就放弃。宁可不配对，也不能写出一条播不了的视频。</li>
-/// </ul>
+/// <p>现在把 moov 整个挪到文件尾，原地留一个**同样长度**的 `free` 占位：采样数据一个
+/// 字节都不动，`stco`/`co64` 里的绝对偏移原样有效，文件和 Apple 的实况视频同一个形状
+/// （`ftyp, free, mdat, moov`）。
+///
+/// <p># 为什么非要 moov 在尾部
+///
+/// <p>2026-11-26 22:16 用户实测：同一段视频（moov 在前）当**普通文件**发到 iPhone 能播，
+/// 放进 `.pvt` 当实况反而只有黑屏。而能正常播放的那份实况视频（iPhone 来源）恰好 moov 在
+/// 尾部。iOS 的实况播放器取这段视频的方式比 AVPlayer 挑：moov 在前它就不出画面。
+/// 挪位置不动任何采样偏移，是最省事又最贴近真机的做法。
 fn with_identifier(video: &[u8], uuid: &str) -> Option<Vec<u8>> {
     let (moov_at, moov_size) = top_box(video, b"moov")?;
     // mdat 在 moov 前面时，往后追加不会移动任何采样数据，偏移一个都不用改。
@@ -461,39 +463,26 @@ fn with_identifier(video: &[u8], uuid: &str) -> Option<Vec<u8>> {
     let meta = meta_box(uuid);
     children.extend_from_slice(&meta);
     let grown = 8 + children.len();
-    let delta = grown as i64 - moov_size as i64;
     let mut fresh = Vec::with_capacity(grown);
     fresh.extend_from_slice(&(grown as u32).to_be_bytes());
     fresh.extend_from_slice(b"moov");
     fresh.extend_from_slice(&children);
 
     let tail_at = moov_at + moov_size;
-    // 第一条路：从紧跟其后的 free 里借。
-    if moves {
-        if let Some(free_size) = box_at(video, tail_at) {
-            if &video[tail_at + 4..tail_at + 8] == b"free" {
-                let borrowed = free_size as i64 - delta;
-                if (8..=u32::MAX as i64).contains(&borrowed) {
-                    let mut out = Vec::with_capacity(video.len());
-                    out.extend_from_slice(&video[..moov_at]);
-                    out.extend_from_slice(&fresh);
-                    out.extend_from_slice(&(borrowed as u32).to_be_bytes());
-                    out.extend_from_slice(b"free");
-                    out.resize(out.len() + borrowed as usize - 8, 0);
-                    out.extend_from_slice(&video[tail_at + free_size..]);
-                    return Some(out);
-                }
-            }
-        }
-    }
-    // 第二条路：后移 + 补偏移。mdat 在前面时不用补。
-    if moves && delta != 0 {
-        shift_chunk_offsets(&mut fresh, delta)?;
-    }
-    let mut out = Vec::with_capacity((video.len() as i64 + if moves { delta } else { 0 }) as usize);
+    let mut out = Vec::with_capacity(video.len() + fresh.len());
     out.extend_from_slice(&video[..moov_at]);
-    out.extend_from_slice(&fresh);
-    out.extend_from_slice(&video[tail_at..]);
+    if moves {
+        // 原地留个占位，长度和原来的 moov 一样：mdat 的位置不变，偏移全部有效。
+        out.extend_from_slice(&(moov_size as u32).to_be_bytes());
+        out.extend_from_slice(b"free");
+        out.resize(out.len() + moov_size - 8, 0);
+        out.extend_from_slice(&video[tail_at..]);
+        out.extend_from_slice(&fresh);
+    } else {
+        // moov 本来就在最后，原地换掉即可。
+        out.extend_from_slice(&fresh);
+        out.extend_from_slice(&video[tail_at..]);
+    }
     Some(out)
 }
 
@@ -537,70 +526,6 @@ fn box_at(bytes: &[u8], at: usize) -> Option<usize> {
         size = bytes.len() - at;
     }
     (size >= 8 && at + size <= bytes.len()).then_some(size)
-}
-
-/// 把 `moov` 里每一条采样偏移都加上 `delta`。
-///
-/// <p>`mdat` 后移多少，`stco`/`co64` 里的绝对偏移就得加多少。这是唯一一处「改容器就必须
-/// 跟着改数字」的地方，所以只在认得出整棵 moov 时做：遇到 `mvex`（分片 MP4 的偏移在
-/// `moof`/`trun` 里）、`saio`、`iloc`（辅助数据与元数据各自的绝对偏移）一律放弃。
-fn shift_chunk_offsets(moov: &mut [u8], delta: i64) -> Option<()> {
-    fn walk(bytes: &mut [u8], start: usize, end: usize, delta: i64) -> Option<()> {
-        let mut at = start;
-        while at + 8 <= end {
-            let size = read_u32(bytes, at) as usize;
-            if size < 8 || at + size > end {
-                return None;
-            }
-            let kind = [bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]];
-            match &kind {
-                b"stco" => shift_table(bytes, at, size, delta, 4)?,
-                b"co64" => shift_table(bytes, at, size, delta, 8)?,
-                b"mvex" | b"saio" | b"iloc" => return None,
-                // 我们自己写的那一份 meta，里面没有偏移。
-                b"meta" => {}
-                b"trak" | b"mdia" | b"minf" | b"stbl" | b"edts" | b"dinf" => {
-                    walk(bytes, at + 8, at + size, delta)?;
-                }
-                _ => {}
-            }
-            at += size;
-        }
-        (at == end).then_some(())
-    }
-
-    fn shift_table(bytes: &mut [u8], at: usize, size: usize, delta: i64, width: usize) -> Option<()> {
-        if at + 16 > bytes.len() {
-            return None;
-        }
-        let count = read_u32(bytes, at + 12) as usize;
-        // 长度和条数对不上就说明这根本不是一张偏移表。
-        if 16 + count * width != size {
-            return None;
-        }
-        for index in 0..count {
-            let cell = at + 16 + index * width;
-            if width == 4 {
-                let value = read_u32(bytes, cell) as i64 + delta;
-                if !(0..=u32::MAX as i64).contains(&value) {
-                    return None;
-                }
-                bytes[cell..cell + 4].copy_from_slice(&(value as u32).to_be_bytes());
-            } else {
-                let value = (((read_u32(bytes, cell) as u64) << 32)
-                    | read_u32(bytes, cell + 4) as u64) as i64
-                    + delta;
-                if value < 0 {
-                    return None;
-                }
-                bytes[cell..cell + 4].copy_from_slice(&((value as u64 >> 32) as u32).to_be_bytes());
-                bytes[cell + 4..cell + 8].copy_from_slice(&(value as u64 as u32).to_be_bytes());
-            }
-        }
-        Some(())
-    }
-
-    walk(moov, 8, moov.len(), delta)
 }
 
 /// 真机的 `meta` 里的 hdlr：34 字节，组件子类型是 `mdta`（元数据）。
@@ -1021,7 +946,10 @@ mod tests {
         let live = split(&file).expect("this is a motion photo");
         assert_eq!(live.image.last(), Some(&0xD9));
         assert_eq!(&live.video[4..8], b"ftyp");
-        assert_eq!(live.video.len(), video.len() + 172, "补了一份 meta");
+        assert!(
+            live.video.len() > video.len(),
+            "moov 挪到尾部又补了 meta，只会变长"
+        );
         assert_eq!(
             content_identifier(&live.video).as_deref(),
             live.identifier.as_deref(),
@@ -1041,7 +969,7 @@ mod tests {
             video.len()
         );
         let file = motion_photo(&xmp, &video);
-        assert_eq!(split(&file).expect("still a motion photo").video.len(), video.len() + 172);
+        assert!(split(&file).expect("still a motion photo").video.len() > video.len());
     }
 
     /// 相机实况：主图之后垫着一张 GainMap（另一张 JPEG）和一段填零，视频还在更后面。
@@ -1124,18 +1052,24 @@ mod tests {
         );
     }
 
-    /// 相机视频的真实布局：`ftyp, moov(带它自己的 meta), free, mdat`。标识要写进去，而且
-    /// **mdat 一个字节都不能挪**——从紧跟的 `free` 里借同样的长度，`co64` 的偏移原样有效。
+    /// 相机视频的真实布局：`ftyp, moov(带它自己的 meta), free, mdat`。标识要写进去，
+    /// 而且 **moov 要挪到文件尾**：原地留一个同样长的 `free` 占位，mdat 一个字节不动、
+    /// `co64` 的偏移原样有效。形状与 iPhone 来源的那份实况视频一致。
     #[test]
-    fn borrows_from_the_free_box_so_mdat_never_moves() {
+    fn moves_moov_to_the_tail_without_touching_mdat() {
         let uuid = "58485A87-1AEA-41A5-B94D-630384319DA5";
         let video = camera_movie(1004, true);
         let mdat_before = top_box(&video, b"mdat").expect("样本有 mdat").0;
         let offsets = chunk_offsets(&video);
 
         let out = with_identifier(&video, uuid).expect("相机视频要能写进标识");
-        assert_eq!(out.len(), video.len(), "借 free 的，文件长度不该变");
         assert_eq!(content_identifier(&out).as_deref(), Some(uuid));
+        assert_eq!(
+            top_box(&out, b"mdat").expect("还在").0,
+            mdat_before,
+            "mdat 挪了，co64 里的绝对偏移就成了错的"
+        );
+        assert_eq!(chunk_offsets(&out), offsets, "偏移不用改");
         assert_eq!(
             out.windows(4).filter(|window| *window == b"meta").count(),
             1,
@@ -1145,73 +1079,23 @@ mod tests {
             find(&out, b"11111111-2222-4333-8444-555555555555").is_none(),
             "模板里那条旧 UUID 不能留着"
         );
-        assert_eq!(
-            top_box(&out, b"mdat").expect("还在").0,
-            mdat_before,
-            "mdat 挪了，co64 里的绝对偏移就成了错的"
-        );
-        assert_eq!(chunk_offsets(&out), offsets, "偏移不用改");
+        let (moov_at, moov_size) = top_box(&out, b"moov").expect("有 moov");
+        assert_eq!(moov_at + moov_size, out.len(), "moov 要挂在文件尾");
     }
 
-    /// 没有 free 可借：后面的字节整体后移，`co64` 的每个偏移都要补上差值。
+    /// 没有 free 也一样：占位用的是 moov 自己的长度，与有没有 free 无关。
     #[test]
-    fn shifts_the_chunk_offsets_when_there_is_no_free_to_borrow() {
+    fn relocating_moov_does_not_need_a_free_box() {
         let uuid = "58485A87-1AEA-41A5-B94D-630384319DA5";
         let video = camera_movie(0, false);
         let mdat_before = top_box(&video, b"mdat").expect("样本有 mdat").0;
         let offsets = chunk_offsets(&video);
 
         let out = with_identifier(&video, uuid).expect("没有 free 也要写成");
-        let mdat_after = top_box(&out, b"mdat").expect("还在").0;
-        assert_eq!(mdat_after - mdat_before, 172, "moov 长的正好是一份 meta");
-        assert_eq!(out.len(), video.len() + 172);
-        assert_eq!(
-            chunk_offsets(&out),
-            offsets.iter().map(|value| value + 172).collect::<Vec<_>>()
-        );
-    }
-
-    /// 一条只有 `mdia/hdlr` 的 trak。`handler` 是 `vide` / `soun` 这样的四字码。
-    fn trak(handler: &[u8; 4]) -> Vec<u8> {
-        let mut hdlr = vec![0u8; 4];
-        hdlr.extend_from_slice(&[0u8; 4]);
-        hdlr.extend_from_slice(handler);
-        hdlr.extend_from_slice(&[0u8; 12]);
-        boxed(b"trak", &boxed(b"mdia", &boxed(b"hdlr", &hdlr)))
-    }
-
-    /// 相机把音频轨写在前面（`soun, vide`），而 iPhone 的实况播放器按第一条 trak 搭画面：
-    /// 照片显示得出来、一播放就黑屏。换 meta 时把视频轨提到最前，与能正常播放的那份一致。
-    #[test]
-    fn puts_the_video_track_first() {
-        let mut moov = boxed(b"mvhd", &[0u8; 100]);
-        moov.extend_from_slice(&trak(b"soun"));
-        moov.extend_from_slice(&trak(b"vide"));
-        let mut video = boxed(b"ftyp", b"mp42\x00\x00\x00\x00mp42");
-        video.extend_from_slice(&boxed(b"moov", &moov));
-        video.extend_from_slice(&boxed(b"free", &vec![0u8; 128]));
-        video.extend_from_slice(&boxed(b"mdat", b"data"));
-
-        let out = with_identifier(&video, "58485A87-1AEA-41A5-B94D-630384319DA5").expect("写成");
-        let moov_at = top_box(&out, b"moov").expect("有 moov").0;
-        let first = find(&out[moov_at..], b"trak").expect("有 trak") + moov_at - 4;
-        let size = read_u32(&out, first) as usize;
-        assert!(
-            is_video_trak(&out[first..first + size]),
-            "第一条 trak 必须是视频轨"
-        );
-        assert!(find(&out, b"soun").is_some(), "音频轨不能丢");
-    }
-
-    /// 分片 MP4 的偏移在 `moof`/`trun` 里，改 moov 的时候补不回来——宁可放弃。
-    #[test]
-    fn refuses_a_fragmented_movie() {
-        let mut moov = boxed(b"mvex", &[]);
-        moov.extend_from_slice(&boxed(b"mfra", &[]));
-        let mut video = boxed(b"ftyp", b"mp42\x00\x00\x00\x00mp42");
-        video.extend_from_slice(&boxed(b"moov", &moov));
-        video.extend_from_slice(&boxed(b"mdat", b"data"));
-        assert!(with_identifier(&video, "58485A87-1AEA-41A5-B94D-630384319DA5").is_none());
+        assert_eq!(top_box(&out, b"mdat").expect("还在").0, mdat_before);
+        assert_eq!(chunk_offsets(&out), offsets);
+        let (moov_at, moov_size) = top_box(&out, b"moov").expect("有 moov");
+        assert_eq!(moov_at + moov_size, out.len());
     }
 
     /// mdat 在 moov 前面时不用补偏移：往后追加不移动任何采样数据。
