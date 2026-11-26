@@ -8,11 +8,13 @@ import android.net.Uri;
 import android.os.Environment;
 import android.provider.MediaStore;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -165,8 +167,36 @@ final class Publish {
         //
         // 这里按名字收一次。丢掉的不是内容：那些成员本来就是同一份。
         java.util.Set<String> seen = new java.util.LinkedHashSet<>();
+
+        // 实况照片的识别与合并（2026-11-26，iPhone 真机取证：IMG_0232.JPG + IMG_0232.MOV
+        // + metadata.plist 三件平级成员）。同 stem 的图+视频配对 → 合成 Motion Photo
+        // （视频嵌进图片尾部，相册长按即播），视频与包标记 plist 不再单独落库。
+        // 实况照片（2026-11-26）：识别同 stem 的图+视频配对与包标记 plist。配对识别
+        // 与 Motion Photo 合成（MotionPhoto.make）已经完成并被 MediaProvider 判定通过
+        // （o_is_live_photo=1），但 ColorOS 相册的 UI 显示还有最后一层私有逻辑没有
+        // 打通（判定列=1 的条目相册仍不显示实况角标）——在那一层解决之前，视频照常
+        // 单独落库（Movies），保证图和视频两样东西用户都拿得到；合成逻辑保留在
+        // MotionPhoto/Publish 的代码路径里，带 MotionPhotoInfo 的图片入库一并生效。
+        java.util.Map<String, String> livePairs = MotionPhoto.pairs(report.names());
+        java.util.Set<String> merged = new java.util.HashSet<>();
+        for (String name : report.names()) {
+            if (MotionPhoto.isPlistMarker(name)) {
+                merged.add(name);
+            }
+        }
+        if (!livePairs.isEmpty()) {
+            Log.i(TAG, "实况照片 " + livePairs.size() + " 组：图与视频分别入库");
+        }
+        // 合成结果（图 stem -> Motion）：入库时带 Oplus 扩展列（o_is_live_photo 等），
+        // MediaProvider 判定层已打通；相册 UI 的显示待其私有逻辑打通后自动生效。
+        java.util.Map<String, MotionPhoto.Motion> liveMotion = new java.util.HashMap<>();
+
         for (String name : report.names()) {
             if (!seen.add(name)) {
+                continue;
+            }
+            // Live Photo 包的标记文件（metadata.plist）：不是内容，不落库。
+            if (merged.contains(name)) {
                 continue;
             }
             File source = new File(staged, name);
@@ -176,10 +206,57 @@ final class Publish {
             if (!source.isFile()) {
                 continue;
             }
+            // 配对图：把视频嵌进图片（Motion Photo），字节写回暂存的同一位——暂存目录
+            // 发布完就删，覆盖无副作用；合成失败保持原图照常落库，视频那一份也照常
+            // 落库（两样东西都不丢）。
+            if (livePairs.containsValue(name)) {
+                try {
+                    String videoName = null;
+                    for (java.util.Map.Entry<String, String> pair : livePairs.entrySet()) {
+                        if (pair.getValue().equals(name)) {
+                            videoName = pair.getKey();
+                        }
+                    }
+                    if (videoName != null) {
+                        // Oplus 扫描器判定实况的最后一关（OplusLivePhotoParser 判定链，
+                        // 反编译 ModernMediaScanner 1542-1562）：EXIF 的 UserComment 必须
+                        // 以 oppo_/oplus_ 开头（checkOplusTag），否则即使 XMP 全对、视频
+                        // 宽高都在，o_is_live_photo 也判 0。必须在 make() 之前改——
+                        // ExifInterface.saveAttributes 重写文件会截掉 EOI 之后嵌入的视频。
+                        android.media.ExifInterface exif =
+                                new android.media.ExifInterface(source.getPath());
+                        exif.setAttribute("UserComment", "oplus_" + source.getName());
+                        exif.saveAttributes();
+                        MotionPhoto.Motion motion = MotionPhoto.make(
+                                readAll(source), readAll(new File(staged, videoName)));
+                        java.nio.file.Files.write(source.toPath(), motion.data);
+                        liveMotion.put(name, motion);
+                        Log.i(TAG, "实况照片已合成：" + source.getName() + "（含 "
+                                + motion.data.length / 1024 + " KiB，视频 "
+                                + motion.durationMs + "ms " + motion.width + "x" + motion.height + "）");
+                    }
+                } catch (IOException | RuntimeException failure) {
+                    Log.w(TAG, "Motion Photo 合成失败，图按原图落库：" + failure);
+                }
+            }
+            // 实况照片的 Oplus 扩展列：相册的实况判定读 MediaStore 行的 o_is_live_photo
+            // 与 o_video_*（2026-11-26 实测：文件 XMP 对齐后相册仍不认，列才是开关）。
+            // 这几列在条目插入时一起给（owner 写自己的行），事后补写会被拒。
+            ContentValues extra = null;
+            MotionPhoto.Motion motion = liveMotion.get(name);
+            if (motion != null) {
+                extra = new ContentValues();
+                extra.put("o_is_live_photo", 1);
+                extra.put("o_video_size", motion.data.length);
+                extra.put("o_video_duration", motion.durationMs);
+                extra.put("o_video_width", motion.width);
+                extra.put("o_video_height", motion.height);
+            }
             Bucket bucket = fixed.isEmpty() ? Bucket.of(name) : null;
             String directory = bucket == null ? fixed : bucket.root + "/" + FOLDER;
             try {
-                Entry entry = save(context, source, source.getName(), bucket, directory, overwrite);
+                Entry entry = save(context, source, source.getName(), bucket, directory,
+                        overwrite, extra);
                 entries.add(entry);
                 landed += entry.size;
             } catch (IOException | RuntimeException failure) {
@@ -205,7 +282,8 @@ final class Publish {
      * 已经提交过的别的行。
      */
     private static Entry save(Context context, File source, String name, Bucket bucket,
-                              String directory, boolean overwrite) throws IOException {
+                              String directory, boolean overwrite, ContentValues extra)
+            throws IOException {
         ContentResolver resolver = context.getContentResolver();
         String mime = mimeOf(name);
         Uri collection = bucket == null
@@ -215,7 +293,7 @@ final class Publish {
             replace(resolver, collection, name, directory);
         }
 
-        Uri uri = insert(resolver, collection, name, mime, directory);
+        Uri uri = insert(resolver, collection, name, mime, directory, extra);
 
         long copied = 0;
         try {
@@ -277,7 +355,7 @@ final class Publish {
      * 换成别的名字也一样过不去，重试只会把真正的原因埋到第三十二次之后。
      */
     private static Uri insert(ContentResolver resolver, Uri collection, String name, String mime,
-                              String directory) throws IOException {
+                              String directory, ContentValues extra) throws IOException {
         RuntimeException refusal = null;
         for (String candidate : numbered(name)) {
             ContentValues values = new ContentValues();
@@ -285,6 +363,9 @@ final class Publish {
             values.put(MediaStore.MediaColumns.MIME_TYPE, mime);
             values.put(MediaStore.MediaColumns.RELATIVE_PATH, directory);
             values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+            if (extra != null) {
+                values.putAll(extra);
+            }
             try {
                 Uri uri = resolver.insert(collection, values);
                 if (uri == null) {
@@ -414,6 +495,19 @@ final class Publish {
 
     /** 扩展名到 MIME。查不到的一律 {@code application/octet-stream}。 */
     private static final java.util.Map<String, String> TYPES = types();
+
+    /** 整文件读进内存（合成 Motion Photo 时的 JPG 与 MOV 都不大：视频几 MiB 级）。 */
+    private static byte[] readAll(File file) throws IOException {
+        try (FileInputStream in = new FileInputStream(file);
+             ByteArrayOutputStream out = new ByteArrayOutputStream((int) file.length())) {
+            byte[] buffer = new byte[64 << 10];
+            int n;
+            while ((n = in.read(buffer)) > 0) {
+                out.write(buffer, 0, n);
+            }
+            return out.toByteArray();
+        }
+    }
 
     private static java.util.Set<String> set(String... values) {
         return java.util.Collections.unmodifiableSet(
