@@ -184,6 +184,14 @@ final class Publish {
                 merged.add(name);
             }
         }
+        try {
+            java.io.File dbg = new java.io.File(context.getExternalFilesDir(null), "pair_debug.txt");
+            java.nio.file.Files.write(dbg.toPath(),
+                    ("names=" + report.names() + "\npairs=" + livePairs + "\n---\n").getBytes("UTF-8"),
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+        } catch (Throwable ignored) {
+        }
+        Log.i(TAG, "实况配对输入：names=" + report.names() + " -> pairs=" + livePairs);
         if (!livePairs.isEmpty()) {
             Log.i(TAG, "实况照片 " + livePairs.size() + " 组：图与视频分别入库");
         }
@@ -237,6 +245,15 @@ final class Publish {
                     }
                 } catch (IOException | RuntimeException failure) {
                     Log.w(TAG, "Motion Photo 合成失败，图按原图落库：" + failure);
+                    try {
+                        java.io.File dbg = new java.io.File(context.getExternalFilesDir(null), "pair_debug.txt");
+                        java.io.StringWriter sw = new java.io.StringWriter();
+                        failure.printStackTrace(new java.io.PrintWriter(sw));
+                        java.nio.file.Files.write(dbg.toPath(),
+                                ("make 失败: " + failure + "\n" + sw + "\n---\n").getBytes("UTF-8"),
+                                java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+                    } catch (Throwable ignored) {
+                    }
                 }
             }
             // 实况照片的 Oplus 扩展列：相册的实况判定读 MediaStore 行的 o_is_live_photo

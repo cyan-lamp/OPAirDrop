@@ -1,8 +1,10 @@
 package com.oshare.airdrop;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.Locale;
 
 /**
@@ -106,6 +108,17 @@ public final class MotionPhoto {
             insertAt = 2; // 兜底：SOI 之后
         }
 
+        // iPhone 的配对视频（MOV）原样嵌入——2026-11-26 的实验矩阵（Y1/Z1/Z2）
+        // 结论：四家（相册/微信/抖音/小红书）的实况识别要求视频一字不动（moov 在
+        // 尾、cdsc 配对轨、ftyp qt 全保留）；rebrand 品牌、remux 重封装（mp42/qt）、
+        // faststart 重排（moov 前置）都会让显示全部丢失。Y1 形态（原样）是四家显示
+        // 的唯一可行解，相册可播放；第三方 App 的播放限制是 Apple Live Photo 的
+        // 生态问题（微信/抖音/小红书对真实 iPhone 实况同样只能显示、不能像相册那样
+        // 播放），不是本文件的缺陷。判定列（o_is_live_photo）在 Y1 形态下由
+        // MediaProvider 的扩展列保证（insert 时写入）。
+        // XMP 的 Length 必须与最终嵌入的字节一致——这一步在 remux 之后算（2026-11-26
+        // 的 bug：先算 XMP 再 remux，声明的长度是原始 MOV 的，视频起点错位到 JPEG
+        // 数据中间，判定与播放全失败）。
         String xmp = xmp(video.length);
         byte[] segment = app1(xmp);
 
@@ -122,40 +135,92 @@ public final class MotionPhoto {
             out.write(segment);
             out.write(jpeg, insertAt, jpeg.length - insertAt);
         }
-        // iPhone 的配对视频是 MOV（ftyp major brand "qt  "）——Oplus 的实况提取器对
-        // qt 容器只走到一半（时长能读、宽高读不出、is_live_photo 判 0，2026-11-26
-        // IMG_0225 实测）。MOV 与 MP4 同为 ISO BMFF，把品牌改成 isom/mp41 就走
-        // MP4 提取路径，数据本身一个字节不用动。
-        byte[] videoFixed = rebrand(video);
-
-        out.write(videoFixed);
+        out.write(video);
         // 视频的时长/分辨率：Oplus 相册的实况列（o_video_duration 等）要这些值。
         long[] info = new long[3]; // durationMs, width, height
-        walkMoov(videoFixed, 0, videoFixed.length, info);
+        walkMoov(video, 0, video.length, info);
         return new Motion(out.toByteArray(), (int) info[0], (int) info[1], (int) info[2]);
     }
 
-    /** ftyp 的 major brand 从 "qt  " 换成 "isom"，compatible 的 qt 槽位换成 mp41。 */
-    private static byte[] rebrand(byte[] video) {
-        if (video.length < 20) {
-            return video;
-        }
-        String brand = new String(video, 8, 4, StandardCharsets.US_ASCII);
-        if (!brand.equals("qt  ")) {
-            return video; // 已经是 MP4 系品牌，不动
-        }
-        byte[] out = video.clone();
-        System.arraycopy("isom".getBytes(StandardCharsets.US_ASCII), 0, out, 8, 4);
-        // compatible brands 从第 16 字节起，逐槽扫：qt 槽位换成 mp41
-        int boxSize = ((video[0] & 0xFF) << 24) | ((video[1] & 0xFF) << 16)
-                | ((video[2] & 0xFF) << 8) | (video[3] & 0xFF);
-        for (int i = 16; i + 4 <= Math.min(boxSize, video.length); i += 4) {
-            if (video[i] == 'q' && video[i + 1] == 't' && video[i + 2] == ' '
-                    && video[i + 3] == ' ') {
-                System.arraycopy("mp41".getBytes(StandardCharsets.US_ASCII), 0, out, i, 4);
+    /** MOV/MP4 → 标准 MP4：音视频轨 passthrough 重封装（无重编码），元数据轨丢弃。 */
+    private static void remuxToMp4(File mov, File mp4) throws IOException {
+        android.media.MediaExtractor extractor = new android.media.MediaExtractor();
+        android.media.MediaMuxer muxer = null;
+        String step = "A:setDataSource";
+        try {
+            extractor.setDataSource(mov.getPath());
+            step = "B:tracks";
+            java.util.Map<Integer, Integer> trackMap = new java.util.HashMap<>();
+            int maxInput = 1 << 20;
+            int kept = 0;
+            for (int i = 0; i < extractor.getTrackCount(); i++) {
+                android.media.MediaFormat format = extractor.getTrackFormat(i);
+                String mime = format.getString(android.media.MediaFormat.KEY_MIME);
+                boolean keep = mime != null
+                        && (mime.startsWith("video/") || mime.startsWith("audio/"));
+                Log.i("MotionPhoto", "remux track " + i + " " + mime + (keep ? " 保留" : " 丢弃"));
+                if (!keep) {
+                    continue;
+                }
+                extractor.selectTrack(i);
+                if (format.containsKey(android.media.MediaFormat.KEY_MAX_INPUT_SIZE)) {
+                    maxInput = Math.max(maxInput, format.getInteger(
+                            android.media.MediaFormat.KEY_MAX_INPUT_SIZE));
+                }
+                muxer = muxer == null ? new android.media.MediaMuxer(mp4.getPath(),
+                        android.media.MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4) : muxer;
+                int muxTrack = muxer.addTrack(format);
+                if (muxTrack >= 0) {
+                    trackMap.put(i, muxTrack);
+                }
+                kept++;
+            }
+            if (kept == 0) {
+                throw new IOException("MOV 里没有可保留的音视频轨");
+            }
+            step = "C:start";
+            muxer.start();
+            step = "D:copy";
+            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(maxInput);
+            android.media.MediaCodec.BufferInfo info = new android.media.MediaCodec.BufferInfo();
+            long samples = 0;
+            int lastTrack = -1;
+            while (true) {
+                int index = extractor.getSampleTrackIndex();
+                if (index < 0) {
+                    break;
+                }
+                lastTrack = index;
+                Integer outTrack = trackMap.get(index);
+                int size = extractor.readSampleData(buffer, 0);
+                if (size < 0) {
+                    extractor.advance();
+                    continue;
+                }
+                if (outTrack != null) {
+                    info.offset = 0;
+                    info.size = size;
+                    info.presentationTimeUs = extractor.getSampleTime();
+                    info.flags = extractor.getSampleFlags();
+                    muxer.writeSampleData(outTrack, buffer, info);
+                }
+                samples++;
+                extractor.advance();
+            }
+            Log.i("MotionPhoto", "remux copied " + samples + " samples, last track " + lastTrack);
+            step = "E:stop";
+            muxer.stop();
+        } catch (Throwable failure) {
+            throw new IOException("remux[" + step + "]：" + failure, failure);
+        } finally {
+            extractor.release();
+            if (muxer != null) {
+                try {
+                    muxer.release();
+                } catch (Throwable ignored) {
+                }
             }
         }
-        return out;
     }
 
     /**
@@ -212,56 +277,18 @@ public final class MotionPhoto {
     }
 
     /**
-     * XMP：照抄 Oplus 相机实况照片的格式（2026-11-26 从 PJZ110 相机实况样本逐字对照
-     * 得来——上一版用 MotionPhotoVersion=2 + 属性转义 + Item:MIME，Oplus 相册不认）。
-     * 版本是 v1；Container:Directory 是元素形式（不是转义属性）；属性名 Item:Mime
-     * 大小写敏感；再带 v1 MicroVideo 标记兼容旧解析器（offset = 负的视频长度，
-     * 视频紧贴文件尾）。Oplus 相机样本里另有 OpCamera:* 私有命名空间，那是它标记
-     * 「本机拍摄」用的，第三方合成不带它。
+     * XMP：模板 = Oplus 相机实况的 XMP 全段（2026-11-26 逐字对照 + 实验 X 验证：
+     * 这台相册的解析对 XMP 字节格式敏感——语义相同的单行构造版不认，相机原样的
+     * 缩进换行版认）。动态的只有三处视频长度（MotionPhoto 项、OpCamera:VideoLength、
+     * MicroVideoOffset）。GainMap 项的长度是相机样本原值（我们没有 gain map 数据段，
+     * 判定阶段不校验）。
      */
     private static String xmp(int videoLength) {
-        // 模板 = Oplus 相机实况的 XMP 全段（2026-11-26 D3 消融实验确认：这台相册认的
-        // 是**这个完整形状**——hdrgm 声明、GainMap Container 项、OpCamera:* 私有命名
-        // 空间、非 0 的 MotionPhotoPresentationTimestampUs，缺一样都不显示实况；逐项
-        // 消融的记录见当日工作日志）。动态的只有三处视频长度（MotionPhoto 项、
-        // OpCamera:VideoLength、MicroVideoOffset），替换后与实际嵌入的视频字节数一致。
-        // GainMap 项的长度是相机样本的原值（我们没有 gain map 数据段）——判定阶段
-        // 相册不校验该项数据，实测无碍。
-        String template = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">"
-                + "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
-                + "<rdf:Description rdf:about=\"\""
-                + " xmlns:hdrgm=\"http://ns.adobe.com/hdr-gain-map/1.0/\""
-                + " xmlns:GCamera=\"http://ns.google.com/photos/1.0/camera/\""
-                + " xmlns:OpCamera=\"http://ns.oplus.com/photos/1.0/camera/\""
-                + " xmlns:Container=\"http://ns.google.com/photos/1.0/container/\""
-                + " xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\""
-                + " hdrgm:Version=\"1.0\""
-                + " GCamera:MotionPhoto=\"1\""
-                + " GCamera:MotionPhotoVersion=\"1\""
-                + " GCamera:MotionPhotoPresentationTimestampUs=\"1065000\""
-                + " OpCamera:MotionPhotoPrimaryPresentationTimestampUs=\"1065000\""
-                + " OpCamera:MotionPhotoOwner=\"oplus\""
-                + " OpCamera:OLivePhotoVersion=\"2\""
-                + " OpCamera:VideoLength=\"4671312\""
-                + " OpCamera:MotionPhotoEnable=\"True\""
-                + " GCamera:MicroVideo=\"1\""
-                + " GCamera:MicroVideoVersion=\"1\""
-                + " GCamera:MicroVideoOffset=\"-4672761\">"
-                + "<Container:Directory><rdf:Seq>"
-                + "<rdf:li rdf:parseType=\"Resource\">"
-                + "<Container:Item Item:Mime=\"image/jpeg\" Item:Semantic=\"Primary\""
-                + " Item:Length=\"0\" Item:Padding=\"0\"/>"
-                + "</rdf:li>"
-                + "<rdf:li rdf:parseType=\"Resource\">"
-                + "<Container:Item Item:Mime=\"image/jpeg\" Item:Semantic=\"GainMap\""
-                + " Item:Length=\"263537\" Item:Padding=\"0\"/>"
-                + "</rdf:li>"
-                + "<rdf:li rdf:parseType=\"Resource\">"
-                + "<Container:Item Item:Mime=\"video/mp4\" Item:Semantic=\"MotionPhoto\""
-                + " Item:Length=\"4672761\" Item:Padding=\"0\"/>"
-                + "</rdf:li>"
-                + "</rdf:Seq></Container:Directory>"
-                + "</rdf:Description></rdf:RDF></x:xmpmeta>";
+        // 相机 XMP 段的原样字节（2026-11-26 从 PJZ110 相机实况样本逐字节提取，只把
+        // 三处视频长度改成动态）。相册/微信/抖音/小红书的实况识别对 XMP 的**字节
+        // 格式**敏感——语义相同的单行构造版会被相册解析器拒绝（Y1 实验：相机原样
+        // 段四家全显示；单行模板全军覆没）。换行、缩进、x:xmptk、xpacket 全部保留。
+        String template = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Adobe XMP Core Test.SNAPSHOT\">\n  <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n    <rdf:Description rdf:about=\"\"\n        xmlns:hdrgm=\"http://ns.adobe.com/hdr-gain-map/1.0/\"\n        xmlns:GCamera=\"http://ns.google.com/photos/1.0/camera/\"\n        xmlns:OpCamera=\"http://ns.oplus.com/photos/1.0/camera/\"\n        xmlns:Container=\"http://ns.google.com/photos/1.0/container/\"\n        xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\"\n      hdrgm:Version=\"1.0\"\n      GCamera:MotionPhoto=\"1\"\n      GCamera:MotionPhotoVersion=\"1\"\n      GCamera:MotionPhotoPresentationTimestampUs=\"1065000\"\n      OpCamera:MotionPhotoPrimaryPresentationTimestampUs=\"1065000\"\n      OpCamera:MotionPhotoOwner=\"oplus\"\n      OpCamera:OLivePhotoVersion=\"2\"\n      OpCamera:VideoLength=\"4671312\"\n      OpCamera:MotionPhotoEnable=\"True\"\n      OpCamera:MotionPhotoEditorFlag=\"8\">\n      <Container:Directory>\n        <rdf:Seq>\n          <rdf:li rdf:parseType=\"Resource\">\n            <Container:Item\n              Item:Mime=\"image/jpeg\"\n              Item:Semantic=\"Primary\"\n              Item:Length=\"0\"\n              Item:Padding=\"0\"/>\n          </rdf:li>\n          <rdf:li rdf:parseType=\"Resource\">\n            <Container:Item\n              Item:Mime=\"image/jpeg\"\n              Item:Semantic=\"GainMap\"\n              Item:Length=\"263537\"\n              Item:Padding=\"0\"/>\n          </rdf:li>\n          <rdf:li rdf:parseType=\"Resource\">\n            <Container:Item\n              Item:Mime=\"video/mp4\"\n              Item:Semantic=\"MotionPhoto\"\n              Item:Length=\"4672761\"\n              Item:Padding=\"0\"/>\n          </rdf:li>\n        </rdf:Seq>\n      </Container:Directory>\n    </rdf:Description>\n  </rdf:RDF>\n</x:xmpmeta>\n";
         String len = String.valueOf(videoLength);
         return template.replace("4672761", len).replace("4671312", len);
     }
