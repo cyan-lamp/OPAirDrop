@@ -34,8 +34,11 @@ final class SendHost {
 
     static final int SUCCESS = 1006;
 
-    /** 成功卡之前留给进度条的时间，见 {@link #finished}。 */
-    private static final long SETTLE_HOLD_MS = 700;
+    /** 成功卡之前留给进度条的时间，见 {@link #finished}：最后一跳很小时用这个。 */
+    private static final long SETTLE_HOLD_MS = 500;
+
+    /** 最后一跳跨满 100 个百分点时给多久。 */
+    private static final long MAX_SETTLE_HOLD_MS = 1600;
     static final int REFUSED = 1008;
     static final int CANCELLED = 1009;
     static final int TIMEOUT = 1010;
@@ -93,12 +96,16 @@ final class SendHost {
      * 起跳，越落越远。2026-11-26 23:42 用户实测「传到 2/3 就发送完了，完成后很快加速滑到
      * 100%」——数字一直是对的（日志里已经报到 100%），落后的是那条被反复重启的动画。
      *
-     * <p>600ms：一次动画（两三百毫秒）能走完，一帧大约一个百分点，看不出跳跃。
+     * <p>450ms：一次动画（两三百毫秒）能走完；小文件也能拿到两三帧，最后一跳不会太大。
      */
-    private static final long CARD_EVERY_MS = 600;
+    private static final long CARD_EVERY_MS = 450;
 
     /** 上一次把进度投到卡上的时刻（{@link SystemClock#uptimeMillis}）。 */
     private static long lastCardAt;
+
+    /** 最近两帧**真正投到卡上**的百分比。收尾的停顿要按最后一跳跨了多远来定。 */
+    private static int shownPercent = -1;
+    private static int beforeShown = -1;
 
     /**
      * 最近造出来的那颗【取消发送】，连同它属于哪一趟。
@@ -279,6 +286,8 @@ final class SendHost {
     static void begin(String session, String peer, String contents) {
         lastPercent = -1;
         lastCardAt = 0;
+        shownPercent = -1;
+        beforeShown = -1;
         show(session, "发送到 " + peer, "准备中 · " + contents, -1);
     }
 
@@ -343,16 +352,18 @@ final class SendHost {
         }
         if (status == SUCCESS) {
             settle(session, status, "发送完成", line);
-            // 先让进度条走完，再换成终态卡。
+            // 先让进度条真的走完，再改成终态。
             //
-            // 进度卡挂【取消发送】、终态卡挂【完成】，形状不一样就得**先撤再投**（见
-            // LiveCard.post 里那段），而系统是**按一条通知**给进度轨道做动画的：新卡一投
-            // 出来，轨道从当前动画位置重新开始，人看到的就是「明明写着发送完成，条还停在
-            // 半路」。接收侧没有这个毛病——那边 100% 之后还要对账等报告，天然要在屏上停
-            // 一会儿；发送侧最后一步太快（真机实测 100% 到收尾只隔 0.55 秒）。
+            // 轨道是系统画的，它从「当前画到的位置」出发、用两三百毫秒滑向新值。小文件
+            // 几十毫秒就传完，最后一跳可能从 10% 直接到 100%——人看到的就是「才走了
+            // 10%，怎么就说发送完成了」，然后那条才慢慢滑到底（2026-11-26 23:49 用户
+            // 实测）。停顿得按这一跳跨了多远来给：跨得越多，动画要得越久。
+            int gap = 100 - Math.max(0, beforeShown);
+            long hold = Math.min(MAX_SETTLE_HOLD_MS,
+                    SETTLE_HOLD_MS + gap * ((MAX_SETTLE_HOLD_MS - SETTLE_HOLD_MS) / 100));
             new Handler(Looper.getMainLooper()).postDelayed(
                     () -> LiveCard.finishWithActions(context, "发送完成", line, null),
-                    SETTLE_HOLD_MS);
+                    hold);
             return;
         }
         if (status == CANCELLED) {
@@ -403,6 +414,8 @@ final class SendHost {
             return;
         }
         lastPercent = percent;
+        beforeShown = shownPercent;
+        shownPercent = percent;
         LiveCard.updateWithStop(context, title, line, percent, "取消发送", stop(context, session));
     }
 
