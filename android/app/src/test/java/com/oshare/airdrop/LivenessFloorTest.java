@@ -21,6 +21,8 @@ import java.util.List;
  *       会把它删进墓里（用户报的「AirDrop 开着，设备却消失了」）。</li>
  *   <li>{@link Peers#dedupe}：一台设备在表里可能有两条记录（键是每分钟轮换的 mDNS 实例名），
  *       界面上就是两格同名设备（用户报的「先看见两台、随即变回一台」）。出口按地址去重。</li>
+ *   <li>{@link SendActivity#listed}：屏幕上出现什么。没有真名也没有型号的对端（冷启动
+ *       {@code recall} 造的那条）不上屏——它唯一能显示的名字是「附近设备」。</li>
  * </ul>
  *
  * <p>凡是调整这些阈值或身份规则的改动，先改这里。
@@ -115,5 +117,34 @@ public class LivenessFloorTest {
         assertTrue(unknown.identified());
         unknown.model = "   ";
         assertFalse(unknown.identified());
+    }
+
+    @Test
+    public void the_list_only_shows_devices_it_can_name() {
+        long now = 100_000;
+
+        // 连不上（地址或端口缺一条）：不上屏。
+        Peers.Peer incomplete = new Peers.Peer("ffff");
+        assertFalse("记录没凑齐就不是一台能发的设备",
+                SendActivity.listed(incomplete, null, now));
+
+        // 有真名：立刻上屏，不用等窗口。
+        Peers.Peer named = peer("gggg", "fe80::2");
+        named.readyAt = now;
+        assertTrue(SendActivity.listed(named, "王小明's iPhone", now));
+
+        // 没有真名、也没有型号（recall 从磁盘造的那条）：等到天荒地老也不上屏——
+        // 它唯一能显示的名字是「附近设备」，用户明确要求不出现这种格子。
+        Peers.Peer bare = peer("hhhh", "fe80::3");
+        bare.readyAt = 0;
+        assertFalse(SendActivity.listed(bare, null, now));
+
+        // 有型号：先等名字窗口（1.5 秒），过了就按型号上屏（「iPhone」说得对）。
+        Peers.Peer typed = peer("iiii", "fe80::4");
+        typed.model = "iPhone17,1";
+        typed.readyAt = now;
+        assertFalse("窗口内还可能有真名，先等一下", SendActivity.listed(typed, null, now));
+        assertFalse(SendActivity.listed(typed, null, now + 1_499));
+        assertTrue(SendActivity.listed(typed, null, now + 1_500));
     }
 }

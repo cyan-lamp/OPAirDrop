@@ -596,9 +596,32 @@ final class FeaturePage {
             RadioSession.onWantChanged(host);
         });
         // 副标题与回执常驻轮询（2026-11-26 用户要求实时及时更新）：这一页活着就每秒
-        // 重读一次状态与回执——RadioSession 断开/恢复热点、守护写回执、会话进出的
-        // 任何变化，最迟一秒落到这两行上。页面切走时旧视图 detach，轮询自停。
-        pollRadio(sub[0], record, 0);
+        // 重读一次状态与回执——RadioSession 断开/恢复热点、守护写回执、会话进出的任何变化，
+        // 最迟一秒落到这两行上。
+        //
+        // 2026-11-27 实测抓到它一直没在跑：卡片是在 build() 里生成的，那一刻视图还没进窗口，
+        // `pollRadio` 第一句 `isAttachedToWindow()` 直接返回，之后再没有人叫它——于是拨开关、
+        // radio-state 都变了，这两行一个字不动。所以启动点改挂在「进入窗口」上；
+        // 同一张卡只允许一条链（进出页面会重新 attach）。
+        Runnable[] tick = new Runnable[1];
+        sub[0].addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override
+            public void onViewAttachedToWindow(View view) {
+                if (tick[0] != null) {
+                    view.removeCallbacks(tick[0]);
+                    tick[0] = null;
+                }
+                pollRadio(sub[0], record, tick);
+            }
+
+            @Override
+            public void onViewDetachedFromWindow(View view) {
+                if (tick[0] != null) {
+                    view.removeCallbacks(tick[0]);
+                    tick[0] = null;
+                }
+            }
+        });
         return card;
     }
 
@@ -614,8 +637,9 @@ final class FeaturePage {
      * {@code isAttachedToWindow}：这一页切走会整页重画，那时这个循环还挂在旧视图上，
      * 继续拨下去只是在给一堆没人看的 TextView 赋值。
      */
-    private void pollRadio(TextView sub, TextView record, int tick) {
+    private void pollRadio(TextView sub, TextView record, Runnable[] tick) {
         if (!sub.isAttachedToWindow()) {
+            tick[0] = null;
             return;
         }
         RadioShare.State state = RadioShare.read(filesDir());
@@ -632,7 +656,8 @@ final class FeaturePage {
         record.setText(state.receipt().present() ? state.receipt().line() : "");
         record.setTextColor(state.failed() ? S.red : S.textDim);
         record.setVisibility(state.receipt().present() ? View.VISIBLE : View.GONE);
-        sub.postDelayed(() -> pollRadio(sub, record, tick + 1), RADIO_POLL_MS);
+        tick[0] = () -> pollRadio(sub, record, tick);
+        sub.postDelayed(tick[0], RADIO_POLL_MS);
     }
 
     /**

@@ -934,23 +934,9 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
     private void settle(long now) {
         List<Peers.Peer> usable = new ArrayList<>();
         for (Peers.Peer peer : reachable) {
-            if (!peer.connectable()) {
-                continue;
+            if (listed(peer, known(peer), now)) {
+                usable.add(peer);
             }
-            if (known(peer) == null) {
-                // 没有真名时只有一个占位可以上屏：TXT 里的型号（「iPhone」说得对，换名时
-                // 宽度也不会翻倍）。连型号都没有的是 {@link Peers#recall} 从磁盘造的那条——
-                // 它没有 TXT，能上屏的名字只剩 {@code kind()} 的兜底文案「附近设备」。那不是
-                // 设备名，是这一侧的自白；用户 2026-11-27 明确要求「只允许真实设备显示」。
-                // 宁可等 {@link #probeName} 把真名问回来（通常不到一秒），也不画一个假格子。
-                if (!peer.identified()) {
-                    continue;
-                }
-                if (now - peer.readyAt < NAME_HOLD_MS) {
-                    continue;
-                }
-            }
-            usable.add(peer);
         }
         found = usable;
 
@@ -967,6 +953,39 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
 
         // 还在等名字的那几台，到点得有人再来算一次：报文不一定来，见 {@link #armSettle}。
         armSettle(now);
+    }
+
+    /**
+     * 这一台现在能不能上屏。
+     *
+     * <p>三条判据，顺序就是它们的强弱：
+     *
+     * <ol>
+     *   <li><b>能连才算有这台设备</b>——地址和端口都到齐（{@link Peers.Peer#connectable()}）。</li>
+     *   <li><b>知道真名就直接上</b>——{@code known} 非空（本次问到的、或上次按地址存下的）。</li>
+     *   <li><b>还没有真名时，只有「型号」这一个占位可以上屏</b>，而且要等过 {@link #NAME_HOLD_MS}：
+     *       型号到了说明它是一条完整的 mDNS 记录（「iPhone」说得对，换名时宽度也不会翻倍），
+     *       真名通常几百毫秒内就到，多等这一下能省掉一次换字。连型号都没有的是
+     *       {@link Peers#recall} 从磁盘造的那条——它没有 TXT，能上屏的名字只剩
+     *       {@code kind()} 的兜底文案「附近设备」。那不是设备名，是这一侧的自白；
+     *       用户 2026-11-27 明确要求「只允许真实设备显示」，所以宁可等
+     *       {@link #probeName} 把真名问回来，也不画一个假格子。</li>
+     * </ol>
+     *
+     * <p>抽成静态方法是为了能在桌面 JVM 上钉住（{@code LivenessFloorTest}）：这三条判据是
+     * 「屏幕上出现什么」的唯一来源，值得有测试。
+     */
+    static boolean listed(Peers.Peer peer, String known, long now) {
+        if (!peer.connectable()) {
+            return false;
+        }
+        if (known != null) {
+            return true;
+        }
+        if (!peer.identified()) {
+            return false;
+        }
+        return now - peer.readyAt >= NAME_HOLD_MS;
     }
 
     /**

@@ -54,8 +54,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       清空主线程队列，顺带把已经排着的跨信道轮询和看门狗一起取消——「看门狗时灵时不灵」
  *       就是这么来的。现在只比代次：旧代次的轮询链自己退出，新代次重新开始。</li>
  *   <li><b>说的话要么是量到的，要么带时刻。</b>「热点已断开」这句以前在 {@code su} 返回之后
- *       就写，不管 wlan0 到底是什么状态；现在下发之后回读 {@code ip link}，写的是读回来的
- *       结论，失败时如实写「未生效」。这句话还有有效期（{@link #ACTION_HOLD_MS}），过期后
+ *       就写，不管 wlan0 到底是什么状态；现在下发之后回读 {@code /sys/class/net/wlan0/flags}，
+ *       写的是读回来的结论，失败时如实写「未生效」。这句话还有有效期（{@link #ACTION_HOLD_MS}），过期后
  *       副标题自动回落到磁盘回执 {@code radio-state}，不再停在最后一次动作上。</li>
  * </ol>
  */
@@ -300,16 +300,23 @@ public final class RadioSession {
     }
 
     private static boolean isDown() {
-        // 接口 down 时 operstate 是 DOWN/NO-CARRIER；连着时是 UP。用 ip link 读。
+        // 判据是「接口被管理性地关掉了吗」，也就是 `IFF_UP` 那一位有没有置——它不带 scope，
+        // 就是 `/sys/class/net/wlan0/flags` 的最低位。**不能用 `ip link` 的 `state`**：
+        // wlan0 恢复后、还没关联上 AP 时 operstate 是 `NO-CARRIER ... state DOWN`，那是
+        // 「没连着」不是「被关了」，按它判会把刚恢复成功的动作报成「未生效」
+        // （2026-11-27 01:23 真机实测：`flags=0x1003`、`ip link` 里 UP 与 state DOWN 同时出现）。
         try {
             Process process = new ProcessBuilder("su", "-c",
-                    "ip link show " + STA_IF + " | grep -oE 'state [A-Z]+'").start();
+                    "cat /sys/class/net/" + STA_IF + "/flags").start();
             BufferedReader reader = new BufferedReader(
                     new InputStreamReader(process.getInputStream()));
             String line = reader.readLine();
             process.waitFor(3000, TimeUnit.MILLISECONDS);
             process.destroy();
-            return line != null && !line.contains("UP");
+            if (line == null || line.trim().isEmpty()) {
+                return false;
+            }
+            return (Long.decode(line.trim()) & 0x1L) == 0;
         } catch (Throwable failed) {
             Log.w("OPAirDrop", "读 wlan0 状态失败：" + failed);
             return false;
