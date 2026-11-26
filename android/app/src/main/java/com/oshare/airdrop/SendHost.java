@@ -5,6 +5,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 
 /**
  * 发送侧的那张卡：现在由我们自己发，交给系统的实时通知。
@@ -84,6 +85,20 @@ final class SendHost {
      * <p>写在这里而不是让调用方算：失败那句话里没有进度，而 {@link #finished} 拿到的只有状态码。
      */
     private static int lastPercent = -1;
+
+    /**
+     * 卡片上那条进度轨道最快多久换一次。
+     *
+     * <p>系统是按**一条通知**给轨道做动画的：投得比动画还密，每一帧都从当前画到的位置重新
+     * 起跳，越落越远。2026-11-26 23:42 用户实测「传到 2/3 就发送完了，完成后很快加速滑到
+     * 100%」——数字一直是对的（日志里已经报到 100%），落后的是那条被反复重启的动画。
+     *
+     * <p>600ms：一次动画（两三百毫秒）能走完，一帧大约一个百分点，看不出跳跃。
+     */
+    private static final long CARD_EVERY_MS = 600;
+
+    /** 上一次把进度投到卡上的时刻（{@link SystemClock#uptimeMillis}）。 */
+    private static long lastCardAt;
 
     /**
      * 最近造出来的那颗【取消发送】，连同它属于哪一趟。
@@ -263,6 +278,7 @@ final class SendHost {
     /** 起一次发送：还没连上，没有百分比可说，画不确定态。 */
     static void begin(String session, String peer, String contents) {
         lastPercent = -1;
+        lastCardAt = 0;
         show(session, "发送到 " + peer, "准备中 · " + contents, -1);
     }
 
@@ -279,6 +295,14 @@ final class SendHost {
      *                同一句话在两处出现就是早晚对不上的那种重复
      */
     static void progress(String session, String peer, int percent, String line) {
+        // 真话先记下来：失败卡要停在断开那一刻，与卡片投了几帧无关。
+        lastPercent = percent;
+        long now = SystemClock.uptimeMillis();
+        // 不确定态、以及 100% 那一帧必须立刻投；中间的按节拍投，见 CARD_EVERY_MS。
+        if (percent >= 0 && percent < 100 && now - lastCardAt < CARD_EVERY_MS) {
+            return;
+        }
+        lastCardAt = now;
         show(session, "发送到 " + peer, percent < 0 ? line : percent + "% · " + line, percent);
     }
 
