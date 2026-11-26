@@ -2052,6 +2052,9 @@ struct Landing {
     object: jobject,
     /// Cached `Landing.landed(JJ)V`.
     landed: jni_sys::jmethodID,
+    /// Cached `Landing.members(II)V` —— 实况的成员进度（0 表示 jmethodID 缺失，
+    /// 只是说卡上少一句「已收 N/M」，不影响别的）。
+    members: jni_sys::jmethodID,
     /// Set once the Java side threw. The receive is not abandoned for it, but the callback
     /// is not made again either: one broken listener must not become thousands of
     /// exceptions on a long transfer.
@@ -2080,10 +2083,34 @@ impl Landing {
         if landed.is_null() || unsafe { pending(env) } {
             return Err(());
         }
+        // 可选：老的 Landing 实现没有 members 方法时，接口的 default 实现也在 class 上，
+        // 所以正常都能查到；查不到就当「这台设备少一句成员进度」。
+        let members_name = c_str("members");
+        let members_signature = c_str("(II)V");
+        // SAFETY: same class object, valid for the call.
+        let class = unsafe { (entry!(table, GetObjectClass))(env, object) };
+        let members = if class.is_null() {
+            std::ptr::null_mut()
+        } else {
+            let id = unsafe {
+                (entry!(table, GetMethodID))(
+                    env,
+                    class,
+                    members_name.as_ptr(),
+                    members_signature.as_ptr(),
+                )
+            };
+            unsafe { (entry!(table, DeleteLocalRef))(env, class) };
+            id
+        };
+        if unsafe { pending(env) } {
+            unsafe { (entry!(table, ExceptionClear))(env) };
+        }
         Ok(Landing {
             env,
             object,
             landed,
+            members,
             failed: false,
         })
     }
@@ -2098,7 +2125,13 @@ impl Landing {
 /// # Safety
 ///
 /// `context` must point at a live [`Landing`].
-unsafe extern "C" fn report_landing(context: *mut c_void, done: u64, total: u64) {
+unsafe extern "C" fn report_landing(
+    context: *mut c_void,
+    done: u64,
+    total: u64,
+    members: u32,
+    member_total: u32,
+) {
     if context.is_null() {
         return;
     }
@@ -2132,6 +2165,22 @@ unsafe extern "C" fn report_landing(context: *mut c_void, done: u64, total: u64)
     if unsafe { pending(landing.env) } {
         // The exception stays pending: it is the Java caller's, and it is the honest report.
         landing.failed = true;
+    }
+    if !landing.members.is_null() {
+        // SAFETY: `members` is `Landing.members(II)V` on the same live object.
+        unsafe {
+            (entry!(table, CallVoidMethod))(
+                landing.env,
+                landing.object,
+                landing.members,
+                members as jint,
+                member_total as jint,
+            )
+        };
+        // SAFETY: `landing.env` is valid.
+        if unsafe { pending(landing.env) } {
+            landing.failed = true;
+        }
     }
 }
 

@@ -51,7 +51,7 @@
 
 use std::ffi::c_void;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use opairdrop_airdrop::inbox::{self, Error as InboxError, Limits};
@@ -109,7 +109,15 @@ impl Decide {
 /// Called from inside the write loop of the inbox, so it runs on the thread serving the
 /// connection, as often as chunks arrive. It must be cheap and must not block: the transfer
 /// is waiting on it.
-pub type LandingCallback = unsafe extern "C" fn(context: *mut c_void, done: u64, total: u64);
+/// `done`/`total` 是字节；`members` 是已落盘成员数，`member_total` 是发送端报的
+/// 成员数（0 = 没报）。实况照片的 /Ask 不给总大小，成员数是卡片上唯一的前进刻度。
+pub type LandingCallback = unsafe extern "C" fn(
+    context: *mut c_void,
+    done: u64,
+    total: u64,
+    members: u32,
+    member_total: u32,
+);
 
 /// A [`LandingCallback`] with the context it was built for.
 #[derive(Clone, Copy)]
@@ -135,9 +143,9 @@ impl Watcher {
         Watcher { callback, context }
     }
 
-    fn say(&self, done: u64, total: u64) {
+    fn say(&self, done: u64, total: u64, members: u32, member_total: u32) {
         // SAFETY: as `Decide::take`: the caller promised this pair for the whole call.
-        unsafe { (self.callback)(self.context, done, total) }
+        unsafe { (self.callback)(self.context, done, total, members, member_total) }
     }
 }
 
@@ -265,6 +273,39 @@ fn links_of(links: &[String]) -> String {
 /// The trait's other three methods have defaults, and this type is the reason two of them
 /// exist: `saw_ask` and `saw_sender` are for a caller that wants to *watch* a conversation
 /// — a log, a notification, a progress bar. Nothing here watches yet: the offer it already
+/// 把 `/Upload` 读过的字节留一份（上限 `cap`）。
+///
+/// <p>只有一个用途：一次接收失败之后，「对端到底发完了没有」这个问题必须能回答——落盘
+/// 字节数只说明我们**写了**多少，说明不了流的末尾长什么样。把原始字节留最后一份，就能
+/// 离线看出它是断在 CPIO trailer 之前、断在 trailer 中间，还是早就发完了、只是我们没认出
+/// 结尾（2026-11-26：单张实况每次都停在 7–9 MiB、16–21 秒，三种可能指三个完全不同的改法）。
+struct Tap<'a> {
+    inner: &'a mut dyn std::io::Read,
+    kept: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    cap: usize,
+}
+
+impl std::io::Read for Tap<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        let mut kept = self.kept.borrow_mut();
+        let room = self.cap.saturating_sub(kept.len());
+        if room > 0 {
+            kept.extend_from_slice(&buf[..n.min(room)]);
+        }
+        Ok(n)
+    }
+}
+
+/// 一小段字节的十六进制，给诊断文件用（只进日志与文件，不上屏幕）。
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 /// accepted is in the body it is about to read, and the sender's name is cosmetic.
 pub(crate) struct Store {
     /// What both answers call this device.
@@ -282,6 +323,11 @@ pub(crate) struct Store {
     /// the reason `accept` reads the sizes: by the time bytes are landing the offer has
     /// been consumed.
     declared: u64,
+    /// 发送端报的成员数（/Ask 的 Files 数），实况没有总大小时的进度刻度。
+    members_total: u32,
+    /// /Ask 里每一份都带了大小吗。实况（.pvt 目录）与混合场景下不是——那时 `declared`
+    /// 只是部分之和，当分母会画出「100% 还在传」，只能退回 /Upload 的 Content-Length。
+    fully_sized: bool,
     /// The budget and the collision rule, both from the settings.
     limits: Limits,
     /// What the `/Discover` answer tells the peer it can store untouched.
@@ -326,6 +372,8 @@ impl Receiver for Store {
         // Kept for the progress hook. A sender that declares no sizes leaves this at zero,
         // and a zero total is a caller's cue to show motion rather than a fraction.
         self.declared = offer.files.iter().filter_map(|file| file.size).sum();
+        self.members_total = offer.files.len() as u32;
+        self.fully_sized = !offer.files.is_empty() && offer.files.iter().all(|file| file.size.is_some());
         match &self.decide {
             None => true,
             Some(decide) => decide.take(offer),
@@ -363,28 +411,119 @@ impl Receiver for Store {
 
     fn upload(&mut self, body: &mut dyn std::io::Read, upload: &Upload<'_>) -> io::Result<()> {
         // The body is de-chunked but still wrapped — gzip or DVZip blocks — and the inbox
-        // sniffs and unwraps it. Doing that here would mean two places that know what an
+        // sniffs and unwraps it. Doing this here would mean two places that know what an
         // upload looks like.
-        let received = match self.watcher {
-            None => inbox::receive_with(&self.directory, self.limits, body),
+        //
+        // 分母（2026-11-26 修）：`/Ask` 每一份都报了 size 时才用 `declared`；否则用
+        // `/Upload` 的 Content-Length。实况（.pvt 目录报 0）与混合场景下 `declared` 只是
+        // **部分之和**——5 张混合报 7.8 MB、真实 30 MB+，拿它当分母就是「进度 100% 还在
+        // 传」。Content-Length 是线上字节总数，单位与落盘字节不同（压缩率 10% 上下），
+        // 但方向对，且它总在。
+        let total = if let Some(total) = upload.total_bytes {
+            // 对端自己说的整次传输字节数，最准。
+            total
+        } else if self.fully_sized && self.declared > 0 {
+            self.declared
+        } else {
+            upload.content_length.unwrap_or(self.declared)
+        };
+        let content_length = upload.content_length;
+        let tap = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let started = std::time::Instant::now();
+        let mut tapped = Tap {
+            inner: body,
+            kept: tap.clone(),
+            cap: 48 << 20,
+        };
+        let outcome = match self.watcher {
+            None => inbox::receive_with(&self.directory, self.limits, &mut tapped),
             Some(watcher) => {
-                // offer 不带 size 时（iPhone 发实况照片），用 /Upload 头里的 Content-Length
-                // 兜底：那是线上压缩字节的总数，media 本就压不动，payload 进度≈真实进度。
-                // 2026-11-24 实测：实况照片全程 -1%，流体云不渲染不定态轨道（评审后用户报告）。
-                let total = if self.declared > 0 {
-                    self.declared
-                } else {
-                    upload.content_length.unwrap_or(0)
-                };
-                let hook: inbox::Progress = Arc::new(move |done| watcher.say(done, total));
-                inbox::receive_watched(&self.directory, self.limits, body, hook)
+                let members_total = self.members_total;
+                let hook: inbox::Progress =
+                    Arc::new(move |done, members| watcher.say(done, total, members, members_total));
+                inbox::receive_watched(&self.directory, self.limits, &mut tapped, hook)
             }
-        }
-        .map_err(io::Error::other)?;
+        };
+        // 决定性的一问：解码器提前放弃之后，流里**还有没有数据**。
+        //
+        // 这一个数字分得开两件完全相反的事（2026-11-26 卡在这一步）：
+        //   - 还能读出几兆 → 流是完整的，是我们自己的分帧/解码错位（app 的 bug）
+        //   - 读出 0      → 对端就发了这么多，剩下的从来没到过
+        // 上限 1 MiB：够判断"有没有"，又不会在一条已经坏掉的连接上读八百兆。
+        let leftover = if outcome.is_err() {
+            let mut sink = [0u8; 8192];
+            let mut total = 0usize;
+            for _ in 0..128 {
+                match body.read(&mut sink) {
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    Err(_) => break,
+                }
+            }
+            total
+        } else {
+            0
+        };
+        // 现场的最后一笔：成败都留一份小的，失败时连原始字节一起留（见 `Tap`）。
+        leave_receive_evidence(
+            &self.directory,
+            &tap.borrow(),
+            content_length,
+            started,
+            &outcome,
+            &upload.head,
+            leftover,
+            upload.total_bytes,
+            total,
+        );
+        let received = outcome.map_err(io::Error::other)?;
         self.landed.bytes += received.bytes;
         self.landed.names.extend(received.names);
         self.clear_ask_diag();
         Ok(())
+    }
+
+
+}
+/// 把这一次 `/Upload` 的形状写到 inbox 旁边：对端声明多少、我们读了多少、花了多久、
+/// 末尾几十个字节是什么。失败时另存一份原始字节。
+///
+/// <p>写不了就算了——诊断失败不是接收失败的理由。
+fn leave_receive_evidence(
+    directory: &Path,
+    kept: &[u8],
+    content_length: Option<u64>,
+    started: std::time::Instant,
+    outcome: &Result<inbox::Received, inbox::Error>,
+    head: &str,
+    leftover: usize,
+    total_bytes: Option<u64>,
+    total_used: u64,
+) {
+    let Some(parent) = directory.parent() else {
+        return;
+    };
+    let mut text = format!(
+        "content_length={content_length:?}\ntotal_bytes={total_bytes:?}\ntotal_used={total_used}\nread={}\nelapsed_ms={}\nleftover_after_refusal={leftover}\nrequest_head={head}\n",
+        kept.len(),
+        started.elapsed().as_millis()
+    );
+    match outcome {
+        Ok(received) => text.push_str(&format!(
+            "outcome=ok names={} bytes={}\n",
+            received.names.len(),
+            received.bytes
+        )),
+        Err(error) => text.push_str(&format!("outcome=err {error}\n")),
+    }
+    text.push_str(&format!(
+        "head={}\ntail={}\n",
+        hex(&kept[..kept.len().min(64)]),
+        hex(&kept[kept.len().saturating_sub(96)..])
+    ));
+    let _ = std::fs::write(parent.join("recv-debug.txt"), text);
+    if outcome.is_err() {
+        let _ = std::fs::write(parent.join("recv-failed.bin"), kept);
     }
 }
 
@@ -665,6 +804,8 @@ pub(crate) unsafe fn serve(
         decide,
         watcher,
         declared: 0,
+        members_total: 0,
+        fully_sized: false,
     });
 
     // SAFETY: the caller guarantees `read`, `write` and `context` for the duration of this

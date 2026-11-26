@@ -1114,3 +1114,25 @@ mod tests {
         assert!(!text.contains("chunked"));
     }
 }
+
+#[cfg(test)]
+mod total_bytes_probe {
+    use super::*;
+
+    /// 2026-11-26：进度分母要用 `/Upload` 头里的 `TotalBytes`（对端声明的整次传输
+    /// 字节数）。这条只回答一个问题：`header()` 能不能把这个名字取出来。
+    #[test]
+    fn total_bytes_is_readable() {
+        let raw = "POST /Upload HTTP/1.1\r\n\
+                   Host: 169.254.9.14:8770\r\n\
+                   User-Agent: AirDrop/1.0\r\n\
+                   TotalBytes: 12212732\r\n\
+                   Content-Type: application/x-dvzip\r\n\
+                   Transfer-Encoding: chunked\r\n\r\n";
+        let mut input = raw.as_bytes();
+        let request = Request::read(&mut input)
+            .expect("head parses")
+            .expect("head present");
+        assert_eq!(request.header("totalbytes"), Some("12212732"));
+    }
+}

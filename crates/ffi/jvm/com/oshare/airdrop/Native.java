@@ -261,6 +261,17 @@ public final class Native {
      */
     public interface Landing {
         void landed(long done, long total);
+
+        /**
+         * 这一次已经落盘了几个成员、总数几个。
+         *
+         * <p>实况照片（.pvt 目录）的 /Ask 不给大小（FileSize=0），百分比无从算起；
+         * 成员计数是唯一还能说的人话——「已收 2/5 个文件」。{@code total} 为 0 时
+         * 说明发送端没报成员数，调用方只说「已收 N 个」。
+         *
+         * <p>默认空实现：老的落地者不需要它为任何东西负责。
+         */
+        default void members(int done, int total) {}
     }
 
     /**

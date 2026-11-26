@@ -160,6 +160,14 @@ pub struct Upload<'a> {
     /// 只能报 -1%——不定态在流体云上不渲染轨道。线上压缩字节数就是传输总量，media 本就
     /// 压不动，用它兜底后 payload 进度≈真实进度；Java 侧 clamp 100 兜住误差。)
     pub content_length: Option<u64>,
+    /// The request head as it arrived, for the failure file only.
+    pub head: String,
+    /// `TotalBytes` 头：对端声明的**整次传输的字节数**（线上压缩后）。
+    ///
+    /// <p>这个字段一直是有的，我们从来没读过它（2026-11-26 从失败现场的头里发现：
+    /// `TotalBytes: 12212732`）。它比 `/Ask` 里的 `FileSize` 之和可靠——后者对实况
+    /// （.pvt 目录报 0）和混合场景只是部分值，正是「进度 100% 还在传」的来源。
+    pub total_bytes: Option<u64>,
     /// The `TransferID` header, when the peer sent one.
     pub transfer_id: Option<&'a str>,
     /// Whether that header equals the `TransferID` the preceding `/Ask` promised, or
@@ -523,6 +531,12 @@ impl<R: Receiver> Server<R> {
             content_length: request.content_length(),
             transfer_id,
             matches_offer,
+            // 诊断用：一次 /Upload 到 body 读取之前，请求头是唯一能说明「对端打算怎么发」
+            // 的东西（chunked 还是定长、有没有 Expect）。进 recv-debug.txt，不上屏幕。
+            head: request.head_summary(480),
+            total_bytes: request
+                .header("totalbytes")
+                .and_then(|value| value.trim().parse::<u64>().ok()),
         };
 
         // Both framings are accepted. A sender is required to chunk this body, but a

@@ -11,6 +11,10 @@ import android.util.Log;
  */
 final class Meter implements Native.Landing {
 
+    /** 最新的成员进度（已落盘个数 / 发送端报的总数，0 = 没报）。读线程写、卡上读。 */
+    private volatile int membersDone;
+    private volatile int membersTotal;
+
     private static final String TAG = "OPAirDrop";
 
         /** 两次投递之间的最小间隔。 */
@@ -117,7 +121,7 @@ final class Meter implements Native.Landing {
                 }
                 // 锁外画卡：UI 慢多久都只慢这一条线程，读线程不受影响。
                 long before = System.nanoTime();
-                attempt.progress(done, total);
+                attempt.progress(done, total, membersDone, membersTotal);
                 long took = (System.nanoTime() - before) / 1_000_000L;
                 // 这三个数只有这一条线程写，读的是 close()，靠 join 建立先后。
                 posts++;
@@ -193,6 +197,27 @@ final class Meter implements Native.Landing {
         String quiet() {
             long silent = silentMillis();
             return silent < 0 ? "no byte ever landed" : "last byte " + silent + " ms before the break";
+        }
+
+        /**
+         * 成员进度：已经落盘几个、发送端报了一共几个。
+         *
+         * <p>上一版这里**漏了实现**——{@code Native.Landing} 上的 {@code members} 有默认空
+         * 方法，所以编译、运行、JNI 查找都不报错，只是两个字段永远是 0，卡片上那句
+         * 「已收 2/5 个」永远不出现（2026-11-26 用户实测）。接口给默认实现是为了不逼老的
+         * 落地者改，代价就是漏实现时没有任何一处会红——所以这里必须显式写出来。
+         *
+         * <p>写在 {@code landed} 之外：成员完成是个独立事件（一个文件收全了），它带着
+         * 上一块已经报过的字节数一起投，节流由 {@link #post} 管。
+         */
+        @Override
+        public void members(int done, int total) {
+            membersDone = done;
+            membersTotal = total;
+            synchronized (slot) {
+                pending = true;
+                slot.notifyAll();
+            }
         }
 
         /** 有结果了。 */

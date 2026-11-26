@@ -177,7 +177,9 @@ enum Settlement {
 /// length of a member — there is nowhere to thread a borrow through that without giving
 /// [`Inbox`] a lifetime parameter and making every caller carry it. A shared, `'static`
 /// handle costs one atomic per chunk and keeps the type where it is.
-pub type Progress = Arc<dyn Fn(u64) + Send + Sync>;
+/// Reports landing bytes and, when a member completes, how many have landed so far
+/// (`0` means "unchanged since the last report" — a chunk write has no member event).
+pub type Progress = Arc<dyn Fn(u64, u32) + Send + Sync>;
 
 /// A member that is currently being written.
 struct Member {
@@ -291,7 +293,7 @@ impl Write for Member {
         // After the write, not before: a chunk that failed did not arrive, and a bar that
         // counts what a full disk refused is worse than no bar.
         if let Some((say, earlier)) = &self.progress {
-            say(earlier.saturating_add(self.written));
+            say(earlier.saturating_add(self.written), 0);
         }
         Ok(bytes.len())
     }
@@ -555,6 +557,15 @@ impl Sink for Inbox {
                 // and the check is skipped rather than paid for.
                 if !self.overwrite || !self.names.contains(&name) {
                     self.names.push(name);
+                }
+                // 成员完成的时刻：字节数（到目前）与已落盘个数一起报——实况的 /Ask 没有
+                // 总大小，成员数是卡片上唯一的前进刻度（「已收 2/5 个文件」）。
+                if let Some(say) = &self.progress {
+                    // 只数顶层成员：/Ask 的分母数的是件（实况一个 .pvt 是一件），而
+                    // `names` 里还有它解出来的子文件与 plist——按 names.len() 报会变成
+                    // 「已收 20/5 个」，那是两个单位在相减。
+                    let top = self.names.iter().filter(|name| !name.contains('/')).count() as u32;
+                    say(self.total, top);
                 }
             }
             Settlement::Refused(failure) => {

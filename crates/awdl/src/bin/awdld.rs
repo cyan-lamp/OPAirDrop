@@ -91,7 +91,9 @@ mod device {
     const TUN_MTU: usize = 1458;
     /// How many to move per wakeup before returning to the poll. A cap rather than a loop
     /// to exhaustion, so a busy direction cannot starve the presence timer.
-    const DRAIN: usize = 64;
+    /// 2026-11-26：64 → 256。每帧 1398 字节，64 帧只有 89 KiB，一轮唤醒搬不完内核里
+    /// 已经排好的数据就回去 poll 一次；接收侧实测 340 帧/秒，多出来的往返全落在吞吐上。
+    const DRAIN: usize = 256;
     /// How often the status line repeats.
     const STATUS_EVERY_US: u64 = 5_000_000;
 

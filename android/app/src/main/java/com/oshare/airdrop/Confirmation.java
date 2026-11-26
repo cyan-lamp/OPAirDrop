@@ -256,10 +256,15 @@ final class Confirmation {
         // 决定。到点之后那张卡写的是「已放弃」，所以在还没到点的时候就得是同一句话。
         // 总大小只在「每一份都声明了大小」时才显示：实况（.pvt 目录）与混合场景下
         // iPhone 只对普通文件给 FileSize，把部分值当总大小会误导人（2026-11-26 实测：
-        // 5 张混合只报 7.8 MB，实际 30 MB+）。有未知大小的就不说这一句。
+        // 5 张混合只报 7.8 MB，实际 30 MB+；2 张「JPG + 实况」报 2.7 MB，实际 12.2 MB）。
+        //
+        // 判据是 **size <= 0**，不是 size < 0：/Ask 里 `.pvt`（还有其它目录成员）报的是
+        // `FileSize: 0` 而**不是缺字段**，把它当成「一份 0 字节的文件」会让上面那两句相加
+        // 恰好剩下普通文件的大小，看起来像个正常总数——这正是 2.7 MB 的来源。
+        // 真实的 0 字节文件在分享面板里选不出来，所以这个判据不会误伤。
         boolean allSized = !entries(field, 4).isEmpty();
         for (Item item : entries(field, 4)) {
-            if (item.size < 0) {
+            if (item.size <= 0) {
                 allSized = false;
                 break;
             }

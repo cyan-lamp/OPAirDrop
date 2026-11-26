@@ -87,6 +87,36 @@ impl RawSocket {
             return Err(io::Error::last_os_error());
         }
 
+        // 接收缓冲（2026-11-26）：这里原来是内核默认的 ~208 KiB，按一帧 1512 字节算是
+        // 137 帧、按实测 340 帧/秒只够缓冲 0.4 秒。主循环只要停一下（写 tun 阻塞、发一次
+        // presence、调度抖动），排队的帧就被丢掉；AF_PACKET 丢帧对 TCP 是静默的，接下来
+        // 就是重传和窗口收缩——表现成「链路只有 450 KB/s」，然后在 20 秒的边缘被对端放弃。
+        // 4 MiB 是八秒的量。SO_RCVBUFFORCE 跳过 `net.core.rmem_max`（这个进程是 root，
+        // 有 CAP_NET_ADMIN）；没有权限时退到普通 SO_RCVBUF，至少翻倍。
+        let buffer: libc::c_int = 4 * 1024 * 1024;
+        // SAFETY: `fd` is live, and the option buffer is a `c_int` of the stated length.
+        let forced = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUFFORCE,
+                &buffer as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if forced < 0 {
+            // SAFETY: as above; `SO_RCVBUF` takes the same buffer.
+            unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &buffer as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+        }
+
         Ok(RawSocket {
             fd,
             ifname: ifname.to_string(),

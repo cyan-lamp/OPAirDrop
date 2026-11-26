@@ -462,16 +462,28 @@ final class ReceiveHost {
         }
 
         /** 走到哪儿了。{@code total} 为 0 是「对端什么都没声明」，不是「零字节」。 */
+        /** 已落盘的成员数 / 发送端报的成员总数（0 = 没报，见 {@link #line}）。 */
+        private int membersDone;
+        private int membersTotal;
+
         void progress(long done, long total) {
+            progress(done, total, membersDone, membersTotal);
+        }
+
+        void progress(long done, long total, int doneMembers, int totalMembers) {
             if (!announced || settled) {
                 return;
             }
+            membersDone = doneMembers;
+            membersTotal = totalMembers;
             // 只有「每一份都声明了大小」时 total 才是可信的分母；实况/混合场景下它只是
             // 部分值，用它算百分比会画出「100% 还在传」的假进度。不可信时 percent 留 -1，
             // 卡片只报「已收 X」。
-            boolean trusted = offer == null || offer.fullySized;
-            percent = trusted && total > 0
-                    ? (int) Math.min(100L, done * 100L / total) : -1;
+            // total 现在由 native 侧算好：/Ask 每份都报了 size 时是那些之和，否则是
+            // /Upload 的 Content-Length（线上字节总数）。两种都比「部分之和」可信，
+            // 所以只要它大于 0 就能当分母（2026-11-26 修：之前按 offer.fullySized 把
+            // Content-Length 也一起否了，实况于是彻底没有进度）。
+            percent = total > 0 ? (int) Math.min(100L, done * 100L / total) : -1;
             if (cloud) {
                 // 同一个 id，同一朵云：邀请那张卡在这里变成进度，不需要先撤再发。
                 //
@@ -524,8 +536,14 @@ final class ReceiveHost {
                 parts.add(Confirmation.tally(offer == null
                         ? java.util.Collections.emptyList() : offer.files, offeredCount));
             }
-            boolean trusted = offer == null || offer.fullySized;
-            if (trusted && total > 0) {
+            // 连 Content-Length 都没有（chunked 分帧）时的最后一把刻度：已落盘成员数 /
+            // 发送端报的件数。只在**没有字节分母**时才用——两边的计数单位并不相同
+            // （分子是归档成员，分母是 /Ask 的件数，实况一个 .pvt 解出好几个成员），
+            // 一起显示就会出现「已收 20/5 个」。
+            if (total <= 0 && membersDone > 0 && membersTotal > 0) {
+                parts.add("已收 " + membersDone + "/" + membersTotal + " 份");
+            }
+            if (total > 0) {
                 // 封顶到 total：对端可以多发，而一条写着「112%」的卡只会让人以为哪里坏了。
                 parts.add(Explains.bytes(Math.min(done, total)) + " / " + Explains.bytes(total));
             } else if (done > 0) {
