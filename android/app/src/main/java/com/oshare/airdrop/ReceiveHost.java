@@ -466,7 +466,12 @@ final class ReceiveHost {
             if (!announced || settled) {
                 return;
             }
-            percent = total > 0 ? (int) Math.min(100L, done * 100L / total) : -1;
+            // 只有「每一份都声明了大小」时 total 才是可信的分母；实况/混合场景下它只是
+            // 部分值，用它算百分比会画出「100% 还在传」的假进度。不可信时 percent 留 -1，
+            // 卡片只报「已收 X」。
+            boolean trusted = offer == null || offer.fullySized;
+            percent = trusted && total > 0
+                    ? (int) Math.min(100L, done * 100L / total) : -1;
             if (cloud) {
                 // 同一个 id，同一朵云：邀请那张卡在这里变成进度，不需要先撤再发。
                 //
@@ -519,7 +524,8 @@ final class ReceiveHost {
                 parts.add(Confirmation.tally(offer == null
                         ? java.util.Collections.emptyList() : offer.files, offeredCount));
             }
-            if (total > 0) {
+            boolean trusted = offer == null || offer.fullySized;
+            if (trusted && total > 0) {
                 // 封顶到 total：对端可以多发，而一条写着「112%」的卡只会让人以为哪里坏了。
                 parts.add(Explains.bytes(Math.min(done, total)) + " / " + Explains.bytes(total));
             } else if (done > 0) {

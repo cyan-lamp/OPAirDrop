@@ -90,7 +90,7 @@ final class Confirmation {
     /**
      * 等人回答多久的回落值。表读不出来时用这个数，所以它必须和表里的默认值一样。
      */
-    private static final long TIMEOUT_MS = 30_000;
+    private static final long TIMEOUT_MS = 25_000;
 
     /**
      * 等人回答多久——表里是 {@code receive.decision_timeout_ms}，上面是它成为一行之前的数。
@@ -158,15 +158,22 @@ final class Confirmation {
          * 再算一遍——两处各写一个数，注水的那一处迟早会说谎。
          */
         private final int seconds;
+        /**
+         * 每一份都声明了大小吗。实况（.pvt 目录）与混合场景 iPhone 只对普通文件报
+         * {@code FileSize}——此时第三字段的总数只是**部分**，拿它当分母会画出「100%
+         * 还在传」的假进度（2026-11-26 实测：5 张混合报 7.8 MB，实际 30 MB+）。
+         */
+        final boolean fullySized;
 
         private Offer(String sender, String body, int seconds,
-                      List<Item> files, long links, List<String> urls) {
+                      List<Item> files, long links, List<String> urls, boolean fullySized) {
             this.sender = sender;
             this.body = body;
             this.seconds = seconds;
             this.files = files;
             this.links = links;
             this.urls = urls;
+            this.fullySized = fullySized;
         }
 
         String title() {
@@ -197,7 +204,7 @@ final class Confirmation {
          * 自动拒绝」是这件事本身的规则，人扫一眼就知道不点会怎样。
          */
         String body(int left) {
-            return body + "，" + left + " 秒后无人应答将自动拒绝。";
+            return body + "\n" + left + " 秒后无人应答将自动拒绝";
         }
     }
 
@@ -247,8 +254,19 @@ final class Confirmation {
         // 「当作拒绝」和结果页那句「已放弃」是两句话说了两件事。人没看见这条邀请、或者看见了
         // 还没来得及伸手，都不等于他拒绝了——发送端拿到的是同一个 401，但屏幕上说什么由这里
         // 决定。到点之后那张卡写的是「已放弃」，所以在还没到点的时候就得是同一句话。
-        Offer built = new Offer(sender, what + (bytes > 0 ? " · " + size(bytes) : ""),
-                (int) seconds(timeoutMs), entries(field, 4), links, urls(field, 5));
+        // 总大小只在「每一份都声明了大小」时才显示：实况（.pvt 目录）与混合场景下
+        // iPhone 只对普通文件给 FileSize，把部分值当总大小会误导人（2026-11-26 实测：
+        // 5 张混合只报 7.8 MB，实际 30 MB+）。有未知大小的就不说这一句。
+        boolean allSized = !entries(field, 4).isEmpty();
+        for (Item item : entries(field, 4)) {
+            if (item.size < 0) {
+                allSized = false;
+                break;
+            }
+        }
+        Offer built = new Offer(sender,
+                what + (allSized && bytes > 0 ? " · " + size(bytes) : ""),
+                (int) seconds(timeoutMs), entries(field, 4), links, urls(field, 5), allSized);
         // 这一行是为了回答「卡片上为什么还是六十秒」：它把**解析出来**的秒数与那张卡最终
         // 会显示的第二行一起打出来。如果这里已经是 30 而屏幕上仍是 60，那问题就在卡片
         // 之后（旧卡没收掉、或者另有投递路径）；如果这里还是 60，就说明 decisionTimeout

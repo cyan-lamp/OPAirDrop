@@ -409,6 +409,15 @@ impl Ask {
             .iter()
             .filter_map(|entry| entry.as_str().map(str::to_string))
             .collect();
+        // 2026-11-26：实况照片的邀请不显示总大小——先看 iPhone 的 /Ask 到底给不给
+        // FileSize（.pvt 是目录，FileIsDirectory 时通常不带）。这一行进 logcat。
+        for entry in root.get_array("Files") {
+            let name = field(entry, "FileName");
+            let size = entry.get_i64("FileSize", -1);
+            let dir = entry.get_bool("FileIsDirectory", false);
+            let ty = field(entry, "FileType");
+            eprintln!("ask item: name='{}' size={} dir={} type='{}'", name, size, dir, ty);
+        }
         Ok(Ask {
             sender: Sender::from_value(&root),
             bundle_id: field(&root, "BundleID"),
