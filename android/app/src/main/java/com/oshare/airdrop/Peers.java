@@ -1610,10 +1610,11 @@ private Thread thread;
                         if (!peer.address.isEmpty()) {
                             buried.put(Addresses.bare(peer.address), new Grave(peer, now));
                         }
-                        // 措辞改了：这条路也要安静满地板才删，所以它不是「不靠沉默、只看端口」，
-                        // 而是两件事同时成立——端口回绝，沉默又过了地板。地板按实测节奏放大
-                        // （见 `LivenessState.goneFloor`），不再是一个常数：iPhone 的应答器
-                        // 会成段休眠 6–8 秒，常数地板会把只是睡着的设备删掉。
+                        // 措辞改了两次。第一次：这条路也要安静满地板才删，所以它不是
+                        // 「不靠沉默、只看端口」，而是两件事同时成立。第二次（2026-11-27
+                        // 真机现场）：地板不再是常数，而是 mDNS 那条 20 秒的沉默线——
+                        // 端口回绝只说明「现在发不出去」，不说明「它不在」；按常数删会把一台
+                        // 就在手边的 iPhone 删掉（用户报的第 2 条）。见 `LivenessState.goneFloor`。
                         long floor = LivenessState.goneFloor(peer);
                         trace("dropped " + peer.name + "@" + peer.address + " after " + peer.knocks
                                 + " unanswered knocks at port " + peer.port + ", once its silence passed "
@@ -1989,6 +1990,13 @@ private Thread thread;
                 }
                 if (PortProbe.ourFault(why)) {
                     // 我们没把包送出去。这种失败不能记在它头上，见 {@link #knock}。
+                    continue;
+                }
+                if (peer.gone) {
+                    // 端口已经给过答案（连着 {@link #KNOCK_FAILS} 次不通），再敲只是往日志里刷
+                    // 「miss 3 of 2」「miss 4 of 2」——2026-11-27 01:33 的真机现场就是这么刷的。
+                    // 判死那笔账记在 {@link #expire} 里，删不删由 mDNS 沉默定；
+                    // 这里只保留每秒一次的短探测，端口一开就 {@link #alive} 把它翻回来。
                     continue;
                 }
                 knockNow(peer, System.currentTimeMillis());

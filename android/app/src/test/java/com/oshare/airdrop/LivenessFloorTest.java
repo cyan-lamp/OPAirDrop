@@ -16,9 +16,9 @@ import java.util.List;
  * <p>两条都是纯函数，所以能在桌面 JVM 上钉住，不需要真机：
  *
  * <ul>
- *   <li>{@link LivenessState#goneFloor}：端口回绝之后的删除地板要跟着实测节奏放大——iPhone
- *       的应答器会成段休眠 6–8 秒，「在旁边、在宣告、却暂时不接 8770」是真实状态。常数 3 秒
- *       会把它删进墓里（用户报的「AirDrop 开着，设备却消失了」）。</li>
+ *   <li>{@link LivenessState#goneFloor}：端口回绝**不是**删除依据，只压制敲门。端口回答的是
+ *       「现在能不能发」，mDNS 沉默才回答「在不在」——2026-11-27 01:33 的真机上，一台就在
+ *       手边的 iPhone 两次 ECONNREFUSED、mDNS 只安静 3.5 秒就被删了（用户报的第 2 条）。</li>
  *   <li>{@link Peers#dedupe}：一台设备在表里可能有两条记录（键是每分钟轮换的 mDNS 实例名），
  *       界面上就是两格同名设备（用户报的「先看见两台、随即变回一台」）。出口按地址去重。</li>
  *   <li>{@link SendActivity#listed}：屏幕上出现什么。没有真名也没有型号的对端（冷启动
@@ -38,32 +38,34 @@ public class LivenessFloorTest {
     }
 
     @Test
-    public void a_gone_peer_waits_the_constant_floor_before_samples() {
+    public void a_gone_peer_stays_while_its_records_are_recent() {
+        // 2026-11-27 01:33 的真机现场：这台 iPhone 就在手边，端口连着两次 ECONNREFUSED，
+        // 而 mDNS 只安静了 3.5 秒。按「端口回绝 + 3 秒地板」它会当场从列表消失——
+        // 那正是用户报的第 2 条（「AirDrop 开关没关，设备却没了」）。
         Peers.Peer peer = peer("a", "fe80::1");
         peer.gone = true;
         peer.seenAt = 1_000;
         peer.heardFrom = 1_000;
-        // 还没有节奏样本：退回常数地板，不能更短。
-        assertEquals(LivenessState.QUIET_BEFORE_GONE_MS, LivenessState.goneFloor(peer));
-        assertEquals(LivenessState.Step.KEEP, LivenessState.decide(peer, 1_000 + 2_999, false));
-        assertEquals(LivenessState.Step.DROP_GONE, LivenessState.decide(peer, 1_000 + 3_000, false));
+        peer.gaps = LivenessState.CONNECTABLE_GAPS;
+        peer.gapMax = 1_296;
+        // 删除地板 = mDNS 那条 20 秒的沉默线，不再是常数、也不跟着节奏缩短。
+        assertEquals(20_000, LivenessState.goneFloor(peer));
+        assertEquals("3.5 秒（真机现场）：还在",
+                LivenessState.Step.KEEP, LivenessState.decide(peer, 1_000 + 3_511, false));
+        assertEquals("19.9 秒：还在", LivenessState.Step.KEEP,
+                LivenessState.decide(peer, 1_000 + 19_999, false));
+        assertEquals("20 秒：才删", LivenessState.Step.DROP_GONE,
+                LivenessState.decide(peer, 1_000 + 20_000, false));
     }
 
     @Test
-    public void a_sleepy_peer_gets_a_floor_that_follows_its_measured_rhythm() {
+    public void a_gone_peer_is_not_knocked_again() {
+        // 端口给过答案之后再敲，只会往日志里刷「miss 3 of 2」「miss 4 of 2」。
         Peers.Peer peer = peer("a", "fe80::1");
         peer.gone = true;
         peer.seenAt = 0;
         peer.heardFrom = 0;
-        // 量到的最坏间隔 4 秒（iPhone 应答器成段休眠的实测形状）。
-        peer.gaps = LivenessState.CONNECTABLE_GAPS;
-        peer.gapMax = 4_000;
-        long floor = LivenessState.goneFloor(peer);
-        assertEquals(2 * 4_000 + LivenessState.CONNECTABLE_SLACK_MS, floor);
-        // 3 秒时不能删：它只是睡着了。这正是「AirDrop 开着设备却消失」的那一格。
-        assertEquals(LivenessState.Step.KEEP, LivenessState.decide(peer, 3_000, false));
-        assertEquals(LivenessState.Step.KEEP, LivenessState.decide(peer, floor - 1, false));
-        assertEquals(LivenessState.Step.DROP_GONE, LivenessState.decide(peer, floor, false));
+        assertEquals(LivenessState.Step.KEEP, LivenessState.decide(peer, 5_000, false));
     }
 
     @Test
@@ -73,7 +75,7 @@ public class LivenessFloorTest {
         peer.heardFrom = 0;
         peer.gaps = LivenessState.CONNECTABLE_GAPS;
         peer.gapMax = 4_000;
-        // 没被端口证死：走的是 timeout()，20 秒起。4 秒以内必须留着。
+        // 没被端口证死：走的是 timeout()，20 秒起。4 秒以内必须留着，而且可以敲门。
         assertEquals(LivenessState.Step.KNOCK, LivenessState.decide(peer, 4_000, false));
     }
 
