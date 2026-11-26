@@ -2577,6 +2577,78 @@ iPhone 把一个对端画成「在」或「走了」，不是一件事，而是�
 
 **分层结论**：hook system_server 的 `forceStop` 保活解决的是"划掉不杀进程"，仍在生效；断网是更下一层（netd BPF），两层都修好才有秒弹。微信/QQ 等能收通知、一加互传能后台弹卡，都是因为它们的 uid 不在 `app_hans_limit_map` 里（互传另走 OPPO 原生 802.11 桥，不经这条 socket）。
 
+### 6.7 实况照片（iPhone ↔ 本机，2026-11-26/27 定论）
+
+**接收**：iPhone 的实况在归档里是三个平级成员——`IMG_xxxx.JPG` + `IMG_xxxx.MOV` +
+`metadata.plist`（另有 `._*` AppleDouble 与 `.pvt` 目录包形态）。本机合成 Google/OPPO 的
+Motion Photo（**保留原 EXIF** + 注入 OPPO XMP + 原 MOV 追加在 EOI 之后），相册/微信/抖音/
+小红书四家实测都能显示与播放。`metadata.plist`、`._*`、`.pvt` 内的重复成员不再单独落库。
+
+**发送**：iPhone 只认「图片 + 同名 MOV + 两边同一个 `ContentIdentifier`」，并且要装进
+`.pvt` 目录包（`/Ask` 里类型 `com.apple.private.live-photo-bundle`，成员含
+`metadata.plist`）。相机实况没有这个标识，于是：
+
+| 缺什么 | 怎么补 | 踩过的坑 |
+| --- | --- | --- |
+| MOV 里没有 `content.identifier` | 自己造 UUID，写进 `moov/meta`（hdlr + keys(mdta) + ilst，172 字节） | 只在 `mdat` 位于 `moov` 之前时能直接追加；否则把 moov **挪到文件尾**（原地留同长 `free` 占位，偏移一个不动） |
+| 图片里没有 Apple MakerNote | 整段换真机 EXIF 模板（`livephoto_exif.bin`，12 KB，含 1455 B 私有 MakerNote），只把里面的 UUID 换掉 | 换模板会连**朝向**一起换，必须继承源图：`0x0112` 取 EXIF、`0x0100/0x0101` 与 `0xA002/0xA003` 取 **SOF**，否则封面差 90° |
+| 视频轨顺序是 `soun, vide` | 重建 moov 时把带 `vide` handler 的 trak 提到最前（与能播的那份一致） | 只调换顺序，不动任何字节位置 |
+| XMP 声明的视频长度不是 `len - ftyp` | 按 `MotionPhoto` 那一项的 `Item:Length` 从尾巴量（六张真机样本全部精确落在 `ftyp`） | 旧判据「视频紧贴主图 EOI」一次都没成立过：相机在主图与视频之间垫着 GainMap（另一张 JPEG），有的机型还垫一整段 GainMap 视频 |
+| 图片里混进 GainMap | 图片按**主图自己的 EOI** 切 | GainMap 是另一张图，塞进 `.pvt` 只会变成装两张图的怪文件 |
+
+**现状**：iPhone 来源的实况可以发回去（实况 + 播放正常）；相机实况在**另一台 iPhone** 上
+实测正常显示与播放。同一份相机实况在这台 iPhone 上播放黑屏**未定性**——同一段视频当普通
+文件发过去能播，`mdat` 逐字节一致、`co64` 零位移、`hvcC` 参数集齐全、trak 顺序与矩阵都对，
+容器与码流均可排除；用户确认另一台正常后**停止追查**。
+
+### 6.8 流体云卡片上的进度：值是准的，条是系统的动画（2026-11-27 钉死）
+
+**证据**：`dumpsys notification --noredact` 里卡片的原始字段就是我们的数，且与发送面板同一个
+`done/whole`：
+
+```
+android.progress = 97   android.progressMax = 100
+android.template = Notification$ProgressStyle
+```
+
+**分母**曾经错：`Meter.total` 取的是源文件大小，而实况发出去的是拆好的图片 + 视频（源文件里
+那张 GainMap 不发）。改成 `Plan::payload()`（归档成员里非目录项之和）后，日志里能看到
+`phase sending 100% (93051139/93051139)`。
+
+**条偏后是 ColorOS 的动画**：它拿到新值后从**当前画到的位置**滑过去。投得比动画密（170 ms）
+→ 每帧都被重启、越落越远（30 秒的传输到结束才 2/3）；投得太稀 → 小文件最后一跳太大
+（「才 10% 就报完成」）。另外完成卡若**撤卡重投**，新通知会把轨道从零重播一遍——终态且
+100% 的那张卡已改成**就地 notify**。
+
+**现行取舍**：发送 `CARD_EVERY_MS = 1200` + 收尾停顿 700–1500 ms（按最后一跳跨多少点算）；
+接收 400 ms + `Handler` 回主线程。**备选（未采用）**：轨道全程 `setProgressIndeterminate(true)`，
+真实百分比只写在文字里——永远不会假，代价是没有填充动画。
+
+### 6.9 传输中途断开（「这两天老是接收/发送失败」，2026-11-27）
+
+**现场**：58.2 MiB 的文件传到 44.6 MiB（76%）断掉：
+
+```
+receive from fe80::289d:95ff:fe33:f872%awdltun0 failed: Software caused connection abort
+live card: 接收失败 · 传输在中途被中断，已收到 44.6 MiB，没有存下 · 76%
+```
+
+同一段时间的日志里，每 200 ms 一张进度卡，**每张卡都触发 LSPosed 把卡片展开一次**
+（`提醒级别 0 → 11，让卡片自己展开`）。
+
+**根因（代码层）**：接收进度是在**接收线程**上直接 `LiveCard.updateWithCancel(...)` ——
+一次 Binder 到 system_server，再让 SystemUI 重建流体云卡片（叠着上面的展开钩子）。通知慢
+100 ms，接收线程就少读 100 ms；58 MB 的传输几秒下来 TCP 窗口填满、对端重传、最后 abort。
+发送侧一直是 `runOnUiThread` 投卡（异步），所以同一条链在发送上轻，但不是零成本。
+11-26 那次把内核接收缓冲加到 4 MiB（`f1511ff`）只是把「静默丢帧」换成「包晚到」，没有解决
+「读得慢」。
+
+**修复**：接收进度改 **400 ms 节拍 + `Handler.post` 回主线程**，接收线程只读字节；百分比与
+「已收 N/M」仍每帧更新（失败卡上的数字不受节拍影响）。
+
+**下一个嫌疑**：LSPosed 那个「每次 notify 都把卡展开」的钩子——把它限制到「邀请 / 结束」
+两个时机，进度帧只更新内容不改提醒级别。
+
 ---
 
 ## 7. 方法论（最贵的一节，别跳）
@@ -2920,6 +2992,8 @@ adb shell am start -n com.oshare.airdrop/.MainActivity
 
 | 时间 | 事件 |
 | --- | --- |
+| **2026-11-27 00:3x** | **传输中途断开的元凶（候选）：接收线程上发通知 + 流体云进度定论**（`b4510e7`、`9e957f6`、`92c6ecb`）。①现场：58.2 MiB 传到 44.6 MiB（76%）断，`Software caused connection abort`；同段日志每 200 ms 一张卡、每张都触发 LSPosed「提醒级别 0→11 让卡片自己展开」。接收进度原在**接收线程**上直接 notify（Binder→system_server→SystemUI 重建卡片），慢 100 ms 就少读 100 ms → 窗口填满 → 重传 → abort；已改成 400 ms 节拍 + `Handler` 回主线程。②进度条的「假」定论：`dumpsys` 里 `android.progress` 与发送面板同源、值正确（分母已从「源文件大小」改成 `Plan::payload()`）；偏后是 ColorOS 对 ProgressStyle 轨道的动画。发送侧改成 1200 ms 节拍 + 收尾停顿 700–1500 ms，完成卡**不撤卡就地 notify**（否则新通知把轨道从零重播）。详见 §6.8 / §6.9。 |
+| **2026-11-26 21:1x–23:5x** | **实况照片收发两条线打通**（`d0ef1e1`…`96b6921`）。①接收端早就定稿（§6.7 表格上半）：三成员合成 Motion Photo、删冗余 MOV、类型化件数文案（1 张照片/1 个视频/N 份文件）、25 秒倒计时、邀请卡不显示部分大小。②发送端从零到可用：编 `.pvt` 目录包 + `metadata.plist`；相机实况补 `ContentIdentifier`（MOV 的 `moov/meta` + 图片的 Apple MakerNote 模板）并继承源图朝向（`0x0112` + SOF）；拆图拆视频的判据从「视频紧贴 EOI」改成「XMP 项长度从尾巴量 + 主图自己的 EOI」，因为相机在主图与视频之间垫着 GainMap；视频 trak 顺序 `soun,vide` → `vide,soun`，`moov` 在 `mdat` 前面时挪到文件尾。iPhone 来源的实况可回发，相机实况在另一台 iPhone 上正常。③发射侧进度的分母、`Meter` 漏实现 `members`、`SO_RCVBUFFORCE 4 MiB` + `DRAIN 256`（`f1511ff`）等一并落地。详见 §6.7 / §6.8。 |
 | **2026-11-24 12:5x** | **评审 P1-23 终章：cargo-fuzz 落地**（cb4f3f8，fuzz+ci 两工作流全绿）。用上 WSL Ubuntu-24.04（rustup 1.100 + clang + cargo-fuzz 0.13.2）：`fuzz/` 独立 workspace（自带 `panic="unwind"` profile——主 workspace 的 `panic="abort"` 会弄坏 libFuzzer 崩溃处理器；不进主 workspace members），四 target：bplist_parse/cpio_read/mdns_parse/http_request_read。**本地冒烟**：bplist 1060 万次/41s、mdns 185 万、cpio 62 万、http 59 万次执行，全部零崩溃。`.github/workflows/fuzz.yml`：CI 每 target 15 秒冒烟（保 targets 不悄悄坏掉），长跑本地 `cd fuzz && cargo fuzz run <t> -- -max_total_time=1800`。corpus/artifacts/target 进 .gitignore。至此评审全部轮次与全部可落地项**清完**：P0×3、P1×20+（P1-18 被实测推翻回退）、4.2/4.3/4.4、CI×2 工作流、proptest 9 条、fuzz 4 target。剩余仅拆分类大工程（Peers/SendActivity/jni.rs）与文档数字自动化。 |
 | **2026-11-24 11:5x** | **评审 P1-26 与 P1-13 落地**。①**P1-26**：Gradle wrapper 9.6.0（gradlew/gradle-wrapper 入库），build.sh 优先 gradlew——CI 不必再装 gradle，谁来跑都是同一版本；②**P1-13 满额显式拒绝**：handOver 的溢出路径从「回 accept 线程同步接待」改为 `HangUp.now` 挂断并记日志——旧行为（51c09b3 的「不丢连接」）会让一条慢连接把 accept 停 12s 握手 + 30s 等人，后面合法传输全排队超时；per-connection 线程模型本身没动，动的只是溢出路径。**基线**：APK 装机。评审剩余：fuzz、巨型文件拆分、文档自动化（均为大工程）。 |
 | **2026-11-24 11:4x** | **评审 P1-16 落地：MainActivity 重建拆分**。①listener 回调与 HomePage 的 root 授权回调走新增的 `refreshHome()`——只重建首页，不再两页全量 + UI 线程读设置盘（一次接收状态变化的 5+ 次回调全部受益）；`refresh()` 保留为全量重建，只走「设置可能真的变了」的路径（onResume 回系统设置后、FeaturePage 写入回调）；onPause 改 refreshHome（离开屏幕没有设置变更）；②`replacePage` 保留滚动位置（listener 每拍重建首页时不再归零）；③编译坑一处：lambda 捕获的 `top` 被赋值两次非 effectively-final，用 `restoreTo` 转手。**基线**：cargo test 0 失败、jvm 394、APK 装机。评审剩余：P1-13（满额拒绝，动 51c09b3 设计）、fuzz、巨型文件拆分、文档自动化。 |
