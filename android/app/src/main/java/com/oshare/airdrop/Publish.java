@@ -180,7 +180,7 @@ final class Publish {
         java.util.Map<String, String> livePairs = MotionPhoto.pairs(report.names());
         java.util.Set<String> merged = new java.util.HashSet<>();
         for (String name : report.names()) {
-            if (MotionPhoto.isPlistMarker(name)) {
+            if (MotionPhoto.isPlistMarker(name) || MotionPhoto.isAppleDouble(name)) {
                 merged.add(name);
             }
         }

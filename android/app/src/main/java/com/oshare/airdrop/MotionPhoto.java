@@ -360,4 +360,16 @@ public final class MotionPhoto {
         String file = name.toLowerCase(Locale.ROOT);
         return file.endsWith("/metadata.plist") || file.equals("metadata.plist");
     }
+
+    /**
+     * AppleDouble 元数据成员（.{@code _IMG_xxx.JPG}、{@code ._IMG_xxx.pvt}）：
+     * .pvt 包里 macOS/iOS 的扩展属性载体，不是内容，不落库（会变成 Download 里的
+     * 垃圾文件）。
+     */
+    static boolean isAppleDouble(String name) {
+        String file = name.toLowerCase(Locale.ROOT);
+        int slash = file.lastIndexOf('/');
+        String base = file.substring(slash + 1);
+        return base.startsWith("._");
+    }
 }
