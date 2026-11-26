@@ -373,7 +373,8 @@ impl Receiver for Store {
         // and a zero total is a caller's cue to show motion rather than a fraction.
         self.declared = offer.files.iter().filter_map(|file| file.size).sum();
         self.members_total = offer.files.len() as u32;
-        self.fully_sized = !offer.files.is_empty() && offer.files.iter().all(|file| file.size.is_some());
+        self.fully_sized =
+            !offer.files.is_empty() && offer.files.iter().all(|file| file.size.is_some());
         match &self.decide {
             None => true,
             Some(decide) => decide.take(offer),
@@ -482,13 +483,14 @@ impl Receiver for Store {
         self.clear_ask_diag();
         Ok(())
     }
-
-
 }
 /// 把这一次 `/Upload` 的形状写到 inbox 旁边：对端声明多少、我们读了多少、花了多久、
 /// 末尾几十个字节是什么。失败时另存一份原始字节。
 ///
 /// <p>写不了就算了——诊断失败不是接收失败的理由。
+// 九个参数都是「这一次接收的现场」，各自来自不同的层（请求头、解码器、计时器、结果），
+// 没有一个自然的归属对象；为凑参数个数造一个结构体只会在唯一的调用点上多一层搬运。
+#[allow(clippy::too_many_arguments)]
 fn leave_receive_evidence(
     directory: &Path,
     kept: &[u8],

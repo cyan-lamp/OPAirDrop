@@ -674,11 +674,7 @@ fn is_image(name: &str) -> bool {
 /// first part is not decoration — it is the only thing in the archive that says where the
 /// members go, and an archive that opens with a file describes a file with no folder around
 /// it.
-fn archive(
-    out: &mut dyn Write,
-    files: &[(Item, Source)],
-    meter: Option<&Meter>,
-) -> io::Result<()> {
+fn archive(out: &mut dyn Write, files: &[(Item, Source)], meter: Option<&Meter>) -> io::Result<()> {
     // Odc is what the protocol's upload section asks a sender to produce.
     let mut builder = Builder::new(dvzip::Encoder::new(out), Format::Odc);
     // An empty `.` member: a directory with no contents costs a header and a name byte, and
@@ -1383,7 +1379,10 @@ mod live_bundle_tests {
         let mut body = Vec::new();
         archive(&mut body, &plan.members, None).expect("archives");
         let names = members(&body);
-        assert!(names.contains(&"IMG_0001.pvt".to_string()), "names: {names:?}");
+        assert!(
+            names.contains(&"IMG_0001.pvt".to_string()),
+            "names: {names:?}"
+        );
         assert!(
             names.contains(&"IMG_0001.pvt/IMG_0001.JPG".to_string()),
             "names: {names:?}"

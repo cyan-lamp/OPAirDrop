@@ -708,10 +708,7 @@ mod tests {
             Arc::new(move |done, top| {
                 let mut recorded = log.lock().expect("the log is not poisoned");
                 recorded.push(done);
-                counted
-                    .lock()
-                    .expect("the log is not poisoned")
-                    .push(top);
+                counted.lock().expect("the log is not poisoned").push(top);
             }),
         )
         .expect("the archive is accepted");
@@ -722,7 +719,10 @@ mod tests {
         // 一件；字节进度那几次报告带的是 0（约定为「没有成员事件」），非零值只有成员收尾。
         let tops = members.lock().expect("the log is not poisoned").clone();
         assert_eq!(
-            tops.iter().copied().filter(|count| *count > 0).collect::<Vec<_>>(),
+            tops.iter()
+                .copied()
+                .filter(|count| *count > 0)
+                .collect::<Vec<_>>(),
             [1, 1],
             "each member's completion reports the top-level count so far: {tops:?}"
         );

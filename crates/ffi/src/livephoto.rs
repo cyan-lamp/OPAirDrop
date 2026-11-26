@@ -389,8 +389,22 @@ fn fresh_uuid() -> String {
     format!(
         "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-\
          {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
     )
 }
 
@@ -565,7 +579,9 @@ fn meta_box(uuid: &str) -> Vec<u8> {
     ilst.extend_from_slice(&item);
 
     let mut meta = Vec::new();
-    meta.extend_from_slice(&(8 + HDLR.len() as u32 + keys.len() as u32 + ilst.len() as u32).to_be_bytes());
+    meta.extend_from_slice(
+        &(8 + HDLR.len() as u32 + keys.len() as u32 + ilst.len() as u32).to_be_bytes(),
+    );
     meta.extend_from_slice(b"meta");
     meta.extend_from_slice(HDLR);
     meta.extend_from_slice(&keys);
@@ -809,7 +825,11 @@ fn number_after(haystack: &[u8], key: &[u8]) -> Option<usize> {
         value = value.checked_mul(10)?.checked_add((byte - b'0') as usize)?;
         digits += 1;
     }
-    if digits == 0 { None } else { Some(value) }
+    if digits == 0 {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 /// MOV 里的 `com.apple.quicktime.content.identifier`。
@@ -840,7 +860,7 @@ fn uuid_at(bytes: &[u8]) -> Option<String> {
         if index >= 36 {
             break;
         }
-        let dash = DASHES.iter().any(|&d| d == index);
+        let dash = DASHES.contains(&index);
         let ok = if dash {
             byte == b'-'
         } else {
@@ -852,7 +872,11 @@ fn uuid_at(bytes: &[u8]) -> Option<String> {
         out.push(byte as char);
         read += 1;
     }
-    if read == 36 { Some(out) } else { None }
+    if read == 36 {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -996,8 +1020,15 @@ mod tests {
 
         let live = split(&file).expect("相机实况要能拆");
         assert_eq!(live.image.last(), Some(&0xD9));
-        assert!(find(&live.image, b"GAINMAP").is_none(), "GainMap 不属于这张图");
-        assert_eq!(&live.video[4..8], b"ftyp", "视频从 ftyp 开始，不带前面的填零");
+        assert!(
+            find(&live.image, b"GAINMAP").is_none(),
+            "GainMap 不属于这张图"
+        );
+        assert_eq!(
+            &live.video[4..8],
+            b"ftyp",
+            "视频从 ftyp 开始，不带前面的填零"
+        );
         assert!(live.identifier.is_some(), "相机实况要造一个配对标识");
     }
 
@@ -1122,7 +1153,10 @@ mod tests {
         let out = with_makernote(&jpeg, uuid).expect("a plain picture gets one");
         assert!(find(&out, b"Apple iOS").is_some(), "模板被写进去了");
         assert!(find(&out, uuid.as_bytes()).is_some(), "UUID 换成了这一次的");
-        assert!(find(&out, TEMPLATE_UUID).is_none(), "模板自带的旧 UUID 不能留着");
+        assert!(
+            find(&out, TEMPLATE_UUID).is_none(),
+            "模板自带的旧 UUID 不能留着"
+        );
         // 段长要自洽：FF E1 之后是两个字节的长度。
         assert_eq!(&out[2..4], &[0xFF, 0xE1]);
         let length = ((out[4] as usize) << 8) | out[5] as usize;
@@ -1186,8 +1220,6 @@ mod tests {
         jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x01, 0xFF, 0xD9]);
         jpeg
     }
-
-
 
     #[test]
     fn no_identifier_is_not_an_error() {
