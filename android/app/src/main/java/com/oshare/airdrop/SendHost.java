@@ -3,6 +3,8 @@ package com.oshare.airdrop;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.os.Handler;
+import android.os.Looper;
 
 /**
  * 发送侧的那张卡：现在由我们自己发，交给系统的实时通知。
@@ -30,6 +32,9 @@ final class SendHost {
     private static final String TAG = "OPAirDropSend";
 
     static final int SUCCESS = 1006;
+
+    /** 成功卡之前留给进度条的时间，见 {@link #finished}。 */
+    private static final long SETTLE_HOLD_MS = 700;
     static final int REFUSED = 1008;
     static final int CANCELLED = 1009;
     static final int TIMEOUT = 1010;
@@ -314,7 +319,16 @@ final class SendHost {
         }
         if (status == SUCCESS) {
             settle(session, status, "发送完成", line);
-            LiveCard.finishWithActions(context, "发送完成", line, null);
+            // 先让进度条走完，再换成终态卡。
+            //
+            // 进度卡挂【取消发送】、终态卡挂【完成】，形状不一样就得**先撤再投**（见
+            // LiveCard.post 里那段），而系统是**按一条通知**给进度轨道做动画的：新卡一投
+            // 出来，轨道从当前动画位置重新开始，人看到的就是「明明写着发送完成，条还停在
+            // 半路」。接收侧没有这个毛病——那边 100% 之后还要对账等报告，天然要在屏上停
+            // 一会儿；发送侧最后一步太快（真机实测 100% 到收尾只隔 0.55 秒）。
+            new Handler(Looper.getMainLooper()).postDelayed(
+                    () -> LiveCard.finishWithActions(context, "发送完成", line, null),
+                    SETTLE_HOLD_MS);
             return;
         }
         if (status == CANCELLED) {

@@ -422,20 +422,41 @@ fn with_identifier(video: &[u8], uuid: &str) -> Option<Vec<u8>> {
     let moov = &video[moov_at..moov_at + moov_size];
     // 相机自己写的 meta（里面只有 `com.android.version`）整段换掉：合并 keys 表要重排
     // 两张表，收益只是省 172 字节，而那条版本号对 iPhone 没有意义。
-    let mut children = Vec::with_capacity(moov_size);
+    //
+    // 顺手把 **视频轨排到最前**。OPPO 相机把音频轨写在前面（`smhd` 在前、`vmhd` 在后），
+    // 而 iPhone 的实况播放器按第一条 trak 搭画面：照片显示得出来、一播放就黑屏——2026-11-26
+    // 21:37 用户实测「显示实况但是播放黑屏」。能正常播放的那份（iPhone 来源的实况）恰好
+    // 就是视频轨在前。调换 trak 的顺序不动任何字节位置，`stco`/`co64` 全都不受影响。
+    let mut head = Vec::with_capacity(moov_size);
+    let mut video_trak: Option<&[u8]> = None;
+    let mut other_traks: Vec<&[u8]> = Vec::new();
     let mut at = 8;
     while at + 8 <= moov.len() {
         let size = read_u32(moov, at) as usize;
         if size < 8 || at + size > moov.len() {
             return None;
         }
-        if &moov[at + 4..at + 8] != b"meta" {
-            children.extend_from_slice(&moov[at..at + size]);
+        let child = &moov[at..at + size];
+        match &moov[at + 4..at + 8] {
+            b"meta" => {}
+            b"trak" => {
+                if video_trak.is_none() && is_video_trak(child) {
+                    video_trak = Some(child);
+                } else {
+                    other_traks.push(child);
+                }
+            }
+            _ => head.extend_from_slice(child),
         }
         at += size;
     }
     if at != moov.len() {
         return None;
+    }
+    let mut children = head;
+    children.extend_from_slice(video_trak.unwrap_or(&[]));
+    for trak in other_traks {
+        children.extend_from_slice(trak);
     }
     let meta = meta_box(uuid);
     children.extend_from_slice(&meta);
@@ -474,6 +495,31 @@ fn with_identifier(video: &[u8], uuid: &str) -> Option<Vec<u8>> {
     out.extend_from_slice(&fresh);
     out.extend_from_slice(&video[tail_at..]);
     Some(out)
+}
+
+/// 这条 `trak` 是不是视频轨：`mdia/hdlr` 的 handler_type 是 `vide`。
+fn is_video_trak(trak: &[u8]) -> bool {
+    let mut at = 8;
+    while at + 8 <= trak.len() {
+        let Some(size) = box_at(trak, at) else {
+            return false;
+        };
+        if &trak[at + 4..at + 8] == b"mdia" {
+            let mut inner = at + 8;
+            while inner + 8 <= at + size {
+                let Some(child) = box_at(trak, inner) else {
+                    return false;
+                };
+                if &trak[inner + 4..inner + 8] == b"hdlr" {
+                    return inner + 20 <= trak.len() && &trak[inner + 16..inner + 20] == b"vide";
+                }
+                inner += child;
+            }
+            return false;
+        }
+        at += size;
+    }
+    false
 }
 
 /// `at` 处那个 box 的总长度（含头）。不搜索、不跳步：不在 `at` 就不是 box。
@@ -744,11 +790,15 @@ fn picture_end(jpeg: &[u8]) -> Option<usize> {
     None
 }
 
-/// 这一段字节是不是一段完整的 MP4：`ftyp` 开头，顶层 box 一个接一个正好走到末尾。
+/// 这一段字节是不是一段像样的 MP4：`ftyp` 开头，box 链里能走到 `moov` 与 `mdat`。
 ///
-/// <p>真机的相机视频尾巴上还挂着一个私有 box（`comm`，几百 KB 的 OPPO 元数据），它的
-/// 类型名不是标准 box，但长度是自洽的——所以判据只能是「链走完」，不能是「只认识标准
-/// 类型」。
+/// <p>**不要求链正好收在文件尾**。我们自己接收 iPhone 实况时合成的那些文件，尾巴上就拖着
+/// 1449 字节的杂数据（XMP 声明的长度把一段填零算了进去）；相机视频后面也挂着一个私有
+/// box（`comm`，几百 KB 的 OPPO 元数据）。2026-11-26 21:37 那一版要求「一步不差走到末尾」，
+/// 结果把 `IMG_20261125_210213.JPG` 这种上一轮还能当实况发的文件打回了普通照片。
+///
+/// <p>真正要挡的是「声明的长度不是视频起点」：那种情况下 `cut` 会落在图像数据里，开头
+/// 四个字节后面不会是 `ftyp`，第一条判据就挡掉了。
 fn looks_like_movie(bytes: &[u8]) -> bool {
     if bytes.len() < 24 || &bytes[4..8] != b"ftyp" {
         return false;
@@ -757,30 +807,18 @@ fn looks_like_movie(bytes: &[u8]) -> bool {
     let mut moov = false;
     let mut mdat = false;
     while at + 8 <= bytes.len() {
-        let mut size = read_u32(bytes, at) as usize;
-        let kind = &bytes[at + 4..at + 8];
-        let mut header = 8;
-        if size == 1 {
-            // 64 位长度：真机样本的 mdat 全是这种。
-            if at + 16 > bytes.len() {
-                return false;
-            }
-            size = ((read_u32(bytes, at + 8) as usize) << 32) | read_u32(bytes, at + 12) as usize;
-            header = 16;
-        } else if size == 0 {
-            size = bytes.len() - at;
-        }
-        if size < header || at + size > bytes.len() {
-            return false;
-        }
-        if kind == b"moov" {
-            moov = true;
-        } else if kind == b"mdat" {
-            mdat = true;
+        let Some(size) = box_at(bytes, at) else {
+            // 尾巴上的杂数据（不到一个 box，或者长度对不上）：停在这里，不再往下走。
+            break;
+        };
+        match &bytes[at + 4..at + 8] {
+            b"moov" => moov = true,
+            b"mdat" => mdat = true,
+            _ => {}
         }
         at += size;
     }
-    at == bytes.len() && moov && mdat
+    moov && mdat
 }
 
 /// XMP 包本身（`http://ns.adobe.com/xap/1.0/\0` 之后到段尾）。
@@ -1133,6 +1171,38 @@ mod tests {
         );
     }
 
+    /// 一条只有 `mdia/hdlr` 的 trak。`handler` 是 `vide` / `soun` 这样的四字码。
+    fn trak(handler: &[u8; 4]) -> Vec<u8> {
+        let mut hdlr = vec![0u8; 4];
+        hdlr.extend_from_slice(&[0u8; 4]);
+        hdlr.extend_from_slice(handler);
+        hdlr.extend_from_slice(&[0u8; 12]);
+        boxed(b"trak", &boxed(b"mdia", &boxed(b"hdlr", &hdlr)))
+    }
+
+    /// 相机把音频轨写在前面（`soun, vide`），而 iPhone 的实况播放器按第一条 trak 搭画面：
+    /// 照片显示得出来、一播放就黑屏。换 meta 时把视频轨提到最前，与能正常播放的那份一致。
+    #[test]
+    fn puts_the_video_track_first() {
+        let mut moov = boxed(b"mvhd", &[0u8; 100]);
+        moov.extend_from_slice(&trak(b"soun"));
+        moov.extend_from_slice(&trak(b"vide"));
+        let mut video = boxed(b"ftyp", b"mp42\x00\x00\x00\x00mp42");
+        video.extend_from_slice(&boxed(b"moov", &moov));
+        video.extend_from_slice(&boxed(b"free", &vec![0u8; 128]));
+        video.extend_from_slice(&boxed(b"mdat", b"data"));
+
+        let out = with_identifier(&video, "58485A87-1AEA-41A5-B94D-630384319DA5").expect("写成");
+        let moov_at = top_box(&out, b"moov").expect("有 moov").0;
+        let first = find(&out[moov_at..], b"trak").expect("有 trak") + moov_at - 4;
+        let size = read_u32(&out, first) as usize;
+        assert!(
+            is_video_trak(&out[first..first + size]),
+            "第一条 trak 必须是视频轨"
+        );
+        assert!(find(&out, b"soun").is_some(), "音频轨不能丢");
+    }
+
     /// 分片 MP4 的偏移在 `moof`/`trun` 里，改 moov 的时候补不回来——宁可放弃。
     #[test]
     fn refuses_a_fragmented_movie() {
@@ -1232,6 +1302,7 @@ mod tests {
         jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x01, 0xFF, 0xD9]);
         jpeg
     }
+
 
 
     #[test]
