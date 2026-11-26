@@ -236,7 +236,7 @@ final class Confirmation {
         // 文件」——一句「没东西可收」的话，而人正是在这一刻决定收不收。
         StringBuilder what = new StringBuilder();
         if (declared != 0 || links == 0) {
-            what.append(declared < 0 ? "?" : Long.toString(declared)).append(" 个文件");
+            what.append(tally(entries(field, 4), declared));
         }
         if (links > 0) {
             if (what.length() > 0) {
@@ -277,6 +277,79 @@ final class Confirmation {
             }
         }
         return list;
+    }
+
+    /**
+     * 一次邀约的件数说明（2026-11-26 用户定的规格）：全部是照片说「N 张照片」，全部是
+     * 视频说「N 个视频」，其余（纯其他、或照片视频混在一起）说「N 份文件」——混合时
+     * 不分类，只报总数。iCloud 的实况照片在归档里是 {@code IMG_x.pvt} 包，算一张照片。
+     *
+     * <p>类型只认得出名字的那几份：老发送端不发名单（{@code entries} 为空）或者名单
+     * 比 {@code declared} 短时，按「分不出来」处理，落回「N 份文件」。
+     */
+    static String tally(List<Item> items, long declared) {
+        List<String> names = new ArrayList<>(items.size());
+        for (Item item : items) {
+            names.add(item.name);
+        }
+        return tallyNames(names, declared);
+    }
+
+    /** 同上，收名字表（完成通知那份「收到 N 张照片」也用它）。 */
+    static String tallyNames(List<String> names, long declared) {
+        long total = declared < 0 ? names.size() : declared;
+        if (names.isEmpty() || names.size() != total) {
+            return (declared < 0 ? "?" : Long.toString(declared)) + " 份文件";
+        }
+        int photos = 0;
+        int videos = 0;
+        for (String name : names) {
+            if (isPhotoName(name)) {
+                photos++;
+            } else if (isVideoName(name)) {
+                videos++;
+            }
+        }
+        if (photos == total) {
+            return photos + " 张照片";
+        }
+        if (videos == total) {
+            return videos + " 个视频";
+        }
+        return total + " 份文件";
+    }
+
+    private static boolean isPhotoName(String name) {
+        switch (extension(name)) {
+            case "jpg": case "jpeg": case "jpe": case "png": case "gif": case "webp":
+            case "bmp": case "heic": case "heif": case "avif": case "dng": case "tif":
+            case "tiff": case "raw": case "cr2": case "nef": case "arw": case "orf":
+            case "rw2": case "pvt":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static boolean isVideoName(String name) {
+        switch (extension(name)) {
+            case "mp4": case "mov": case "m4v": case "mkv": case "webm": case "3gp":
+            case "3g2": case "avi": case "wmv": case "flv": case "mpg": case "mpeg":
+            case "ts": case "mts": case "m2ts":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static String extension(String name) {
+        String file = name == null ? "" : name;
+        int slash = file.lastIndexOf('/');
+        if (slash >= 0) {
+            file = file.substring(slash + 1);
+        }
+        int dot = file.lastIndexOf('.');
+        return dot <= 0 ? "" : file.substring(dot + 1).toLowerCase(java.util.Locale.ROOT);
     }
 
     /** 一个超时写成整秒，给文案用。 */

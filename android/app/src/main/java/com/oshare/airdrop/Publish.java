@@ -184,13 +184,8 @@ final class Publish {
                 merged.add(name);
             }
         }
-        try {
-            java.io.File dbg = new java.io.File(context.getExternalFilesDir(null), "pair_debug.txt");
-            java.nio.file.Files.write(dbg.toPath(),
-                    ("names=" + report.names() + "\npairs=" + livePairs + "\n---\n").getBytes("UTF-8"),
-                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
-        } catch (Throwable ignored) {
-        }
+        // 配对视频并入合成图后不再单独落库（OPPO 格式实测四家全通，图里已含视频）。
+        merged.addAll(livePairs.keySet());
         Log.i(TAG, "实况配对输入：names=" + report.names() + " -> pairs=" + livePairs);
         if (!livePairs.isEmpty()) {
             Log.i(TAG, "实况照片 " + livePairs.size() + " 组：图与视频分别入库");
@@ -226,15 +221,6 @@ final class Publish {
                         }
                     }
                     if (videoName != null) {
-                        // Oplus 扫描器判定实况的最后一关（OplusLivePhotoParser 判定链，
-                        // 反编译 ModernMediaScanner 1542-1562）：EXIF 的 UserComment 必须
-                        // 以 oppo_/oplus_ 开头（checkOplusTag），否则即使 XMP 全对、视频
-                        // 宽高都在，o_is_live_photo 也判 0。必须在 make() 之前改——
-                        // ExifInterface.saveAttributes 重写文件会截掉 EOI 之后嵌入的视频。
-                        android.media.ExifInterface exif =
-                                new android.media.ExifInterface(source.getPath());
-                        exif.setAttribute("UserComment", "oplus_" + source.getName());
-                        exif.saveAttributes();
                         MotionPhoto.Motion motion = MotionPhoto.make(
                                 readAll(source), readAll(new File(staged, videoName)));
                         java.nio.file.Files.write(source.toPath(), motion.data);
@@ -245,14 +231,10 @@ final class Publish {
                     }
                 } catch (IOException | RuntimeException failure) {
                     Log.w(TAG, "Motion Photo 合成失败，图按原图落库：" + failure);
-                    try {
-                        java.io.File dbg = new java.io.File(context.getExternalFilesDir(null), "pair_debug.txt");
-                        java.io.StringWriter sw = new java.io.StringWriter();
-                        failure.printStackTrace(new java.io.PrintWriter(sw));
-                        java.nio.file.Files.write(dbg.toPath(),
-                                ("make 失败: " + failure + "\n" + sw + "\n---\n").getBytes("UTF-8"),
-                                java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
-                    } catch (Throwable ignored) {
+                    for (java.util.Map.Entry<String, String> pair : livePairs.entrySet()) {
+                        if (pair.getValue().equals(name)) {
+                            merged.remove(pair.getKey());
+                        }
                     }
                 }
             }

@@ -65,81 +65,161 @@ public final class MotionPhoto {
         }
     }
 
+    /**
+     * OPPO 实况专用 EXIF APP1 模板（116 字节，照抄 motion-live-photo 的
+     * "oppo full-support" 实现，逐字节）：0x0100 宽 / 0x0101 高 / 0x0112 方向 /
+     * 0x8769 ExifIFD 指针 / 0x9286 UserComment="oplus_8388608" / 0x9208 闪光灯。
+     * 宽高与方向按原图动态改（2026-11-26 实测：模板固定 Orientation=0 会让封面
+     * 横竖颠倒——原图 iPhone 竖拍 Orientation=6，必须继承）。
+     */
+    private static final String OPPO_EXIF_HEX = "FFE100724578696600004D4D002A000000080004"
+            + "0100000400000001000005A001010004000000010000043C87690004000000010000003E"
+            + "011200030000000100000000000000000002928600020000000E0000005C"
+            + "920800040000000100000000000000006F706C75735F3833383836303800";
+
+    /** OPPO 实况的 XMP 模板（照抄同一实现；timestamp=0、无 GainMap 项）。 */
+    private static final String OPPO_XMP = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" "
+            + "x:xmptk=\"Adobe XMP Core 5.1.0-jc003\">\n"
+            + "  <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n"
+            + "    <rdf:Description rdf:about=\"\"\n"
+            + "        xmlns:hdrgm=\"http://ns.adobe.com/hdr-gain-map/1.0/\"\n"
+            + "        xmlns:GCamera=\"http://ns.google.com/photos/1.0/camera/\"\n"
+            + "        xmlns:OpCamera=\"http://ns.oplus.com/photos/1.0/camera/\"\n"
+            + "        xmlns:Container=\"http://ns.google.com/photos/1.0/container/\"\n"
+            + "        xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\"\n"
+            + "      hdrgm:Version=\"1.0\"\n"
+            + "      GCamera:MotionPhoto=\"1\"\n"
+            + "      GCamera:MotionPhotoVersion=\"1\"\n"
+            + "      GCamera:MotionPhotoPresentationTimestampUs=\"0\"\n"
+            + "      OpCamera:MotionPhotoPrimaryPresentationTimestampUs=\"0\"\n"
+            + "      OpCamera:MotionPhotoOwner=\"oplus\"\n"
+            + "      OpCamera:OLivePhotoVersion=\"2\"\n"
+            + "      OpCamera:VideoLength=\"{LEN}\">\n"
+            + "      <Container:Directory>\n"
+            + "        <rdf:Seq>\n"
+            + "          <rdf:li rdf:parseType=\"Resource\">\n"
+            + "            <Container:Item\n"
+            + "              Item:Mime=\"image/jpeg\"\n"
+            + "              Item:Semantic=\"Primary\"\n"
+            + "              Item:Length=\"0\"\n"
+            + "              Item:Padding=\"0\"/>\n"
+            + "          </rdf:li>\n"
+            + "          <rdf:li rdf:parseType=\"Resource\">\n"
+            + "            <Container:Item\n"
+            + "              Item:Mime=\"video/mp4\"\n"
+            + "              Item:Semantic=\"MotionPhoto\"\n"
+            + "              Item:Length=\"{LEN}\"/>\n"
+            + "          </rdf:li>\n"
+            + "        </rdf:Seq>\n"
+            + "      </Container:Directory>\n"
+            + "    </rdf:Description>\n"
+            + "  </rdf:RDF>\n"
+            + "</x:xmpmeta>";
+
     public static Motion make(byte[] jpeg, byte[] video) throws IOException {
         if (jpeg == null || jpeg.length < 4 || (jpeg[0] & 0xFF) != 0xFF
                 || (jpeg[1] & 0xFF) != 0xD8) {
             throw new IOException("不是 JPEG（缺 SOI）");
         }
-        // EOI 以文件末尾两字节为准：JPEG 的规范收尾，相机导出的文件都满足。
         if ((jpeg[jpeg.length - 2] & 0xFF) != 0xFF || (jpeg[jpeg.length - 1] & 0xFF) != 0xD9) {
             throw new IOException("不是完整 JPEG（结尾不是 EOI）");
         }
 
-        // 遍历段：定位插入点（第一个段之后）与既有 XMP 段（替换）。
-        int i = 2;
-        int insertAt = -1;      // 新 XMP 的插入点（默认第一个段结束处）
-        int existingXmp = -1;   // 既有 XMP APP1 段的起点（marker 处）
-        while (i + 4 <= jpeg.length) {
-            if ((jpeg[i] & 0xFF) != 0xFF) {
-                break; // 不在段边界上，停手只做追加式插入
+        // 原图的宽/高/方向（EXIF 0x0100/0x0101/0x0112）——写进 OPPO 实况 EXIF。
+        int width = 0;
+        int height = 0;
+        int orientation = 1;
+        try {
+            android.media.ExifInterface exif = new android.media.ExifInterface(
+                    new java.io.ByteArrayInputStream(jpeg));
+            String w = exif.getAttribute(android.media.ExifInterface.TAG_IMAGE_WIDTH);
+            String h = exif.getAttribute(android.media.ExifInterface.TAG_IMAGE_LENGTH);
+            String o = exif.getAttribute(android.media.ExifInterface.TAG_ORIENTATION);
+            if (w != null) {
+                width = Integer.parseInt(w.trim());
             }
-            int marker = jpeg[i + 1] & 0xFF;
-            if (marker == 0xD8 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
-                i += 2; // 无长度的段
-                continue;
+            if (h != null) {
+                height = Integer.parseInt(h.trim());
             }
-            if (marker == 0xDA) {
-                break; // SOS：后面是压缩数据，段遍历到此为止
+            if (o != null) {
+                orientation = Integer.parseInt(o.trim());
             }
-            int length = ((jpeg[i + 2] & 0xFF) << 8) | (jpeg[i + 3] & 0xFF);
-            if (length < 2) {
+        } catch (Throwable ignored) {
+        }
+        if (width <= 0 || height <= 0) {
+            width = 4032;
+            height = 3024;
+        }
+        if (orientation <= 0) {
+            orientation = 1;
+        }
+
+        byte[] exifTpl = hex(OPPO_EXIF_HEX);
+        exifTpl[28] = (byte) (width >> 24);
+        exifTpl[29] = (byte) (width >> 16);
+        exifTpl[30] = (byte) (width >> 8);
+        exifTpl[31] = (byte) width;
+        exifTpl[40] = (byte) (height >> 24);
+        exifTpl[41] = (byte) (height >> 16);
+        exifTpl[42] = (byte) (height >> 8);
+        exifTpl[43] = (byte) height;
+        exifTpl[64] = (byte) (orientation >> 8);
+        exifTpl[65] = (byte) orientation;
+
+        // 跳过原 JPG 的前两个 APP1（EXIF、XMP），保留其余段（ICC/DQT/SOF/DHT/SOS…）。
+        java.io.ByteArrayOutputStream rest = new java.io.ByteArrayOutputStream();
+        int pos = 2;
+        int skipped = 0;
+        while (pos + 4 <= jpeg.length) {
+            if ((jpeg[pos] & 0xFF) != 0xFF) {
                 break;
             }
-            if (marker == 0xE1 && i + 4 + XAP_URI.length() <= jpeg.length
-                    && startsWith(jpeg, i + 4, XAP_URI)) {
-                existingXmp = i;
+            int marker = jpeg[pos + 1] & 0xFF;
+            if (marker == 0xD9 || marker == 0xDA) {
+                rest.write(jpeg, pos, jpeg.length - pos);
+                break;
             }
-            if (insertAt < 0) {
-                insertAt = i + 2 + length; // 第一个有长度的段结束处
+            int length = ((jpeg[pos + 2] & 0xFF) << 8) | (jpeg[pos + 3] & 0xFF);
+            if (skipped < 2 && marker == 0xE1) {
+                skipped++;
+            } else {
+                rest.write(jpeg, pos, 2 + length);
             }
-            i += 2 + length;
-        }
-        if (insertAt < 0) {
-            insertAt = 2; // 兜底：SOI 之后
+            pos += 2 + length;
         }
 
-        // iPhone 的配对视频（MOV）原样嵌入——2026-11-26 的实验矩阵（Y1/Z1/Z2）
-        // 结论：四家（相册/微信/抖音/小红书）的实况识别要求视频一字不动（moov 在
-        // 尾、cdsc 配对轨、ftyp qt 全保留）；rebrand 品牌、remux 重封装（mp42/qt）、
-        // faststart 重排（moov 前置）都会让显示全部丢失。Y1 形态（原样）是四家显示
-        // 的唯一可行解，相册可播放；第三方 App 的播放限制是 Apple Live Photo 的
-        // 生态问题（微信/抖音/小红书对真实 iPhone 实况同样只能显示、不能像相册那样
-        // 播放），不是本文件的缺陷。判定列（o_is_live_photo）在 Y1 形态下由
-        // MediaProvider 的扩展列保证（insert 时写入）。
-        // XMP 的 Length 必须与最终嵌入的字节一致——这一步在 remux 之后算（2026-11-26
-        // 的 bug：先算 XMP 再 remux，声明的长度是原始 MOV 的，视频起点错位到 JPEG
-        // 数据中间，判定与播放全失败）。
-        String xmp = xmp(video.length);
-        byte[] segment = app1(xmp);
+        String len = String.valueOf(video.length);
+        byte[] xmp = OPPO_XMP.replace("{LEN}", len).getBytes(StandardCharsets.UTF_8);
+        byte[] xmpSeg = new byte[2 + 2 + 29 + xmp.length];
+        xmpSeg[0] = (byte) 0xFF;
+        xmpSeg[1] = (byte) 0xE1;
+        int xmpLen = 2 + 29 + xmp.length;
+        xmpSeg[2] = (byte) ((xmpLen >> 8) & 0xFF);
+        xmpSeg[3] = (byte) (xmpLen & 0xFF);
+        System.arraycopy(XAP_URI.getBytes(StandardCharsets.US_ASCII), 0, xmpSeg, 4, 29);
+        System.arraycopy(xmp, 0, xmpSeg, 4 + 29, xmp.length);
 
         ByteArrayOutputStream out = new ByteArrayOutputStream(
-                jpeg.length + segment.length + video.length);
-        if (existingXmp >= 0) {
-            // 既有 XMP 段：跳过它、在它的位置上放新版——避免出现两个 XMP 段。
-            int len = ((jpeg[existingXmp + 2] & 0xFF) << 8) | (jpeg[existingXmp + 3] & 0xFF);
-            out.write(jpeg, 0, existingXmp);
-            out.write(segment);
-            out.write(jpeg, existingXmp + 2 + len, jpeg.length - existingXmp - 2 - len);
-        } else {
-            out.write(jpeg, 0, insertAt);
-            out.write(segment);
-            out.write(jpeg, insertAt, jpeg.length - insertAt);
-        }
+                jpeg.length + video.length + 256);
+        out.write(0xFF);
+        out.write(0xD8);
+        out.write(exifTpl);
+        out.write(xmpSeg);
+        rest.writeTo(out);
         out.write(video);
-        // 视频的时长/分辨率：Oplus 相册的实况列（o_video_duration 等）要这些值。
-        long[] info = new long[3]; // durationMs, width, height
+
+        long[] info = new long[3];
         walkMoov(video, 0, video.length, info);
         return new Motion(out.toByteArray(), (int) info[0], (int) info[1], (int) info[2]);
+    }
+
+    private static byte[] hex(String value) {
+        int n = value.length() / 2;
+        byte[] out = new byte[n];
+        for (int i = 0; i < n; i++) {
+            out[i] = (byte) Integer.parseInt(value.substring(i * 2, i * 2 + 2), 16);
+        }
+        return out;
     }
 
     /** MOV/MP4 → 标准 MP4：音视频轨 passthrough 重封装（无重编码），元数据轨丢弃。 */

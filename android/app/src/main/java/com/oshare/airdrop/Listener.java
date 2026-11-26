@@ -1155,7 +1155,12 @@ final class Listener {
             return "收到「" + entry.name + "」，" + Explains.bytes(entry.size)
                     + "，存到 " + entry.directory + "/" + lost;
         }
-        return "收到 " + entries.size() + " 个文件，共 " + Explains.bytes(published.bytes())
+        java.util.List<String> names = new java.util.ArrayList<>(entries.size());
+        for (Publish.Entry entry : entries) {
+            names.add(entry.name);
+        }
+        return "收到 " + Confirmation.tallyNames(names, entries.size())
+                + "，共 " + Explains.bytes(published.bytes())
                 + "，存到 " + Explains.where(entries) + lost;
     }
 

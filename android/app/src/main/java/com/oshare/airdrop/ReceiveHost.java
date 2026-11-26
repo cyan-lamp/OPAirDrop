@@ -514,7 +514,10 @@ final class ReceiveHost {
                 parts.add(percent + "%");
             }
             if (offeredCount > 0) {
-                parts.add(offeredCount + " 个文件");
+                // 类型化件数（2026-11-26 用户规格，见 Confirmation.tally）：照片说「张」、
+                // 视频说「个」、其余与混合说「份」。
+                parts.add(Confirmation.tally(offer == null
+                        ? java.util.Collections.emptyList() : offer.files, offeredCount));
             }
             if (total > 0) {
                 // 封顶到 total：对端可以多发，而一条写着「112%」的卡只会让人以为哪里坏了。
