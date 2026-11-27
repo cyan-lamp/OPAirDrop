@@ -206,6 +206,16 @@ public final class FluidModule extends XposedModule {
             return chain.proceed();
         }
         Object name = chain.getArg(0);
+        // 2026-11-27：插件里的类被混淆成单字母（`…seedling.card.ui.viewmodel.i` 就是卡片
+        // ViewModel），所以按 `LiveAlertModel`/`SeedlingContext` 这些显示名猜候选永远 MISS。
+        // 这里把疑似插件的类加载全部记下来：重启后触发一次缩回（那些类是懒加载的），
+        // 日志里就会出现真实全名，钩子就能按真名装上。
+        if (name instanceof String) {
+            String text = (String) name;
+            if (text.contains("seedling") || text.contains("LiveAlert")) {
+                log(Log.INFO, TAG, "插件类加载: " + text);
+            }
+        }
         // 只认「卡片 ViewModel」这一个触发点，不认拦截器：拦截器那一刀按 2026-11-19 的取证
         // 本来就不该装（装上反而让状态机判 REFUSED）。认它是白等一类加载。
         if (!CARD_VIEW_MODELS[0].equals(name) && !CARD_VIEW_MODELS[1].equals(name)) {
@@ -513,9 +523,16 @@ public final class FluidModule extends XposedModule {
         String[] candidates = {
                 "com.oplus.systemui.plugins.seedling.statusbar.model.LiveAlertModel",
                 "com.oplus.systemui.plugins.seedling.statusbar.LiveAlertModel",
+                "com.oplus.systemui.plugins.seedling.statusbar.viewmodel.LiveAlertModel",
                 "com.oplus.systemui.plugins.seedling.card.ui.model.LiveAlertModel",
+                "com.oplus.systemui.plugins.seedling.card.ui.viewmodel.LiveAlertModel",
+                "com.oplus.systemui.plugins.seedling.card.model.LiveAlertModel",
                 "com.oplus.systemui.plugins.seedling.engine.model.LiveAlertModel",
+                "com.oplus.systemui.plugins.seedling.engine.LiveAlertModel",
+                "com.oplus.systemui.plugins.seedling.capsule.LiveAlertModel",
+                "com.oplus.systemui.plugins.seedling.capsule.model.LiveAlertModel",
                 "com.oplus.systemui.plugins.seedling.model.LiveAlertModel",
+                "com.oplus.systemui.plugins.seedling.LiveAlertModel",
         };
         for (String name : candidates) {
             Class<?> type;
@@ -550,6 +567,78 @@ public final class FluidModule extends XposedModule {
         }
         log(Log.ERROR, TAG, "seedling hook: MISS——候选类都没命中，卡片可能仍会 3 秒缩回"
                 + "（把这一行发出来，按新类名再加候选）");
+        // 2026-11-27：`LiveAlertModel` 的候选全 MISS（它住在动态加载的插件里，SystemUI.apk
+        // 与几个插件 apk 里都没有这个符号）。改钩缩回动作的**起点**：
+        // `SeedlingContext.setScene(CARD_TO_CAPSULE)`——真机日志里它紧挨着 modelState 变 5，
+        // 是整条缩回链的第一步；拦掉它，后面的 CARD_TO_CAPSULE 与 onHide-card 都不会发生。
+        // 类名同样按简名 + 日志里的包前缀推测，候选都试一遍。
+        String[] sceneClasses = {
+                "com.oplus.systemui.plugins.seedling.engine.SeedlingContext",
+                "com.oplus.systemui.plugins.seedling.SeedlingContext",
+                "com.oplus.systemui.plugins.seedling.engine.SeedlingContextImpl",
+                "com.oplus.systemui.plugins.seedling.statusbar.SeedlingContext",
+                "com.oplus.systemui.plugins.seedling.card.SeedlingContext",
+        };
+        for (String name : sceneClasses) {
+            Class<?> type;
+            try {
+                type = Class.forName(name, false, loader);
+            } catch (Throwable missing) {
+                continue;
+            }
+            for (Method method : type.getDeclaredMethods()) {
+                if (!"setScene".equals(method.getName()) || method.getParameterCount() != 1) {
+                    continue;
+                }
+                hook(method)
+                        .setPriority(PRIORITY_DEFAULT)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PASSTHROUGH)
+                        .setId("opairdrop-seedling-scene")
+                        .intercept(this::keepScene);
+                log(Log.INFO, TAG, "seedling scene hook: 已钩住 " + method + "（卡片不再缩回）");
+                return;
+            }
+        }
+        log(Log.ERROR, TAG, "seedling scene hook: 也 MISS——类名还得再找");
+
+        // 2026-11-27：从真机调用栈里拿到的缩回决策者（不是猜的）：
+        //   com.oplus.systemui.plugins.seedling.capsule.strategy.d.p
+        //     <- ...capsule.strategy.d.l <- ...capsule.ui.viewmodel.F.<init>
+        // `I(key, delay, …)` 是被它调用的（诊断日志里那条 delay=600000 的栈就是它），
+        // 而 3 秒缩回有时根本不经过 I()——所以直接拦这颗策略入口 `d.l`。
+        try {
+            Class<?> strategy = Class.forName(
+                    "com.oplus.systemui.plugins.seedling.capsule.strategy.d", false, loader);
+            for (Method method : strategy.getDeclaredMethods()) {
+                if (!"l".equals(method.getName())) {
+                    continue;
+                }
+                hook(method)
+                        .setPriority(PRIORITY_DEFAULT)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PASSTHROUGH)
+                        .setId("opairdrop-shrink-strategy")
+                        .intercept(chain -> {
+                            log(Log.INFO, TAG, "缩回策略被跳过（卡片保持展开）");
+                            return null;
+                        });
+                log(Log.INFO, TAG, "已钩住缩回策略 " + method + "（卡片不再缩回）");
+                return;
+            }
+            log(Log.ERROR, TAG, "缩回策略类里没有 l()");
+        } catch (Throwable missing) {
+            log(Log.ERROR, TAG, "缩回策略类没找到：" + missing);
+        }
+    }
+
+    /** `setScene(CARD_TO_CAPSULE)` 直接吞掉：不切场景，卡片就不会变成胶囊。 */
+    private Object keepScene(XposedInterface.Chain chain) throws Throwable {
+        Object arg = chain.getArg(0);
+        String text = String.valueOf(arg);
+        if (text.contains("CARD_TO_CAPSULE")) {
+            log(Log.INFO, TAG, "seedling scene: 跳过 CARD_TO_CAPSULE");
+            return null;
+        }
+        return chain.proceed();
     }
 
     /** 我们的 key 形如 {@code 0|com.oshare.airdrop|2816|null|10449}；命中就不让卡片隐藏。 */

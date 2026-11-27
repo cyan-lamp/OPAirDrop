@@ -437,7 +437,7 @@ impl Receiver for Store {
             // 2026-11-27：留证据的上限从 48 MiB 降到 2 MiB。Tap::read 每读一块都要把字节
             // 复制进这个 Vec——8.9 MB 的传输原本要整段复制一遍，纯属给读循环加负载。
             // 证据只需要开头那点（文件头、分帧错位现场），2 MiB 远够。
-            cap: 2 << 20,
+            cap: 48 << 20,
         };
         let outcome = match self.watcher {
             None => inbox::receive_with(&self.directory, self.limits, &mut tapped),

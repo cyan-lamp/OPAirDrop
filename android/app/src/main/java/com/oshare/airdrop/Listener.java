@@ -140,7 +140,11 @@ final class Listener {
      * 几分钟。一台握完手就改了主意的手机会反复来（分享面板开着的时候就是这样），那是常态，
      * 不是攻击；八秒是 legacy 的数字，比一个真实发送端拼出第一句请求需要的时长多一个量级。
      */
-    private static final int REQUEST_TIMEOUT_MS = 8_000;
+    // 2026-11-27：8 秒 → 60 秒。这条界原本是「一个连接最多占住 serving 线程多久」，但它同时
+    // 成了 /Upload body 的读超时——而 60 秒的 read_timeout_ms 只在 /Ask 的 summary 回调里
+    // 才设上。真机断流现场的 recv-debug.txt 是 `the archive could not be read: the reader
+    // aborted with -1`，elapsed_ms=18000（10 秒正常传输 + 8 秒超时），就是被这条 8 秒掐断的。
+    private static final int REQUEST_TIMEOUT_MS = 60_000;
 
     /**
      * How long a transfer may go without delivering a byte before it is dropped, when the table
