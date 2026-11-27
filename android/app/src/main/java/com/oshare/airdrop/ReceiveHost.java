@@ -487,7 +487,10 @@ final class ReceiveHost {
         private int membersTotal;
 
         /** 卡片最快多久换一次（与发送侧同一个理由：别让通知拖慢传输线程）。 */
-        private static final long CARD_EVERY_MS = 400;
+    // 2026-11-27：400 ms 一次是「每秒 2-3 次通知重建」，每次重建系统都要重新走一遍流体云
+    // 展开流程（LSPosed 日志里每秒一条「提醒级别 0 → 11」就是它）。慢速链路下这种重建要持续
+    // 几十秒，纯属给 SystemUI 加负载。放到 1 秒一次，进度看起来照样是连续的。
+    private static final long CARD_EVERY_MS = 1000;
 
         private final Handler main = new Handler(Looper.getMainLooper());
         private long lastCardAt;
