@@ -926,7 +926,27 @@ final class Listener {
                         // 进度、以及最后把文件搬进公共目录那一步，也都在这把锁里。而握手、读
                         // 请求头、/Discover 全在锁外——把它们排在这扇门后面，正是「弹窗迟迟
                         // 不出来」和「有时候一直不显示这台设备」的成因（见类注释）。
-                        card.lock();
+                        //
+                        // 2026-11-27：先量一次「等这把锁等了多久」。一张卡一次只问一个人，
+                        // 前一张邀请没人答时默认挂 25 秒，第二条邀请就得在这扇门后等着——
+                        // 「有时弹窗几十秒才出来」到底是不是它，这一行能给出答案（行为不变）。
+                        long lockStart = System.currentTimeMillis();
+                        try {
+                            if (!card.tryLock(300, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                                long waited = System.currentTimeMillis() - lockStart;
+                                Log.i(TAG, "offer is waiting for the card lock — another invitation "
+                                        + "is still on screen (" + waited + " ms so far)");
+                                card.lock();
+                            }
+                        } catch (InterruptedException stopped) {
+                            Thread.currentThread().interrupt();
+                            card.lock();
+                        }
+                        long lockWait = System.currentTimeMillis() - lockStart;
+                        if (lockWait > 200) {
+                            Log.i(TAG, "card lock acquired after " + lockWait + " ms — that is time "
+                                    + "the person did not see a card for");
+                        }
                         // 问在有卡片的时候是卡片，没卡片的时候是通知——两条路都落回同一个闩，
                         // 所以这里不需要知道这一刻是哪一种。
                         return attempt.decide(summary);

@@ -33,3 +33,10 @@
 # 栈还原要用的类型信息；行号会被 R8 重写，不强制保留。
 -keepattributes Signature, InnerClasses, EnclosingMethod
 -keepattributes *Annotation*
+
+# JNI 侧按名字构造的异常：R8 会把没人静态引用的类裁掉，
+# 然后「对方拒绝」就变成 ClassNotFoundException，界面上显示成「发送失败」。
+# （2026-11-27 真机：iPhone 点拒绝，本机显示「发送失败」而不是「对方拒绝」。）
+-keep class com.oshare.airdrop.RefusedException { *; }
+-keep class com.oshare.airdrop.PeerMismatch { *; }
+-keep class com.oshare.airdrop.Report { *; }

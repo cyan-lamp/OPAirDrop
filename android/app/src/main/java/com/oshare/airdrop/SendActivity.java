@@ -355,10 +355,10 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
 
     @Override
     protected void onCreate(Bundle state) {
-        // 判据验证（2026-11-27）：面板一创建就开始扫对端的 BLE nearby-info 广播。
-        // 放在这里而不是 wake() 里——wake() 在权限不满足时会提前 return，扫描就跟着不跑了。
-        // 这一步只打日志，不改任何显示逻辑。
-        BleScanProbe.start(getApplicationContext());
+        // 注意：BLE 扫描探针（BleScanProbe）已经验证完毕——它不随 AirDrop 开关变化，
+        // 不能当判据，而且每秒几十行日志会把真正有用的现场冲掉（2026-11-27 下午因此
+        // 丢掉了「对方拒绝却显示发送失败」的那一次全线日志）。所以这里不再启动它；
+        // 类保留，需要时再临时打开。
         super.onCreate(state);
 
         S = schemeOf(getResources().getConfiguration());

@@ -352,6 +352,14 @@ final class SendHost {
         if (context == null) {
             return;
         }
+        // 这趟已经结过账了：`session` 为空说明前面某条车道已经写下了终态（拒绝、完成或取消）。
+        // 后来者只是同一次发送里别的车道在关闭连接时抛出的第二个异常——它不该把一张
+        // 「发送失败」盖在正确结论上。2026-11-27 真机现场：正确显示「对方拒绝」之后，
+        // 紧接着又被「发送失败」覆盖。取消那一支例外：它本来就是撤卡，不需要 session。
+        if (session == null && status != CANCELLED) {
+            Log.i(TAG, "ignoring a late finish (status " + status + "): this send already ended");
+            return;
+        }
         if (status == SUCCESS) {
             settle(session, status, "发送完成", line);
             // 先让进度条真的走完，再改成终态。
