@@ -15,5 +15,14 @@ public final class CardDismiss extends BroadcastReceiver {
     @Override
     public void onReceive(Context context, Intent intent) {
         LiveCard.dropById(context, intent.getIntExtra("card_id", 0x0B00));
+        // 点【打开文件】时，那颗原始动作随广播带过来：撤完卡再触发它。
+        android.app.PendingIntent open = intent.getParcelableExtra(LiveCard.OPEN_PI);
+        if (open != null) {
+            try {
+                open.send();
+            } catch (android.app.PendingIntent.CanceledException ignored) {
+                // 那颗动作已失效：卡撤了，打开这件事只能作罢。
+            }
+        }
     }
 }

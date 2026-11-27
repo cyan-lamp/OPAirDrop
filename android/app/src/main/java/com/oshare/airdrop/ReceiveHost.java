@@ -52,6 +52,10 @@ final class ReceiveHost {
 
     private static final String TAG = "OPAirDrop";
 
+    /** 有没有一条传输正在跑：iPhone 一次只推一个流，第二条要如实拒绝（见 decide）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean BUSY =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
     /**
      * 卡片上【取消接收】那颗按钮的广播。带 {@link Confirmation#EXTRA_ID}，值是 session。
      *
@@ -366,6 +370,14 @@ final class ReceiveHost {
         }
 
         boolean decide(String summary) {
+            // 2026-11-27：前一条传输还在跑时**根本不弹卡**。iPhone 一次只推一个流，第二条
+            // 并行连接会空等 20 秒再把正在传的那条一起掐断；而先弹卡再拒绝，用户会看到一张
+            // 按钮全失效、也撤不掉的死卡（用户指出的问题）。所以在这里就如实拒绝，卡不出现。
+            if (BUSY.get()) {
+                Log.w(TAG, "invitation " + session
+                        + " refused before the card: another transfer is still running");
+                return false;
+            }
             // 一次邀请一个数，卡片和通知都从这里拿：让两条路共用一个常量是上一版的做法，
             // 那是「同一个数」靠人记得；现在它们读同一行设置，是结构上的同一个数。
             long decisionMs = Confirmation.decisionTimeout(context);
@@ -506,6 +518,7 @@ final class ReceiveHost {
             // 所以只要它大于 0 就能当分母（2026-11-26 修：之前按 offer.fullySized 把
             // Content-Length 也一起否了，实况于是彻底没有进度）。
             percent = total > 0 ? (int) Math.min(100L, done * 100L / total) : -1;
+            BUSY.set(true);
             if (cloud) {
                 // 同一个 id，同一朵云：邀请那张卡在这里变成进度，不需要先撤再发。
                 //
@@ -604,6 +617,9 @@ final class ReceiveHost {
          * 要单独说出来（同一句里的「另有 N 个没存下」）。
          */
         void delivered(Publish.Result published) {
+            // 成功的收尾走这里、不走 end()：不清这一位的话，「前一条传输中」会永远为真，
+            // 之后每一张邀请都被拒绝（2026-11-27 真机：第一条成功后，第二条点了没反应）。
+            BUSY.set(false);
             if (!announced || settled) {
                 return;
             }
@@ -687,6 +703,9 @@ final class ReceiveHost {
          * 人看到的是通知无故消失——一次**失败**被画成了一次**没有发生**。
          */
         void failed(String message) {
+            // 失败的收尾也不走 end()：不清这一位，之后每张邀请都会被当成「前一条还在跑」
+            // 而拒绝——真机现象是「传输已经结束了，再来一张还是被拒」（2026-11-27）。
+            BUSY.set(false);
             if (cloud) {
                 // 只挂【完成】，没有【重试】：重来一次要对面重新发，而对面那台手机不归我们叫醒。
                 // 轨道停在真走到的那个数上（{@link #percent}），不拉满——失败画成成功，是这里
@@ -800,6 +819,7 @@ final class ReceiveHost {
         }
 
         private void end() {
+            BUSY.set(false);
             if (cloud) {
                 // 没有收成就没有可留的东西：一张停在中间态、也没人能再点的常驻卡，比没有更糟。
                 // 失败是唯一的例外，它走 {@link #failed}——那一句解释值得留在屏幕上几秒。

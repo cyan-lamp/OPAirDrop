@@ -188,6 +188,9 @@ final class LiveCard {
     /** 卡上【完成】按下去的那条广播；一个 id 一处，免得两次传输抢同一个 PendingIntent。 */
     private static final int DONE_REQUEST = 0x0B04;
 
+    /** 【打开文件】广播里带的那颗原始动作（见 wrapOpen）。 */
+    static final String OPEN_PI = "open_pi";
+
     /**
      * 曾经在这里的那四个常量已经删掉了：{@code ACTION_EXPAND}（请模块摊开卡片）、
      * {@code KEY_OPTIONS}（{@code oplusLiveAlertOptions}）、{@code REMIND_STRONG_ALWAYS}（13）、
@@ -296,9 +299,23 @@ final class LiveCard {
      *
      * @param open 打开那份文件的 intent；没有可打开的时传 {@code null}，那就只挂「完成」
      */
+    /**
+     * 把【打开文件】按钮包一层广播：**先撤这张卡，再触发原来的动作**（2026-11-27 用户要求）。
+     * 原来那颗是 Activity PendingIntent，只能做一件事；包成广播后 CardDismiss 先撤卡
+     * 再 pi.send()，点「打开文件」就会顺手把卡片关掉。
+     */
+    private static PendingIntent wrapOpen(Context context, PendingIntent open) {
+        Intent intent = new Intent(context, CardDismiss.class)
+                .putExtra("card_id", sCardId)
+                .putExtra(OPEN_PI, open);
+        return PendingIntent.getBroadcast(context, 0x0B30 + (sCardId & 0x3F), intent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+    }
+
     static void finishWithActions(Context context, String title, String shortText,
                                   PendingIntent open) {
-        post(context, title, shortText, 100, true, true, open, "打开文件", null);
+        post(context, title, shortText, 100, true, true,
+                open == null ? null : wrapOpen(context, open), "打开文件", null);
     }
 
     /**
@@ -311,7 +328,8 @@ final class LiveCard {
      * @param open 打开那条链接的 intent
      */
     static void finishWithLink(Context context, String title, String shortText, PendingIntent open) {
-        post(context, title, shortText, 100, true, true, open, "打开链接", null);
+        post(context, title, shortText, 100, true, true,
+                open == null ? null : wrapOpen(context, open), "打开链接", null);
     }
 
     /**
