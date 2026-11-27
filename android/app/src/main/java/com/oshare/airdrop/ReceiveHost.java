@@ -360,6 +360,11 @@ final class ReceiveHost {
          * 时候，问题是本应用自己的通知。两条路都回到同一个闩上，所以「同时出现两个框」这个
          * 情形在这里不可能发生——不是靠判断，是靠只有一条路被走到。
          */
+        /** 这条邀请的通知 id：每条一个，互不覆盖（2026-11-27）。 */
+        private int inviteId() {
+            return 0x0B00 + 1 + (Math.abs(session.hashCode()) % 0x60);
+        }
+
         boolean decide(String summary) {
             // 一次邀请一个数，卡片和通知都从这里拿：让两条路共用一个常量是上一版的做法，
             // 那是「同一个数」靠人记得；现在它们读同一行设置，是结构上的同一个数。
@@ -386,6 +391,7 @@ final class ReceiveHost {
             // 互传的卡一起撤了（2026-11-16 16:40）。系统不肯提升我们时退到本应用的抬头通知：
             // 它比互传那张卡可靠一个量级，发出去就是发出去了，没有「binder 活着但没画」这种
             // 状态（2026-11-16 13:14 撞过一次，屏幕上什么都没有，超时后按时过期）。
+            // 流体云只有一张：上一张邀请还没结论时，这条用普通通知问人，不排队、不阻塞。
             cloud = LiveCard.allowed(context);
             if (cloud) {
                 // 接到东西了，这张卡本该自己摊开：消息藏在胶囊里等于没送到。摊开这件事应用侧
@@ -396,7 +402,7 @@ final class ReceiveHost {
                 // 看不看得清那两个按钮交给用户点一下胶囊。
                 PendingIntent yes = Confirmation.decision(context, session, true);
                 PendingIntent no = Confirmation.decision(context, session, false);
-                LiveCard.invite(context, offer.title(), offer.body(), yes, no);
+                LiveCard.invite(context, inviteId(), offer.title(), offer.body(), yes, no);
             }
             // 三条出口都不通的时候，别让对面等满六十秒。
             //
@@ -431,6 +437,8 @@ final class ReceiveHost {
             } finally {
                 // 云卡只在没接受时撤。接受的那条路马上会被 {@link #progress} 改写成进度，
                 // 收完再由 {@link #delivered} 收尾。
+                LiveCard.dropInvite(context, inviteId());
+                LiveCard.releaseInvite();
                 if (cloud && !wanted) {
                     LiveCard.drop(context);
                     cloud = false;
@@ -510,6 +518,7 @@ final class ReceiveHost {
                 // （Software caused connection abort）就是这个形状。
                 //
                 // 所以：按 400ms 节拍、扔回主线程投；接收线程只管读字节。
+                LiveCard.useCard(inviteId());
                 long now = SystemClock.uptimeMillis();
                 if (percent >= 0 && percent < 100 && now - lastCardAt < CARD_EVERY_MS) {
                     return;
@@ -603,6 +612,7 @@ final class ReceiveHost {
                 // 收完不是结束：人还要去打开那份东西。所以这张卡不自己消失，留到人按「完成」。
                 // 第二行和发送完成那张说同一句话的形状：几份、多少字节。这里不写「100%」——
                 // 完成这件事由标题说，而百分比在一张已经画满的轨道旁边是同一个意思说两遍。
+                LiveCard.useCard(inviteId());
                 LiveCard.finishWithActions(context, "接收完成",
                         published.entries().size() + " 个文件 · " + Explains.bytes(published.bytes()),
                         openAction(context, published));
@@ -640,6 +650,7 @@ final class ReceiveHost {
             if (cloud) {
                 // 和文件那一份同样的形状、同样的理由：收完不自己消失，留到人按【完成】——
                 // 人拿到链接之后的下一步是打开它，而这张卡是唯一告诉他「东西在哪」的东西。
+                LiveCard.useCard(inviteId());
                 LiveCard.finishWithLink(context, "接收完成", linkLine(offer),
                         openLink(context, offer.urls));
                 cloud = false;
@@ -680,6 +691,7 @@ final class ReceiveHost {
                 // 只挂【完成】，没有【重试】：重来一次要对面重新发，而对面那台手机不归我们叫醒。
                 // 轨道停在真走到的那个数上（{@link #percent}），不拉满——失败画成成功，是这里
                 // 最不能犯的错。
+                LiveCard.useCard(inviteId());
                 LiveCard.failedWithActions(context, "接收失败", message, percent, null);
                 cloud = false;
             }

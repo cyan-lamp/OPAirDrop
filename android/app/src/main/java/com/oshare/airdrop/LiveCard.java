@@ -164,6 +164,27 @@ final class LiveCard {
     /** 一张卡一个 id：同时只有一个传输在走，第二个会覆盖第一个，这正是我们要的。 */
     private static final int ID = 0x0B00;
 
+    /** 接下来投的卡落在哪个 id（由 ReceiveHost 按自己那条邀请设置）。 */
+    private static volatile int sCardId = ID;
+
+    static void useCard(int id) {
+        sCardId = id;
+    }
+
+    /**
+     * 当前有一条邀请正占着流体云那张卡（0 = 没有）。
+     *
+     * <p>系统只有一张流体云，两条邀请同时上卡会互相盖掉按钮。但**不能让第二条排队等**
+     * （第一张可能挂很久等人回答，24 秒到 24 小时都可能）——所以第二条直接退到普通通知问人，
+     * 由 {@code ReceiveHost} 读 {@link #freeForInvite()} 决定。这就是「第二次发送也要弹窗」。
+     */
+    private static volatile int sInviteId;
+
+    /** 流体云那张卡此刻空着吗。 */
+    static boolean freeForInvite() {
+        return sInviteId == 0;
+    }
+
     /** 卡上【完成】按下去的那条广播；一个 id 一处，免得两次传输抢同一个 PendingIntent。 */
     private static final int DONE_REQUEST = 0x0B04;
 
@@ -341,7 +362,8 @@ final class LiveCard {
      */
     static void invite(Context context, String title, String shortText,
                        PendingIntent accept, PendingIntent refuse) {
-        postInvite(context, title, shortText, accept, refuse, false);
+        sInviteId = ID;
+        invite(context, ID, title, shortText, accept, refuse);
     }
 
     /**
@@ -353,6 +375,32 @@ final class LiveCard {
      * <p>{@code setOnlyAlertOnce(true)} 是这个方法存在的理由：邀请卡走的是会响的那条渠道，
      * 更新帧要是也响，就成了每秒一声的门铃；它同时压掉抬头，卡已经在那儿了。
      */
+    /**
+     * 每条邀请一个通知 id，两条都走流体云渠道（同一 live_card + promoted）：系统自己会把
+     * 最新那条画在胶囊/展开位，旧的留在通知中心、仍是流体云样式——用户 2026-11-27 要的就是这个。
+     */
+    static void invite(Context context, int id, String title, String shortText,
+                       PendingIntent accept, PendingIntent refuse) {
+        sInviteId = id;
+        postInvite(context, id, title, shortText, accept, refuse, false);
+    }
+
+    /** 按 id 撤一条邀请（接受/拒绝/超时都撤）。 */
+    /** 按指定 id 撤卡（【完成】广播用）。 */
+    static void dropById(Context context, int id) {
+        NotificationManager manager = context.getSystemService(NotificationManager.class);
+        if (manager != null) {
+            manager.cancel(id);
+        }
+    }
+
+    static void dropInvite(Context context, int id) {
+        NotificationManager manager = context.getSystemService(NotificationManager.class);
+        if (manager != null) {
+            manager.cancel(id);
+        }
+    }
+
     static void inviteQuiet(Context context, String title, String text,
                             PendingIntent accept, PendingIntent refuse) {
         // 倒计时已彻底移除（2026-11-27 用户要求）：邀请卡投出后不再有任何更新帧。
@@ -364,7 +412,7 @@ final class LiveCard {
      * 邀请卡唯一的构建点。{@code tick} 为假是第一次投递（要响、要抬头），
      * 为真就是倒计时的更新帧（不响、不抬头）。
      */
-    private static void postInvite(Context context, String title, String shortText,
+    private static void postInvite(Context context, int id, String title, String shortText,
                                    PendingIntent accept, PendingIntent refuse, boolean tick) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.BAKLAVA) {
             return;
@@ -395,7 +443,7 @@ final class LiveCard {
                 .addAction(new Notification.Action.Builder(null, "接收", accept).build());
         Notification card = builder.build();
         immersive(card);
-        manager.notify(ID, card);
+        manager.notify(id, card);
         // 邀请卡不走 {@link #post}（它不发进度条、走的是另一条会响的渠道），所以形状得在这里
         // 自己记一笔：否则下一张进度卡的形状与上一次传输留下的那个恰好相同时，系统会把
         // 「拒绝/接收」这两个答案留在屏上。
@@ -460,10 +508,16 @@ final class LiveCard {
     }
 
     /** 撤掉。传 {@code null} 之外什么都不需要。 */
+    /** 邀请有了结论（接受/拒绝/超时）或卡被撤：把「占着」这件事放开。 */
+    static void releaseInvite() {
+        sInviteId = 0;
+    }
+
     static void drop(Context context) {
+        sInviteId = 0;
         NotificationManager manager = context.getSystemService(NotificationManager.class);
         if (manager != null) {
-            manager.cancel(ID);
+            manager.cancel(sCardId);
         }
     }
 
@@ -489,8 +543,13 @@ final class LiveCard {
 
     /** 卡上【完成】按下去的那条广播。两处（发送完成、接收完成）指向同一个动作。 */
     private static PendingIntent done(Context context) {
-        return PendingIntent.getBroadcast(context, DONE_REQUEST,
-                new Intent(context, CardDismiss.class),
+        // 把「这张卡在哪个 id」带进广播：卡可能落在 per-invite id 上（多邀请），
+        // 只撤全局 sCardId 会让「点完成没反应」或撤错另一张（2026-11-27 真机）。
+        // requestCode 必须按卡 id 唯一：两张完成卡的【完成】若共用 DONE_REQUEST，
+        // FLAG_UPDATE_CURRENT 会让它们共用一个 PendingIntent，后建的覆盖先建的 card_id，
+        // 于是「点旧卡完成没反应、只关掉新卡」（2026-11-27 真机，和邀请按钮同一类 bug）。
+        return PendingIntent.getBroadcast(context, DONE_REQUEST * 131 + (sCardId & 0x7F),
+                new Intent(context, CardDismiss.class).putExtra("card_id", sCardId),
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
     }
 
@@ -635,10 +694,10 @@ final class LiveCard {
         // SendHost.settleCard 认得「已经结束的那一趟」，会把终态卡按原样再摆一遍。
         boolean rebuilt = !shape.equals(lastShape) && !complete;
         if (rebuilt) {
-            manager.cancel(ID);
+            manager.cancel(sCardId);
         }
         lastShape = shape;
-        manager.notify(ID, card);
+        manager.notify(sCardId, card);
         Log.i(TAG, "live card: " + title + " · " + shortText + " · " + percent + "%"
                 + (rebuilt ? " (rebuilt " + shape + ")" : "")
                 + (alert ? " (heads-up)" : ""));

@@ -14,6 +14,6 @@ public final class CardDismiss extends BroadcastReceiver {
 
     @Override
     public void onReceive(Context context, Intent intent) {
-        LiveCard.drop(context);
+        LiveCard.dropById(context, intent.getIntExtra("card_id", 0x0B00));
     }
 }

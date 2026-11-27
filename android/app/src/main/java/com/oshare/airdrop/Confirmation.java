@@ -566,7 +566,11 @@ final class Confirmation {
                 .setAction(accepted ? ACCEPT : DECLINE)
                 .putExtra(EXTRA_ID, session);
         // 编号进 requestCode：两个动作、多个并发请求，用同一个 requestCode 会互相覆盖。
-        int requestCode = notification * 2 + (accepted ? 1 : 0);
+        // 2026-11-27 真机：两条邀请同时在场时，后发那条的按钮点了没反应——原本 requestCode 只按动作算，
+        // 配 FLAG_UPDATE_CURRENT 会让两张卡共用一个 PendingIntent，后建的覆盖先建的 session。
+        // 把 session 折进来：同一条邀请的同一动作永远同值，不同邀请互不相同。
+        int requestCode = (notification * 2 + (accepted ? 1 : 0)) * 131
+                + (session.hashCode() & 0xFFFF);
         return PendingIntent.getBroadcast(
                 context, requestCode, intent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);

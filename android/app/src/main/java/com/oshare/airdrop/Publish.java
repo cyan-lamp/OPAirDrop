@@ -152,7 +152,14 @@ final class Publish {
      * @return 每一份最终落在哪儿，以及哪些没存下
      * @throws IOException 一份都没存下时抛出第一个原因；存下了一部分则不抛
      */
-    static Result run(Context context, Report report, File staged, String configured, boolean overwrite)
+    /**
+     * 落盘发布：把暂存目录里的文件搬进公共目录并插入媒体库。
+     *
+     * <p>2026-11-27：**这一段必须串行**。传输本身可以并行（每条连接写自己的暂存目录），
+     * 但「搬进公共目录 + 媒体库 IS_PENDING 提交 + 同名去重」共用同一批系统状态，两条并发
+     * 时真机实测两份都没进相册。所以只锁发布这一段，传输不再排队——这正是方案 B 需要的形态。
+     */
+    static synchronized Result run(Context context, Report report, File staged, String configured, boolean overwrite)
             throws IOException {
         String fixed = configured == null ? "" : configured.trim();
         List<Entry> entries = new ArrayList<>();

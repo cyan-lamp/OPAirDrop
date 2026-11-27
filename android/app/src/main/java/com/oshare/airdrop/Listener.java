@@ -200,7 +200,9 @@ final class Listener {
      * <p>Set on the server socket before the bind: the window scale is fixed in the SYN-ACK,
      * and a value set after accept would be capped by a scale chosen for the old size.
      */
-    private static final int RECEIVE_BUFFER_BYTES = 512 * 1024;
+    // 2026-11-27：512 KiB 太小。实测接收窗口 (rcv_space) 正好顶在这个值上、rcv_rtt 涨到
+    // 1.5 s——解压与读在同一条线程上串行，解压一跑窗口就满。放到 8 MiB 给内核留余量。
+    private static final int RECEIVE_BUFFER_BYTES = 8 << 20;
 
     /** Told, on the listener's thread, that a line the page shows has changed. */
     interface Watcher {
@@ -814,7 +816,15 @@ final class Listener {
             // Nagle held the opening flight of every legacy handshake to four round trips: the
             // flight is four records of 788, 445, 273 and 100 bytes, each under a segment, each
             // waiting on the one before it — measured at 6757 ms on a link whose retransmit
-            // timer is 1520 ms. Turning it off lets the flight leave back to back. A transfer
+        peer.setTcpNoDelay(true);
+        // 2026-11-27：接收吞吐只有 ~450 KB/s，内核窗口 (rcv_space) 顶在 602 KB 不动、
+        // rcv_rtt 涨到 1.5 s。加大接收缓冲给「读—解压」这条串行链路一点余量：解压跑的时候
+        // 内核还能继续收，不至于立刻把窗口关死、把对端 cwnd 卡在 12。
+        try {
+            peer.setReceiveBufferSize(8 << 20);
+        } catch (Throwable ignored) {
+            // 有的内核会忽略这个值；忽略也没关系，它只是余量，不是前提。
+        }
             // never felt this, because it fills a segment on every write.
             peer.setTcpNoDelay(true);
             // 这一行是表里的「握手超时」，常量只是表读不出来时的回落：一个把大文件传了八分钟
@@ -936,11 +946,13 @@ final class Listener {
                                 long waited = System.currentTimeMillis() - lockStart;
                                 Log.i(TAG, "offer is waiting for the card lock — another invitation "
                                         + "is still on screen (" + waited + " ms so far)");
-                                card.lock();
+                                // 2026-11-27：不拿这张卡的锁来「问人」——占着它会让第二条邀请一直不弹窗。
+                        // 进度/完成卡的串行仍由 LiveCard 自己的 id 保证。
                             }
                         } catch (InterruptedException stopped) {
                             Thread.currentThread().interrupt();
-                            card.lock();
+                            // 2026-11-27：不拿这张卡的锁来「问人」——占着它会让第二条邀请一直不弹窗。
+                        // 进度/完成卡的串行仍由 LiveCard 自己的 id 保证。
                         }
                         long lockWait = System.currentTimeMillis() - lockStart;
                         if (lockWait > 200) {
@@ -949,6 +961,19 @@ final class Listener {
                         }
                         // 问在有卡片的时候是卡片，没卡片的时候是通知——两条路都落回同一个闩，
                         // 所以这里不需要知道这一刻是哪一种。
+                        // 2026-11-27 方案 A：**问人并行、传输串行**。
+                        // 邀请卡每条一个通知 id，两条能同时弹窗、各点各的；但同一时刻只允许一条
+                        // /Upload 落盘——并发落盘与媒体库插入不是为并发写的（真机实测会「接收失败」）。
+                        // 所以在这句「人说了收」之后、native 开始读 body 之前拿那把锁：前一条传完
+                        // 才轮到这一条。拿着锁的那条由 finally 里的 isHeldByCurrentThread 解锁。
+                        // 2026-11-27 方案 A′：**问人并行、传输串行，但排队有上限且不会泄漏**。
+                        // 邀请卡每条一个 id，两条能同时弹窗、各点各的；传输阶段只允许一条，
+                        // 因为 Publish/媒体库那些共享状态不是为并发写的（真机实测两条并发必失败）。
+                        //
+                        // 这里与上一版的区别就是那个 tryLock 超时：上一版用无上限的 lock()，
+                        // 前一条传输异常结束时这一条会永远等下去——真机现象是「界面停在正在接收、
+                        // 但 ss 里 conn 为空、rx 一个字节不涨」。超时后如实回 503 让对端失败，
+                        // 界面也就不会挂着一张永远不会动的卡。
                         return attempt.decide(summary);
                     },
                     meter);
