@@ -513,6 +513,17 @@ mod device {
                         radio_line,
                         link.schedule().describe_peer()
                     );
+                    // 对端此刻还在不在 AWDL 链路上：时钟源 peer 最近一次 presence 帧距今多少毫秒。
+                    // 这是 2026-11-27 新判据的唯一数据源——mDNS 应答会休眠、8770 会拒连，而 PSF
+                    // presence 是「它在链路上」这件事本身。先只打印，不改任何行为。
+                    //
+                    // 标定（2026-11-27 实测）：`now` 本身就是**微秒**，不需要 TU×1024 折算——
+                    // 第一版按 TU 折算，量出 41 789 秒这种荒唐值，正是这一步错的。
+                    let pres_ago_ms = link
+                        .last_presence_us()
+                        .map(|us| now.saturating_sub(us) / 1000);
+                    println!("PRES ago_ms={:?} now_us={} pres_us={:?}",
+                        pres_ago_ms, now, link.last_presence_us());
                     let _ = io::stdout().flush();
                 }
                 last_stats = stats;

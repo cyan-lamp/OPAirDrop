@@ -31,6 +31,11 @@
          （这枚芯片够不够格做多路广播、蓝牙开没开）时要用的，缺了它那几个 getter 是抛
          SecurityException 而不是返回 false。 -->
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <!-- 扫描：判「对方的隔空投送现在开着吗」用。iOS 在 AirDrop 接收范围内会广播 nearby-info
+         帧，扫到=开着、扫不到=关了——这是唯一能做到秒级、事件驱动的判据（2026-11-27 定的方向）。
+         neverForLocation：我们只用它判断附近有没有设备，不做定位。 -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <!-- 没有 BLE 的机器装得上、只是叫不醒对端；用 required="false" 而不是让安装被拦下。 -->
     <uses-feature

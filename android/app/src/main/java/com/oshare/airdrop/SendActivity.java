@@ -239,7 +239,7 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
      */
     private final Map<String, Long> probed = new LinkedHashMap<>();
     /** 同一台设备两次问名字至少隔这么久。问一次要连 TLS，问得太勤纯耗电。 */
-    private static final long NAME_RETRY_MS = 15_000;
+    private static final long NAME_RETRY_MS = 3_000;
 
     /**
      * 一台设备凑齐地址端口之后，为了等名字最多先不上屏多久。
@@ -258,7 +258,13 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
      * 是一个不看报文的时刻。iPhone 锁屏、或者它只是一遍遍重复答同一个地址（那种重复只更新
      * 时刻，不算「变了」，连重画都不触发）时，没人来叫我们——那台设备就会一直停在「没上屏」。
      */
-    private final Runnable settleDue = () -> settle(System.currentTimeMillis());
+    private final Runnable settleDue = () -> {
+        long now = System.currentTimeMillis();
+        settle(now);
+        // `/Discover` 是「服务开着吗」的唯一判据，必须周期性跑。以前它只跟着 onPeers 触发，
+        // 而那一路在设备静默时会停——实测「关掉 AirDrop 要十几秒才消失」就是它停了。
+        probeNames(now);
+    };
 
 
     /**
@@ -349,6 +355,10 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
 
     @Override
     protected void onCreate(Bundle state) {
+        // 判据验证（2026-11-27）：面板一创建就开始扫对端的 BLE nearby-info 广播。
+        // 放在这里而不是 wake() 里——wake() 在权限不满足时会提前 return，扫描就跟着不跑了。
+        // 这一步只打日志，不改任何显示逻辑。
+        BleScanProbe.start(getApplicationContext());
         super.onCreate(state);
 
         S = schemeOf(getResources().getConfiguration());
@@ -566,13 +576,21 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
         if (checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE)
                 != PackageManager.PERMISSION_GRANTED
                 || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
+                != PackageManager.PERMISSION_GRANTED
+                // 扫描是「对方隔空投送现在开着吗」的唯一事件驱动判据（见 BleScanProbe）。
+                // 它不在旧的“附近的设备”授权里，必须一起申请——Android 13+ 把 SCAN 单列。
+                || checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN)
                 != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{
                     Manifest.permission.BLUETOOTH_ADVERTISE,
-                    Manifest.permission.BLUETOOTH_CONNECT}, ASK_BLE);
+                    Manifest.permission.BLUETOOTH_CONNECT,
+                    Manifest.permission.BLUETOOTH_SCAN}, ASK_BLE);
             return;
         }
         say(Native.bleAdvertise(this));
+        // 判据验证用（2026-11-27）：同时扫一下对端的 BLE nearby-info 广播——它是「对方隔空投送
+        // 现在开着吗」唯一事件驱动的信号。这一步只打日志，不改任何显示逻辑。
+        BleScanProbe.start(this);
     }
 
     @Override
@@ -909,9 +927,10 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
                 due = Math.min(due, window);
             }
         }
-        if (due != Long.MAX_VALUE) {
-            stage.postDelayed(settleDue, due - now);
-        }
+        // 不管有没有在等名字，都最多 2 秒重排一次：`/Discover` 判据要靠这个节拍驱动
+        // （设备静默时 onPeers 不再来，只等报文就等于等不到）。
+        long wait = due == Long.MAX_VALUE ? 2_000 : Math.min(2_000, due - now);
+        stage.postDelayed(settleDue, Math.max(50, wait));
     }
 
     /**
@@ -979,6 +998,11 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
         if (!peer.connectable()) {
             return false;
         }
+        // 它的服务这一刻开着吗：`/Discover` 被拒 = 立刻不在；mDNS 应答/端口接通 = 在。
+        // 判据放在这一层（而不是数据层过滤），探测才能继续轮到被隐藏的那台。
+        if (!peer.serviceAlive(now)) {
+            return false;
+        }
         if (known != null) {
             return true;
         }
@@ -1004,9 +1028,12 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
                 continue;
             }
             String key = PeerNames.key(peer);
-            if (key == null || PeerNames.get(peer) != null || realNames.containsKey(peer.name)) {
+            if (key == null) {
                 continue;
             }
+            // 已经知道名字的也要继续探测：`/Discover` 现在不只是「取名」，它是**判据**——
+            // 连得上=服务开着，被拒=服务关着（见 Peers.Peer.serviceDown）。所以这里不再
+            // 因为「缓存里有名字」就跳过，只按 {@link #NAME_RETRY_MS} 限流。
             Long tried = probed.get(key);
             if (tried != null && now - tried < NAME_RETRY_MS) {
                 continue;
@@ -1639,13 +1666,22 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
                 String name = SendPipeline.discoverName(peer, connectMs, readMs,
                         settingsText(), senderName(), modelName(), senderId());
                 if (!name.trim().isEmpty()) {
+                    // 探测成功 = 它的服务此刻开着。清掉「服务关着」的结论，把名字缓存住。
+                    peer.serviceDown = false;
+                    peer.portAt = System.currentTimeMillis();
                     PeerNames.put(peer, name);
                     runOnUiThread(() -> showRealName(peer, name));
                     Log.i(TAG, "probed name for " + peer.name + " -> " + name);
                 }
+            } catch (java.net.ConnectException refused) {
+                // **明确被拒**：它在链路上活着，但隔空投送服务关着。这是判据里最硬的一条
+                // 「关着」——不用等任何窗口，立刻把那一格清掉（下一次探测成功会立刻回来）。
+                peer.serviceDown = true;
+                Log.i(TAG, "probe refused for " + peer.name
+                        + ": air drop service is not listening — hiding it now");
             } catch (Exception failed) {
-                // 问不到很正常：对面锁屏、AirDrop 关了、或者还没答完。留着 hash，下一次
-                // 广播会再试。不记日志——每台设备每两秒一次，会把日志冲掉。
+                // 超时/其它失败：可能是链路抖动，也可能是对面锁屏。不改结论，下一轮再问。
+                // 不记日志——每台每 8 秒一次，会把日志冲掉。
             }
         }, "opairdrop-name-" + peer.name).start();
     }

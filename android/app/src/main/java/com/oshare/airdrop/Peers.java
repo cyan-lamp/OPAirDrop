@@ -147,6 +147,10 @@ final class Peers {
      * <p>两分钟是「缓存应答不会活这么久」的量级：真机那四趟波动持续了 31 秒。而 AirDrop
      * 重新打开时记录一到就会被敲通，所以这个长度不会让人等——只影响「多久之后不再追究」。
      */
+    /** 上一次打「三种新鲜度」那行的时刻，见 {@link #expire()} 里的标定块。 */
+    private long lastSeenTrace;
+
+    /** 上次记日志时那一串「谁在、在哪」。 */
     private static final long BURIED_MS = 120_000;
 
     /**
@@ -160,7 +164,27 @@ final class Peers {
      * 1090 ms（`browse: rhythm: … speaks every 1090 ms`）；4.5 秒是四个应答周期，够容两次
      * 丢包与一次应答器休眠，又短到人关掉 AirDrop 之后几乎立刻看见那格消失。
      */
-    static final long SERVICE_WINDOW_MS = 6_000;
+    /**
+     * 一台设备的隔空投送服务「多久没给出正面证据就不再上屏」。
+     *
+     * <p>正面证据只有两种：它答了我们的 mDNS 查询（{@link Peer#seenAt}），或 8770 接通了
+     * （{@link Peer#portAt}）。
+     *
+     * <p># 12 秒是怎么来的（2026-11-27 定，别再猜）
+     *
+     * <p>参考实现是我们能拿到的最硬的证据：Google Mosey（Quick Share 的 AWDL 提供者）判
+     * 对端过期的宽限期 = `availability_period(16 TU) × 96 = 1.572864 s`（NDK 反汇编见
+     * Weverses 的 `patch-mosey-peer-grace.py`；他们把乘数改成 384 → **6.29 s** 以容忍 iPhone
+     * 抖动）。这说明「判离场」本来就是超时，业界取值 1.6–6.3 秒。
+     *
+     * <p>但他们用的是对端在 **AWDL 广告里声明的 availability period**，稳定在 16 TU；
+     * 我们能用的是 mDNS 应答，实测最长空窗 **11.1 秒**（我们自己的真机曲线）。所以窗口取
+     * 12 秒 = 11.1 × 1.08 的余量：放着不动不消失；关掉 AirDrop 后约 12 秒清除。
+     *
+     * <p>**不能更短**——短于 11.1 秒必然误删（这一整天反复验证过）。想更快只有一条路：
+     * 让对端答得更勤（我们能做的只有“更勤地问”和“组播+单播双发”）。
+     */
+    static final long SERVICE_WINDOW_MS = 12_000;
 
     /**
      * 只收到 RST（设备在链路上、8770 没开）时，那格还留多久。
@@ -312,21 +336,28 @@ final class Peers {
         long linkAt;
 
         /**
+         * 最近一次 `/Discover` 的结论：对方**明确拒绝**（{@code ECONNREFUSED}）时置真。
+         *
+         * <p>这是四条候选判据里唯一成立的：BLE 广播不随 AirDrop 开关变化（实测 90 秒帧数不变）、
+         * presence/驱动槽位只代表「在链路」、mDNS 应答最长中断 11.1 秒、goodbye 不存在。
+         * 而 `/Discover` 是**直接问它的服务**：连得上就是开着，被拒就是关着——不需要等超时。
+         *
+         * <p>一旦被拒，列表里那格就该立刻消失；下一次探测成功再立刻回来。
+         */
+        boolean serviceDown;
+
+        /**
          * 它的隔空投送服务这一刻还算不算「开着」。
          *
-         * <p>用户 2026-11-27 给出的两条要求：打开「所有人」要很快出现，关掉要很快消失。
-         * 能回答这件事的只有两个正面证据：**它答了我们的 mDNS 查询**（{@link #seenAt}），
-         * 或者**8770 真的接通了**（{@link #portAt}）。RST 不算——那是「设备在」，不是
-         * 「它在收」。窗口取 {@link Peers#SERVICE_WINDOW_MS}。
+         * <p>三条正面证据任一条成立：它答了我们的 mDNS 查询（{@link #seenAt}）、8770 接通了
+         * （{@link #portAt}）、或最近 15 秒内 `/Discover` 成功过（也是刷新 {@link #portAt}）。
+         * 反过来，`/Discover` 明确被拒（{@link #serviceDown}）就**立刻**判为关着，不等任何窗口。
          */
         boolean serviceAlive(long now) {
-            // 三态判据（2026-11-27 12:14 实验定）：iPhone **不发 goodbye**（3 分钟 0 条），
-            // 所以「关掉 AirDrop」只能靠「没有任何回应」来认。RST 说明设备在链路上——
-            // 给它一个更长的窗口（30 秒），既不会「放一会儿就消失」，也不会「关了还一直挂着」。
-            if (now - Math.max(this.seenAt, this.portAt) < Peers.SERVICE_WINDOW_MS) {
-                return true;
-            }
-            return now - this.linkAt < Peers.LINK_WINDOW_MS;
+            // 只认正面证据。`/Discover` 被拒**不**作为离场判据：iPhone 的接收端本来就是间歇
+            // 监听的，开着「所有人」时也会拒连（2026-11-27 实测），按它立刻隐藏会把在场设备删掉。
+            // RST（{@link #linkAt}）同理：它只说明设备在链路上，不说明服务开着。
+            return now - Math.max(this.seenAt, this.portAt) < Peers.SERVICE_WINDOW_MS;
         }
 
         /**
@@ -830,10 +861,10 @@ private Thread thread;
             if (peer.unproven) {
                 continue;
             }
-            // 「它的隔空投送这一刻还开着吗」——见 {@link Peer#serviceAlive}。
-            // 这一条是用户 2026-11-27 的两条要求：打开「所有人」很快出现、关掉很快消失。
-            // 放在出口而不是删表：表里留着它，端口一接、mDNS 一答就能立刻回来。
-            if (!peer.serviceAlive(now)) {
+            // **不在这里按「服务开着吗」过滤**：过滤一旦发生在数据层，被隐藏的那台就同时从
+            // `reachable` 里消失了，`/Discover` 探测再也轮不到它——它只能等 mDNS 重新宣布才回来。
+            // 判据属于显示层（`SendActivity.listed`），数据层要保留全部候选，探测才转得动。
+            if (peer.unproven) {
                 continue;
             }
             String key = identity(peer);
@@ -1727,6 +1758,19 @@ private Thread thread;
                         trace("retired " + older.name + " — same address as " + newer.name);
                         break;
                     }
+                }
+            }
+            // 判据标定（2026-11-27）：每约 5 秒打一行每台对端的三种「新鲜度」。
+            // 要回答的问题只有一个——**它答不答我们的 mDNS 查询**能不能代表「AirDrop 开着」。
+            // presence（守护侧 PSF）只能证明它在链路上：实测切「仅联系人」、锁屏时它照样每秒发，
+            // 年龄一直 6–112 ms。所以「服务开没开」只能看这一行里的 seen_ms。
+            if (now - lastSeenTrace >= 5_000) {
+                lastSeenTrace = now;
+                for (Peer peer : peers.values()) {
+                    trace("seen " + peer.name + " seen_ms=" + (now - peer.seenAt)
+                            + " heard_ms=" + (now - peer.heardFrom)
+                            + " tcp_ms=" + (peer.portAt == 0 ? -1 : now - peer.portAt)
+                            + " link_ms=" + (peer.linkAt == 0 ? -1 : now - peer.linkAt));
                 }
             }
             // 墓碑只留这么久。过期之后这条地址再冒出来就是一台普通的新设备——一次历史结论
