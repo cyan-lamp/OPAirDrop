@@ -416,7 +416,12 @@ public final class FluidModule extends XposedModule {
 
     private Object skipShrinkTimer(XposedInterface.Chain chain) throws Throwable {
         Object key = chain.getArg(0);
-        if (key instanceof String && ((String) key).contains(SELF)) {
+        // 2026-11-27：key 不是包名，而是 "capsuleToBubble" 这类动作名（见下面 11-25 的诊断注释），
+        // 所以 contains(SELF) 永远不成立——这就是「钩住了缩回定时器、卡片却仍然 3 秒缩回」的原因。
+        // 改判 delay：3000 ms 正是「展开后 3 秒缩回」的时长，跳过这一条调度即可。
+        Object rawDelay = chain.getArg(1);
+        long delayMs = rawDelay instanceof Number ? ((Number) rawDelay).longValue() : -1L;
+        if (delayMs == 3000L) {
             sSkipCount++;
             if (sSkipCount == 1 || sSkipCount % 25 == 0) {
                 log(Log.INFO, TAG, "第 " + sSkipCount + " 次跳过自家的缩回定时器（key=" + key + "）");

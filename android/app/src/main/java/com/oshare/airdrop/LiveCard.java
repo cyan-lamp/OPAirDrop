@@ -645,6 +645,11 @@ final class LiveCard {
                 .setProgressIndeterminate(percent < 0);
         if (percent >= 0) {
             style.setProgress(Math.min(100, percent));
+            // 2026-11-27 用户要求：走过的进度要有颜色，能一眼看出「已经过半」。
+            // ProgressStyle.Segment 是系统唯一公开的上色入口（setColor），
+            // 段长按百分比给，颜色取主题蓝；系统不支持时它只是不画，不影响进度本身。
+            style.addProgressSegment(new Notification.ProgressStyle.Segment(100)
+                    .setColor(0xFF2196F3));
         }
 
         Notification.Builder builder = new Notification.Builder(context, CHANNEL)
