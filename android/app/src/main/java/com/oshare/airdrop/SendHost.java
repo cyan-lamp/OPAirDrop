@@ -305,16 +305,21 @@ final class SendHost {
      * @param line    第二行，例如 {@code 3 个文件 · 2.6 MB}。百分比不写在这句里：胶囊上已经有了，
      *                同一句话在两处出现就是早晚对不上的那种重复
      */
-    static void progress(String session, String peer, int percent, String line) {
+    /**
+     * 返回「这一帧到底有没有投出去」。调用方要用它决定列表文字要不要跟着更新——
+     * 卡片是节流的、列表原来不节流，同一时刻于是显示两个数（39% vs 59%，2026-11-27 真机）。
+     */
+    static boolean progress(String session, String peer, int percent, String line) {
         // 真话先记下来：失败卡要停在断开那一刻，与卡片投了几帧无关。
         lastPercent = percent;
         long now = SystemClock.uptimeMillis();
         // 不确定态、以及 100% 那一帧必须立刻投；中间的按节拍投，见 CARD_EVERY_MS。
         if (percent >= 0 && percent < 100 && now - lastCardAt < CARD_EVERY_MS) {
-            return;
+            return false;
         }
         lastCardAt = now;
         show(session, "发送到 " + peer, percent < 0 ? line : percent + "% · " + line, percent);
+        return true;
     }
 
     /**

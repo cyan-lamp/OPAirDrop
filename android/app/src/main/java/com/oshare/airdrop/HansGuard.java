@@ -36,7 +36,7 @@ import java.io.InputStreamReader;
 final class HansGuard {
 
     private static final String TAG = "OPAirDrop";
-    private static final long EVERY_MS = 30_000;
+    private static final long EVERY_MS = 5_000;
     private static final String MAP = "/sys/fs/bpf/map_oplus-netd_app_hans_limit_map";
 
     private static boolean started;

@@ -1444,14 +1444,16 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
                                             whole == 0 ? 0f : Math.min(1f, (float) done / whole));
                                     redrawProgress(peer.name);
                                     String count = "发送中 " + (whole == 0 ? 0 : done * 100 / whole) + "%";
-                                    status(peer, count);
-                                    // 卡片上的百分比走胶囊，第二行给的是字节数：同一句「45%」在
-                                    // 两个地方各写一遍，晚一帧就是两个数。
+                                    // 2026-11-27：列表文字原来每帧都更新、卡片却按节拍更新，
+                                    // 同一时刻显示两个数（真机见过 39% vs 59%）。现在只有卡片
+                                    // 真的投出去那一帧才同步文字，两个数字永远一致。
                                     // 胶囊标题用真名（/Discover 带回的那个），不是 hash。
-                                    SendHost.progress(sendSession, label(peer),
+                                    if (SendHost.progress(sendSession, label(peer),
                                             whole == 0 ? -1 : (int) (done * 100 / whole),
                                             files.size() + " 个文件" + (whole == 0 ? ""
-                                                    : " · " + size(done) + " / " + size(whole)));
+                                                    : " · " + size(done) + " / " + size(whole)))) {
+                                        status(peer, count);
+                                    }
                                 }
                                 case Native.Progress.DONE -> {
                                     if (!last) {
