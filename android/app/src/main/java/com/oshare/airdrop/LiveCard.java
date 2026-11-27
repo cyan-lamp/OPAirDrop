@@ -355,7 +355,9 @@ final class LiveCard {
      */
     static void inviteQuiet(Context context, String title, String text,
                             PendingIntent accept, PendingIntent refuse) {
-        postInvite(context, title, text, accept, refuse, true);
+        // 倒计时已彻底移除（2026-11-27 用户要求）：邀请卡投出后不再有任何更新帧。
+        // 每次 notify 都会让系统按「一张新卡片」重走入场/收起流程——那正是「弹出约 3 秒后
+        // 又缩回去」的来源。方法留着兼容旧调用点，实际不做事。
     }
 
     /**

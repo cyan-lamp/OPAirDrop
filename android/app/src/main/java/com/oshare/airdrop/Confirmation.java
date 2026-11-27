@@ -100,8 +100,20 @@ final class Confirmation {
      * 五秒就放弃」这种错只有分开取才做得出来。
      */
     static long decisionTimeout(Context context) {
-        return Tuning.ms(context, "receive.decision_timeout_ms", TIMEOUT_MS);
+        // 用户 2026-11-27 明确要求：邀请卡**只有人按了按钮才消失**，不能自动消失。
+        // 原来这里是表里的 25 秒（{@code receive.decision_timeout_ms}），到点自动拒绝并撤卡——
+        // 真机日志里「卡片弹出 → 24.5 秒后被 removeLiveAlert 撤掉、连胶囊一起没了」就是它。
+        // 现在固定成一个足够大的值：对端的等待由它自己超时，我们这边一直挂着等人来点。
+        return NO_TIMEOUT_MS;
     }
+
+    /**
+     * 「一直等」的上限。
+     *
+     * <p>不是真正的无限：一条邀请会占住一条 serving 线程（`Listener` 的 PEERS=8 槽位），
+     * 24 小时足够覆盖任何真实场景（人就在旁边），又不会让一条被遗忘的连接永久占着槽位。
+     */
+    private static final long NO_TIMEOUT_MS = 24L * 60 * 60 * 1000;
 
     /** 正在等的那些问题，键是 session。 */
     private static final Map<String, Waiter> OPEN = new ConcurrentHashMap<>();
@@ -194,7 +206,10 @@ final class Confirmation {
 
         /** 正文说清几件、多大，并说明还等多久。 */
         String body() {
-            return body(seconds);
+            // 2026-11-27：倒计时已按用户要求从界面上彻底移除（对齐 iPhone：只给「接受 / 拒绝」）。
+            // 无参的 body() 是**实际投出去的那句话**，以前它转调 body(seconds) 把倒计时也带上了，
+            // 所以只清空 countdown() 之后卡片上仍写着「N 秒后无人应答将自动拒绝」。
+            return body;
         }
 
         /**
@@ -204,7 +219,9 @@ final class Confirmation {
          * 自动拒绝」是这件事本身的规则，人扫一眼就知道不点会怎样。
          */
         String body(int left) {
-            return body + "\n" + left + " 秒后无人应答将自动拒绝";
+            // 倒计时已彻底移除（2026-11-27 用户要求）：这句话只保留正文，不再拼任何秒数。
+            // 方法留着是因为调用点都走 body()；下次清理时可以直接删掉这个重载。
+            return body;
         }
     }
 

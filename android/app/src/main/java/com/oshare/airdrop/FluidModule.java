@@ -242,6 +242,13 @@ public final class FluidModule extends XposedModule {
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "缩回定时器那一刀没装上：" + t, t);
         }
+        try {
+            // 第三刀的现行版本：拦动作终点 onHide-card（见方法注释）。与上面的定时器钩并存，
+            // 任何一条生效都能让卡片不缩回。
+            hookSeedlingHide(pluginLoader);
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "seedling onHide 那一刀没装上：" + t, t);
+        }
         sPluginHooked = true;
         XposedInterface.HookHandle watch = sLoaderWatch;
         sLoaderWatch = null;
@@ -481,6 +488,82 @@ public final class FluidModule extends XposedModule {
      * 卡列表里的 {@code a} 字段稳得多，那个字段名同样是混淆出来的，而且列表字段本身也已经
      * 从 {@code d} 挪到了 {@code e}。能只读一个参数就不碰任何反射出来的字段。
      */
+    /**
+     * 「卡片展开后约 3 秒缩回胶囊」这一刀：拦**动作终点** `LiveAlertModel.onHide-card(key, …)`。
+     *
+     * <p>2026-11-27 的真机日志把链路钉死了：
+     *
+     * <pre>
+     * 14:18:40.277 PluginSeedling--StatusBar: LiveAlertModel-->onHide-card 0|com.oshare.airdrop|2816|null|10449, true, true
+     * 14:18:40.277 PluginSeedling--Track: TrackManager-->mapKey: … keepTime: 3978
+     * </pre>
+     *
+     * <p>以前拦的是上游定时器（`handleDataTimeout`，后来换成 `com.heytap.log.collect.auto.d.I`），
+     * 系统一更新就 0 命中——这就是「有时好、有时失效」的真实原因。`onHide-card` 是**唯一出口**，
+     * 不管上游计时器叫什么，卡片要收起都得经过这里。按 key 判断，只对我们自己的包生效。
+     */
+    private void hookSeedlingHide(ClassLoader loader) {
+        // 日志只给了类名（LiveAlertModel）与包前缀（com.oplus.systemui.plugins.seedling.*），
+        // 具体包没露出来，所以按候选全名逐个试——这是不依赖「插件 APK 在哪」的做法。
+        String[] candidates = {
+                "com.oplus.systemui.plugins.seedling.statusbar.model.LiveAlertModel",
+                "com.oplus.systemui.plugins.seedling.statusbar.LiveAlertModel",
+                "com.oplus.systemui.plugins.seedling.card.ui.model.LiveAlertModel",
+                "com.oplus.systemui.plugins.seedling.engine.model.LiveAlertModel",
+                "com.oplus.systemui.plugins.seedling.model.LiveAlertModel",
+        };
+        for (String name : candidates) {
+            Class<?> type;
+            try {
+                type = Class.forName(name, false, loader);
+            } catch (Throwable missing) {
+                continue;
+            }
+            Method target = null;
+            for (Method method : type.getDeclaredMethods()) {
+                if (method.getName().startsWith("onHide") && method.getParameterCount() >= 1) {
+                    target = method;
+                    break;
+                }
+            }
+            if (target == null) {
+                log(Log.ERROR, TAG, "seedling: " + name + " 里没有 onHide*，换下一个候选");
+                continue;
+            }
+            try {
+                hook(target)
+                        .setPriority(PRIORITY_DEFAULT)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PASSTHROUGH)
+                        .setId("opairdrop-seedling-keep")
+                        .intercept(this::keepSeedlingCard);
+                log(Log.INFO, TAG, "seedling hook: 已钩住 " + target
+                        + "（卡片不再 3 秒缩回）");
+                return;
+            } catch (Throwable failed) {
+                log(Log.ERROR, TAG, "seedling hook 装不上 " + target + "：" + failed);
+            }
+        }
+        log(Log.ERROR, TAG, "seedling hook: MISS——候选类都没命中，卡片可能仍会 3 秒缩回"
+                + "（把这一行发出来，按新类名再加候选）");
+    }
+
+    /** 我们的 key 形如 {@code 0|com.oshare.airdrop|2816|null|10449}；命中就不让卡片隐藏。 */
+    private Object keepSeedlingCard(XposedInterface.Chain chain) throws Throwable {
+        for (int i = 0; i < 3; i++) {
+            Object arg;
+            try {
+                arg = chain.getArg(i);
+            } catch (Throwable outOfRange) {
+                break;
+            }
+            if (arg instanceof String && ((String) arg).contains(SELF)) {
+                log(Log.INFO, TAG, "seedling keep: onHide 被忽略 " + arg);
+                return null;
+            }
+        }
+        return chain.proceed();
+    }
+
     private Object keepCard(XposedInterface.Chain chain) throws Throwable {
         Object self = chain.getThisObject();
         Object key = chain.getArg(0);

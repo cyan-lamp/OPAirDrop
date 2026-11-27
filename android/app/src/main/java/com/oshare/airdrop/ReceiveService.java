@@ -351,6 +351,9 @@ public final class ReceiveService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        // hans 豁免自检：APatch 上 /data/adb/service.d 的守护从未被执行，改成服务内每 30 秒查一次
+        // BPF 表（见 HansGuard 的注释）。没有 root 时静默，不影响任何功能。
+        HansGuard.start(this);
         if (listening(this)) {
             up();
         }

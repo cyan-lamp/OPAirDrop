@@ -397,9 +397,6 @@ final class ReceiveHost {
                 PendingIntent yes = Confirmation.decision(context, session, true);
                 PendingIntent no = Confirmation.decision(context, session, false);
                 LiveCard.invite(context, offer.title(), offer.body(), yes, no);
-                // 六十秒不再隐形。原来这段时间里卡片一动不动，时间一到它自己消失，人只会觉得
-                // 「它怎么不见了」——倒计时把「还剩多久」和「到点会发生什么」一起说清楚。
-                countdown(decisionMs, offer, yes, no);
             }
             // 三条出口都不通的时候，别让对面等满六十秒。
             //
@@ -822,26 +819,6 @@ final class ReceiveHost {
          * <p>60 秒这条上限由 {@link Confirmation#decisionTimeout} 决定，这里只负责显示它，
          * 不自己算一遍：两处各写一个数，改了一处另一处就会说谎。
          */
-        private void countdown(long decisionMs, Confirmation.Offer offer,
-                               PendingIntent yes, PendingIntent no) {
-            int total = (int) ((decisionMs + 999) / 1000);
-            Thread ticker = new Thread(() -> {
-                for (int left = total - 1; left >= 1; left--) {
-                    if (decision.tick()) {
-                        return;
-                    }
-                    try {
-                        LiveCard.inviteQuiet(context, offer.title(), offer.body(left),
-                                yes, no);
-                    } catch (Throwable ignored) {
-                        // 通知被禁、渠道被关：画不上去就算了，倒计时不是这次接待的前提。
-                    }
-                }
-            }, "opairdrop-countdown");
-            ticker.setDaemon(true);
-            ticker.start();
-        }
-
         private boolean await(long timeoutMs) {
             return decision.await(timeoutMs);
         }
