@@ -184,7 +184,7 @@ final class Peers {
      * <p>**不能更短**——短于 11.1 秒必然误删（这一整天反复验证过）。想更快只有一条路：
      * 让对端答得更勤（我们能做的只有“更勤地问”和“组播+单播双发”）。
      */
-    static final long SERVICE_WINDOW_MS = 12_000;
+    static final long SERVICE_WINDOW_MS = 4_000;
 
     /**
      * 只收到 RST（设备在链路上、8770 没开）时，那格还留多久。

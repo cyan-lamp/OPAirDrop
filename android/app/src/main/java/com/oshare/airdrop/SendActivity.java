@@ -239,7 +239,7 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
      */
     private final Map<String, Long> probed = new LinkedHashMap<>();
     /** 同一台设备两次问名字至少隔这么久。问一次要连 TLS，问得太勤纯耗电。 */
-    private static final long NAME_RETRY_MS = 3_000;
+    private static final long NAME_RETRY_MS = 5_000;
 
     /**
      * 一台设备凑齐地址端口之后，为了等名字最多先不上屏多久。
