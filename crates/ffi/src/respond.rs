@@ -56,8 +56,15 @@ pub const RECORD_SRV: u32 = 2;
 pub const RECORD_TXT: u32 = 4;
 /// Bit for the AAAA records.
 pub const RECORD_ADDRESS: u32 = 8;
+/// Bit for the NSEC record: "I have no A record, stop waiting for one".
+///
+/// 2026-11-27：Apple 设备会问 IPv4 的 A 记录。不回答它就一直等，可能推迟把设备显示出来。
+/// airdrop-linux（kimsherry）的实测注释写明了这一点（"This says there is none, so they stop
+/// waiting for it"），这里补上。
+pub const RECORD_NSEC: u32 = 16;
 /// Every record kind, which is what an announcement of a live instance carries.
-pub const RECORD_ALL: u32 = RECORD_PTR | RECORD_SRV | RECORD_TXT | RECORD_ADDRESS;
+pub const RECORD_ALL: u32 =
+    RECORD_PTR | RECORD_SRV | RECORD_TXT | RECORD_ADDRESS | RECORD_NSEC;
 
 /// The PTR lifetime: seventy-five minutes, which is the cost of not withdrawing.
 pub const TTL_PTR: u32 = 4500;
@@ -208,7 +215,30 @@ pub fn announce(
         }
     }
 
+    if types & RECORD_NSEC != 0 {
+        // rdata = 下一个域名（本机 host 的完整 DNS 编码）+ 类型位图。
+        // 位图字节抄自 airdrop-linux 的实测值：window 0 / len 6，置位 AAAA 与 NSEC，
+        // 意思就是「我只有这些类型，别等 A 记录」。
+        let mut rdata = dns_name(host);
+        rdata.extend_from_slice(&[0, 6, 0, 0, 0, 0x08, 0, 0x01]);
+        builder = builder.answer(host, 47, ttl(TTL_ADDRESS, ttl_override), &rdata)?;
+    }
+
     Ok(builder.build())
+}
+
+/// 把形如 `air.local` 的名字写成 DNS 线上格式：每段「长度 + 字节」+ 结尾 0。
+fn dns_name(name: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for label in name.trim_end_matches('.').split('.') {
+        if label.is_empty() || label.len() > 63 {
+            continue;
+        }
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0);
+    out
 }
 
 /// Answers one query packet, or says there is nothing to answer.

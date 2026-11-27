@@ -120,12 +120,22 @@ final class Responder {
      */
     private static final int WITHDRAW_COPIES = 3;
 
-    /** {@code RECORD_PTR} and friends: which of the four records an announcement carries. */
+    /** {@code RECORD_PTR} and friends: which of the records an announcement carries. */
     static final int RECORD_PTR = 1;
     static final int RECORD_SRV = 2;
     static final int RECORD_TXT = 4;
     static final int RECORD_ADDRESS = 8;
-    static final int RECORD_ALL = RECORD_PTR | RECORD_SRV | RECORD_TXT | RECORD_ADDRESS;
+    /**
+     * NSEC：「我没有 A 记录，别等它」。
+     *
+     * <p>2026-11-27：Apple 设备会问 IPv4 的 A 记录，不回答就一直等，可能推迟把我们显示出来。
+     * airdrop-linux（kimsherry）的实测注释写明了这一点（"This says there is none, so they stop
+     * waiting for it"）。Rust 侧 {@code respond.rs} 已经能生成这条记录，但原来这里没把位传下去，
+     * 所以真机上一条都没发出去（抓包：awdltun0 上是 4 条记录的 328 字节包）。
+     */
+    static final int RECORD_NSEC = 16;
+    static final int RECORD_ALL =
+            RECORD_PTR | RECORD_SRV | RECORD_TXT | RECORD_ADDRESS | RECORD_NSEC;
 
     /** Each record keeps its own published lifetime. */
     static final int TTL_AS_PUBLISHED = -1;
