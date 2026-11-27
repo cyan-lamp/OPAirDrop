@@ -269,6 +269,18 @@ final class Peers {
         long heardFrom;
 
         /**
+         * 最后一次「它的 8770 接了我的连接」的时刻。
+         *
+         * <p>这是全表最硬的一条「还在」：TCP 连得上，就说明这台设备此刻在这条链路上、并且
+         * 活着。它必须算进 {@link LivenessState#lastHeard}，否则会出现 2026-11-27 11:49 那种
+         * 现场——iPhone 的 8770 每分钟都答得好好的，可它的 mDNS 应答器一声不吭，于是「沉默」
+         * 一直涨，20 秒后我们把这台明明连得上的设备从列表里删掉。
+         *
+         * <p>不更新它就等于只信 mDNS 一种证据；而端口和 mDNS 是两条独立的证据，哪条在场都算在。
+         */
+        long portAt;
+
+        /**
          * 实测出来的「它多久说一次话」，毫秒。0 表示还没测出来。
          *
          * <p>**平滑值，用来读，不用来判。** 判定要的是「最坏情况下它安静多久」，那是
@@ -1738,6 +1750,8 @@ private Thread thread;
                 peer.knocks = 0;
                 peer.gone = false;
                 peer.heardFrom = System.currentTimeMillis();
+                // 端口答过也算「还在」的硬证据，见 {@link Peer#portAt}。
+                peer.portAt = peer.heardFrom;
                 return;
             }
             // 第三种失败不能算它的账：`Network is unreachable` / `No route to host` 说的是
@@ -1863,6 +1877,8 @@ private Thread thread;
                 peer.readyAt = now;
                 peer.seenAt = now;
                 peer.heardFrom = now;
+                // 这条记录本身就是一次 TCP 接通，见 {@link Peer#portAt}。
+                peer.portAt = now;
                 trace("recall: " + name + "@" + address + ":" + port + " answered in " + took
                         + " ms — showing it after " + (now - startedAt)
                         + " ms of browsing, before mDNS says anything");
@@ -1965,11 +1981,14 @@ private Thread thread;
                     }
                 }
             }
-            // 别人全都不说话了，先别敲谁的门：那量的是我们自己的听筒，不是它们走没走。
+            // 别人全都不说话了，也不敲谁的门：那量的是我们自己的听筒，不是它们走没走。
             // 这条和 {@link #expire} 里 LINK_DEAD_MS 的用法是同一个道理。
-            if (LivenessState.deaf(lastForeign, now)) {
-                continue;
-            }
+            //
+            // 但**探测照跑**，只是失败不作数：TCP 接通是「它还在」的正面证据，与 mDNS 听不听得见
+            // 无关。2026-11-27 11:49 的现场正是这样——iPhone 的 mDNS 一声不吭（我们判 deaf），
+            // 8770 却一直答；旧代码在 deaf 时整个跳过探测，于是 {@link Peer#portAt} 不再更新，
+            // 沉默照涨，20 秒后那台明明连得上的设备还是被删了。
+            boolean deaf = LivenessState.deaf(lastForeign, now);
             for (Peer peer : snapshot()) {
                 if (!peer.connectable() || peer.unproven || peer.knocking) {
                     continue;
@@ -1982,8 +2001,11 @@ private Thread thread;
                 // 所以短超时的代价只是多问一次，不会是误删。
                 String why = PortProbe.probe(peer, PortProbe.WATCH_TIMEOUT_MS);
                 if (why == null) {
-                    // 通着。它说没说话是 mDNS 的账，这里一个字都不改——但敲门的账要清，见 alive。
-                    if (peer.knocks > 0) {
+                    // 通着。这是最硬的一条「还在」：记下来，别让「mDNS 沉默」把一台明明
+                    // 连得上的设备删掉（2026-11-27 11:49：iPhone 的 8770 一直答，mDNS 不吭声，
+                    // 20 秒后列表里那格自己没了）。
+                    peer.portAt = now;
+                    if (peer.knocks > 0 || peer.gone) {
                         alive(peer);
                     }
                     continue;
@@ -1997,6 +2019,11 @@ private Thread thread;
                     // 「miss 3 of 2」「miss 4 of 2」——2026-11-27 01:33 的真机现场就是这么刷的。
                     // 判死那笔账记在 {@link #expire} 里，删不删由 mDNS 沉默定；
                     // 这里只保留每秒一次的短探测，端口一开就 {@link #alive} 把它翻回来。
+                    continue;
+                }
+                if (deaf) {
+                    // 我们听不见任何人：探测失败可能只是这条链路此刻不通，不能记在它头上。
+                    // 成功那一支已经在上面的 `why == null` 里记过账了。
                     continue;
                 }
                 knockNow(peer, System.currentTimeMillis());

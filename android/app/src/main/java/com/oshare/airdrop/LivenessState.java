@@ -307,9 +307,9 @@ final class LivenessState {
     static final long LINK_DEAD_MS = 20_000;
     // —— 判定 ——
 
-    /** 最后一次「有证据说明它还在」的时刻：答了记录，或者发了任意一包。 */
+    /** 最后一次「有证据说明它还在」的时刻：答了记录、发了任意一包，或者 8770 接通了。 */
     static long lastHeard(Peers.Peer peer) {
-        return Math.max(peer.seenAt, peer.heardFrom);
+        return Math.max(Math.max(peer.seenAt, peer.heardFrom), peer.portAt);
     }
 
     /**

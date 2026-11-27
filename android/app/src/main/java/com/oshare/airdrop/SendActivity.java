@@ -1286,10 +1286,16 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
                 // 等不到回答。分成两档说，是因为人要做的事不同：还没走字节，等的是对面手机
                 // 上那一下「接受」；走了一半才超时，是对面不再读这条连接了。
                 boolean timedOut = failed instanceof SocketTimeoutException;
+                // 连都没连上。这一支从「连接被中断」里分出来的理由：它说的不是「传着传着断了」，
+                // 而是「对面此刻根本没在收」。2026-11-27 11:45 的真机现场——后台那次 /Discover
+                // 取名把 iPhone 的接收窗口用完就关了，两秒后点发送得到 ECONNREFUSED，
+                // 卡片却写「连接被中断 · 保持两台设备都亮屏」，人只会去查屏幕亮度。
+                boolean unopened = failed instanceof java.net.ConnectException;
                 String message = stopped ? "已取消"
                         : refused ? "对方拒绝"
                         : impostor ? "对方身份不符"
                         : timedOut ? (flight.moving.get() ? "对方不再回应" : "对方没有接受")
+                        : unopened ? "对方没有在接收"
                         // 原文（"Connection reset" 之类）只进日志：页面那行是给站在两台手机
                         // 中间的人看的，他要知道的是「还得再试一次」，不是异常类名。
                         : "连接被中断";
@@ -1334,6 +1340,9 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
                             // 这时候劝人再去调环境，等于替对面那次「停」编一个不存在的理由。
                             // 所以只说发生了什么：发了多少、没发完。**刻意不点名是谁停的**，
                             // 从我们这侧看，「对面取消」和「对面断网」长得一模一样。
+                            : unopened
+                                    ? who + " 现在没在收 · 在 iPhone 上把隔空投送重新选一次"
+                                            + "「所有人」并保持亮屏，再点一次设备重试"
                             : flight.sentBytes() > 0
                                     ? "传输在中途被中断，已发出 " + size(flight.sentBytes())
                                             + "，没有发完"
@@ -1530,7 +1539,7 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
      */
     private SSLSocket open(Peers.Peer peer, int connectMs, int readMs, SendPipeline.Flight flight)
             throws IOException {
-        Socket raw = SendPipeline.rawSocket(peer, connectMs, readMs);
+        Socket raw = connectWaking(peer, connectMs, readMs);
         // 裸 socket 先登记：握手要几百毫秒，人在那期间点取消，能关的只有这一条。
         live.add(raw);
         SSLSocket tls = null;
@@ -1553,6 +1562,61 @@ public final class SendActivity extends Activity implements Peers.Watcher, SendP
             }
             SendPipeline.closeQuietly(tls != null ? tls : raw);
             throw failed;
+        }
+    }
+
+    /**
+     * 连一次；被拒（端口没开）就叫一声蓝牙再连，最多三次。
+     *
+     * <p># 为什么值得这么写
+     *
+     * <p>iPhone 的隔空投送接收端是**被唤醒才开**的：我们为了在列表里显示真名，会在设备出现
+     * 之后立刻做一次后台 {@code /Discover}（{@link #probeName}），那次连接用完，它就关。
+     * 2026-11-27 11:45 的现场：11:45:55.891 取名字成功，11:45:58.1 敲门就是 ECONNREFUSED，
+     * 11:46:02 点发送 → 直接失败；作为对照，11:47:07 那一轮名字已经缓存、没有后台探测，
+     * 两次连接都一次成功。
+     *
+     * <p>所以「端口拒绝」这一类失败补一次唤醒重试：面板开着时 BLE 广播一直在发，再叫一声
+     * 通常一两秒内就能把对面的接收端拉回来。三次都拒才算真失败——那时文案（
+     * 「对方没有在接收」）说的是实话，也没有把「对面真的关了」误报成网络故障。
+     */
+    private Socket connectWaking(Peers.Peer peer, int connectMs, int readMs) throws IOException {
+        java.net.ConnectException refused = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (attempt > 0) {
+                Log.i(TAG, "connect to " + peer.name + " refused, waking it again (attempt "
+                        + (attempt + 1) + " of 3)");
+                wakeQuietly();
+                try {
+                    Thread.sleep(900);
+                } catch (InterruptedException stopped) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            try {
+                return SendPipeline.rawSocket(peer, connectMs, readMs);
+            } catch (java.net.ConnectException refusedNow) {
+                refused = refusedNow;
+            }
+        }
+        throw refused != null ? refused : new IOException("the connection was cancelled");
+    }
+
+    /**
+     * 后台线程上的 BLE 唤醒：不碰权限对话框、不碰 UI，只发一次广播。
+     *
+     * <p>和 {@link #wake()} 分开：那个会 {@code requestPermissions}，只能在主线程调。
+     */
+    private void wakeQuietly() {
+        try {
+            if (checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE)
+                    != PackageManager.PERMISSION_GRANTED) {
+                return;
+            }
+            say(Native.bleAdvertise(getApplicationContext()));
+        } catch (Throwable failed) {
+            Log.w(TAG, "唤醒对端失败：" + failed);
         }
     }
 

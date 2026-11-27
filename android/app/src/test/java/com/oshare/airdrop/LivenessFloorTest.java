@@ -122,6 +122,19 @@ public class LivenessFloorTest {
     }
 
     @Test
+    public void a_port_that_answers_counts_as_being_there() {
+        // 2026-11-27 11:49 的现场：iPhone 的 8770 每分钟都接通，mDNS 却一声不吭——
+        // 只信 mDNS 的话，20 秒后这台明明连得上的设备就被删了。
+        Peers.Peer peer = peer("a", "fe80::1");
+        long now = 30_000;
+        peer.seenAt = 0;
+        peer.heardFrom = 0;
+        peer.portAt = now - 1_000;
+        assertEquals(now - 1_000, LivenessState.lastHeard(peer));
+        assertEquals(now - 20_000, LivenessState.lastHeard(peer) - 19_000);
+    }
+
+    @Test
     public void the_list_only_shows_devices_it_can_name() {
         long now = 100_000;
 
