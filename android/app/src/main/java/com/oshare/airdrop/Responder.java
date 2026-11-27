@@ -94,7 +94,7 @@ final class Responder {
      * announce**（30 秒抓包 0 个入方向包）。所以「iPhone 显示我们慢」的主要延迟就是这 3 秒：
      * 面板打开后最长要等 3 秒才听见我们。改成 1.5 秒，最长等待减半，代价是组播包翻倍
      * （每包 ~200 字节，可忽略）。 */
-    private static final long ANNOUNCE_MS = 1_500L;
+    private static final long ANNOUNCE_MS = 1_000L;
 
     /** Resolution of the schedule; also the granularity at which a stop is noticed. */
     private static final long TICK_MS = 250L;
