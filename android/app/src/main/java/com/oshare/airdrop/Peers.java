@@ -150,6 +150,27 @@ final class Peers {
     private static final long BURIED_MS = 120_000;
 
     /**
+     * 一台设备的隔空投送服务「多久没给出正面证据就不再上屏」。
+     *
+     * <p>正面证据只有两种：它答了我们的 mDNS 查询（{@link Peer#seenAt}），或 8770 接通了
+     * （{@link Peer#portAt}）。RST 不算——用户关掉 AirDrop 之后它照样回 RST，按 RST 续命
+     * 就会「对方早关了，这边还挂着」（2026-11-27 下午的现场）。
+     *
+     * <p>取 4.5 秒的理由：发送页开着时我们每 0.3–1 秒问一次，实测 iPhone 的应答节奏
+     * 1090 ms（`browse: rhythm: … speaks every 1090 ms`）；4.5 秒是四个应答周期，够容两次
+     * 丢包与一次应答器休眠，又短到人关掉 AirDrop 之后几乎立刻看见那格消失。
+     */
+    static final long SERVICE_WINDOW_MS = 6_000;
+
+    /**
+     * 只收到 RST（设备在链路上、8770 没开）时，那格还留多久。
+     *
+     * <p>30 秒是取舍：短了会「放一会儿就消失」（用户 12 点的反馈），长了会「AirDrop 早关了还挂着」。
+     * 这个窗口里格子仍然可点——点下去会走「被拒 → 自动唤醒重试 3 次」，若对面其实开着，多半能发成。
+     */
+    static final long LINK_WINDOW_MS = 30_000;
+
+    /**
      * 连发几个预热的空包。三个，因为内核的未解析队列默认只留三个。
      *
      * <p>第一个包触发 NS，后两个排进队列，等 NA 一来三个一起出去——这条路径上丢一个包太常见
@@ -279,6 +300,34 @@ final class Peers {
          * <p>不更新它就等于只信 mDNS 一种证据；而端口和 mDNS 是两条独立的证据，哪条在场都算在。
          */
         long portAt;
+
+        /**
+         * 最后一次「收到 RST」的时刻：它在链路上活着，但 8770 没开。
+         *
+         * <p>这条证据只说明「设备在」，**不能**说明「它的隔空投送开着」——用户关掉 AirDrop 之后
+         * 它照样回 RST。所以它只用来避免「设备明明在、却被当成走了」的误判（比如留墓碑、
+         * 不立刻删表项），**不参与「上不上屏」**，也不续 {@link #portAt} 的命。
+         * 上屏判据见 {@link #serviceAlive}。
+         */
+        long linkAt;
+
+        /**
+         * 它的隔空投送服务这一刻还算不算「开着」。
+         *
+         * <p>用户 2026-11-27 给出的两条要求：打开「所有人」要很快出现，关掉要很快消失。
+         * 能回答这件事的只有两个正面证据：**它答了我们的 mDNS 查询**（{@link #seenAt}），
+         * 或者**8770 真的接通了**（{@link #portAt}）。RST 不算——那是「设备在」，不是
+         * 「它在收」。窗口取 {@link Peers#SERVICE_WINDOW_MS}。
+         */
+        boolean serviceAlive(long now) {
+            // 三态判据（2026-11-27 12:14 实验定）：iPhone **不发 goodbye**（3 分钟 0 条），
+            // 所以「关掉 AirDrop」只能靠「没有任何回应」来认。RST 说明设备在链路上——
+            // 给它一个更长的窗口（30 秒），既不会「放一会儿就消失」，也不会「关了还一直挂着」。
+            if (now - Math.max(this.seenAt, this.portAt) < Peers.SERVICE_WINDOW_MS) {
+                return true;
+            }
+            return now - this.linkAt < Peers.LINK_WINDOW_MS;
+        }
 
         /**
          * 实测出来的「它多久说一次话」，毫秒。0 表示还没测出来。
@@ -775,9 +824,16 @@ private Thread thread;
      * <p>抽成静态方法是为了能在桌面 JVM 上直接测（{@code LivenessFloorTest}）。
      */
     static List<Peer> dedupe(java.util.Collection<Peer> all) {
+        long now = System.currentTimeMillis();
         Map<String, Peer> byIdentity = new LinkedHashMap<>(all.size());
         for (Peer peer : all) {
             if (peer.unproven) {
+                continue;
+            }
+            // 「它的隔空投送这一刻还开着吗」——见 {@link Peer#serviceAlive}。
+            // 这一条是用户 2026-11-27 的两条要求：打开「所有人」很快出现、关掉很快消失。
+            // 放在出口而不是删表：表里留着它，端口一接、mDNS 一答就能立刻回来。
+            if (!peer.serviceAlive(now)) {
                 continue;
             }
             String key = identity(peer);
@@ -1989,7 +2045,22 @@ private Thread thread;
             // 8770 却一直答；旧代码在 deaf 时整个跳过探测，于是 {@link Peer#portAt} 不再更新，
             // 沉默照涨，20 秒后那台明明连得上的设备还是被删了。
             boolean deaf = LivenessState.deaf(lastForeign, now);
-            for (Peer peer : snapshot()) {
+            // 探的是**整张表**，不是上屏的那份：不上屏只是「它的服务这一刻没证据」，
+            // 表项还要继续每秒探一次——AirDrop 一开、8770 接通，它就该立刻回到屏幕上。
+            List<Peer> watching;
+            synchronized (peers) {
+                watching = new ArrayList<>(peers.values());
+            }
+            for (Peer peer : watching) {
+                if (peer.connectable()) {
+                    // **主动问一声**：这就是用户要的「主动探测在不在」，比 ping 更贴题——
+                    // 问的是「你的隔空投送服务还在不在」。AirDrop 开着时它对单播查询（QU）
+                    // 会立刻答，{@code seenAt} 因此每秒续命，设备不会再因为应答器休眠 6–8 秒
+                    // 而「一段时间后消失」；关掉 AirDrop 之后它不再答，窗口一到就下线。
+                    //
+                    // 代价是每台设备每秒一个 mDNS 包——和它自己每秒一次的宣告同一个量级。
+                    ask(peer);
+                }
                 if (!peer.connectable() || peer.unproven || peer.knocking) {
                     continue;
                 }
@@ -2012,6 +2083,13 @@ private Thread thread;
                 }
                 if (PortProbe.ourFault(why)) {
                     // 我们没把包送出去。这种失败不能记在它头上，见 {@link #knock}。
+                    continue;
+                }
+                if (PortProbe.refused(why)) {
+                    // 收到 RST：设备在链路上活着，但 8770 没开——**不能**据此认为它的隔空投送
+                    // 还开着（用户关掉 AirDrop 之后它照样回 RST）。所以这里只记 linkAt，
+                    // 不续 portAt、不上屏。真离场仍由 mDNS 沉默判定。
+                    peer.linkAt = now;
                     continue;
                 }
                 if (peer.gone) {

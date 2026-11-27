@@ -540,6 +540,19 @@ impl<R: Radio, T: Tunnel> Link<R, T> {
         self.stats
     }
 
+    /// 时钟源那个 peer 最近一次 presence 帧的时刻（微秒，调度时钟）。
+    ///
+    /// <p>这是整个工程里**唯一能直接回答「对端此刻还在不在 AWDL 链路上」的信号**：mDNS 应答会
+    /// 休眠、8770 会拒连、RST 只能说明它在，而 PSF presence 是它在链路上真实存在的行为本身。
+    /// 2026-11-27 的判据调整（用户要求：打开 AirDrop 很快出现、关掉很快清除、放着不消失）就建立
+    /// 在它上面——用它的年龄，而不是数 mDNS 沉默了多少秒。
+    ///
+    /// <p>返回原始时刻而不是年龄，是因为年龄要一个“现在”，而这条链路上的“现在”由调用方
+    /// （`awdld` 的拍子）持有；在这里自己取时钟会和拍子差半个周期。
+    pub fn last_presence_us(&self) -> Option<u64> {
+        self.last_presence_us
+    }
+
     /// The node this link announces itself as.
     pub fn node(&self) -> &NodeInfo {
         &self.node

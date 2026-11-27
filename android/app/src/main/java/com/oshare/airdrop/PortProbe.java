@@ -76,4 +76,19 @@ final class PortProbe {
     static boolean ourFault(String why) {
         return why.contains("unreachable") || why.contains("No route");
     }
+
+    /**
+     * 这次失败是不是「它还在、只是不接」——也就是收到了 RST（{@code ECONNREFUSED}）。
+     *
+     * <p><b>RST 是对方的 TCP 栈发回来的，所以它本身就是「对方在这条链路上活着」的证据。</b>
+     * 只有「连 SYN 都没人答」（超时）才是「可能不在了」。把这两件事混成一种失败，是
+     * 2026-11-27 那次「AirDrop 一直开着、设备却从列表消失」的根因：iPhone 的隔空投送接收端
+     * 不是常开的，它关着的时候我们收到的是 RST，于是被判成了离场。
+     *
+     * <p>用户的判据说得很直接：**看对方在不在链路上，而不是等它发 mDNS**。RST 正好是可随时
+     * 主动发起、又不需要 ICMP 权限的那种「在不在」探测。
+     */
+    static boolean refused(String why) {
+        return why.contains("ECONNREFUSED") || why.contains("Connection refused");
+    }
 }
