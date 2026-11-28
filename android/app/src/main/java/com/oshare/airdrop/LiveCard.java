@@ -523,6 +523,20 @@ final class LiveCard {
             card.extras = new Bundle();
         }
         card.extras.putInt("immersiveCardType", 2);
+        // 2026-11-28：抄时钟 APP 的做法。它的倒计时卡片用 OPPO 的 SeedlingCardOptions 的
+        // `requestShowPanel=true` 让面板保持显示（反编译 JsonToSeedlingCardOptionsConvertor
+        // 得到属性名：requestShowPanel / remind_type / importance / showHostMap / …）。
+        // 这些属性最终写进通知 extras 的 `oplusLiveAlertOptions`（JSON），所以不集成 OPPO SDK
+        // 也能直接写一份——若系统读它，卡片就不缩回；不读也只是多一个无害的 extras。
+        try {
+            org.json.JSONObject options = new org.json.JSONObject();
+            options.put("requestShowPanel", true);
+            options.put("remind_type", 13);
+            options.put("importance", 4);
+            card.extras.putString("oplusLiveAlertOptions", options.toString());
+        } catch (Throwable ignored) {
+            // 只是尽力而为：写不进去不影响卡片本身。
+        }
     }
 
     /** 撤掉。传 {@code null} 之外什么都不需要。 */
@@ -655,7 +669,6 @@ final class LiveCard {
         // 2026-11-28：卡片不缩回的最终解法——给通知挂一个非空 fullScreenIntent。
         // 系统的 entryToReminderType 只看它是否非空就返回 13（强提醒·始终），
         // 而 13 不会在 3 秒后收成胶囊。这是纯 Java 层，不经过任何 hook。
-        PendingIntent reminder = stop != null ? stop : (open != null ? open : retry);
         Notification.Builder builder = new Notification.Builder(context, CHANNEL)
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentTitle(title)
@@ -668,10 +681,6 @@ final class LiveCard {
                 .setOnlyAlertOnce(!alert)
                 .setShowWhen(false)
                 .setRequestPromotedOngoing(true);
-        if (reminder != null) {
-            builder.setFullScreenIntent(reminder, false);
-        }
-        // 顺序就是左右顺序：【打开文件】/【打开链接】/【重试】说的是「接下来做什么」，排在
         // 左边；【完成】是「这件事到此为止」，永远在最右。前两颗不会同时出现，所以最多两颗。
         if (open != null) {
             builder.addAction(new Notification.Action.Builder(null,

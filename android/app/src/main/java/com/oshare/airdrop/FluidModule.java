@@ -236,6 +236,31 @@ public final class FluidModule extends XposedModule {
 
     private void installPluginHooks(ClassLoader pluginLoader) {
         log(Log.INFO, TAG, "拿到流体云插件的 loader：" + pluginLoader);
+        // 2026-11-28：换路——不再钩插件（插件类是动态加载的，hook 会被 LSPosed 的动态代码
+        // 保护拦掉），改成钩 SystemUI **主 APK** 里的 remindType 计算。项目注释里那个公式
+        //   remindType = promoted ? (fullScreenIntent != null ? 13 : sticky ? 12 : 11) : 0
+        // 就在 `entryToReminderType` 里；它是主 APK 类，onLoad 时已存在，可以合法 hook。
+        // 强制返回 13（强提醒·始终），卡片就不会 3 秒缩回。
+        try {
+            Class<?> repo = Class.forName(
+                    "com.oplus.systemui.statusbar.notification.livealert.data.repository"
+                            + ".OplusLiveAlertNotificationsRepository",
+                    false, FluidModule.class.getClassLoader());
+            for (java.lang.reflect.Method method : repo.getDeclaredMethods()) {
+                if (!"entryToReminderType".equals(method.getName())) {
+                    continue;
+                }
+                hook(method)
+                        .setPriority(PRIORITY_DEFAULT)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PASSTHROUGH)
+                        .setId("opairdrop-remind-type-13")
+                        .intercept(chain -> 13);
+                log(Log.INFO, TAG, "已钩住 entryToReminderType → 恒返 13（卡片不缩回）");
+                break;
+            }
+        } catch (Throwable missing) {
+            log(Log.ERROR, TAG, "Repository.entryToReminderType 钩不上：" + missing);
+        }
         // 前台抑制那一刀**故意不装**。2026-11-19 01:43 试过：装上之后它确实把卡放行了，
         // 但同一轮状态机反而判 REFUSED（cardLiveSize=1 / capsuleLiveSize=1 /
         // transientReminderSize=0 / cardsLevel=-1），比不装还差。
